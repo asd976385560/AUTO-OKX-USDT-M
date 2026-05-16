@@ -8,9 +8,10 @@
 ---
 
 ## 快速开始
- git clone https://github.com/asd976385560/AUTO-OKX-USDT-M.git
- 填写 config.md 必填项
- 
+
+git clone https://github.com/asd976385560/AUTO-OKX-USDT-M.git
+填写 config.md 必填项
+
 ⚠️使用openclaw/qclaw等等个人智能助手
 ⚠️聊天窗口发送：读取分析E:\OKX  目录下skill.md，config.md，README.md，按照skill里面内容部署OKX 永续合约自主交易系统,部署完成后进行测试，缺少key或者需要我决定的，最后列个表。
 
