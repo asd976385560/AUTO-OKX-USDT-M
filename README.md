@@ -1,83 +1,32 @@
 # OKX 永续合约自主交易系统 v3.1
 
-> 小灵（AI 交易员）在 OKX USDT-M 永续合约上的自动化交易系统。
-> 核心流程为：数据采集 -> 数据库存储 -> Agent 决策 -> 交易执行 -> 每日复盘。
+> 小灵（AI 交易员）在 OKX 永续合约上的全自动自主交易系统。
+> **可迁移、可分享**——拿到这个目录，配置好环境和 API Key，即可运行。
+> 全币种扫描（300+ 合约），五维评分为参考锚点，小灵拥有最大裁量权。
+> 所有交易数据、状态、经验全部写入数据库。
+
+---
 
 ## 快速开始
-
-git clone https://github.com/asd976385560/AUTO-OKX-USDT-M.git
-修改config.md文件配置
-
 ⚠️使用openclaw/qclaw等等个人智能助手
 ⚠️聊天窗口发送：读取分析E:\OKX  目录下skill.md，config.md，README.md，按照skill里面内容部署OKX 永续合约自主交易系统,部署完成后进行测试，缺少key或者需要我决定的，最后列个表。
 
 **⚠️最好使用opus 4.7或者gpt-5.5安装，其他的大模型，装好后再让他测试一遍。**
 **⚠️注意：config.md文件里面需要填一些配置，像指令E:\OKX这些目录按实际的修改。**
 
-本仓库面向两类使用方式：
-1. 本地脚本运行：手动初始化、健康检查、触发采集和复盘脚本。
-2. OpenClaw 定时运行：用 Cron 唤醒 Job A / B / C / E，形成完整自动化闭环。
+### Step 1 — 安装运行环境
 
-如果你是第一次接触这个项目，先看 [skill.md](skill.md) 了解规则边界，再看 [config.md](config.md) 填配置，最后按本文完成部署。
+```bash
+# 1. Python 3.14+（内置 sqlite3）
+#    https://www.python.org/downloads/
 
----
+# 2. pwsh 7+（PowerShell Core）— 禁止使用 PS 5.1
+#    https://github.com/PowerShell/PowerShell/releases
 
-## 项目概览
+# 3. Node.js 18+
+#    https://nodejs.org/
 
-### 系统能力
-
-- 市场范围：OKX 全部 USDT-M 永续合约。
-- 运行模式：全自动自主运行，默认实盘 profile = live。
-- 决策逻辑：五维评分提供参考锚点，最终由 Agent 综合裁量。
-- 数据落盘：行情、账户、持仓、评分、交易事件、经验库全部写入 SQLite。
-
-### 四大 Job
-
-| Job | 频率 | 职责 | 入口 |
-|-----|------|------|------|
-| Job A | 每 15 分钟 | 快速采集行情、账户、新闻、15m 数据 | `scripts/collect_data.py`（当前占位，需补齐后启用） |
-| Job E | 每 1 小时 | 慢源采集 1H/4H/1D/1W/1M、宏观与情绪 | `scripts/collect_slow.py` |
-| Job B | 每 15 分钟 | 全币种扫描、推理、下单、写交易痕迹 | `prompts/jobb-prompt.md` |
-| Job C | 每日 00:30 | 复盘、归因、参数建议、经验更新 | `scripts/self_review.py` + `prompts/jobc-prompt.md` |
-
-### 数据流
-
-```text
-Job A / Job E -> market.db / news.db / account.db -> Job B -> trade_events / scoring_history
-Job C <- account.db / lessons.db / market.db / news.db <- Job B 运行痕迹
-```
-
----
-
-## 运行要求
-
-| 项目 | 要求 |
-|------|------|
-| 操作系统 | Windows 10+ |
-| Python | 3.14+ |
-| PowerShell | pwsh 7+，不要使用 Windows PowerShell 5.1 |
-| Node.js | 18+ |
-| OKX CLI | `npm install -g @okx_ai/okx-trade-cli` |
-| OpenClaw | 最新版，用于 Cron 自动调度 |
-| 网络 | 能访问 `okx.com`、FRED、CoinGecko、DefiLlama |
-
----
-
-## 部署前准备
-
-### 1. 约定项目路径
-
-本文统一使用以下占位符：
-
-- `<PROJECT_ROOT>`：项目根目录，例如 `D:\AUTO-OKX-USDT-M`
-- `<DB_DIR>`：数据库目录，例如 `D:\AUTO-OKX-USDT-M\db`
-
-如果你沿用其他路径，所有命令中的目录都要同步替换，不要继续照抄 `E:\OKX`。
-
-### 2. 安装依赖
-
-```powershell
-# 安装 OKX CLI
+# 4. OKX CLI
 npm install -g @okx_ai/okx-trade-cli
 
 # 验证基础工具
