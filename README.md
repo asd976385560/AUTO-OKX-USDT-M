@@ -1,117 +1,230 @@
 # OKX 永续合约自主交易系统 v3.1
 
-> 小灵（AI 交易员）在 OKX 永续合约上的全自动自主交易系统。
-> **可迁移、可分享**——拿到这个目录，配置好环境和 API Key，即可运行。
-> 全币种扫描（300+ 合约），五维评分为参考锚点，小灵拥有最大裁量权。
-> 所有交易数据、状态、经验全部写入数据库。
-
----
+> 小灵（AI 交易员）在 OKX USDT-M 永续合约上的自动化交易系统。
+> 核心流程为：数据采集 -> 数据库存储 -> Agent 决策 -> 交易执行 -> 每日复盘。
 
 ## 快速开始
+
+git clone https://github.com/asd976385560/AUTO-OKX-USDT-M.git
+修改config.md文件配置
+
 ⚠️使用openclaw/qclaw等等个人智能助手
 ⚠️聊天窗口发送：读取分析E:\OKX  目录下skill.md，config.md，README.md，按照skill里面内容部署OKX 永续合约自主交易系统,部署完成后进行测试，缺少key或者需要我决定的，最后列个表。
 
 **⚠️最好使用opus 4.7或者gpt-5.5安装，其他的大模型，装好后再让他测试一遍。**
 **⚠️注意：config.md文件里面需要填一些配置，像指令E:\OKX这些目录按实际的修改。**
 
-### Step 1 — 安装运行环境
+本仓库面向两类使用方式：
+1. 本地脚本运行：手动初始化、健康检查、触发采集和复盘脚本。
+2. OpenClaw 定时运行：用 Cron 唤醒 Job A / B / C / E，形成完整自动化闭环。
 
-```bash
-# 1. Python 3.14+（内置 sqlite3）
-#    https://www.python.org/downloads/
+如果你是第一次接触这个项目，先看 [skill.md](skill.md) 了解规则边界，再看 [config.md](config.md) 填配置，最后按本文完成部署。
 
-# 2. pwsh 7+（PowerShell Core）— 禁止使用 PS 5.1
-#    https://github.com/PowerShell/PowerShell/releases
+---
 
-# 3. Node.js 18+
-#    https://nodejs.org/
+## 项目概览
 
-# 4. OKX CLI
+### 系统能力
+
+- 市场范围：OKX 全部 USDT-M 永续合约。
+- 运行模式：全自动自主运行，默认实盘 profile = live。
+- 决策逻辑：五维评分提供参考锚点，最终由 Agent 综合裁量。
+- 数据落盘：行情、账户、持仓、评分、交易事件、经验库全部写入 SQLite。
+
+### 四大 Job
+
+| Job | 频率 | 职责 | 入口 |
+|-----|------|------|------|
+| Job A | 每 15 分钟 | 快速采集行情、账户、新闻、15m 数据 | `scripts/collect_data.py`（当前占位，需补齐后启用） |
+| Job E | 每 1 小时 | 慢源采集 1H/4H/1D/1W/1M、宏观与情绪 | `scripts/collect_slow.py` |
+| Job B | 每 15 分钟 | 全币种扫描、推理、下单、写交易痕迹 | `prompts/jobb-prompt.md` |
+| Job C | 每日 00:30 | 复盘、归因、参数建议、经验更新 | `scripts/self_review.py` + `prompts/jobc-prompt.md` |
+
+### 数据流
+
+```text
+Job A / Job E -> market.db / news.db / account.db -> Job B -> trade_events / scoring_history
+Job C <- account.db / lessons.db / market.db / news.db <- Job B 运行痕迹
+```
+
+---
+
+## 运行要求
+
+| 项目 | 要求 |
+|------|------|
+| 操作系统 | Windows 10+ |
+| Python | 3.14+ |
+| PowerShell | pwsh 7+，不要使用 Windows PowerShell 5.1 |
+| Node.js | 18+ |
+| OKX CLI | `npm install -g @okx_ai/okx-trade-cli` |
+| OpenClaw | 最新版，用于 Cron 自动调度 |
+| 网络 | 能访问 `okx.com`、FRED、CoinGecko、DefiLlama |
+
+---
+
+## 部署前准备
+
+### 1. 约定项目路径
+
+本文统一使用以下占位符：
+
+- `<PROJECT_ROOT>`：项目根目录，例如 `D:\AUTO-OKX-USDT-M`
+- `<DB_DIR>`：数据库目录，例如 `D:\AUTO-OKX-USDT-M\db`
+
+如果你沿用其他路径，所有命令中的目录都要同步替换，不要继续照抄 `E:\OKX`。
+
+### 2. 安装依赖
+
+```powershell
+# 安装 OKX CLI
 npm install -g @okx_ai/okx-trade-cli
+
+# 验证基础工具
+python --version
+pwsh --version
+node --version
+okx --version
+```
+
+### 3. 配置 OKX CLI
+
+```powershell
 okx config init
-# 配置 API Key / Secret / Passphrase，profile = live
-
-# 5. OpenClaw（定时任务调度）
-#    https://docs.openclaw.ai
-```
-
-### Step 2 — 配置 API Key
-
-编辑 `config.md`，填写以下必填项：
-
-| # | 必填项 | 说明 | 获取方式 |
-|---|--------|------|---------|
-| 1 | 数据库目录 | SQLite 存放路径 | 本地创建，如 `E:\OKX\db` |
-| 2 | FRED API Key | 美联储经济数据 | https://fred.stlouisfed.org/docs/api/api_key.html |
-| 3 | CoinGecko API Key | 加密市场宏观数据 | https://www.coingecko.com/en/api |
-| 4 | 妙想 API Key | 东方财富资讯 | 联系妙想平台获取 |
-| 5 | QQ Bot 推送目标 | QQ C2C 目标 ID | OpenClaw QQ Bot 配置 |
-
-### Step 3 — 初始化数据库
-
-```bash
-python scripts/init_okx2.py --root E:\OKX --db-dir <数据库目录>
-```
-
-### Step 4 — 健康检查
-
-```bash
-python scripts/health_check.py
 okx config show
 okx account balance --profile live
 ```
 
-### Step 5 — 启动定时任务
+要求：
 
-通过 OpenClaw Cron 配置四大定时任务（详见下方 §定时任务配置）。
+- profile 使用 `live`
+- 能正常返回余额
+- 凭证保存在用户目录的 `.okx/config.toml`，不在项目仓库内
+
+### 4. 填写 config.md 必填项
+
+首次运行前，至少补齐 [config.md](config.md) 里的以下内容：
+
+| 项目 | 用途 |
+|------|------|
+| 数据库目录 | SQLite 落盘位置 |
+| FRED API Key | 宏观数据 |
+| CoinGecko API Key | 市场宏观与 ETF 代理数据 |
+| 妙想 API Key | 新闻与地缘数据 |
+| QQ Bot 推送目标 | Job B / Job C 通知 |
 
 ---
 
-## 外部工具与技能
+## 首次部署
 
-### 1. OKX CLI（`@okx_ai/okx-trade-cli`）
+推荐按下面的顺序执行，一步一步确认，不要直接跳到定时任务。
 
-**安装**：
-```bash
-npm install -g @okx_ai/okx-trade-cli
+### Step 1. 初始化数据库与目录
+
+```powershell
+Set-Location <PROJECT_ROOT>
+python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>
 ```
 
-**配置**：
-```bash
-okx config init
-# 输入 API Key / Secret / Passphrase
-# 选择 profile = live
+这个脚本会做三件事：
+
+1. 检查 [config.md](config.md) 的必填项是否已填写。
+2. 创建数据库目录、报告目录等运行目录。
+3. 初始化 `market.db`、`news.db`、`account.db`、`lessons.db`。
+
+### Step 2. 执行健康检查
+
+```powershell
+Set-Location <PROJECT_ROOT>
+python scripts/health_check.py
 ```
 
-**用途**：
-| 命令 | 用途 | 使用场景 |
-|------|------|---------|
-| `okx market instruments --instType SWAP` | 获取所有永续合约列表 | 品种发现（300+ 合约） |
-| `okx market ticker --instId BTC-USDT-SWAP` | 获取单个合约行情 | 单币种查询 |
-| `okx account balance --profile live` | 账户余额 | Job A / Job B |
-| `okx account positions --instType SWAP --profile live` | 当前持仓 | Job A / Job B |
-| `okx swap place --profile live ...` | 下单 | Job B 交易执行 |
-| `okx swap close-all --profile live ...` | 全部平仓 | 紧急平仓 |
-| `okx algo order --profile live ...` | 挂 algo 止损 | Job B 开仓后必挂 |
+健康检查通过后，应至少确认：
 
-**验证**：
-```bash
-okx config show              # 确认凭证
-okx account balance --profile live  # 确认余额
+- OKX API 可访问
+- FRED / DefiLlama / CoinGecko 可访问
+- Python 自带 SQLite 可用
+- OKX CLI 可执行
+
+### Step 3. 手动跑一次 Job E
+
+```powershell
+Set-Location <PROJECT_ROOT>
+python scripts/collect_slow.py --db-root <DB_DIR>
 ```
 
-### 2. OpenClaw Cron（定时任务调度）
+如果你想首次一次性补齐所有长周期时间框架，可改为：
 
-**配置方法**：通过 OpenClaw 的 `cron` 工具设置定时任务。
+```powershell
+python scripts/collect_slow.py --db-root <DB_DIR> --force-all-timeframes
+```
 
-每个 Job 的配置包括：
-- `schedule`：Cron 表达式（如 `5,20,35,50 * * * *`）
-- `payload.kind`：`agentTurn`（Agent 执行）
-- `payload.message`：Agent prompt（见 `prompts/` 目录）
-- `sessionTarget`：`isolated`（独立会话）
-- `delivery`：QQ Bot 推送配置
+### Step 4. 手动跑一次 Job C
 
-**配置示例**：
+```powershell
+Set-Location <PROJECT_ROOT>
+python scripts/self_review.py --db-root <DB_DIR>
+```
+
+如果要复盘指定日期：
+
+```powershell
+python scripts/self_review.py --date 2026-05-15 --db-root <DB_DIR>
+```
+
+---
+
+## 使用说明
+
+### 1. 手动运行模式
+
+适合首次部署、联调和故障排查。
+
+常用命令：
+
+```powershell
+# 初始化
+python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>
+
+# 健康检查
+python scripts/health_check.py
+
+# Job E：慢源采集
+python scripts/collect_slow.py --db-root <DB_DIR>
+
+# Job E：强制全周期采集
+python scripts/collect_slow.py --db-root <DB_DIR> --force-all-timeframes
+
+# Job C：每日复盘
+python scripts/self_review.py --db-root <DB_DIR>
+
+# OKX CLI 检查
+okx config show
+okx account balance --profile live
+okx account positions --instType SWAP --profile live
+```
+
+### 2. OpenClaw 自动运行模式
+
+完整自动化依赖 OpenClaw Cron。当前推荐的错峰执行为：
+
+| 任务 | Cron | 说明 |
+|------|------|------|
+| Job A | `1,16,31,46 * * * *` | 快速采集 |
+| Job B | `5,20,35,50 * * * *` | 决策与执行 |
+| Job E | `10 * * * *` | 慢源采集 |
+| Job C | `30 0 * * *` | 每日复盘 |
+
+注意：当前仓库里的 `scripts/collect_data.py` 是空文件，Job A 需要先补齐实现再接入 Cron。未补齐前，可以先联调 Job E、Job C 和 OKX CLI 连通性。
+
+调度原则：
+
+- 先采集，后决策。
+- Job A 与 Job B 至少错开 4 分钟，给数据库写入留时间。
+- Job C 只做复盘，不允许任何交易动作。
+
+Job A 的 OpenClaw 示例：
+
 ```json
 {
   "name": "OKX-JobA-快速采集",
@@ -119,234 +232,117 @@ okx account balance --profile live  # 确认余额
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "运行 OKX Job A 快速采集: py E:\\OKX\\scripts\\collect_data.py --profile live --db-root E:\\OKX\\db",
+    "message": "运行 OKX Job A 快速采集: py <PROJECT_ROOT>\\scripts\\collect_data.py --profile live --db-root <DB_DIR>",
     "model": "MiniMax-M2.7-highspeed",
     "lightContext": true
   }
 }
 ```
 
-### 3. OKX CLI 技能路由（OpenClaw 技能）
+### 3. 与 AI 助手协作部署
 
-以下技能由 OpenClaw 管理，为 OKX CLI 提供高级封装：
+如果你用 OpenClaw、qclaw 或其他个人助手协助部署，建议让它同时读取：
 
-| 技能 | 用途 | 安装 |
-|------|------|------|
-| `okx-cex-market` | 行情 / K线 / 深度 / 资金费率 / OI / 技术指标 | `clawhub install okx-cex-market` |
-| `okx-cex-portfolio` | 余额 / 持仓 / P&L / 费率 / 转账 | `clawhub install okx-cex-portfolio` |
-| `okx-cex-trade` | 下单 / 撤单 / 改单 / 止损止盈 | `clawhub install okx-cex-trade` |
-| `okx-cex-bot` | Grid 网格 / DCA 马丁策略 | `clawhub install okx-cex-bot` |
-| `mx-search` | 妙想地缘政治新闻搜索 | `clawhub install mx-search` |
+1. [skill.md](skill.md)
+2. [config.md](config.md)
+3. [README.md](README.md)
 
-**注意**：这些技能是 OpenClaw 生态的一部分，需要在 OpenClaw 环境中运行。独立运行采集脚本（`collect_data.py`）不需要这些技能，脚本通过 `_okx_http.py` 直接调用 OKX API。
-
-### 4. 外部数据源
-
-| 数据源 | 用途 | API Key | 免费额度 |
-|--------|------|---------|---------|
-| **FRED** | DXY / VIX / S&P500 + 日变化率 | config.md §4.1 | 120 req/min |
-| **DefiLlama** | 全链 TVL | 无需 | 无限 |
-| **CoinGecko** | BTC 市占率 / 加密总市值 / 24h 交易量 | config.md §4.3 | 30 req/min |
-| **妙想（mx-search）** | 地缘政治新闻 | config.md §4.4 | 按配额 |
-
-**配置**：所有 Key 填入 `config.md` 对应位置。
-
-### 5. QQ Bot 推送
-
-| 项目 | 值 |
-|------|-----|
-| 推送通道 | QQ C2C |
-| 目标 ID | config.md §8 |
-| 推送内容 | Job B 每轮决策要点、Job C 每日复盘摘要 |
-| 配置方式 | OpenClaw `cron` 工具的 `delivery` 字段 |
+这样它能同时拿到规则边界、运行配置和部署流程，避免只按单个文件做错误假设。
 
 ---
 
-## 目录结构
+## 核心脚本
 
-```
-E:\OKX\
-├── README.md              # 本文件
-├── REFACTOR_PLAN.md       # 重构计划
-├── skill.md               # 交易系统最高权威 v3.1
-├── config.md              # 运行时配置 v3.1
-├── schema.sql             # 数据库表结构参考
-│
-├── scripts/               # 核心脚本（仅 8 个）
-│   ├── collect_data.py    # Job A 快速采集（300+ 币种 Ticker/Funding/K线/账户/新闻）
-│   ├── collect_slow.py    # Job E 慢源采集（1H/4H 每小时，1D/1W/1M 分频 + 跨市场宏观 + 情绪）
-│   ├── init_okx2.py       # 数据库初始化（幂等）
-│   ├── health_check.py    # 运行前连通性检测
-│   ├── self_review.py     # Job C 每日复盘
-│   ├── _okxcli.py         # OKX CLI 封装
-│   ├── _okx_http.py       # OKX HTTP 批量并发封装
-│   └── _timeutils.py      # 时间工具
-│
-├── prompts/               # Cron Agent Prompt 备份
-│   ├── jobb-prompt.md     # Job B 决策执行完整 prompt
-│   └── jobc-prompt.md     # Job C 复盘完整 prompt
-│
-├── reports/               # 报告输出
-│   ├── jobb/              # JobB 每轮决策报告
-│   ├── self-reviews/      # JobC 每日自省报告
-│   └── daily/             # 日报备份
-│
-└── docs/                  # 项目文档
-    ├── architecture.md    # 系统架构
-    ├── data-flow.md       # 数据流与存储模式
-    ├── cron-jobs.md       # 定时任务配置方法
-    ├── risk-limits.md     # 风控硬上限
-    └── trading-summary.md # 交易总结
-```
+| 脚本 | 用途 | 关键参数 |
+|------|------|----------|
+| `scripts/init_okx2.py` | 初始化目录与数据库 | `--root`、`--db-dir`、`--skip-config-check` |
+| `scripts/health_check.py` | 启动前连通性检查 | 无 |
+| `scripts/collect_data.py` | Job A 快速采集 | 当前为空文件，补齐后应支持 `--profile live --db-root <DB_DIR>` |
+| `scripts/collect_slow.py` | Job E 慢源采集 | `--db-root`、`--force-all-timeframes` |
+| `scripts/self_review.py` | Job C 每日复盘 | `--date`、`--db-root`、`--okx-root` |
+
+说明：
+
+- `init_okx2.py` 是幂等的，数据库缺表或目录缺失时可以重复执行。
+- `collect_slow.py` 当前支持按小时选择 1D/1W/1M，首次联调建议加 `--force-all-timeframes`。
+- `self_review.py` 默认复盘昨天的数据。
 
 ---
 
-## 系统架构
+## 数据与目录
 
-### 五层架构
+### 目录结构
 
-```
-采集层（Job A/E）→ 数据库层 → 决策层（Job B）→ 执行层 → 复盘层（Job C）
-```
-
-### 四大定时任务
-
-| 任务 | 频率 | 职责 |
-|------|------|------|
-| **Job A** | 每 15 分钟 | 提供最新 15 分钟市场快照（300+ 币种 Ticker / 资金费率 / 15m K线 / 账户 / 新闻） |
-| **Job E** | 每 1 小时 | 采集长期数据（1H/4H/1D K线 / DXY / 黄金 / VIX / SPX / ETF / 情绪 / Regime） |
-| **Job B** | 每 15 分钟 | 全币种扫描 → 五维评分 → 小灵推理 → 交易执行（实时获取账户信息） |
-| **Job C** | 每日 00:30 | 短期+长期复盘 → 优化 A/B/E 策略 → 补充缺失数据 → 解决运行异常 |
-
-### 数据流
-
-```
-Job A (15min) ──→ market.db / news.db / account.db ──┐
-                                                      ├──→ Job B (15min) ──→ 交易执行
-Job E (1h)    ──→ market.db / news.db              ──┘         │
-                                                                │
-Job C (daily) ◄── account.db / lessons.db / market.db ◄────────┘
-     │
-     ├──→ 优化 Job B 策略
-     ├──→ 优化 Job A 搜索配置
-     └──→ 优化 Job E 采集
+```text
+<PROJECT_ROOT>
+├── README.md
+├── skill.md
+├── config.md
+├── schema.sql
+├── scripts/
+├── prompts/
+├── reports/
+└── docs/
 ```
 
----
+### 核心数据库
 
-## 定时任务配置
+| 数据库 | 作用 |
+|--------|------|
+| `market.db` | 行情、K 线、衍生品、跨市场宏观 |
+| `news.db` | 新闻事件、币种情绪 |
+| `account.db` | 账户、持仓、评分、交易事件、系统状态 |
+| `lessons.db` | 经验库、错判模式、参数建议、复盘结果 |
 
-### OpenClaw Cron 配置
-
-| 任务 | Cron 表达式 | 触发方式 | 脚本/Prompt |
-|------|------------|---------|-----------|
-| Job A | `1,16,31,46 * * * *` | `isolated agentTurn` | `py E:\OKX\scripts\collect_data.py --profile live --db-root E:\OKX\db` |
-| Job E | `10 * * * *` | `isolated agentTurn` | `py E:\OKX\scripts\collect_slow.py --db-root E:\OKX\db` |
-| Job B | `5,20,35,50 * * * *` | `isolated agentTurn` | 见 `prompts/jobb-prompt.md` |
-| Job C | `30 0 * * *` | `isolated agentTurn` | 见 `prompts/jobc-prompt.md` |
-
-> 错开设计：A 在 :01/:16/:31/:46 采集 → B 在 :05/:20/:35/:50 决策（给 A 4 分钟完成写入）→ E 在 :10 慢源采集
-
-### 配置参数
-
-| 任务 | model | thinking | lightContext | timeout |
-|------|-------|----------|-------------|---------|
-| Job A | MiniMax-M2.7-highspeed | off | true | 666s |
-| Job E | MiniMax-M2.7-highspeed | off | true | 999s |
-| Job B | （默认模型） | off | false | 888s |
-| Job C | （默认模型） | off | false | 999s |
-
----
-
-## 核心脚本说明
-
-| 脚本 | 用途 | 参数 | 依赖 |
-|------|------|------|------|
-| `collect_data.py` | Job A 快速采集 | `--profile live --db-root <DB>` | _okxcli.py, _okx_http.py, _timeutils.py |
-| `collect_slow.py` | Job E 慢源采集 | `--db-root <DB> [--force-all-timeframes]` | _okxcli.py, _okx_http.py, _timeutils.py |
-| `init_okx2.py` | 数据库初始化 | `--root <ROOT> --db-dir <DB>` | — |
-| `health_check.py` | 健康检查 | — | config.md |
-| `self_review.py` | Job C 复盘 | `--db-root <DB>` | — |
-| `_okxcli.py` | OKX CLI 封装 | — | okx CLI |
-| `_okx_http.py` | OKX HTTP 封装 | — | requests |
-| `_timeutils.py` | 时间工具 | — | — |
-
----
-
-## 数据库说明
-
-4 个 SQLite 数据库，26+ 张核心表：
-
-| 库 | 核心表 | 说明 |
-|----|--------|------|
-| market.db | tick_snapshots | 300+ 币种 Ticker 快照（每轮 300+行） |
-| market.db | kline_cache | K 线 + 指标（15m/1H/4H/1D） |
-| market.db | cross_market | 跨市场宏观快照 |
-| market.db | derivatives | 资金费率 / OI / 溢价 |
-| news.db | news_items | 新闻事件（哈希去重） |
-| news.db | coin_sentiment | 币种情绪 |
-| account.db | 全部 | 账户/持仓/评分/事件/报告/系统状态/经验库 |
-| lessons.db | 全部 | 信号表现/错判模式/参数建议/错失机会 |
-
-**存储模式**：增量追加（时间序列），非全量覆盖。详见 `docs/data-flow.md`。
+存储模式为时间序列增量追加，详细表结构见 [schema.sql](schema.sql) 和 [docs/data-flow.md](docs/data-flow.md)。
 
 ---
 
 ## 风控硬上限
 
-触碰任一条 → 立即停手 + 进入 PAUSE，需主人手动恢复。
+以下限制来自 [skill.md](skill.md)，不能被 prompt、学习结果或临时判断放宽：
 
 | 限制项 | 默认推荐 | 硬上限 |
-|--------|---------|--------|
-| 单笔仓位占净值 | ≤ 5% | ≤ **10%** |
-| 杠杆（BTC/ETH） | 10x | ≤ **10x** |
-| 杠杆（山寨） | 5x | ≤ **10x** |
-| 同侧暴露 | ≤ 50% | ≤ **60%** |
-| 并发持仓 | ≤ 3 仓 | ≤ **6 仓** |
-| 单次开仓保证金 | — | ≤ **10% 净值** |
+|--------|----------|--------|
+| 单笔仓位占净值 | <= 5% | <= 10% |
+| 单次开仓保证金 | - | <= 10% 净值 |
+| 杠杆（BTC/ETH） | 10x | <= 10x |
+| 杠杆（山寨） | 5x | <= 10x |
+| 同侧暴露 | <= 50% | <= 60% |
+| 并发持仓 | <= 3 仓 | <= 6 仓 |
+
+任一条被突破，都应立即进入 PAUSE，而不是继续尝试开仓。
 
 ---
 
-## 常用命令
+## 常见问题
 
-```bash
-# 健康检查
-python scripts/health_check.py
-
-# 初始化
-python scripts/init_okx2.py --root E:\OKX --db-dir E:\OKX\db
-
-# 手动触发 Job A
-python scripts/collect_data.py --profile live --db-root E:\OKX\db
-
-# 手动触发 Job E
-python scripts/collect_slow.py --db-root E:\OKX\db
-
-# 验证 OKX CLI
-okx config show
-okx account balance --profile live
-```
+| 问题 | 处理方式 |
+|------|----------|
+| 初始化时报配置未填写 | 回到 [config.md](config.md) 补齐必填项，再重跑 `init_okx2.py` |
+| `okx account balance --profile live` 失败 | 重新执行 `okx config init`，确认是 `live` profile |
+| 健康检查访问失败 | 先查网络，再查 API Key 是否有效 |
+| 数据库表缺失 | 重新执行 `python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>` |
+| Job E 没有写入长周期数据 | 用 `--force-all-timeframes` 做一次全量补齐 |
+| Job C 没有输出复盘 | 检查 `--okx-root` 指向的运行目录是否存在记录文件 |
 
 ---
 
-## 故障排查
+## 参考文档
 
-| 问题 | 排查 |
-|------|------|
-| 初始化中断 | 检查 `config.md` 必填项是否全部填写 |
-| `okx config show` 无输出 | 运行 `okx config init` |
-| 健康检查某接口失败 | 检查网络 / VPN / API Key |
-| 数据库表缺失 | 重新运行 `init_okx2.py`（幂等） |
-| Job B 只评 BTC/ETH/SOL | 检查 prompt 中是否有全币种扫描要求 |
-| cross_market 数据 stale | 检查 Job E 是否正常运行 |
-| coin_sentiment 数据 stale | 检查 Job E 采集脚本 |
+- [skill.md](skill.md)：最高权威，定义硬上限、Job 流程和学习边界
+- [config.md](config.md)：运行配置、API、路径与 Cron 参数
+- [schema.sql](schema.sql)：数据库表结构参考
+- [docs/architecture.md](docs/architecture.md)：系统架构
+- [docs/cron-jobs.md](docs/cron-jobs.md)：定时任务配置
+- [docs/risk-limits.md](docs/risk-limits.md)：风控硬上限详解
+- [docs/trading-summary.md](docs/trading-summary.md)：交易总结
 
 ---
 
-## 版本
+## 版本历史
 
-| 版本 | 日期 | 说明 |
+| 日期 | 版本 | 变更 |
 |------|------|------|
-| v2.1.2 | 2026-04-23 | 旧版（仅 BTC/ETH/SOL） |
-| **v3.0** | 2026-05-11 | 全币种扫描；项目独立化；外部工具文档化；四大 Job 重定义 |
-| **v3.1** | 2026-05-15 | 精简最高权威与 prompt；统一 stale 规则；Job E 长周期分频采集 |
+| 2026-05-11 | v3.0 | 项目独立化；全币种扫描；四大 Job 重定义 |
+| 2026-05-15 | v3.1 | 精简最高权威文件；统一 stale 规则；Job E 长周期分频采集 |
