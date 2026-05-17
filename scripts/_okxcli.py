@@ -3,13 +3,32 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-OKX_PS1 = Path(os.environ.get("OKX_CLI_PS1", r"C:\Users\97638\AppData\Roaming\npm\okx.ps1"))
+
+def _default_okx_ps1() -> Path:
+    env_path = os.environ.get("OKX_CLI_PS1")
+    if env_path:
+        return Path(env_path)
+    npm_ps1 = Path.home() / "AppData" / "Roaming" / "npm" / "okx.ps1"
+    if npm_ps1.exists():
+        return npm_ps1
+    found = shutil.which("okx.ps1") or shutil.which("okx")
+    if found:
+        p = Path(found)
+        if p.suffix.lower() == ".cmd":
+            ps1 = p.with_suffix(".ps1")
+            if ps1.exists():
+                return ps1
+        return p
+    return npm_ps1
+
+OKX_PS1 = _default_okx_ps1()
 DEFAULT_TIMEOUT_SEC = 45.0
 DEFAULT_MIN_INTERVAL_SEC = 0.25
 DEFAULT_RETRY_COUNT = 1
@@ -56,7 +75,7 @@ def okx_json(*args: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC, global_args: 
     _throttle()
     resolved_global_args = global_args if global_args is not None else _global_args_from_env()
     command = [
-        "powershell",
+        "pwsh",
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",

@@ -57,7 +57,16 @@ def main() -> None:
     results.append(("OKX API", ok, detail))
 
     # 2. FRED
-    ok, detail = check_url("https://api.stlouisfed.org/fred/series?series_id=VIXCLS&api_key=placeholder&file_type=json")
+    try:
+        import re
+        cfg = (Path(__file__).resolve().parents[1] / "config.md").read_text(encoding="utf-8")
+        m = re.search(r"###\s+4\.1 FRED.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
+        fred_key = m.group(1).strip() if m else "placeholder"
+        if fred_key.startswith("<REDACTED_"):
+            fred_key = "placeholder"
+    except Exception:
+        fred_key = "placeholder"
+    ok, detail = check_url(f"https://api.stlouisfed.org/fred/series?series_id=VIXCLS&api_key={fred_key}&file_type=json")
     results.append(("FRED API", ok, detail))
 
     # 3. DefiLlama

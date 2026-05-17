@@ -512,7 +512,8 @@ def build_self_review_text(
 
 
 def write_self_review(okx_root: Path, review_day: date, text: str) -> Path:
-    review_dir = okx_root / "self-reviews"
+    # v3.0 README/config.md define reports/self-reviews as the canonical output dir.
+    review_dir = okx_root / "reports" / "self-reviews"
     review_dir.mkdir(parents=True, exist_ok=True)
     output_path = review_dir / f"self-review-{review_day.isoformat()}.md"
     output_path.write_text(text, encoding="utf-8")
@@ -656,6 +657,10 @@ def weekly_activity(
     open_times: dict[str, datetime] = {}
     hold_hours: list[float] = []
     events_path = okx_root / "trade-events.jsonl"
+    if not events_path.exists():
+        candidate = okx_root / "reports" / "trade-events" / "trade-events.jsonl"
+        if candidate.exists():
+            events_path = candidate
     if events_path.exists():
         try:
             for line in events_path.read_text(encoding="utf-8").splitlines():

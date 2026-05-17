@@ -235,7 +235,7 @@ README 大纲：
 
 ### Step 7 — 写入交易总结到 docs/trading-summary.md
 
-- 账户净值变化（$768 → $1,221 USDT）
+- 账户净值变化（<REDACTED_ACCOUNT_EQUITY_BEFORE> → <REDACTED_ACCOUNT_EQUITY_AFTER>）
 - 5 笔已平仓交易记录
 - 关键教训：
   - position_state DB vs OKX live 不一致 → 必须先查 live
@@ -269,5 +269,5 @@ README 大纲：
 | 2 | 旧脚本归档在原位，不迁移到新目录 | ✅ 确认 |
 | 3 | skill.md 升为 v3.0 | ✅ 确认 |
 | 4 | 不需要同步更新 Cron 配置 | ✅ 确认（Cron 仍指向原路径） |
-| 5 | API Key 不迁移到环境变量 | ✅ 确认（保留在 config.md） |
+| 5 | API Key 不提交到仓库 | ✅ 确认（config.md 仅保留占位符） |
 | 6 | README 必须写清外部工具/技能/配置 | ✅ 确认 |

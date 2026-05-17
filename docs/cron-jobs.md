@@ -31,9 +31,9 @@
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "运行 OKX Job A 快速采集: py E:\\OKX\\scripts\\collect_data.py --profile live --db-root E:\\OKX\\db",
+    "message": "运行 OKX Job A 快速采集: python E:\\OKX\\scripts\\collect_data.py --profile live",
     "model": "MiniMax-M2.7-highspeed",
-    "thinking": "off",
+    "thinking": "high",
     "lightContext": true,
     "timeoutSeconds": 666
   },
@@ -50,9 +50,9 @@
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "运行 OKX Job E 慢源采集: py E:\\OKX\\scripts\\collect_slow.py --db-root E:\\OKX\\db",
+    "message": "运行 OKX Job E 慢源采集: python E:\\OKX\\scripts\\collect_slow.py --db-root E:\\OKX\\db",
     "model": "MiniMax-M2.7-highspeed",
-    "thinking": "off",
+    "thinking": "high",
     "lightContext": true,
     "timeoutSeconds": 999
   },
@@ -106,5 +106,4 @@
 - Job B/C 推送到 QQ Bot（`delivery.mode: "announce"`）
 - Job B timeout 888s（< 900s = 15 分钟间隔）
 - Job B 使用默认模型（非 MiniMax），因为决策需要更强的推理能力
-- Job A/E 使用 MiniMax-M2.7-highspeed 且 `thinking=off`（采集任务，提示词尽量短，快速+低成本）
-- Job E 默认 1H/4H 每小时采集，1D 每 4 小时采集，1W/1M 每日 UTC 0 点采集；需要全周期刷新时在 message 中追加 `--force-all-timeframes`
+- Job A/E 使用 MiniMax-M2.7-highspeed（采集任务，快速+低成本）

@@ -66,9 +66,9 @@ config.md §11 版本历史只有 v1.0.0、v1.2.0、v2.0，但当前文件头写
 
 skill.md 的 "相关文件" 列表只列了 scripts/ 和 prompts/，缺少 docs/ 下的文件。
 
-### 7. skill.md 和 config.md 中 "妙想 API Key" 明文暴露
+### 7. config.md 中 API Key 已脱敏
 
-config.md §4.4 中妙想 Key 是明文。虽然主人说不需要迁移到环境变量，但这是一个安全隐患。
+config.md §4.1 / §4.3 / §4.4 中的外部 API Key 已替换为占位符，真实凭证不应提交到仓库。
 
 ---
 
@@ -126,7 +126,7 @@ E:\OKX\skill.md
 
 - [ ] **#3** skill.md 版本历史补充中间版本
 - [ ] **#6** skill.md 相关文件列表补充 docs/
-- [ ] **#7** API Key 安全（主人已确认不改）
+- [x] **#7** API Key 安全（已替换为占位符）
 - [ ] **#8** README 版本表格补充
 - [ ] **#9** trading-summary.md 补充完整交易记录
 

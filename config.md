@@ -1,4 +1,4 @@
-# config.md — OKX v3.1 交易系统运行时配置
+# config.md — OKX v3.0 交易系统运行时配置
 
 > 本文件是**小灵交易系统的运行时配置中心**。
 > 所有路径、API 密钥、数据库位置、定时任务频率均在此集中声明。
@@ -33,6 +33,7 @@ python scripts/init_okx2.py --root E:\OKX --db-dir <数据库目录>
 |------|------|------|
 | 项目根目录 | `E:\OKX` | skill.md / config.md / scripts / docs 所在目录 |
 | 数据库目录 | `E:\OKX\db` | SQLite 数据库文件存放目录（可配置） |
+| 临时目录 | `E:\OKX\tmp` | 临时目录（临时测试、调试脚本，项目临时文件存放地方，临时文件只允许存放在这里，不允许存放在别的目录） |
 
 初始化后自动生成的目录结构：
 
@@ -138,13 +139,12 @@ python scripts/init_okx2.py --root E:\OKX --db-dir <数据库目录>
 
 | 任务 | 频率 | Cron 表达式 | 触发方式 | 脚本/Agent |
 |------|------|------------|---------|-----------|
-| Job A — 快速采集 | 每 15 分钟 | `1,16,31,46 * * * *` | isolated agentTurn | `py E:\OKX\scripts\collect_data.py --profile live --db-root E:\OKX\db` |
-| Job E — 慢源采集 | 每 1 小时 | `10 * * * *` | isolated agentTurn | `py E:\OKX\scripts\collect_slow.py --db-root E:\OKX\db` |
-| Job B — 决策执行 | 每 15 分钟 | `5,20,35,50 * * * *` | isolated agentTurn | 简洁 Agent prompt（见 prompts/jobb-prompt.md） |
-| Job C — 自我复盘 | 每日 1 次 | `30 0 * * *` | isolated agentTurn | 简洁 Agent prompt（见 prompts/jobc-prompt.md） |
+| Job A — 快速采集 | 每 15 分钟 | `1,16,31,46 * * * *` | isolated agentTurn | `python scripts/collect_data.py --profile live` |
+| Job E — 慢源采集 | 每 1 小时 | `10 * * * *` | isolated agentTurn | `python scripts/collect_slow.py --db-root <DB>` |
+| Job B — 决策执行 | 每 15 分钟 | `5,20,35,50 * * * *` | isolated agentTurn | 完整 Agent prompt（见 prompts/jobb-prompt.md） |
+| Job C — 自我复盘 | 每日 1 次 | `30 0 * * *` | isolated agentTurn | 完整 Agent prompt（见 prompts/jobc-prompt.md） |
 
 > 错开设计：A 在 x1/x6 采集 → B 在 x5/x0 决策（给 A 4 分钟完成写入）→ E 在 x0 慢源采集
-> Job E 默认 1H/4H 每小时采集，1D 每 4 小时采集，1W/1M 每日 UTC 0 点采集；如需全周期刷新可加 `--force-all-timeframes`。
 
 ---
 
@@ -217,4 +217,3 @@ python scripts/init_okx2.py --root E:\OKX --db-dir <数据库目录>
 | 2026-04-23 | v1.0.0 | 初始版本 |
 | 2026-04-23 | v1.2.0 | 路径去硬编码；妙想/QQ Bot 加占位符 |
 | 2026-05-11 | **v3.0** | 项目独立化；全币种扫描；四大 Job 职责重定义；Cron 同步实际配置 |
-| 2026-05-15 | **v3.1** | 精简 skill/prompt；统一 stale 规则；Job E 长周期分频采集 |

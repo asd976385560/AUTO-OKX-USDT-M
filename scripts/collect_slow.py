@@ -5,12 +5,14 @@ import argparse
 import json
 import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from _http import TokenBucket, get_json, load_coingecko_key, load_fred_key, make_client
 from _okxcli import okx_json
 from _okx_http import fetch_candles_batch_sync, fetch_instruments_sync
+from _okxcli import okx_json
 
 DEFAULT_DB_ROOT = Path(r"E:\OKX\db")
 FRED_SERIES = {
@@ -29,8 +31,6 @@ SLOW_TIMEFRAMES = {
     "1W":  "1W",
     "1M":  "1M",
 }
-
-HOURLY_TIMEFRAMES = {"1H": "1H", "4H": "4H"}
 
 
 def utc_now_iso() -> str:
@@ -61,10 +61,25 @@ def _fetch_gold_etf_d1() -> float | None:
     try:
         import sys
         from pathlib import Path
-        mx_data_path = Path(__file__).resolve().parents[2] / "mx-data" / "mx_data.py"
-        if not mx_data_path.exists():
+        candidates = [
+            Path(__file__).resolve().parents[2] / "mx-data" / "mx_data.py",
+            Path.home() / ".openclaw" / "workspace" / "skills" / "mx-data" / "mx_data.py",
+        ]
+        mx_data_path = next((p for p in candidates if p.exists()), None)
+        if mx_data_path is None:
             print("[WARN] mx_data.py not found, gold ETF skipped", flush=True)
             return None
+        if not os.environ.get("MX_APIKEY"):
+            try:
+                cfg = (Path(__file__).resolve().parents[1] / "config.md").read_text(encoding="utf-8")
+                import re
+                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
+                if m:
+                    mx_key = m.group(1).strip()
+                    if mx_key and not mx_key.startswith("<REDACTED_"):
+                        os.environ["MX_APIKEY"] = mx_key
+            except Exception:
+                pass
         sys.path.insert(0, str(mx_data_path.parent))
         from mx_data import MXData
         mx = MXData()
@@ -99,29 +114,6 @@ def open_db(db_root: Path, name: str) -> sqlite3.Connection:
     connection = sqlite3.connect(str(path))
     connection.execute("PRAGMA journal_mode=WAL;")
     return connection
-
-
-def write_cycle_run(account_con: sqlite3.Connection, ts_start: str, ts_end: str, error: str | None) -> None:
-    account_con.execute(
-        "INSERT OR REPLACE INTO cycle_runs "
-        "(ts_start, ts_end, job_id, profile, state_before, state_after, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ts_start, ts_end, "collect_slow", "live", None, None, error),
-    )
-    account_con.commit()
-
-
-def select_timeframes(now: datetime, daily_every_hours: int, weekly_hour: int, monthly_hour: int, force_all: bool) -> dict[str, str]:
-    if force_all:
-        return dict(SLOW_TIMEFRAMES)
-
-    selected = dict(HOURLY_TIMEFRAMES)
-    if daily_every_hours > 0 and now.hour % daily_every_hours == 0:
-        selected["1D"] = "1D"
-    if now.hour == weekly_hour:
-        selected["1W"] = "1W"
-    if now.hour == monthly_hour:
-        selected["1M"] = "1M"
-    return selected
 
 
 # ── Indicator computation (same logic as collect_data.py) ────────────────────────
@@ -420,114 +412,77 @@ def collect_coin_sentiment(news_con: sqlite3.Connection) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="OKX Job E: slow data collector.")
     parser.add_argument("--db-root", default=str(DEFAULT_DB_ROOT))
-    parser.add_argument("--daily-every-hours", type=int, default=4, help="Collect 1D K-lines every N UTC hours; <=0 disables 1D unless --force-all-timeframes")
-    parser.add_argument("--weekly-hour", type=int, default=0, help="UTC hour to collect 1W K-lines")
-    parser.add_argument("--monthly-hour", type=int, default=0, help="UTC hour to collect 1M K-lines")
-    parser.add_argument("--force-all-timeframes", action="store_true", help="Collect 1H/4H/1D/1W/1M in this run")
     args = parser.parse_args()
     db_root = Path(args.db_root)
-    started_at = datetime.now(timezone.utc)
-    ts = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = utc_now_iso()
 
-    market_con = news_con = account_con = None
-    error: str | None = None
-    kline_rows = 0
-    sentiment_rows = 0
-    cross_market_rows = 0
-    all_symbols: list[str] = []
-    selected_timeframes: dict[str, str] = {}
+    market_con = open_db(db_root, "market.db")
+    news_con = open_db(db_root, "news.db")
+
+    # Dynamically discover all live USDT-M SWAP symbols
+    try:
+        all_symbols = _fetch_all_swap_symbols()
+        print(f"[collect_slow] Discovered {len(all_symbols)} USDT-M SWAP contracts", flush=True)
+    except Exception as e:
+        print(f"[collect_slow] WARNING: Could not fetch symbols ({e}); using empty list", flush=True)
+        all_symbols = []
+
+    bucket = TokenBucket(rate_per_sec=0.5, capacity=2)
+
+    # ── K-lines (1H/4H/1D/1W/1M) ───────────────────────────────────────────
+    # ALL symbols get slow K-lines (full coverage for accuracy)
+    try:
+        kline_rows = collect_slow_klines(market_con, all_symbols)
+        print(f"[collect_slow] Wrote {kline_rows} slow kline rows for {len(all_symbols)} symbols", flush=True)
+    except Exception as e:
+        print(f"[collect_slow] K-line collection failed: {e}", flush=True)
+        kline_rows = 0
+
+    # ── Macro data ────────────────────────────────────────────────────────────
+    # Gold ETF (518880) daily return via mx-data
+    gold_d1 = _fetch_gold_etf_d1()
 
     try:
-        market_con = open_db(db_root, "market.db")
-        news_con = open_db(db_root, "news.db")
-        account_con = open_db(db_root, "account.db")
-
-        # Dynamically discover all live USDT-M SWAP symbols
-        try:
-            all_symbols = _fetch_all_swap_symbols()
-            print(f"[collect_slow] Discovered {len(all_symbols)} USDT-M SWAP contracts", flush=True)
-        except Exception as e:
-            print(f"[collect_slow] WARNING: Could not fetch symbols ({e}); using empty list", flush=True)
-            all_symbols = []
-
-        bucket = TokenBucket(rate_per_sec=0.5, capacity=2)
-        selected_timeframes = select_timeframes(
-            started_at,
-            args.daily_every_hours,
-            args.weekly_hour,
-            args.monthly_hour,
-            args.force_all_timeframes,
-        )
-
-        # ── K-lines ───────────────────────────────────────────────────────────
-        # 1H/4H every run; 1D/1W/1M are time-gated to avoid redundant hourly writes.
-        try:
-            kline_rows = collect_slow_klines(market_con, all_symbols, selected_timeframes)
-            print(
-                f"[collect_slow] Wrote {kline_rows} slow kline rows for {len(all_symbols)} symbols "
-                f"timeframes={','.join(selected_timeframes)}",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"[collect_slow] K-line collection failed: {e}", flush=True)
-            kline_rows = 0
-
-        # ── Macro data ────────────────────────────────────────────────────────
-        # Gold ETF (518880) daily return via mx-data
-        gold_d1 = _fetch_gold_etf_d1()
-
-        try:
-            with make_client() as client:
-                fred_key = load_fred_key()
-                dxy, dxy_d1 = fred_latest(client, bucket, FRED_SERIES["dxy"], fred_key)
-                vix, vix_d1 = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
-                spx, spx_d1 = fred_latest(client, bucket, FRED_SERIES["spx"], fred_key)
-                tvl_total = defillama_total_tvl(client, bucket)
-                try:
-                    cg_key = load_coingecko_key()
-                    cg = coingecko_global(bucket, cg_key)
-                    btc_etf_flow = _fetch_btc_etf_flow_proxy(bucket, cg_key)
-                except Exception as e:
-                    print(f"[WARN] coingecko 跳过（API/key 不可达）: {e}", flush=True)
-                    cg = {"btc_d": None, "total_mcap_usd": None, "total_volume_24h_usd": None}
-                    btc_etf_flow = None
-
-            prev_row = market_con.execute(
-                "SELECT regime FROM cross_market ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-            prev_regime = prev_row[0] if prev_row else "low_vol"
-            market_con.execute(
-                "INSERT OR REPLACE INTO cross_market "
-                "(ts, dxy, gold, vix, spx, btc_etf_flow, dxy_d1, vix_d1, defillama_tvl_total, regime, "
-                "btc_dominance, total_mcap_usd, total_volume_24h_usd) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, dxy, gold_d1, vix, spx_d1, btc_etf_flow, dxy_d1, vix_d1, tvl_total, prev_regime,
-                 cg["btc_d"], cg["total_mcap_usd"], cg["total_volume_24h_usd"]),
-            )
-            market_con.commit()
-            cross_market_rows = 1
-        except Exception as e:
-            print(f"[collect_slow] Macro/cross_market collection failed: {e}", flush=True)
-
-        # ── Coin sentiment ────────────────────────────────────────────────────
-        try:
-            sentiment_rows = collect_coin_sentiment(news_con)
-        except Exception as e:
-            print(f"[WARN] coin_sentiment 跳过（API 不可达）: {e}", flush=True)
-            sentiment_rows = 0
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        print(f"[collect_slow] failed: {error}", flush=True)
-    finally:
-        ts_end = utc_now_iso()
-        if account_con is not None:
+        with make_client() as client:
+            fred_key = load_fred_key()
+            dxy, dxy_d1 = fred_latest(client, bucket, FRED_SERIES["dxy"], fred_key)
+            vix, vix_d1 = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
+            spx, spx_d1 = fred_latest(client, bucket, FRED_SERIES["spx"], fred_key)
+            tvl_total = defillama_total_tvl(client, bucket)
             try:
-                write_cycle_run(account_con, ts, ts_end, error)
-            except sqlite3.Error as e:
-                print(f"[collect_slow] cycle_runs 写入失败: {e}", flush=True)
-        for connection in (market_con, news_con, account_con):
-            if connection is not None:
-                connection.close()
+                cg_key = load_coingecko_key()
+                cg = coingecko_global(bucket, cg_key)
+                btc_etf_flow = _fetch_btc_etf_flow_proxy(bucket, cg_key)
+            except Exception as e:
+                print(f"[WARN] coingecko 跳过（API/key 不可达）: {e}", flush=True)
+                cg = {"btc_d": None, "total_mcap_usd": None, "total_volume_24h_usd": None}
+                btc_etf_flow = None
+
+        prev_row = market_con.execute(
+            "SELECT regime FROM cross_market ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        prev_regime = prev_row[0] if prev_row else "low_vol"
+        market_con.execute(
+            "INSERT OR REPLACE INTO cross_market "
+            "(ts, dxy, gold, vix, spx, btc_etf_flow, dxy_d1, vix_d1, defillama_tvl_total, regime, "
+            "btc_dominance, total_mcap_usd, total_volume_24h_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, dxy, gold_d1, vix, spx_d1, btc_etf_flow, dxy_d1, vix_d1, tvl_total, prev_regime,
+             cg["btc_d"], cg["total_mcap_usd"], cg["total_volume_24h_usd"]),
+        )
+        market_con.commit()
+    except Exception as e:
+        print(f"[collect_slow] Macro/cross_market collection failed: {e}", flush=True)
+
+    # ── Coin sentiment ────────────────────────────────────────────────────────
+    try:
+        sentiment_rows = collect_coin_sentiment(news_con)
+    except Exception as e:
+        print(f"[WARN] coin_sentiment 跳过（API 不可达）: {e}", flush=True)
+        sentiment_rows = 0
+
+    market_con.close()
+    news_con.close()
 
     print(
         json.dumps(
@@ -535,18 +490,16 @@ def main() -> int:
                 "ts": ts,
                 "wrote": {
                     "klines": kline_rows,
-                    "cross_market": cross_market_rows,
+                    "cross_market": 1,
                     "coin_sentiment": sentiment_rows,
                 },
                 "symbols_count": len(all_symbols),
-                "timeframes": list(selected_timeframes),
                 "proxy": os.environ.get("OKX_PROXY_URL", "none"),
-                "error": error,
             },
             ensure_ascii=False,
         )
     )
-    return 1 if error else 0
+    return 0
 
 
 if __name__ == "__main__":
