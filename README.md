@@ -1,301 +1,149 @@
-# OKX 永续合约自主交易系统 v3.1
+# AUTO-OKX-USDT-M
 
-> 小灵（AI 交易员）在 OKX 永续合约上的全自动自主交易系统。
-> **可迁移、可分享**——拿到这个目录，配置好环境和 API Key，即可运行。
-> 全币种扫描（300+ 合约），五维评分为参考锚点，小灵拥有最大裁量权。
-> 所有交易数据、状态、经验全部写入数据库。
+V2.0 是一个面向 OKX USDT 永续合约的自主交易系统代码库。它将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给独立 Agent。系统同时支持 live 与 demo；两者共用同一套硬风控和止损要求，只切换执行环境。
 
----
+> 风险提示：本项目包含真实交易执行能力。首次部署应保持 `OKX_EXECUTOR_DRYRUN=1` 和 `OKX_TRIGGER_DRYRUN=1`，在隔离数据库中完成验证后再单独评估是否启用外部调用。本仓库不提供投资建议，也不保证盈利。
 
-## 快速开始
+## 公开发布边界
 
-git clone https://github.com/asd976385560/AUTO-OKX-USDT-M.git
-填写 config.md 必填项
+公开版本只包含源码、角色规则、模板、数据库 DDL、配置示例和公开文档，不包含：
 
-⚠️使用openclaw/qclaw等等个人智能助手
-⚠️聊天窗口发送：读取分析E:\OKX  目录下skill.md，config.md，README.md，按照skill里面内容部署OKX 永续合约自主交易系统,部署完成后进行测试，缺少key或者需要我决定的，最后列个表。
+- `config.md`、`.env*` 或任何真实凭证；
+- SQLite 运行库、WAL/SHM、日志、报告、记忆和临时文件；
+- QQ/Webhook 真实目标、账户、设备、主机或用户标识；
+- 本地依赖目录 `Lib/`、缓存和字节码；
+- 内部宿主运维资料、历史归档和一次性兼容脚本。
 
-**⚠️最好使用opus 4.7或者gpt-5.5安装，其他的大模型，装好后再让他测试一遍。**
-**⚠️注意：config.md文件里面需要填一些配置，像指令E:\OKX这些目录按实际的修改。**
+复制 `config.example.md` 为本地的 `config.md` 后再填写。`config.md` 已被 `.gitignore` 强制排除。凭证读取以环境变量为优先级最高的来源；公开代码中没有真实值或可用默认凭证。
 
-### Step 1 — 安装运行环境
+## 版本线说明
 
-```bash
-# 1. Python 3.14+（内置 sqlite3）
-#    https://www.python.org/downloads/
+当前源码事实源自称 `V2.0`。GitHub 远端旧 README 曾使用 `v3.1` 标识，两者不是在本次同步中自动推导出的可比较语义版本。本次只同步并脱敏 V2.0 代码，不创建标签或 Release；最终公开版本号由仓库维护者另行决定。
 
-# 2. pwsh 7+（PowerShell Core）— 禁止使用 PS 5.1
-#    https://github.com/PowerShell/PowerShell/releases
-
-# 3. Node.js 18+
-#    https://nodejs.org/
-
-# 4. OKX CLI
-npm install -g @okx_ai/okx-trade-cli
-
-# 验证基础工具
-python --version
-pwsh --version
-node --version
-okx --version
-```
-
-### 3. 配置 OKX CLI
-
-```powershell
-okx config init
-okx config show
-okx account balance --profile live
-```
-
-要求：
-
-- profile 使用 `live`
-- 能正常返回余额
-- 凭证保存在用户目录的 `.okx/config.toml`，不在项目仓库内
-
-### 4. 填写 config.md 必填项
-
-首次运行前，至少补齐 [config.md](config.md) 里的以下内容：
-
-| 项目 | 用途 |
-|------|------|
-| 数据库目录 | SQLite 落盘位置 |
-| FRED API Key | 宏观数据 |
-| CoinGecko API Key | 市场宏观与 ETF 代理数据 |
-| 妙想 API Key | 新闻与地缘数据 |
-| QQ Bot 推送目标 | Job B / Job C 通知 |
-
----
-
-## 首次部署
-
-推荐按下面的顺序执行，一步一步确认，不要直接跳到定时任务。
-
-### Step 1. 初始化数据库与目录
-
-```powershell
-Set-Location <PROJECT_ROOT>
-python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>
-```
-
-这个脚本会做三件事：
-
-1. 检查 [config.md](config.md) 的必填项是否已填写。
-2. 创建数据库目录、报告目录等运行目录。
-3. 初始化 `market.db`、`news.db`、`account.db`、`lessons.db`。
-
-### Step 2. 执行健康检查
-
-```powershell
-Set-Location <PROJECT_ROOT>
-python scripts/health_check.py
-```
-
-健康检查通过后，应至少确认：
-
-- OKX API 可访问
-- FRED / DefiLlama / CoinGecko 可访问
-- Python 自带 SQLite 可用
-- OKX CLI 可执行
-
-### Step 3. 手动跑一次 Job E
-
-```powershell
-Set-Location <PROJECT_ROOT>
-python scripts/collect_slow.py --db-root <DB_DIR>
-```
-
-如果你想首次一次性补齐所有长周期时间框架，可改为：
-
-```powershell
-python scripts/collect_slow.py --db-root <DB_DIR> --force-all-timeframes
-```
-
-### Step 4. 手动跑一次 Job C
-
-```powershell
-Set-Location <PROJECT_ROOT>
-python scripts/self_review.py --db-root <DB_DIR>
-```
-
-如果要复盘指定日期：
-
-```powershell
-python scripts/self_review.py --date 2026-05-15 --db-root <DB_DIR>
-```
-
----
-
-## 使用说明
-
-### 1. 手动运行模式
-
-适合首次部署、联调和故障排查。
-
-常用命令：
-
-```powershell
-# 初始化
-python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>
-
-# 健康检查
-python scripts/health_check.py
-
-# Job E：慢源采集
-python scripts/collect_slow.py --db-root <DB_DIR>
-
-# Job E：强制全周期采集
-python scripts/collect_slow.py --db-root <DB_DIR> --force-all-timeframes
-
-# Job C：每日复盘
-python scripts/self_review.py --db-root <DB_DIR>
-
-# OKX CLI 检查
-okx config show
-okx account balance --profile live
-okx account positions --instType SWAP --profile live
-```
-
-### 2. OpenClaw 自动运行模式
-
-完整自动化依赖 OpenClaw Cron。当前推荐的错峰执行为：
-
-| 任务 | Cron | 说明 |
-|------|------|------|
-| Job A | `1,16,31,46 * * * *` | 快速采集 |
-| Job B | `5,20,35,50 * * * *` | 决策与执行 |
-| Job E | `10 * * * *` | 慢源采集 |
-| Job C | `30 0 * * *` | 每日复盘 |
-
-注意：当前仓库里的 `scripts/collect_data.py` 是空文件，Job A 需要先补齐实现再接入 Cron。未补齐前，可以先联调 Job E、Job C 和 OKX CLI 连通性。
-
-调度原则：
-
-- 先采集，后决策。
-- Job A 与 Job B 至少错开 4 分钟，给数据库写入留时间。
-- Job C 只做复盘，不允许任何交易动作。
-
-Job A 的 OpenClaw 示例：
-
-```json
-{
-  "name": "OKX-JobA-快速采集",
-  "schedule": { "kind": "cron", "expr": "1,16,31,46 * * * *" },
-  "sessionTarget": "isolated",
-  "payload": {
-    "kind": "agentTurn",
-    "message": "运行 OKX Job A 快速采集: py <PROJECT_ROOT>\\scripts\\collect_data.py --profile live --db-root <DB_DIR>",
-    "model": "MiniMax-M2.7-highspeed",
-    "lightContext": true
-  }
-}
-```
-
-### 3. 与 AI 助手协作部署
-
-如果你用 OpenClaw、qclaw 或其他个人助手协助部署，建议让它同时读取：
-
-1. [skill.md](skill.md)
-2. [config.md](config.md)
-3. [README.md](README.md)
-
-这样它能同时拿到规则边界、运行配置和部署流程，避免只按单个文件做错误假设。
-
----
-
-## 核心脚本
-
-| 脚本 | 用途 | 关键参数 |
-|------|------|----------|
-| `scripts/init_okx2.py` | 初始化目录与数据库 | `--root`、`--db-dir`、`--skip-config-check` |
-| `scripts/health_check.py` | 启动前连通性检查 | 无 |
-| `scripts/collect_data.py` | Job A 快速采集 | 当前为空文件，补齐后应支持 `--profile live --db-root <DB_DIR>` |
-| `scripts/collect_slow.py` | Job E 慢源采集 | `--db-root`、`--force-all-timeframes` |
-| `scripts/self_review.py` | Job C 每日复盘 | `--date`、`--db-root`、`--okx-root` |
-
-说明：
-
-- `init_okx2.py` 是幂等的，数据库缺表或目录缺失时可以重复执行。
-- `collect_slow.py` 当前支持按小时选择 1D/1W/1M，首次联调建议加 `--force-all-timeframes`。
-- `self_review.py` 默认复盘昨天的数据。
-
----
-
-## 数据与目录
-
-### 目录结构
+## 架构
 
 ```text
-<PROJECT_ROOT>
-├── README.md
-├── skill.md
-├── config.md
-├── schema.sql
-├── scripts/
-├── prompts/
-├── reports/
-└── docs/
+OpenClaw cron
+  ├─ fast_collect.py ───────────────┐
+  ├─ slow_collect.py ───────────────┼─> ledger.db
+  └─ sources/news_collect.py ───────┘
+                                      │
+                                      v
+                              core/dispatcher.py
+                                      │
+                    stage_dispatch 唯一键幂等闩锁
+                                      │
+                 ┌────────────────────┴───────────────────┐
+                 v                                        v
+       unified live trader                         demo trader
+       analysis + live execution                   demo execution
+                 │                                        │
+                 └───────────────┬────────────────────────┘
+                                 v
+                     scripts/push_pipeline.py
+                     render -> validate -> archive/send
 ```
 
-### 核心数据库
+核心不变量：
 
-| 数据库 | 作用 |
-|--------|------|
-| `market.db` | 行情、K 线、衍生品、跨市场宏观 |
-| `news.db` | 新闻事件、币种情绪 |
-| `account.db` | 账户、持仓、评分、交易事件、系统状态 |
-| `lessons.db` | 经验库、错判模式、参数建议、复盘结果 |
+- `skill.md` 是 V2.0 业务事实源，本文是公开系统地图；
+- `ledger.db.stage_dispatch(cycle_id, stage)` 是阶段派发幂等真值；
+- 每张表或明确键域只有一个权威 writer，读者使用 SQLite `mode=ro`；
+- live 开仓只经 `core/order_executor.py`，内部强制调用 `core/risk_validator.py`；
+- live/demo 都要求止损，并共用同一套硬上限；
+- 当前持仓以 OKX API 为准，不能由本地快照推断；
+- push 固定走 `scripts/push_pipeline.py`，不由 Agent 临时拼接执行链。
 
-存储模式为时间序列增量追加，详细表结构见 [schema.sql](schema.sql) 和 [docs/data-flow.md](docs/data-flow.md)。
+## 目录
 
----
+```text
+agents/       Agent 角色规则与公开 persona 源
+collectors/   市场、新闻、账户采集，writer 与 ledger
+core/         风控、订单执行、决策卡与 dispatcher
+db/           仅公开 schema.sql；运行数据库不会进入 Git
+docs/         公开文档索引
+scripts/      查询、维护、迁移、报告与推送工具
+templates/    分析、交易、推送和日报模板
+```
 
-## 风控硬上限
+`docs/archive/`、`scripts/archive/` 以及发布排除清单中的内部/兼容文件会保留在本地工作区，但不进入公开分支。当前代码没有完整 `tests/` 目录；不要引用旧文档中的历史测试数量。
 
-以下限制来自 [skill.md](skill.md)，不能被 prompt、学习结果或临时判断放宽：
+## 运行依赖
 
-| 限制项 | 默认推荐 | 硬上限 |
-|--------|----------|--------|
-| 单笔仓位占净值 | <= 5% | <= 10% |
-| 单次开仓保证金 | - | <= 10% 净值 |
-| 杠杆（BTC/ETH） | 10x | <= 10x |
-| 杠杆（山寨） | 5x | <= 10x |
-| 同侧暴露 | <= 50% | <= 60% |
-| 并发持仓 | <= 3 仓 | <= 6 仓 |
+- Python 3.11 或更高版本；
+- `httpx`；
+- SQLite（Python 标准库）；
+- 需要 Agent 调度时安装并配置 OpenClaw；
+- 需要实际下单时安装并在仓库外配置 OKX CLI profile；
+- PowerShell 7（Windows 包装器与运维脚本）。
 
-任一条被突破，都应立即进入 PAUSE，而不是继续尝试开仓。
+安装 Python 依赖：
 
----
+```powershell
+python -m pip install -r requirements.txt
+```
 
-## 常见问题
+项目根目录优先读取 `OKX_ROOT`；未设置时，Python 代码从当前文件位置推导根目录。包装器优先读取 `OKX_PYTHON_BIN`，否则使用 `PATH` 中的 Python。公开版不包含 `Lib/`。
 
-| 问题 | 处理方式 |
-|------|----------|
-| 初始化时报配置未填写 | 回到 [config.md](config.md) 补齐必填项，再重跑 `init_okx2.py` |
-| `okx account balance --profile live` 失败 | 重新执行 `okx config init`，确认是 `live` profile |
-| 健康检查访问失败 | 先查网络，再查 API Key 是否有效 |
-| 数据库表缺失 | 重新执行 `python scripts/init_okx2.py --root <PROJECT_ROOT> --db-dir <DB_DIR>` |
-| Job E 没有写入长周期数据 | 用 `--force-all-timeframes` 做一次全量补齐 |
-| Job C 没有输出复盘 | 检查 `--okx-root` 指向的运行目录是否存在记录文件 |
+## 配置
 
----
+```powershell
+Copy-Item config.example.md config.md
+$env:OKX_ROOT = (Resolve-Path .).Path
+$env:OKX_PYTHON_BIN = (Get-Command python).Source
+$env:OKX_EXECUTOR_DRYRUN = '1'
+$env:OKX_TRIGGER_DRYRUN = '1'
+```
 
-## 参考文档
+主要环境变量：
 
-- [skill.md](skill.md)：最高权威，定义硬上限、Job 流程和学习边界
-- [config.md](config.md)：运行配置、API、路径与 Cron 参数
-- [schema.sql](schema.sql)：数据库表结构参考
-- [docs/architecture.md](docs/architecture.md)：系统架构
-- [docs/cron-jobs.md](docs/cron-jobs.md)：定时任务配置
-- [docs/risk-limits.md](docs/risk-limits.md)：风控硬上限详解
-- [docs/trading-summary.md](docs/trading-summary.md)：交易总结
+| 变量 | 用途 |
+|---|---|
+| `OKX_ROOT` | 项目根目录；未设置时从源码位置推导 |
+| `OKX_DB_ROOT` | 数据库目录；默认 `<PROJECT_ROOT>/db` |
+| `OKX_PYTHON_BIN` | Python 可执行文件 |
+| `OKX_SITE_PACKAGES` | 可选的额外依赖目录 |
+| `OKX_CONFIG_MD` | 本地配置页；默认 `<PROJECT_ROOT>/config.md` |
+| `FRED_API_KEY` | FRED 数据源凭证 |
+| `COINGECKO_API_KEY` | CoinGecko 数据源凭证 |
+| `MX_APIKEY` | 妙想数据源凭证 |
+| `OKX_PROXY_URL` | 可选代理 URL |
+| `OKX_QQ_TARGET` | QQ 目标，例如 `group:<openid>`；无默认值 |
+| `OKX_EXECUTOR_DRYRUN` | `1` 时阻止交易变更命令 |
+| `OKX_TRIGGER_DRYRUN` | `1` 时阻止 Agent/push 起棒 |
 
----
+OKX API key、secret 和 passphrase 由 OKX CLI profile 或部署环境管理，不写入仓库。
 
-## 版本历史
+## 安全验证
 
-| 日期 | 版本 | 变更 |
-|------|------|------|
-| 2026-05-11 | v3.0 | 项目独立化；全币种扫描；四大 Job 重定义 |
-| 2026-05-15 | v3.1 | 精简最高权威文件；统一 stale 规则；Job E 长周期分频采集 |
+不访问交易所、不推送、不写运行数据库的基础检查：
+
+```powershell
+# Python 语法
+python -m compileall -q collectors core scripts
+
+# registry 结构
+python collectors/sources/_registry.py --validate
+
+# 角色规则同步检查（只读）
+python scripts/check_trader_docs_sync.py
+```
+
+涉及数据库的工具应传入隔离目录。涉及 Agent、QQ、OpenClaw 或 OKX 的入口在发布验证中只允许 dry-run，或因缺少外部运行环境而明确跳过。
+
+## 风控摘要
+
+权威值以 `core/risk_validator.py` 为准：
+
+- 单笔保证金最多为权益的 20%；
+- 最多使用当前可用 USDT 保证金的 98%；
+- 杠杆不超过 10x；
+- 单笔名义价值不低于权益的 1%；
+- 止损偏离 mark price 不超过 30%；
+- 合约规格、余额、可用保证金或成交确认缺失时 fail-safe 拒绝。
+
+这些限制没有因公开发布而修改。
+
+## 安全报告
+
+发现凭证或公开仓库历史泄漏时，不要在 issue 中粘贴真实值。请先轮换凭证，再通过仓库的私密安全报告渠道联系维护者。更多边界见 `SECURITY.md`。

@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*-
+"""push_pipeline.py — 由 dispatcher 触发的纯脚本推送编排器。
+
+一条确定性链，无 LLM 参与：
+  build_push_payload → render_push_report → validate_push_format
+    → qq_push（--no-send 跳过）→ push_archive → system_state_writer → 环节报告
+
+幂等：dispatcher 的 ledger.stage_dispatch(cycle,'push') 闩锁保每 cycle 单发；
+qq_push 层用显式 --dedupe-key push:{cycle}。
+故本脚本可安全重跑。
+
+每环节出详细报告：reports/push/pipeline-<cycle>.json + 追加 logs/push/pipeline_runs.jsonl，
+含 build/render/validate/send/archive/state 各步 rc 与关键指标。
+
+用法（阶段一开发，安全）:
+  push_pipeline.py --cycle 2026-07-07T12:00 --no-send        # build→render→validate→archive，不外发
+用法（阶段二生产，dispatcher 起）:
+  push_pipeline.py --cycle 2026-07-07T12:00                  # 全链含外发
+"""
+from __future__ import annotations
+
+import os as _project_os
+from pathlib import Path as _ProjectPath
+
+_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
+
+
+def _project_path(*parts: str) -> str:
+    return str(_PROJECT_ROOT.joinpath(*parts))
+
+
+import argparse
+import importlib.util as ilu
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+CST = timezone(timedelta(hours=8))
+OKX = _project_path()
+SCRIPTS = _project_path('scripts')
+WRAP = _project_path('scripts', 'run_okx_python.ps1')
+# 绝对 pwsh 路径——对齐 okx-* cron（cron 进程 PATH 不保证有 pwsh）；env 可覆盖
+PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
+# 组装器（2026-07-07 已迁 scripts/）；env 可覆盖
+BUILD_PY = os.environ.get("OKX_BUILD_PY", _project_path('scripts', 'build_push_payload.py'))
+WORK = Path(_project_path('tmp', 'push_pipeline'))
+REPORT_DIR = Path(_project_path('reports', 'push'))
+RUNLOG = Path(_project_path('logs', 'push', 'pipeline_runs.jsonl'))
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def now_ts() -> str:
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _run(script: str, args: list, stdin_text: str | None = None):
+    """经 wrapper 跑脚本，返回 (rc, stdout, stderr)。"""
+    cmd = [PWSH, "-NoProfile", "-File", WRAP, script, *args]
+    p = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=120,
+                       creationflags=_CREATE_NO_WINDOW)
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def _load_build():
+    spec = ilu.spec_from_file_location("build_push_payload", BUILD_PY)
+    m = ilu.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def run(cycle: str, db_root: str, no_send: bool) -> dict:
+    WORK.mkdir(parents=True, exist_ok=True)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    RUNLOG.parent.mkdir(parents=True, exist_ok=True)
+    safe = cycle.replace(":", "").replace("T", "-")
+    payload_f = str(WORK / f"payload-{safe}.json")
+    content_f = str(WORK / f"content-{safe}.txt")
+
+    rep: dict = {"cycle": cycle, "ts": now_ts(), "steps": {}, "ok": False}
+
+    # 1. build（进程内直调，确定性组装）
+    try:
+        bpp = _load_build()
+        payload = bpp.build(db_root, cycle)
+        with open(payload_f, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        rep["steps"]["build"] = {"ok": True, "action": payload.get("action_taken"),
+                                 "symbol": payload.get("symbol"),
+                                 "n_trades": len(payload.get("trades", {}).get("live", []))
+                                 + len(payload.get("trades", {}).get("demo", []))}
+    except Exception as e:
+        rep["steps"]["build"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        rep["fatal"] = "build_failed"
+        return _finish(rep)
+
+    # 2. render：透传 db_root，确保库权威覆盖读取同一根目录。
+    rc, out, err = _run(_project_path('scripts', 'render_push_report.py'),
+                        ["--json-file", payload_f, "--out-file", content_f,
+                         "--db-root", str(db_root)])
+    receipt = {}
+    try:
+        receipt = json.loads(out) if out else {}
+    except Exception:
+        pass
+    rep["steps"]["render"] = {"rc": rc, "bytes": receipt.get("bytes"),
+                              "title": receipt.get("title"), "err": err[:200] if rc else None}
+    if rc != 0 or not Path(content_f).exists():
+        rep["fatal"] = "render_failed"
+        return _finish(rep)
+
+    # 3. validate（必须 rc=0 才外发）
+    rc, out, err = _run(_project_path('scripts', 'validate_push_format.py'), ["--file", content_f])
+    vres = {}
+    try:
+        vres = json.loads(out) if out else {}
+    except Exception:
+        pass
+    rep["steps"]["validate"] = {"rc": rc, "errors": vres.get("errors"),
+                                "missing": vres.get("missing_fields"),
+                                "char_count": vres.get("char_count")}
+    if rc != 0:
+        rep["fatal"] = "validate_failed"       # 不外发残缺内容（阶段二在此写 repair_queue + 告警）
+        return _finish(rep)
+
+    # 4. 外发（--no-send 跳过）
+    if no_send:
+        rep["steps"]["send"] = {"skipped": True, "reason": "--no-send"}
+    else:
+        # 显式身份键 push:{cycle}：同 cycle 任何 content 同键，重跑幂等。
+        rc, out, err = _run(_project_path('scripts', 'qq_push.py'),
+                            ["--content-file", content_f, "--dedupe-key", f"push:{cycle}"])
+        rep["steps"]["send"] = {"rc": rc, "out": out[:500], "err": err[:200] if rc else None}
+        # 外发失败 ≠ 交易失败：不中断，继续归档
+
+    # 5. 归档（必做，不因外发失败裁剪）。--no-send 下归到 dev 目录，不覆写生产 latest.md
+    title = receipt.get("title") or f"push {cycle}"
+    arch_in = json.dumps({"ts": now_ts(), "content_file": content_f, "title": title},
+                         ensure_ascii=False)
+    arch_args = ["--stdin"]
+    if no_send:
+        arch_args = ["--reports-dir", str(WORK / "reports"), "--stdin"]
+    rc, out, err = _run(_project_path('scripts', 'push_archive.py'), arch_args, stdin_text=arch_in)
+    ares = {}
+    try:
+        ares = json.loads(out) if out else {}
+    except Exception:
+        pass
+    rep["steps"]["archive"] = {"rc": rc, "path": ares.get("path"), "bytes": ares.get("bytes"),
+                               "degraded": ares.get("degraded")}
+
+    # 6. 状态落库（--no-send 下不真写生产 account.db，只报告将写什么）
+    if no_send:
+        status = "skipped"
+    else:
+        _send = rep["steps"].get("send", {})
+        _o = (_send.get("out") or "").lower()
+        if _send.get("rc") == 0:
+            status = "duplicate_skip" if ("duplicate" in _o or "skip" in _o) else "sent"
+        elif ("messageid" in _o) or ('"action": "send"' in _o):
+            # rc!=0 但回执带 messageId=已投递（qq_push 送达后置步骤偶发报错，非漏推）
+            status = "sent"
+        else:
+            status = "failed"
+    if no_send:
+        rep["steps"]["system_state"] = {"skipped": True,
+                                        "would_write": {"push_last_cycle": cycle,
+                                                        "push_last_status": status}}
+    else:
+        state_json = str(WORK / f"state-{safe}.json")
+        with open(state_json, "w", encoding="utf-8") as f:
+            json.dump({"updates": {"push_last_cycle": cycle, "push_last_status": status},
+                       "ts": now_ts()}, f, ensure_ascii=False)
+        rc, out, err = _run(_project_path('scripts', 'system_state_writer.py'), ["--json-file", state_json])
+        rep["steps"]["system_state"] = {"rc": rc}
+
+    rep["ok"] = True
+    rep["send_status"] = status
+    return _finish(rep)
+
+
+def _finish(rep: dict) -> dict:
+    """落环节报告 + 追加 run-log。"""
+    try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        safe = rep["cycle"].replace(":", "").replace("T", "-")
+        with open(REPORT_DIR / f"pipeline-{safe}.json", "w", encoding="utf-8") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+        RUNLOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(RUNLOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rep, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[push_pipeline] WARN 报告落盘失败: {e}", file=sys.stderr)
+    return rep
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="纯脚本推送编排器")
+    ap.add_argument("--cycle", required=True)
+    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--no-send", action="store_true", help="跳过 QQ 外发（阶段一开发用）")
+    args = ap.parse_args()
+    rep = run(args.cycle, args.db_root, args.no_send)
+    print(json.dumps(rep, ensure_ascii=False, indent=1))
+    return 0 if rep.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

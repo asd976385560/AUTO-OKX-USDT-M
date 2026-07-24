@@ -1,401 +1,235 @@
-# skill.md — OKX 永续合约自主交易系统（小灵 v3.0）
+<!--
+doc-version: V2.0
+last-updated: 2026-07-24
+change-summary: Public release baseline; host identifiers, credentials, targets, runtime data and incident history removed.
+-->
 
-> 本文件是**小灵 OKX 永续合约自主交易**的**总入口与最高权威**。
-> 所有 cron 唤醒与对话触发都先回到这里，再分发到子流程。
-> 配套配置见 [config.md](config.md)。
+# OKX 自主交易系统 V2.0 · 事实源
 
----
+本文定义公开代码中的 V2.0 架构、职责边界与安全不变量。`README.md` 是面向使用者的系统地图；发生冲突时，以本文和真实代码为准。
 
-## 1. 身份与定位
+## 1. 设计原则
 
-- **运营者**：小灵——主人最信任的专业加密永续合约交易员
-- **服务对象**：主人
-- **市场**：OKX 永续合约（USDT-Margined Swap）
-- **环境**：`profile = live`（实盘，写死，禁止 `demo`）
-- **授权**：**全自动 + 最大自主权**——在风险硬上限内由小灵自主决定开/平/加/减/暂停，**无需事前确认**
-- **小灵决策权**：**最大**——五维评分仅作参考锚点（20%），最终开/平/加/减/观望由小灵综合所有信息裁量主导（80%）
-- **报告与对话语言**：**中文**，时间使用 **UTC+8**
+| 原则 | 约束 |
+|---|---|
+| 可移植 | 核心逻辑使用 Python、SQLite 和明确契约；项目根目录从 `OKX_ROOT` 或源码位置推导 |
+| 确定性管道 | 采集、风控、下单、记账、推送和触发由代码完成；LLM 只做判断或结构化取数 |
+| 单 writer | 每张表或明确键域只有一个权威 writer；读者使用 `mode=ro` |
+| 幂等 | `ledger.db.stage_dispatch(cycle_id, stage)` 唯一约束是阶段派发真值 |
+| 模板化 | 分析、交易、推送和日报都有固定回执或模板并在写入前校验 |
+| 角色隔离 | 每个 Agent 只加载自己的 `agents/<role>.md`；cron 消息只描述本轮工作 |
+| fail-safe | 权威字段、凭证、合约规格、余额或成交确认缺失时拒绝执行，不使用猜测默认值 |
 
-> 任何与上述身份/范围冲突的请求 → 拒绝并解释，**不要降低安全栏**。
+## 2. 系统定位与流程
 
----
+系统面向 OKX USDT 永续合约，支持 live 与 demo 双盘。两盘共用风控、止损和成交确认路径，只切换执行环境。
 
-## 2. 首次运行（必读）
-
-> ⚠️ **在首次执行交易前，必须按顺序完成以下步骤：**
-
-### Step 1 — 安装运行环境
-
-| 项目 | 安装方式 |
-|------|---------|
-| Python 3.14+ | https://www.python.org/downloads/ |
-| pwsh 7+ | https://github.com/PowerShell/PowerShell/releases |
-| Node.js 18+ | https://nodejs.org/ |
-| OKX CLI | `npm install -g @okx_ai/okx-trade-cli` |
-| OKX API 凭证 | `okx config init`（或编辑 `~/.okx/config.toml`） |
-
-> ⚠️ **禁止使用 PS 5.1**，所有脚本和命令调用统一使用 `pwsh`。
-
-### Step 2 — 填写 config.md
-
-打开 `config.md`，填写所有必填项（API Key、数据库路径等）。详见 config.md §0。
-
-### Step 3 — 执行初始化脚本
-
-```bash
-python scripts/init_okx2.py --root E:\OKX --db-dir <数据库目录>
+```text
+fast/slow/news/account collectors
+              │
+              v
+          ledger.db
+              │
+              v
+       core/dispatcher.py
+              │
+  stage_dispatch unique lock
+              │
+     ┌────────┴────────┐
+     v                 v
+unified live       demo trader
+analysis+trade      demo trade
+     └────────┬────────┘
+              v
+     scripts/push_pipeline.py
 ```
 
-该脚本将：校验配置、创建 reports/ 目录、初始化 4 个 SQLite 数据库及所有表、写入 system_state 默认值。
+主链：
 
-**幂等**：重复运行不会破坏已有数据。
+1. fast collector 采集即时行情并同步账户；
+2. slow collector 采集合约规格和低频宏观数据；
+3. registry 新闻源经 `news_writer` 落库，news-scout 作为非必需旁路；
+4. dispatcher 在采集齐全且新鲜时抢 `stage_dispatch(live)`；
+5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，经过风控和订单执行层；
+6. analysis 就绪后 dispatcher 派 demo；
+7. 双盘 trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
+8. reviewer 与日频维护独立于 15 分钟事件链。
 
-### Step 4 — 验证
+`cycle_id` 使用 UTC+8 的 `YYYY-MM-DDTHH:MM` 槽位。过窗周期只告警，不自动补单或恢复。
 
-```bash
-okx config show
-python scripts/health_check.py
+## 3. 调度口径
+
+默认调度表达式：
+
+| 工作 | 类型 | 表达式或触发 |
+|---|---|---|
+| fast collect | command | `0,15,30,45 * * * *` |
+| slow collect | command | `2 * * * *` |
+| dispatcher | command | `*/2 * * * *`，writer 成功后可额外 nudge |
+| registry news | command | `3,18,33,48 * * * *` |
+| news-scout | agent | `5,20,35,50 * * * *`，非必需 |
+| daily maintenance | command | 每日一次 |
+| reviewer | agent | 每日一次 |
+
+公开仓库不包含真实 cron job id、OpenClaw 数据库、设备配置或宿主状态。部署者应在自己的环境中创建和核验调度。
+
+## 4. 角色边界
+
+| 角色 | 职责 | 写入 |
+|---|---|---|
+| collectors | 采集与账户同步，失败隔离 | market/news/regime/account + ledger |
+| dispatcher | 读取就绪状态、抢阶段锁、起下一棒 | ledger.stage_dispatch |
+| analyst | 仅人工回滚时使用的分析角色 | analysis.db |
+| unified live trader | 分析、实盘判断、风控和执行 | analysis.db + live_trades.db |
+| demo trader | 使用同一分析和同一硬风控完成模拟执行 | demo_trades.db |
+| reviewer | 日/周/月复盘和经验摘要 | account.db reports |
+| news-scout | X/无 API 新闻取数和结构化，不做方向判断 | news.db + ledger |
+| push pipeline | 从数据库组装、渲染、校验、归档和可选发送 | reports + system_state |
+
+Agent 不得直接写表，不得绕过 writer，不得手拼 OKX 下单命令，也不得读取或输出 raw credential。
+
+## 5. 目录与配置
+
+```text
+<PROJECT_ROOT>/
+├── agents/
+├── collectors/
+├── core/
+├── db/schema.sql
+├── docs/
+├── scripts/
+├── templates/
+├── config.example.md
+├── README.md
+└── skill.md
 ```
 
----
+运行时会创建 `db/*.db`、`logs/`、`reports/`、`memory/` 和 `tmp/`，这些内容都被 `.gitignore` 排除。
 
-## 3. 系统架构
+配置规则：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        skill.md（本文件）                     │
-│                     总入口 · 安全栏 · 决策权威                 │
-├──────────┬──────────┬──────────┬──────────┬──────────────────┤
-│  资讯层   │  行情层   │  账户层   │  跨市场层  │    外部数据源     │
-│ OKX News │ OKX HTTP │ OKX CLI  │ DXY/Gold │ FRED/DefiLlama/ │
-│ mx-search│ 批量并发  │ Portfolio│ VIX/SPX  │ CoinGecko/妙想  │
-│ 币种情绪  │ K线/深度  │ 余额/持仓 │ ETF Flow │                 │
-├──────────┴──────────┴──────────┴──────────┴──────────────────┤
-│                        本地数据库层                            │
-│         market.db · news.db · account.db · lessons.db         │
-│         （所有交易数据、状态、经验全部写入数据库）                 │
-├─────────────────────────────────────────────────────────────┤
-│                        决策层                                  │
-│     全币种扫描 → ctVal 过滤 → 五维评分 → 小灵综合判断           │
-│     （20%参考锚点 + 80%小灵裁量）                               │
-├─────────────────────────────────────────────────────────────┤
-│                        执行层                                  │
-│     okx-cex-trade（下单·止损·止盈）+ algo 强制挂单              │
-├─────────────────────────────────────────────────────────────┤
-│                        记账与复盘层（全部入库）                  │
-│  account.db (trade_events / records / daily_reports /         │
-│  playbook) · lessons.db · reports/self-reviews/               │
-└─────────────────────────────────────────────────────────────┘
-```
+- 环境变量优先；
+- 允许采集器从本地 `config.md` 读取受控 fallback；
+- `config.md` 从 `config.example.md` 复制后填写，永远不得提交；
+- QQ 目标必须由 `OKX_QQ_TARGET` 或 CLI 参数提供，公开代码无默认目标；
+- OKX API credential 由仓库外的 CLI profile 或部署环境管理；
+- 代理由 `OKX_PROXY_URL` 或当前启用的系统代理提供，代码不带私网地址或端口默认值。
 
----
+## 6. 数据库与 writer
 
-## 4. 四大定时任务
+| 数据库 | 关键表 | 权威写入方 |
+|---|---|---|
+| market.db | tick_snapshots, kline_cache, derivatives, market_microstructure, market_trade_flow, instruments_cache | fast/slow collectors |
+| regime.db | cross_market, macro_events | slow collector / macro maintenance |
+| news.db | news_items, coin_sentiment, news_events_index | `collectors/news_writer.py` |
+| analysis.db | analysis_runs, analysis_signals | `collectors/analyst_writer.py` |
+| live_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile live` |
+| demo_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile demo` |
+| account.db | snapshots, trade_experiences, bills, reports, playbook, system_state | 对应表或键域 writer |
+| ledger.db | collection_runs, stage_dispatch | `collectors/ledger.py` / dispatcher |
+| lessons.db | error_patterns, missed_opportunities, signal_perf | reviewer |
+| drill.db | drill_* | 只读兼容数据 |
 
-### Job A — 快速采集（每 15 分钟）
+SQLite 连接使用 WAL、`busy_timeout=5000` 和 `synchronous=NORMAL`。schema 变更通过幂等迁移脚本完成；`db/schema.sql` 是公开 DDL，不包含运行数据。
 
-**职责**：提供最新 15 分钟市场快照。
+## 7. 数据源
 
-| 采集内容 | 数据源 | 写入 |
-|---------|--------|------|
-| 300+ USDT-M 永续合约 Ticker | OKX HTTP 批量并发 | market.db.tick_snapshots |
-| 资金费率 / 下次结算时间 | OKX HTTP 批量并发 | market.db.derivatives |
-| 15m K 线 + MA/ATR/RSI/MACD | OKX HTTP 批量并发 | market.db.kline_cache |
-| 账户余额 / 持仓快照 | OKX CLI | account.db |
-| OKX 重要新闻 + 最新新闻 | OKX CLI | news.db.news_items |
-| 妙想地缘新闻 | mx-search 技能 | news.db.news_items |
-| 全网搜索相关数据 | 可配置搜索关键词 | news.db |
+`collectors/sources/registry.json` 是声明式源注册表。每个源声明：
 
-### Job E — 慢源采集（每小时）
-
-**职责**：采集长期数据供决断。
-
-| 采集内容 | 数据源 | 写入 |
-|---------|--------|------|
-| 1H / 4H / 1D K 线 + 指标 | OKX HTTP | market.db.kline_cache |
-| DXY / VIX / S&P500 + 日变化率 | FRED API | market.db.cross_market |
-| 黄金价格 | FRED API | market.db.cross_market |
-| BTC ETF 流向 | FRED API | market.db.cross_market |
-| 全链 TVL | DefiLlama API | market.db.cross_market |
-| BTC 市占率 / 加密总市值 / 24h 交易量 | CoinGecko API | market.db.cross_market |
-| 币种情绪数据 | OKX CLI | news.db.coin_sentiment |
-| Regime 计算 | 本地计算 | market.db.cross_market |
-
-### Job B — 决策执行（每 15 分钟）
-
-**职责**：根据 A+E 数据进行决断，实时交易。
-
-1. 加载上下文：system_state / 账户 / 行情 / 新闻 / 经验库 / 假设
-2. 数据校验：新鲜度检查，降级规则
-3. **全币种扫描**（见 §8）
-4. 小灵综合推理（6 项必答）
-5. 执行交易（如触发 OPEN_LONG / OPEN_SHORT / ADD / CLOSE）
-6. 自我学习闭环：假设落库 / 经验引用 / 参数建议
-7. 记账入 DB + QQ Bot 推送
-
-### Job C — 每日复盘（每日 00:30）
-
-**职责**：短期 + 长期复盘，优化 A/B/E 任务。
-
-1. 验证 JobB 假设（confirmed / falsified / undecided）
-2. 交易归因（盈/亏/错失的原因分析）
-3. 五维评分质量评估
-4. **优化 Job B**：更新 playbook / lessons / param_suggestions
-5. **优化 Job A**：缺失数据补充、搜索关键词调整建议
-6. **优化 Job E**：数据源异常检测、采集频率建议
-7. 识别运行异常，写入 error_patterns / missed_opportunities
-8. 写入 daily_reports / self-reviews / playbook
-
-### 任务间数据流
-
-```
-Job A (15min) ──→ market.db / news.db / account.db ──┐
-                                                      ├──→ Job B (15min) ──→ 交易执行
-Job E (1h)    ──→ market.db / news.db              ──┘         │
-                                                                │
-Job C (daily) ◄── account.db / lessons.db / market.db ◄────────┘
-     │
-     ├──→ 优化 Job B 策略（playbook / lessons）
-     ├──→ 优化 Job A 搜索配置（缺失数据补充）
-     └──→ 优化 Job E 采集（异常检测 / 频率建议）
+```text
+id / type / endpoint / native_cadence / required /
+staleness_sec / enabled / auth_env / adapter / timeout_sec
 ```
 
----
+规则：
 
-## 5. 数据采集流程
+- 采集器只迭代 enabled 且有确定性 adapter 的新闻源；
+- `auth_env` 只存环境变量名，不存值；
+- required 源缺失或过期会阻断本轮派发；
+- optional 源失败只记降级；
+- event 源不因无新事件自动判 stale；
+- `event_time` 使用源发布时间，缺失时保持 NULL，不能伪造为当前时间；
+- news-scout 只取数和结构化，方向与影响判断仍归分析阶段。
 
-### 5.1 Job A — 每 15 分钟快速采集
+## 8. 风控契约
 
-脚本：`scripts/collect_data.py`
+live 开仓唯一路径是 `core/order_executor.open_position()`；该函数内部强制调用 `core/risk_validator.validate()`。
 
-1. **动态品种发现**：`okx market instruments --instType SWAP` → 获取所有 live 的 USDT-M linear SWAP 合约（~310+）
-2. **Ticker 快照**：HTTP 批量并发获取所有合约的 last/bid/ask/vol24h
-3. **资金费率**：HTTP 批量并发获取所有合约的 fundingRate/nextFundingTime
-4. **15m K 线**：HTTP 批量并发 + 本地计算 MA5/MA20/ATR14/RSI14/MACD
-5. **跨市场快照**：复制最近一条 slow snapshot + 刷新 regime
-6. **OKX 新闻**：重要新闻 + 最新新闻，哈希去重
-7. **妙想地缘新闻**：7 组关键词搜索
-8. **账户余额/持仓**：OKX CLI 实时查询
+权威常量：
 
-### 5.2 Job E — 每 1 小时慢源采集
+| 限制 | 值 | 处置 |
+|---|---:|---|
+| 单笔保证金占权益 | `MAX_MARGIN_PCT = 0.20` | clamp |
+| 可用 USDT 保证金使用比例 | `AVAILABLE_MARGIN_USE_PCT = 0.98` | clamp / 不可行时 reject |
+| 最大杠杆 | `MAX_LEVERAGE = 10.0` | reject |
+| 最小名义价值占权益 | `MIN_NOTIONAL_PCT = 0.01` | clamp |
+| 最大止损偏离 | `MAX_SL_DEVIATION = 0.30` | reject |
 
-脚本：`scripts/collect_slow.py`
+保证金与名义价值必须包含 `ctVal`：
 
-1. 1H / 4H / 1D K 线 + 技术指标
-2. FRED：DXY / VIX / S&P500（当前值 + 日变化率）
-3. DefiLlama：全链 TVL 总值
-4. CoinGecko：BTC 市占率 / 加密总市值 / 24h 总交易量
-5. BTC ETF 流向
-6. 币种情绪数据
-7. Regime 计算
-
-### 5.3 数据存储模式
-
-**增量追加（时间序列）**，非全量覆盖：
-
-| 表 | 每轮插入 | 去重策略 |
-|----|---------|---------|
-| tick_snapshots | ~313 行（全币种） | `INSERT OR REPLACE` + (ts, symbol) PK |
-| kline_cache | ~18K 行（60 bars × 313 币） | `INSERT OR REPLACE` + (ts, symbol, tf) PK |
-| derivatives | ~313 行 | `INSERT OR REPLACE` + (ts, symbol) PK |
-| cross_market | 1 行 | `INSERT OR REPLACE` + (ts) PK |
-| news_items | 仅新新闻 | `INSERT OR IGNORE` + hash 去重 |
-| coin_sentiment | 全币种情绪 | `INSERT OR REPLACE` + (ts, symbol, period) PK |
-| account_snapshots | 1 行 | `INSERT OR REPLACE` + (ts, profile) PK |
-| position_snapshots | 有持仓时插入 | DELETE + INSERT（同 ts/profile） |
-
-### 5.4 数据库核心表
-
-| 库 | 核心表 | 说明 |
-|----|--------|------|
-| market.db | tick_snapshots | Ticker 快照（每轮全币种） |
-| market.db | kline_cache | K 线 + 指标缓存（15m/1H/4H/1D） |
-| market.db | cross_market | 跨市场宏观快照 |
-| market.db | derivatives | 资金费率 / OI / 溢价 |
-| news.db | news_items | 新闻事件（哈希去重） |
-| news.db | coin_sentiment | 币种情绪 |
-| account.db | account_snapshots | 账户快照 |
-| account.db | position_snapshots | 持仓快照 |
-| account.db | scoring_history | 五维评分记录 |
-| account.db | cycle_runs | 轮次审计 |
-| account.db | trade_events | 交易事件 |
-| account.db | system_state | 系统运行状态 |
-| account.db | playbook | 经验库 |
-| account.db | records | 已平仓复盘 |
-| account.db | daily_reports ~ yearly_reports | 各周期报告 |
-| lessons.db | signal_perf | 信号表现统计 |
-| lessons.db | error_patterns | 错判模式 |
-| lessons.db | param_suggestions | 参数建议 |
-| lessons.db | missed_opportunities | 错失机会 |
-
----
-
-## 6. 决策流程（Job B — 每轮强制顺序）
-
-> **每一步失败都要写入 `account.db.cycle_runs` 并决定是否进入兜底，禁止静默吞错。**
-
-### Step 1 — 加载上下文（全部从数据库读取）
-
-1. 读 `account.db.system_state`
-2. 读 `market.db` 最近 tick / kline / cross_market / derivatives
-3. 读 `news.db` 最近新闻 / coin_sentiment
-4. 读 `account.db` 最近账户 / 持仓 / 评分
-5. 读经验库：playbook / lessons / 假设
-
-### Step 2 — 数据校验
-
-- 最近一轮 Job A 成功时间距当前 > 15 min → 禁止新开仓
-- 部分字段缺失 → 进入降级模式
-
-### Step 3 — 全币种扫描（见 §8）
-
-### Step 4 — 小灵综合裁量
-
-> **这是整个系统的核心**——小灵拥有最大决策权。
-
-**决策权重**：
-- 五维量化评分：**20%**（参考锚点）
-- 小灵综合判断：**80%**（主导）
-
-**偏离记录**：最终动作与量化评分不一致时，必须在 `trade_events.ai_deviation` 中写明。
-
-**PAUSE 触发条件**（触碰即暂停，需主人手动恢复）：
-- 单笔超 10% 净值
-- 杠杆 > 10x
-- 同侧暴露 > 60%
-- 并发持仓 > 6 仓
-- HTTP 401 / 签名失败
-- 连续 3 轮开仓失败
-
-### Step 5 — 执行
-
-1. ctVal 必查 + 仓位计算
-2. 下单：`okx swap place --profile live ...`
-3. 同栈挂 algo 止损
-4. algo 失败 → 重试 1 次 → 仍失败 → 立即市价平仓
-
-### Step 6 — 记账（全部写入数据库）
-
-### Step 7 — 推送
-
-- QQ Bot 推送本轮要点
-- 推送失败 ≠ 交易失败
-
----
-
-## 7. 风险硬上限（系统强制执行，不可绕过）
-
-| 限制项 | 默认推荐档 | 契约硬上限 |
-|--------|-----------|-----------|
-| 单笔仓位占净值 | ≤ **5%** | ≤ **10%** |
-| 杠杆（BTC/ETH） | **10x** | ≤ **10x** |
-| 杠杆（山寨） | **5x** | ≤ **10x** |
-| 同侧暴露 | ≤ 50% | ≤ **60%** |
-| 并发持仓 | ≤ 3 仓 | ≤ **6 仓** |
-| **单次开仓保证金** | — | ≤ **10% 净值**（硬上限） |
-
-### 10% 净值硬上限计算
-
-```
-每张保证金 = markPx × ctVal ÷ leverage
-最大张数 = floor(保证金预算 ÷ 每张保证金)
-锁定 = (最大张数 < 1)
+```text
+margin_per_contract = mark_px * ct_val / leverage
+notional = mark_px * size * ct_val
 ```
 
-⚠️ **勿用 ctVal（合约面值）直接比较硬上限**——这是常见 bug。正确比较的是每张保证金。
+其他不变量：
 
----
+- `ctVal` 和 `lotSz` 来自 instruments cache，缺失时现拉，仍缺则 reject；
+- 当前持仓来自 OKX API，不能由 position snapshot 聚合推断；
+- 可用 USDT 保证金字段缺失时 fail-safe reject；
+- live/demo 开仓都必须提供止损；
+- 附挂止损回读失败时尝试独立止损，仍失败则立即平掉裸仓并报告 P0；
+- 成交优先由 fills 确认，失败时查订单状态；两者均无法确认时进入 repair queue；
+- 写命令超时后不能盲目重试，以免重复下单；
+- 组合集中度与持仓数量只作观察，不改变上述硬闸。
 
-## 8. 交易品种与全币种扫描
+## 9. 交易经验
 
-| 项目 | 值 |
-|------|-----|
-| 市场类型 | OKX USDT-M 永续合约（Swap） |
-| 品种范围 | **无白名单限制**，全部 USDT-M 永续合约均可交易 |
-| 品种发现 | `okx market instruments --instType SWAP` 动态获取 |
-| 非加密资产 | 股票代币 / 贵金属 / 大宗 / 外汇 / 债券 |
+live/demo 成交写入后，由 `trades_writer.write_experiences` 调用 `trade_experience_writer` 更新 `account.db.trade_experiences`。交易库与经验库使用独立事务；经验写入失败不得回滚已经确认的交易行。
 
-### 全币种扫描要求（每轮 Job B 强制执行）
+经验状态为 `open|closed|expired`。只有已确认且可计算的 PnL 才能进入经验统计；`pnl_approx=True` 或成交未确认的关闭事件不得污染经验。
 
-1. **读取全量币种**：从 `market.db.tick_snapshots` 读取本轮所有有数据的币种（~300+）
-2. **ctVal 可行性过滤**：计算每张保证金 = markPx × ctVal ÷ leverage(10x)，排除 > 10% 净值的
-3. **批量五维评分**：对所有可行币种进行五维评分
-4. **输出 TOP 20**：报告中列出评分最高的 20 个币种
-5. **深度分析 TOP 3**：仅对评分最高的 1-3 个币种进行深度推理
-6. **小账户友好优先**：ctVal 较低的币种（DOGE/SHIB/LAYER/BIO 等）评分相同时优先
-7. **全部评分入库**：所有可行币种评分写入 `scoring_history`
+经验检索同时返回相似盈利、相似亏损和错失机会。历史样本是 Agent 的参考输入，不自动批准或禁止 live。
 
-### 账户容量参考
+## 10. 报告与推送
 
-| 币种 | ctVal | 每张保证金 @10x | 最大张数（示例净值） |
-|------|-------|---------------|-----------------|
-| BTC | 0.01 BTC | ~$81 | 15 |
-| ETH | 0.01 ETH | ~$23 | 53 |
-| SOL | 0.1 SOL | ~$9 | 135 |
-| DOGE | 1000 DOGE | ~$11 | 111 |
+| 产物 | 入口 |
+|---|---|
+| 分析回执 | `collectors/analyst_writer.py` |
+| 交易回执 | `collectors/trades_writer.py` |
+| 15 分钟战报 | `scripts/push_pipeline.py` |
+| 日/周/月报 | `scripts/daily_report_writer.py` |
 
----
+push 顺序固定为：
 
-## 9. 强制安全栏
+```text
+build_push_payload -> render_push_report -> validate_push_format
+-> optional send -> push_archive -> system_state_writer
+```
 
-1. **profile 必须 = `live`**
-2. **ctVal 必查**：开仓前确认合约面值
-3. **`--tgtCcy` 三模式**正确
-4. **algo 止损必挂**：失败则市价平仓
-5. **HTTP 401** → 立即 PAUSE
-6. **降级数据** → 扣分 + 记录
-7. **统一使用 pwsh**
+公开代码不包含目标。未配置 `OKX_QQ_TARGET` 时，发送入口必须返回配置错误，不能使用隐藏 fallback。
 
----
+## 11. 失败与安全响应
 
-## 10. OKX CLI 技能路由
+以下情况应视为 P0：鉴权失败、硬风控被绕过、writer 连续失败、裸 live 仓无法补止损或平仓、凭证疑似泄漏。
 
-| 需求 | 技能 | 说明 |
-|------|------|------|
-| 价格 / K线 / 深度 / 资金费率 / OI | `okx-cex-market` | 只读 |
-| 余额 / 持仓 / P&L / 转账 | `okx-cex-portfolio` | 需 API |
-| 下单 / 撤单 / 改单 / 止损止盈 | `okx-cex-trade` | 需 API |
-| Grid / DCA Bot | `okx-cex-bot` | 需 API |
-| 地缘新闻搜索 | `mx-search` | 妙想 API |
+响应原则：
 
----
+1. 停止业务调度；
+2. 禁止自动恢复；
+3. 在运行环境配置的安全渠道告警；
+4. 保存本地事件记录，不提交日志或凭证；
+5. 等待维护者决定是否恢复。
 
-## 11. 自主交易闭环 — 复盘体系
+发现疑似泄漏时先轮换凭证。公开仓库历史问题只报告，不在常规同步中重写 Git 历史。
 
-| 任务 | 频率 | 写入 |
-|------|------|------|
-| Job C — 每日复盘 | 每日 00:30 | lessons.db / playbook / daily_reports / self-reviews |
-| Job D — 每日总结 | 每日 00:00 | daily_reports |
-| Job W — 每周总结 | 每周日 | weekly_reports |
-| Job M — 每月总结 | 每月 1 日 | monthly_reports |
-| Job Q — 每季总结 | 每季度首日 | quarterly_reports |
-| Job Y — 每年总结 | 每年 1 月 1 日 | yearly_reports |
+## 12. 当前实装状态
 
----
+- dispatcher 使用 unified live → demo → push 完成触发；
+- analysis、trade、news、report 和 system state 都有明确 writer；
+- 新闻采集由 registry 驱动，news-scout 是解耦旁路；
+- push 固定为纯脚本管道；
+- 项目当前没有完整 `tests/` 目录；
+- 无生产数据库时的发布验证为全量 `py_compile`、registry/schema/doc 静态检查、dry-run 和独立敏感扫描。
 
-## 12. 相关文件
-
-| 文件 | 说明 |
-|------|------|
-| [config.md](config.md) | 运行时配置 |
-| [schema.sql](schema.sql) | 数据库表结构参考 |
-| scripts/collect_data.py | Job A 快速采集 |
-| scripts/collect_slow.py | Job E 慢源采集 |
-| scripts/init_okx2.py | 初始化脚本 |
-| scripts/health_check.py | 健康检查 |
-| scripts/self_review.py | Job C 复盘 |
-| scripts/_okxcli.py | OKX CLI 封装 |
-| scripts/_okx_http.py | OKX HTTP 封装 |
-| scripts/_timeutils.py | 时间工具 |
-| prompts/jobb-prompt.md | Job B agent prompt |
-| prompts/jobc-prompt.md | Job C agent prompt |
-
----
-
-## 13. 版本历史
-
-| 日期 | 版本 | 变更 |
-|------|------|------|
-| 2026-04-23 | v2.0.0 | 初始版本 |
-| 2026-04-23 | v2.1.2 | 风险上限上调；cron 错开；health_check |
-| 2026-05-11 | **v3.0** | 全币种扫描；四大 Job 职责重定义；项目独立化；可迁移可分享 |
+公开发布不改变风控、订单执行、writer、账本幂等或交易业务判断逻辑。

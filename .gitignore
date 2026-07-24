@@ -1,7 +1,67 @@
-.vs/
-__pycache__/
-*.py[cod]
-.venv/
-venv/
+# Local credentials and configuration
+config.md
 .env
 .env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime databases and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.wal
+*.shm
+
+# Runtime output
+logs/
+reports/
+memory/
+tmp/
+
+# Local dependency/runtime trees
+/Lib/
+**/__pycache__/
+**/*pycache*/
+**pycache**/
+*.py[cod]
+
+# Backups and editor/OS artifacts
+*.bak
+*.bak*
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local OpenClaw/Codex state
+/.openclaw/
+/.codex/
+
+# Historical archives retained locally but not published
+/docs/archive/
+/scripts/archive/
+
+# Internal host operations and execution records
+/docs/data_enrichment_execution_plan_20260720.md
+/docs/openclaw_host_upgrade_runbook.md
+/docs/quality-optimization-plan-v1.1.md
+/scripts/fulltest_orchestrator.py
+/scripts/openclaw_baseline.json
+/scripts/openclaw_baseline_check.py
+/scripts/gateway_rss_sample.ps1
+/scripts/snapshot_source.ps1
+
+# Compatibility and one-off maintenance tools
+/scripts/backfill_rank5_history.py
+/scripts/drill_reconcile.py
+/scripts/microtest_order.py
+/scripts/phase5_writer.py
+/scripts/query_cross_market.ps1
+/scripts/validate_receipt.py
+
+# Local security scan artifacts
+/.gitleaks-*.json
+/.gitleaks-*.sarif

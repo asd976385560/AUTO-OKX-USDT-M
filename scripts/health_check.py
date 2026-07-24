@@ -3,10 +3,10 @@
 health_check.py - Pre-flight connectivity check for OKX v2.0
 
 Validates that all external APIs are reachable before starting data collection.
-Run this once before the first Job A / Job E cycle.
+采集/交易链启动前的外部 API 连通性预检。
 
 Usage:
-    python scripts/health_check.py
+    pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 <PROJECT_ROOT>\\scripts\\health_check.py
 """
 
 from __future__ import annotations
@@ -62,8 +62,6 @@ def main() -> None:
         cfg = (Path(__file__).resolve().parents[1] / "config.md").read_text(encoding="utf-8")
         m = re.search(r"###\s+4\.1 FRED.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
         fred_key = m.group(1).strip() if m else "placeholder"
-        if fred_key.startswith("<REDACTED_"):
-            fred_key = "placeholder"
     except Exception:
         fred_key = "placeholder"
     ok, detail = check_url(f"https://api.stlouisfed.org/fred/series?series_id=VIXCLS&api_key={fred_key}&file_type=json")

@@ -1,191 +1,182 @@
+# -*- coding: utf-8 -*-
+r"""OKX CLI 调用封装。
+
+本模块严格对齐消费者事实契约（collect_data / collect_slow / demo_account_check /
+drill_reconcile / jobb_live_account_check / phase5_writer / core/lib/_okxorder）：
+
+    okx_json(*args, global_args=["--profile", <p>], timeout_sec=45.0) -> 解析后的 JSON
+        成功：返回 dict / list（OKX `--json` 输出原样解析）
+        失败：抛 RuntimeError（rc!=0 / 空输出 / 非 JSON）或 TimeoutError（超时）
+
+事实依据
+--------
+- CLI = npm `@okx_ai/okx-trade-cli`（node entry）。
+- OKX CLI（undici）使用直连；env 有
+  HTTP(S)_PROXY 时反走代理失败。`_subprocess_env()` 剥 HTTP(S)_PROXY/ALL_PROXY +
+  设 NO_PROXY=* 强制直连。凭证由 CLI 自身 profile 配置（--profile live/demo），本模块不碰 key。
+
+安全设计（live 真金）
+--------------------
+- **窗口隐藏**：Windows CREATE_NO_WINDOW，不弹控制台。
+- **节流**：相邻调用最小间隔，防打爆。
+- **写命令绝不在超时后重试**（防 place/close 重复下单致双仓）：只读命令可重试，
+  写命令（place/close/leverage/cancel）超时即抛、rc!=0 即抛，由 order_executor 经
+  fills 回读自行判定真实成交（不靠本层重试）。
+- 零模型名（红线 #1）。
+"""
 from __future__ import annotations
 
 import json
 import os
-import shlex
-import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
+
+# --- CLI 定位（env 可覆盖）---------------------------------------------------
+_NODE = os.environ.get("OKX_NODE_BIN", "node")
+_ENTRY = os.environ.get(
+    "OKX_CLI_ENTRY",
+    str(Path.home() / "AppData" / "Roaming" / "npm" / "node_modules"
+        / "@okx_ai" / "okx-trade-cli" / "dist" / "index.js"),
+)
+# 备用：npm 全局 .cmd（entry 缺失时；okx 参数无 JSON，.cmd 不会 mangle）
+_OKX_CMD = os.environ.get(
+    "OKX_CLI_CMD", str(Path.home() / "AppData" / "Roaming" / "npm" / "okx.cmd")
+)
+
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# 写命令 token：命中即视为变更类，超时/rc!=0 不重试（防重复下单）
+_WRITE_TOKENS = {"place", "close", "leverage", "amend", "cancel", "cancel-algos"}
+
+# --- 节流 -------------------------------------------------------------------
+_THROTTLE_LOCK = threading.Lock()
+_LAST_CALL = [0.0]
+_MIN_INTERVAL_SEC = float(os.environ.get("OKX_CLI_MIN_INTERVAL", "0.12"))
 
 
-def _default_okx_ps1() -> Path:
-    env_path = os.environ.get("OKX_CLI_PS1")
-    if env_path:
-        return Path(env_path)
-    npm_ps1 = Path.home() / "AppData" / "Roaming" / "npm" / "okx.ps1"
-    if npm_ps1.exists():
-        return npm_ps1
-    found = shutil.which("okx.ps1") or shutil.which("okx")
-    if found:
-        p = Path(found)
-        if p.suffix.lower() == ".cmd":
-            ps1 = p.with_suffix(".ps1")
-            if ps1.exists():
-                return ps1
-        return p
-    return npm_ps1
-
-OKX_PS1 = _default_okx_ps1()
-DEFAULT_TIMEOUT_SEC = 45.0
-DEFAULT_MIN_INTERVAL_SEC = 0.25
-DEFAULT_RETRY_COUNT = 1
-
-_LOCK = threading.Lock()
-_LAST_CALL_AT = 0.0
-
-
-def _throttle(min_interval_sec: float = DEFAULT_MIN_INTERVAL_SEC) -> None:
-    global _LAST_CALL_AT
-    with _LOCK:
+def _throttle() -> None:
+    with _THROTTLE_LOCK:
         now = time.monotonic()
-        wait_for = _LAST_CALL_AT + min_interval_sec - now
-        if wait_for > 0:
-            time.sleep(wait_for)
-        _LAST_CALL_AT = time.monotonic()
+        wait = _MIN_INTERVAL_SEC - (now - _LAST_CALL[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[0] = time.monotonic()
 
 
-def _extract_json_payload(stdout: str) -> str:
-    stripped = stdout.strip()
-    indexes = [index for index in (stripped.find("{"), stripped.find("[")) if index != -1]
-    for index in sorted(indexes):
-        candidate = stripped[index:]
-        json.loads(candidate)
-        return candidate
-    raise ValueError("stdout 中未找到 JSON 载荷")
+def _subprocess_env() -> dict:
+    """剥代理 env + NO_PROXY=*，让 okx CLI（undici）直连（OKX 经代理反不通）。"""
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+              "ALL_PROXY", "all_proxy"):
+        env.pop(k, None)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
 
 
-def _is_timeout_like(message: str) -> bool:
-    lowered = message.lower()
-    return "timeout" in lowered or "timed out" in lowered
+def _base_cmd() -> list[str]:
+    """优先 node + entry（最稳，无 .cmd / PATH 依赖）；entry 缺则退 okx.cmd。"""
+    if Path(_ENTRY).exists():
+        return [_NODE, _ENTRY, "--json"]
+    if Path(_OKX_CMD).exists():
+        return [_OKX_CMD, "--json"]
+    raise RuntimeError(
+        f"okx CLI not found: entry={_ENTRY} / cmd={_OKX_CMD}（设 OKX_CLI_ENTRY 覆盖）")
 
 
-def _global_args_from_env() -> list[str]:
-    raw = os.environ.get("OKX_CLI_GLOBAL_ARGS", "").strip()
-    if not raw:
-        return []
-    return shlex.split(raw, posix=False)
+def _is_write(args: Sequence[str]) -> bool:
+    return any(a in _WRITE_TOKENS for a in args)
 
 
-def okx_json(*args: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC, global_args: list[str] | None = None) -> Any:
-    if not OKX_PS1.exists():
-        raise FileNotFoundError(f"OKX CLI 不存在：{OKX_PS1}")
-    _throttle()
-    resolved_global_args = global_args if global_args is not None else _global_args_from_env()
-    command = [
-        "pwsh",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(OKX_PS1),
-        "--json",
-        *resolved_global_args,
-        *args,
-    ]
-    last_message = ""
-    for attempt in range(DEFAULT_RETRY_COUNT + 1):
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_sec,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except subprocess.TimeoutExpired as exc:
-            last_message = f"OKX CLI 超时（{timeout_sec:.0f}s）：{' '.join(args)}"
-            if attempt < DEFAULT_RETRY_COUNT:
-                time.sleep(DEFAULT_MIN_INTERVAL_SEC)
-                continue
-            raise TimeoutError(last_message) from exc
-
-        stdout = completed.stdout.strip()
-        stderr = completed.stderr.strip()
-        if completed.returncode != 0:
-            message = stderr or stdout or f"returncode={completed.returncode}"
-            last_message = message
-            if attempt < DEFAULT_RETRY_COUNT and _is_timeout_like(message):
-                time.sleep(DEFAULT_MIN_INTERVAL_SEC)
-                continue
-            raise RuntimeError(f"OKX CLI 失败：{' '.join(args)} :: {message}")
-        payload = _extract_json_payload(stdout)
-        return json.loads(payload)
-    raise RuntimeError(f"OKX CLI 失败：{' '.join(args)} :: {last_message}")
+def _parse_json(out: str) -> Optional[Any]:
+    """解析 CLI stdout 为 JSON；容忍前后混杂日志行（抠第一个完整 JSON 块）。"""
+    out = (out or "").strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        pass
+    # 退而求其次：取首个 '['/'{' 到末个 ']'/'}' 的子串
+    starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+    ends = [i for i in (out.rfind("]"), out.rfind("}")) if i >= 0]
+    if starts and ends:
+        s, e = min(starts), max(ends)
+        if e > s:
+            try:
+                return json.loads(out[s:e + 1])
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
-def self_check(profile: str, *, demo: bool = False, timeout_sec: float = 10.0) -> dict:
-    """启动金丝雀：调用 account balance 一次性验证 CLI/网络/签名/账户权限。
+def okx_json(*args: str, global_args: Optional[Sequence[str]] = None,
+             timeout_sec: float = 45.0, retries: int = 2) -> Any:
+    """调 okx CLI 并返回解析后的 JSON。失败抛 RuntimeError / TimeoutError。
 
-    OKX CLI 1.3.x 缺少不需签名的轻量 public 端点，故只用 balance 一步覆盖
-    所有失败模式（CLI 不存在、网络不通、签名错、权限不足）。
-
-    返回 {ok, profile, demo, usdt_avail, total_eq, latency_ms}；失败时 RuntimeError。
+    写命令（place/close/leverage/cancel）超时或 rc!=0 **不重试**（防重复下单）；
+    只读命令在 retries 次内重试瞬时失败。
     """
-    base: list[str] = ["--profile", profile]
-    if demo:
-        base.append("--demo")
+    cmd = _base_cmd() + list(global_args or []) + [str(a) for a in args]
+    write = _is_write(args)
+    env = _subprocess_env()
+    attempt = 0
+    last_err = ""
+    while True:
+        attempt += 1
+        _throttle()
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout_sec, env=env,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except FileNotFoundError as exc:
+            # node/entry 不可执行——什么都没发出去，但重试也救不了 → 直接抛
+            raise RuntimeError(f"okx CLI not launchable: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            last_err = f"timeout after {timeout_sec}s"
+            if write or attempt > retries:
+                raise TimeoutError(
+                    f"okx CLI {last_err}: {' '.join(map(str, args))}") from exc
+            continue  # 只读：重试
 
-    t0 = time.monotonic()
+        if proc.returncode != 0:
+            last_err = (proc.stderr or proc.stdout or "").strip()
+            if write or attempt > retries:
+                raise RuntimeError(
+                    f"okx CLI rc={proc.returncode}: {last_err[:600]}")
+            continue  # 只读：重试瞬时网络/CLI 错
+
+        parsed = _parse_json(proc.stdout)
+        if parsed is not None:
+            return parsed
+        last_err = f"non-JSON/empty output: {(proc.stdout or '')[:400]}"
+        if write or attempt > retries:
+            raise RuntimeError(f"okx CLI {last_err}")
+        continue
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """便于命令行自检：python _okxcli.py --profile demo account balance"""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    raw = list(argv if argv is not None else sys.argv[1:])
+    g: list[str] = []
+    while raw and raw[0] in ("--profile",):
+        g += [raw.pop(0), raw.pop(0)]
     try:
-        bal_payload = okx_json("account", "balance", global_args=base, timeout_sec=timeout_sec)
-    except Exception as exc:
-        raise RuntimeError(f"self_check step=account_balance 失败: {exc}") from exc
-    balance_ms = int((time.monotonic() - t0) * 1000)
-
-    usdt_avail: str | None = None
-    total_eq: str | None = None
-    bal_rows: list = []
-    if isinstance(bal_payload, list):
-        bal_rows = bal_payload
-    elif isinstance(bal_payload, dict):
-        data = bal_payload.get("data")
-        if isinstance(data, list):
-            bal_rows = data
-    for row in bal_rows:
-        if not isinstance(row, dict):
-            continue
-        if total_eq is None:
-            total_eq = str(row.get("totalEq") or "")
-        for detail in row.get("details", []) or []:
-            if isinstance(detail, dict) and detail.get("ccy") == "USDT":
-                usdt_avail = str(detail.get("availBal") or detail.get("availEq") or "")
-                break
-        if usdt_avail is not None:
-            break
-
-    return {
-        "ok": True,
-        "profile": profile,
-        "demo": demo,
-        "usdt_avail": usdt_avail,
-        "total_eq": total_eq,
-        "latency_ms": {"balance": balance_ms},
-    }
-
-
-def _main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="OKX CLI 启动自检（public time + account balance）")
-    parser.add_argument("--profile", required=True, help="OKX CLI profile 名称")
-    parser.add_argument("--demo", action="store_true", help="使用 demo 环境")
-    parser.add_argument("--timeout", type=float, default=10.0, help="单步超时（秒）")
-    args = parser.parse_args()
-
-    try:
-        result = self_check(args.profile, demo=args.demo, timeout_sec=args.timeout)
-    except Exception as exc:
+        out = okx_json(*raw, global_args=g)
+    except (RuntimeError, TimeoutError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(out, ensure_ascii=False)[:2000])
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    raise SystemExit(main())

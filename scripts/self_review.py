@@ -4,7 +4,7 @@ self_review.py —— Job C 自省与学习脚本（每日一次，独立于 Job
 
 职责：
     1) 从 .okx/records/ 中识别指定日期的已平仓样本及其盈亏
-    2) 结合 account.db.scoring_history 反向归因 dim1..dim5 的近 7 / 30 天表现
+    2) 汇总交易经验的正样本、负样本与错失机会；旧 scoring_history 只保留历史兼容
     3) 更新 lessons.db.signal_perf / error_patterns / param_suggestions
     4) 维护 .okx/playbook.md（月度滚动，主文件保留最近 30 条）
     5) 生成 .okx/self-reviews/self-review-YYYY-MM-DD.md 详版复盘
@@ -16,10 +16,21 @@ self_review.py —— Job C 自省与学习脚本（每日一次，独立于 Job
 """
 from __future__ import annotations
 
+import os as _project_os
+from pathlib import Path as _ProjectPath
+
+_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
+
+
+def _project_path(*parts: str) -> str:
+    return str(_PROJECT_ROOT.joinpath(*parts))
+
+
 import argparse
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -34,7 +45,6 @@ FILE_NAME_RE = re.compile(
 )
 ISO_DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 ISO_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
-NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 PNL_PATTERNS = (
     r"净收益[:：]\s*(-?\d+(?:\.\d+)?)",
     r"pnl[:：]\s*(-?\d+(?:\.\d+)?)",
@@ -101,13 +111,16 @@ class ReviewError(RuntimeError):
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 2026-07-15（D4 批0 写方封口）：UTC-Z 改 CST——四处调用（repair_queue 文本头/
+    # lessons.db reviewed_utc/updated/seen_utc）全是业务域，统一 CST；函数名沿用。
+    # 注意：本文件 :885/:1197-1198 查 market.db（Z 域）的 Z 串查询边界是另一回事，禁动。
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run daily self-review and update lessons.db.")
-    parser.add_argument("--date", dest="review_date", help="UTC review date in YYYY-MM-DD, default=yesterday")
-    parser.add_argument("--db-root", default=r"E:\OKX\db", help=r"DB root, default E:\OKX\db")
+    parser.add_argument("--date", dest="review_date", help="UTC+8 review date in YYYY-MM-DD, default=yesterday in Asia/Shanghai")
+    parser.add_argument("--db-root", default=_project_path('db'), help=r"DB root, default <PROJECT_ROOT>\db")
     parser.add_argument(
         "--okx-root",
         default=str(Path.home() / ".openclaw" / "workspace" / ".okx"),
@@ -119,7 +132,10 @@ def parse_args() -> argparse.Namespace:
 def resolve_review_day(raw_value: str | None) -> date:
     if raw_value:
         return date.fromisoformat(raw_value)
-    return (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    # Job C runs at 00:30 Asia/Shanghai and reviews the previous UTC+8 calendar day.
+    # Using UTC here shifts the report two local dates back, so keep the default aligned with skill.md.
+    shanghai_tz = timezone(timedelta(hours=8))
+    return (datetime.now(shanghai_tz) - timedelta(days=1)).date()
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -281,6 +297,7 @@ def filter_window(samples: Iterable[TradeSample], review_day: date, window_days:
 
 
 def build_perf_rows(samples: Iterable[TradeSample], review_day: date) -> list[PerfRow]:
+    """按真实平仓结果聚合；不再按旧五维评分拆桶。"""
     perf_rows: list[PerfRow] = []
     updated_utc = datetime.combine(review_day, time.min, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     samples_list = list(samples)
@@ -291,23 +308,19 @@ def build_perf_rows(samples: Iterable[TradeSample], review_day: date) -> list[Pe
             symbol_samples = [sample for sample in window_samples if sample.symbol == symbol]
             if not symbol_samples:
                 continue
-            for dimension in DIMENSIONS:
-                dim_samples = [sample for sample in symbol_samples if dimension in sample.dims]
-                if not dim_samples:
-                    continue
-                win_count = sum(1 for sample in dim_samples if sample.pnl_value > 0)
-                avg_return = sum(sample.pnl_value for sample in dim_samples) / len(dim_samples)
-                perf_rows.append(
-                    PerfRow(
-                        symbol=symbol,
-                        dimension=dimension,
-                        window_days=window_days,
-                        win_rate=win_count / len(dim_samples),
-                        sample_n=len(dim_samples),
-                        avg_return=avg_return,
-                        updated_utc=updated_utc,
-                    )
+            win_count = sum(1 for sample in symbol_samples if sample.pnl_value > 0)
+            avg_return = sum(sample.pnl_value for sample in symbol_samples) / len(symbol_samples)
+            perf_rows.append(
+                PerfRow(
+                    symbol=symbol,
+                    dimension="closed_outcome",
+                    window_days=window_days,
+                    win_rate=win_count / len(symbol_samples),
+                    sample_n=len(symbol_samples),
+                    avg_return=avg_return,
+                    updated_utc=updated_utc,
                 )
+            )
     return perf_rows
 
 
@@ -447,8 +460,8 @@ def build_playbook_entry(
     perf_rows: list[PerfRow],
 ) -> str:
     total_count = len(day_samples)
-    high_score_count = sum(1 for sample in day_samples if sample.score_total is not None and sample.score_total >= 35)
     win_count = sum(1 for sample in day_samples if sample.pnl_value > 0)
+    loss_count = sum(1 for sample in day_samples if sample.pnl_value < 0)
     hit_rate = (win_count / total_count) if total_count else 0.0
     day_perf = [row for row in perf_rows if row.window_days == 7]
     best_rows = sorted(day_perf, key=lambda row: (row.win_rate, row.sample_n), reverse=True)[:3]
@@ -459,7 +472,7 @@ def build_playbook_entry(
     return (
         f"## {review_day.isoformat()}\n"
         f"- 总闭环样本: {total_count}\n"
-        f"- 高分样本: {high_score_count}\n"
+        f"- 盈利/亏损样本: {win_count}/{loss_count}\n"
         f"- 命中率: {hit_rate:.2%}\n"
         f"- 强项: {best_line}\n"
         f"- 弱项: {weak_line}\n"
@@ -482,7 +495,7 @@ def build_self_review_text(
         f"- 盈利样本数: {sum(1 for sample in day_samples if sample.pnl_value > 0)}",
         f"- 亏损样本数: {sum(1 for sample in day_samples if sample.pnl_value < 0)}",
         "",
-        "## 近 7 / 30 天信号表现",
+        "## 近 7 / 30 天真实平仓表现",
     ]
     ordered_rows = sorted(perf_rows, key=lambda row: (row.window_days, row.symbol, row.dimension))
     if ordered_rows:
@@ -520,7 +533,316 @@ def write_self_review(okx_root: Path, review_day: date, text: str) -> Path:
     return output_path
 
 
-# -------- 审计三件套（G1 反事实回看 / G7 周度活跃度 / G12 分数桶分布） --------
+# -------- 运行异常巡检 / 任务自修记录 --------
+
+def issue_severity(text: str, default: str = "P2") -> str:
+    lowered = text.lower()
+    # P0 只给可能直接影响实盘安全的异常；不要因为 prompt 里出现“风控/风险”，
+    # 或 JSON timestamp/call id 中偶然包含 401 这类数字片段就误判。
+    p0_tokens = ("no stop", "无止损", "止损失败", "algo failed", "wrong order", "错误下单", "signature", "签名失败", "profile 异常", "profile mismatch")
+    if any(token in lowered for token in p0_tokens) or re.search(r"\b(?:http\s*)?401\b|\bunauthori[sz]ed\b", lowered):
+        return "P0"
+    if any(token in lowered for token in ("joba", "jobe", "collect", "schema", "database", "db", "python", "command not found", "file not found", "no such file", "write-error")):
+        return "P1"
+    return default
+
+
+def add_repair_issue(
+    issues: list[dict[str, str]],
+    severity: str,
+    source: str,
+    title: str,
+    detail: str,
+    action: str,
+    confirm: str = "否",
+) -> None:
+    fingerprint = (severity, source, title, detail[:300])
+    for existing in issues:
+        if existing.get("fingerprint") == repr(fingerprint):
+            return
+    issues.append(
+        {
+            "id": f"RQ-{len(issues) + 1:03d}",
+            "severity": severity,
+            "source": source,
+            "title": title,
+            "detail": detail.strip().replace("\r", " ").replace("\n", " ")[:1200],
+            "action": action.strip().replace("\r", " ").replace("\n", " ")[:1200],
+            "confirm": confirm,
+            "fingerprint": repr(fingerprint),
+        }
+    )
+
+
+def recent_cutoff_iso(hours: int = 24) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+def is_runtime_failure(text: str) -> bool:
+    lowered = (text or "").lower()
+    hard_markers = (
+        "traceback", "syntaxerror", "exception", "operationalerror", "permission denied",
+        "command not found", "can't open file", "no such file", "file not found",
+        "timed out", "timeout", "interrupted", "exit code 1", "returned non-zero",
+        "edit failed", "oldtext must match", "could not find edits", "write-error",
+        "401", "signature", "schema mismatch", "database is locked", "failed"
+    )
+    # cycle_runs.error 里大量存的是“决策理由”，例如 IDLE/HOLD_SHORT/CLOSE_SHORT；这些不是运行异常。
+    benign_prefixes = ("idle:", "hold_", "close_short", "close_long", "hypothesis:")
+    stripped = lowered.strip()
+    if stripped.startswith(benign_prefixes) and not any(marker in lowered for marker in hard_markers[:15]):
+        return False
+    return any(marker in lowered for marker in hard_markers)
+
+
+def scan_db_runtime_issues(db_root: Path, issues: list[dict[str, str]]) -> None:
+    cutoff = recent_cutoff_iso(24)
+    account_path = db_root / "account.db"
+    if not account_path.exists():
+        add_repair_issue(issues, "P1", "account.db", "account.db 不存在", str(account_path), "当前 JobC 检查数据库目录与初始化状态；必要时在确认目标目录后运行 scripts/init_v20_dbs.py --db-root <DB_DIR>。", "是")
+        return
+    con = connect_readonly(account_path)
+    try:
+        con.row_factory = sqlite3.Row
+        cols = fetch_table_columns(con, "cycle_runs")
+        if {"ts_start", "job_id", "error"}.issubset(cols):
+            grouped: dict[tuple[str, str], dict[str, object]] = {}
+            for row in con.execute(
+                """
+                SELECT ts_start, ts_end, job_id, state_before, state_after, error
+                FROM cycle_runs
+                WHERE ts_start >= ? AND error IS NOT NULL AND TRIM(error) <> ''
+                ORDER BY ts_start DESC
+                LIMIT 200
+                """,
+                (cutoff,),
+            ).fetchall():
+                detail = f"{row['ts_start']} {row['job_id']} {row['state_before']}->{row['state_after']} error={row['error']}"
+                if not is_runtime_failure(detail):
+                    continue
+                key = (str(row["job_id"]), str(row["error"])[:300])
+                item = grouped.setdefault(key, {"count": 0, "first": row["ts_start"], "latest": row["ts_start"], "detail": detail})
+                item["count"] = int(item["count"]) + 1
+                item["first"] = min(str(item["first"]), str(row["ts_start"]))
+                item["latest"] = max(str(item["latest"]), str(row["ts_start"]))
+            for (_job, _err), item in grouped.items():
+                detail = f"count={item['count']} first={item['first']} latest={item['latest']} sample={item['detail']}"
+                add_repair_issue(
+                    issues,
+                    issue_severity(detail, "P1"),
+                    "account.db.cycle_runs",
+                    "cycle_runs 存在运行失败",
+                    detail,
+                    "当前 JobC/对应任务读取相关脚本/报告，先复现最小失败命令；低风险代码或环境问题立即修复并验证。",
+                    "视情况",
+                )
+        cols = fetch_table_columns(con, "trade_events")
+        if {"ts", "action"}.issubset(cols):
+            grouped: dict[tuple[str, str], dict[str, object]] = {}
+            for row in con.execute(
+                """
+                SELECT ts, symbol, action, side, sz, fill_px, pnl, ai_reasoning, raw
+                FROM trade_events
+                WHERE (CASE WHEN ts LIKE '%Z' THEN datetime(ts)
+                            ELSE datetime(ts, '-8 hours') END) >= datetime(?) AND (
+                    UPPER(action) LIKE '%FAIL%' OR UPPER(action) LIKE '%ERROR%' OR
+                    UPPER(action) LIKE '%REJECT%' OR UPPER(action) LIKE '%PAUSE%'
+                )
+                ORDER BY ts DESC
+                LIMIT 100
+                """,
+                (cutoff,),
+            ).fetchall():
+                raw = row["raw"] or row["ai_reasoning"] or ""
+                detail = f"{row['ts']} {row['symbol']} action={row['action']} side={row['side']} sz={row['sz']} px={row['fill_px']} pnl={row['pnl']} raw={raw}"
+                if not is_runtime_failure(detail):
+                    continue
+                key = (str(row["symbol"]), str(row["action"]))
+                item = grouped.setdefault(key, {"count": 0, "first": row["ts"], "latest": row["ts"], "detail": detail})
+                item["count"] = int(item["count"]) + 1
+                item["first"] = min(str(item["first"]), str(row["ts"]))
+                item["latest"] = max(str(item["latest"]), str(row["ts"]))
+            for (_sym, _action), item in grouped.items():
+                detail = f"count={item['count']} first={item['first']} latest={item['latest']} sample={item['detail']}"
+                sev = issue_severity(detail, "P1")
+                add_repair_issue(
+                    issues,
+                    sev,
+                    "account.db.trade_events",
+                    "trade_events 存在失败/暂停事件",
+                    detail,
+                    "当前 JobC/对应任务优先确认是否涉及止损、下单、签名或 profile；P0 必须先保证实盘安全，触碰交易/凭证/风控边界时请求主人确认。",
+                    "是" if sev == "P0" else "视情况",
+                )
+        cols = fetch_table_columns(con, "system_state")
+        if {"key", "value"}.issubset(cols):
+            for key in ("pause_reason", "panic_reason", "last_error"):
+                row = con.execute("SELECT value, updated_utc FROM system_state WHERE key=?", (key,)).fetchone()
+                if row and str(row["value"] or "").strip():
+                    detail = f"{key}={row['value']} updated={row['updated_utc'] if 'updated_utc' in row.keys() else 'N/A'}"
+                    add_repair_issue(issues, issue_severity(detail, "P1"), "account.db.system_state", f"system_state.{key} 非空", detail, "当前 JobC 查看 PAUSE/错误原因；不得自动清除，除非已确认根因修复且得到主人确认。", "是")
+    finally:
+        con.close()
+
+
+def scan_script_health(okx_root: Path, db_root: Path, issues: list[dict[str, str]]) -> None:
+    wrapper = okx_root / "scripts" / "run_okx_python.ps1"
+    if not wrapper.exists():
+        add_repair_issue(issues, "P1", "scripts", "Python wrapper 缺失", str(wrapper), "当前 JobC 在安全边界内恢复 run_okx_python.ps1；恢复前 JobA/B/E/C 可能无法稳定运行。", "否")
+    scripts = [
+        okx_root / "scripts" / "collect_data.py",
+        okx_root / "scripts" / "collect_slow.py",
+        okx_root / "scripts" / "self_review.py",
+        okx_root / "scripts" / "jobb_live_account_check.py",
+        okx_root / "scripts" / "query_db.py",
+    ]
+    for script in scripts:
+        if not script.exists():
+            add_repair_issue(issues, "P1", "scripts", "关键脚本缺失", str(script), "当前 JobC 从备份或版本记录恢复该脚本，并做最小验证。", "否")
+            continue
+        proc = subprocess.run([sys.executable, "-m", "py_compile", str(script)], capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            detail = f"{script}: {proc.stderr or proc.stdout}"
+            add_repair_issue(issues, "P1", "py_compile", "关键脚本语法检查失败", detail, "当前 JobC 先 read 该文件，再使用最小 edit 修复并重新 py_compile 验证。", "否")
+    schema_path = db_root / "schema.sql"
+    if not schema_path.exists():
+        add_repair_issue(issues, "P1", "db", "schema.sql 缺失", str(schema_path), "当前 JobC 恢复 schema.sql，否则后续 AI 可能猜表结构。", "否")
+
+
+def scan_openclaw_runtime_logs(okx_root: Path, issues: list[dict[str, str]]) -> None:
+    sessions_dir = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+    if not sessions_dir.exists():
+        return
+    scan_started_ts = datetime.now().timestamp()
+    since = scan_started_ts - 24 * 3600
+    include_markers = ("OKX-JobA", "OKX-JobB", "OKX-JobC", "OKX-JobE", _project_path(), _project_path())
+    error_markers = (
+        "edit failed", "oldtext must match", "could not find edits", "could not find the exact text",
+        "file not found", "no such file", "permission denied", "command not found", "can't open file",
+        "write-error", "traceback", "syntaxerror", "operationalerror", "schema mismatch"
+    )
+    scanned = 0
+    grouped: dict[tuple[str, str], str] = {}
+    for path in sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if path.name.endswith(".trajectory.jsonl"):
+            continue
+        try:
+            stat = path.stat()
+            if stat.st_mtime < since:
+                continue
+            # 跳过仍在写入的会话（通常就是当前 JobC）。否则读取 latest.md/self-review
+            # 的成功输出会把旧修复队列里的 traceback/no such file 递归识别为新异常。
+            if stat.st_mtime > scan_started_ts - 120:
+                continue
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        full_text = "\n".join(lines)
+        # 只扫 cron 隔离会话；不要把人工排查/修复时的临时错误也塞进次日队列。
+        # cron 会话的开头 user 消息会带 [cron:...]；其他会话后续工具输出里也可能出现该字符串，不能用全文判断。
+        head_text = "\n".join(lines[:20])
+        if "[cron:" not in head_text and "agent:main:cron:" not in head_text:
+            continue
+        session_has_okx = any(marker in full_text for marker in include_markers)
+        if not session_has_okx:
+            continue
+        scanned += 1
+        for line in lines:
+            lowered = line.lower()
+            if not any(marker in lowered for marker in error_markers):
+                continue
+            # 只采集真实消息/工具结果里的错误，避免 system prompt/tool schema 的 oldText/timeout 噪音。
+            # 成功 read 报告文件时，内容里会包含历史 traceback/no such file；这不是新的运行异常。
+            if '"toolName":"read"' in line and '"status":"error"' not in line and "enoent" not in lowered:
+                continue
+            if "# okx 修复队列" in lowered:
+                continue
+            if not (('"isError":true' in line) or ('"status":"error"' in line) or ('"exitCode":1' in line) or ('command exited with code 1' in lowered) or ('"error"' in lowered and 'toolresult' in lowered)):
+                continue
+            if not is_runtime_failure(line):
+                continue
+            marker = next((m for m in error_markers if m in lowered), "runtime error")
+            grouped.setdefault((marker, path.name), line[:1500])
+        if scanned >= 80:
+            break
+    for (marker, name), snippet in grouped.items():
+        add_repair_issue(
+            issues,
+            issue_severity(snippet, "P2"),
+            f"openclaw session {name}",
+            f"隔离会话日志发现 {marker}",
+            snippet,
+            "当前 JobC/对应任务读取对应 session 日志/cron runs，确认是否已修复；若是 edit/oldText 类问题，必须先 read 文件再构造 edit，或改为脚本化补丁并验证。",
+            "视情况",
+        )
+
+
+def build_repair_queue_text(review_day: date, issues: list[dict[str, str]]) -> str:
+    generated = utc_now_iso()
+    actionable = [i for i in issues if i["severity"] in ("P0", "P1", "P2")]
+    lines = [
+        f"# OKX 修复队列 {review_day.isoformat()}",
+        "",
+        f"- generated_utc: {generated}",
+        f"- actionable_count(P0/P1/P2): {len(actionable)}",
+        f"- total_count: {len(issues)}",
+        "",
+    ]
+    if not actionable:
+        lines.append("今日无待处理异常。")
+    else:
+        lines.append("## 待处理/已自修事项")
+        lines.append("")
+        for issue in sorted(actionable, key=lambda i: (i["severity"], i["id"])):
+            lines.extend([
+                f"### {issue['id']} [{issue['severity']}] {issue['title']}",
+                f"- 来源：{issue['source']}",
+                f"- 详情：{issue['detail']}",
+                f"- 建议处理：{issue['action']}",
+                f"- 是否需要主人确认：{issue['confirm']}",
+                "",
+            ])
+    p3_items = [i for i in issues if i["severity"] == "P3"]
+    if p3_items:
+        lines.append("## P3 观察项")
+        for issue in p3_items:
+            lines.append(f"- {issue['id']} {issue['title']}：{issue['detail']}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_repair_queue(okx_root: Path, db_root: Path, review_day: date) -> tuple[Path, Path, list[dict[str, str]]]:
+    issues: list[dict[str, str]] = []
+    try:
+        scan_db_runtime_issues(db_root, issues)
+    except Exception as exc:  # 巡检本身不能阻断 JobC
+        add_repair_issue(issues, "P1", "repair_queue", "数据库异常巡检失败", f"{type(exc).__name__}: {exc}", "当前 JobC 检查 self_review.py 的 repair_queue 逻辑和 DB 访问。", "否")
+    try:
+        scan_script_health(okx_root, db_root, issues)
+    except Exception as exc:
+        add_repair_issue(issues, "P1", "repair_queue", "脚本健康巡检失败", f"{type(exc).__name__}: {exc}", "当前 JobC 检查 py_compile/wrapper 路径。", "否")
+    try:
+        scan_openclaw_runtime_logs(okx_root, issues)
+    except Exception as exc:
+        add_repair_issue(issues, "P2", "repair_queue", "OpenClaw 日志巡检失败", f"{type(exc).__name__}: {exc}", "当前 JobC 检查日志目录权限或路径。", "否")
+
+    repair_dir = okx_root / "reports" / "repair-queue"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    dated_path = repair_dir / f"repair-queue-{review_day.isoformat()}.md"
+    latest_path = repair_dir / "latest.md"
+    text = build_repair_queue_text(review_day, issues)
+    dated_path.write_text(text, encoding="utf-8")
+    latest_path.write_text(text, encoding="utf-8")
+    return dated_path, latest_path, issues
+
+
+# -------- 历史审计（错失机会由 missed_opps_writer 的 decision_card_v1 路径负责） --------
 
 def reflective_lookback(
     review_day: date,
@@ -807,17 +1129,19 @@ def threshold_bucket(review_day: date, db_root: Path) -> dict[str, int]:
 
 def format_audit_block(audit: dict[str, object]) -> list[str]:
     """把审计三件套结果格式化成 markdown 段落。"""
-    lines: list[str] = ["", "## 审计三件套", ""]
+    lines: list[str] = ["", "## 历史与执行审计", ""]
     refl = audit.get("reflective") or {}
     if isinstance(refl, dict) and "error" in refl:
         lines.append(f"### 反事实回看（错失机会）\n- 失败：{refl['error']}")
     else:
         lines.append("### 反事实回看（错失机会）")
-        lines.append(
-            f"- 当日扫描擦边轮次（30-37 分且 IDLE）：{refl.get('scanned', 0)} 条；"
-            f"写入 missed_opportunities：{refl.get('written', 0)} 条；"
-            f"其中后续 4h 会触发 1R 的：{refl.get('would_hit_1R', 0)} 条"
-        )
+        if refl.get("source") == "decision_card_v1":
+            lines.append("- 错失机会由 missed_opps_writer 按 wait/hold 决策卡回填，不使用分数阈值")
+        else:
+            lines.append(
+                f"- 历史兼容扫描：{refl.get('scanned', 0)} 条；"
+                f"写入：{refl.get('written', 0)} 条"
+            )
     lines.append("")
 
     weekly = audit.get("weekly")
@@ -843,23 +1167,110 @@ def format_audit_block(audit: dict[str, object]) -> list[str]:
             lines.append("- ⚠️ over_conservative=1（连续 2 周开仓 <3 且 IDLE>70%；建议主人复盘是否过于保守）")
     lines.append("")
 
-    buckets = audit.get("buckets") or {}
-    lines.append("### 近 30 日评分桶分布")
-    if isinstance(buckets, dict) and "error" in buckets:
-        lines.append(f"- 失败：{buckets['error']}")
-    elif not buckets:
-        lines.append("- 无数据")
-    else:
-        total = sum(int(v) for v in buckets.values())
-        for k in ("<25", "25-29", "30-37", "38-44", ">=45"):
-            v = int(buckets.get(k, 0))
-            pct = (v / total * 100.0) if total else 0.0
-            lines.append(f"- {k}：{v} 条（{pct:.1f}%）")
-        edge = int(buckets.get("30-37", 0))
-        if edge >= max(1, int(total * 0.4)):
-            lines.append(f"- 提示：擦边桶（30-37）占比 ≥ 40%，说明大量机会处于临界区，建议结合趋势环境复盘是否过于保守")
-    lines.append("")
     return lines
+
+
+def write_daily_report_row(
+    db_root: Path,
+    review_day: date,
+    samples: list[TradeSample],
+    audit: dict[str, object],
+    repair_issues: list[dict[str, str]],
+    warning: str | None = None,
+) -> None:
+    """Upsert account.db.daily_reports for Job C's report contract.
+
+    The table is an audit/report table only; this function never creates trade records and never
+    changes system_state or risk settings.
+    """
+    account_path = db_root / "account.db"
+    con = connect_rw(account_path)
+    try:
+        con.row_factory = sqlite3.Row
+        day_start_local = datetime.combine(review_day, time.min, tzinfo=timezone(timedelta(hours=8)))
+        day_end_local = day_start_local + timedelta(days=1)
+        start_utc = day_start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = day_end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        open_count = 0
+        close_count = 0
+        total_pnl = 0.0
+        try:
+            row = con.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN UPPER(action) LIKE 'OPEN%' THEN 1 ELSE 0 END) AS open_count,
+                    SUM(CASE WHEN UPPER(action) LIKE 'CLOSE%' THEN 1 ELSE 0 END) AS close_count,
+                    SUM(CASE WHEN UPPER(action) LIKE 'CLOSE%' THEN COALESCE(pnl, 0) ELSE 0 END) AS total_pnl
+                FROM trade_events
+                WHERE (CASE WHEN ts LIKE '%Z' THEN datetime(ts)
+                            ELSE datetime(ts, '-8 hours') END) >= datetime(?)
+                  AND (CASE WHEN ts LIKE '%Z' THEN datetime(ts)
+                            ELSE datetime(ts, '-8 hours') END) < datetime(?)
+                """,
+                (start_utc, end_utc),
+            ).fetchone()
+            if row:
+                open_count = int(row["open_count"] or 0)
+                close_count = int(row["close_count"] or 0)
+                total_pnl = float(row["total_pnl"] or 0.0)
+        except sqlite3.Error:
+            # 冷启动/旧 schema 时仍写入复盘摘要，交易计数降级为 0。
+            pass
+
+        best_sample = max(samples, key=lambda s: normalize_pnl(s), default=None)
+        worst_sample = min(samples, key=lambda s: normalize_pnl(s), default=None)
+        actionable = [issue for issue in repair_issues if issue.get("severity") in ("P0", "P1", "P2")]
+        reflective = audit.get("reflective") if isinstance(audit, dict) else None
+        buckets = audit.get("buckets") if isinstance(audit, dict) else None
+        summary = (
+            f"JobC daily review {review_day.isoformat()}: samples={len(samples)}, "
+            f"open_count={open_count}, close_count={close_count}, total_pnl={total_pnl:.4f}, "
+            f"repair_actionable={len(actionable)}"
+        )
+        if warning:
+            summary += f", warning={warning}"
+        lessons = json.dumps(
+            {
+                "audit_reflective": reflective,
+                "legacy_score_audit": buckets,
+                "repair_actionable": len(actionable),
+                "sample_count": len(samples),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        raw = json.dumps(
+            {
+                "review_day": review_day.isoformat(),
+                "window_utc": [start_utc, end_utc],
+                "warning": warning,
+                "audit": audit,
+                "repair_issue_count": len(repair_issues),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        con.execute(
+            """
+            INSERT OR REPLACE INTO daily_reports
+                (ts, profile, open_count, close_count, total_pnl, total_fees, best_trade, worst_trade, summary, lessons, raw)
+            VALUES (?, 'live', ?, ?, ?, 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_day.isoformat(),
+                open_count,
+                close_count,
+                total_pnl,
+                best_sample.symbol if best_sample else None,
+                worst_sample.symbol if worst_sample else None,
+                summary,
+                lessons,
+                raw,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, object]:
@@ -871,33 +1282,42 @@ def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, obj
         raise ReviewError(f"account.db not found: {account_path}")
 
     # 先打开 lessons_con 跑审计三件套；任一失败不阻塞主流程
-    audit: dict[str, object] = {"reflective": None, "weekly": None, "buckets": None}
+    audit: dict[str, object] = {
+        "reflective": {
+            "source": "decision_card_v1",
+            "scanned": 0,
+            "written": 0,
+            "would_hit_1R": 0,
+        },
+        "weekly": None,
+        "buckets": {"retired": True},
+    }
     audit_lessons_con = connect_rw(lessons_path)
     try:
-        try:
-            audit["reflective"] = reflective_lookback(review_day, db_root, audit_lessons_con)
-        except (sqlite3.Error, OSError, ValueError) as exc:
-            audit["reflective"] = {"error": f"{type(exc).__name__}: {exc}"}
         try:
             audit["weekly"] = weekly_activity(review_day, db_root, okx_root, audit_lessons_con)
         except (sqlite3.Error, OSError, ValueError) as exc:
             audit["weekly"] = {"error": f"{type(exc).__name__}: {exc}"}
-        try:
-            audit["buckets"] = threshold_bucket(review_day, db_root)
-        except (sqlite3.Error, OSError, ValueError) as exc:
-            audit["buckets"] = {"error": f"{type(exc).__name__}: {exc}"}
     finally:
         audit_lessons_con.close()
 
     all_records = [record for path in list_record_files(okx_root / "records") if (record := parse_record_file(path))]
     if not all_records:
         # 冷启动也写带审计内容的最小 review
+        repair_path, repair_latest_path, repair_issues = write_repair_queue(okx_root, db_root, review_day)
+        actionable_count = sum(1 for issue in repair_issues if issue["severity"] in ("P0", "P1", "P2"))
         cold_lines = [
             f"# 自省日报 {review_day.isoformat()}",
             "",
             "> 今日无平仓样本，仅输出审计三件套。",
-        ] + format_audit_block(audit)
+        ] + format_audit_block(audit) + [
+            "## 运行异常自修记录",
+            f"- 待处理/已自修事项(P0/P1/P2): {actionable_count}",
+            f"- latest: {repair_latest_path}",
+            "",
+        ]
         review_path = write_self_review(okx_root, review_day, "\n".join(cold_lines))
+        write_daily_report_row(db_root, review_day, [], audit, repair_issues, "no closed records found")
         return {
             "samples": [],
             "perf_rows": [],
@@ -905,16 +1325,20 @@ def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, obj
             "suggestions_inserted": 0,
             "playbook_path": None,
             "review_path": review_path,
+            "repair_path": repair_path,
+            "repair_latest_path": repair_latest_path,
+            "repair_issues": repair_issues,
             "warning": "no closed records found",
             "audit": audit,
         }
 
     start_day = review_day - timedelta(days=29)
-    scoring_con = connect_readonly(account_path)
     lessons_con = connect_rw(lessons_path)
     try:
-        scoring_rows = load_scoring_rows(scoring_con, start_day, review_day)
-        samples = build_trade_samples(scoring_rows, [record for record in all_records if start_day <= record.close_day <= review_day])
+        samples = build_trade_samples(
+            {},
+            [record for record in all_records if start_day <= record.close_day <= review_day],
+        )
         day_samples = [sample for sample in samples if sample.close_day == review_day]
         perf_rows = build_perf_rows(samples, review_day)
         day_events = detect_error_events(day_samples)
@@ -932,6 +1356,12 @@ def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, obj
         write_playbook(playbook_path, review_day, playbook_entry)
         review_text = build_self_review_text(review_day, day_samples, day_events, perf_rows, pending_rows)
         review_text += "\n" + "\n".join(format_audit_block(audit))
+        repair_path, repair_latest_path, repair_issues = write_repair_queue(okx_root, db_root, review_day)
+        write_daily_report_row(db_root, review_day, day_samples, audit, repair_issues, None)
+        review_text += "\n## 运行异常自修记录\n"
+        actionable_count = sum(1 for issue in repair_issues if issue["severity"] in ("P0", "P1", "P2"))
+        review_text += f"- 待处理/已自修事项(P0/P1/P2): {actionable_count}\n"
+        review_text += f"- latest: {repair_latest_path}\n"
         review_path = write_self_review(okx_root, review_day, review_text)
         return {
             "samples": day_samples,
@@ -940,11 +1370,13 @@ def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, obj
             "suggestions_inserted": suggestions_inserted,
             "playbook_path": playbook_path,
             "review_path": review_path,
+            "repair_path": repair_path,
+            "repair_latest_path": repair_latest_path,
+            "repair_issues": repair_issues,
             "warning": None,
             "audit": audit,
         }
     finally:
-        scoring_con.close()
         lessons_con.close()
 
 
@@ -968,6 +1400,11 @@ def main() -> int:
         print(f"[self_review] playbook={result['playbook_path']}")
     if result["review_path"]:
         print(f"[self_review] self_review={result['review_path']}")
+    if result.get("repair_latest_path"):
+        print(f"[self_review] repair_latest={result['repair_latest_path']}")
+        repair_issues = result.get("repair_issues") or []
+        actionable_count = sum(1 for issue in repair_issues if issue["severity"] in ("P0", "P1", "P2"))
+        print(f"[self_review] repair_actionable={actionable_count}")
     if result["warning"]:
         print(f"[self_review] warning={result['warning']}")
     return 0
