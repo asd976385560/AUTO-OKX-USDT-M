@@ -87,9 +87,9 @@ def _fetch_gold_etf_d1() -> float | None:
             try:
                 cfg = (_PROJECT_ROOT / "config.md").read_text(encoding="utf-8")
                 import re
-                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
+                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|\s][^|]*?)\s*\|", cfg, re.S)
                 if m:
-                    value = m.group(1).strip()
+                    value = m.group(1).strip().strip("`").strip()
                     if not (value.startswith("<") and value.endswith(">")):
                         os.environ["MX_APIKEY"] = value
             except Exception:

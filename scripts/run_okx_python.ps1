@@ -85,7 +85,7 @@ if ([string]::IsNullOrWhiteSpace($env:MX_APIKEY)) {
             # v7.0e.3 修复：原 `[^|`\s]` 排除反引号，导致 §4.4 含 `MX_APIKEY` 反引号的行匹配失败穿透到 §4.5；改用 `[^|\s]`
             $mxMatch = [regex]::Match($cfgContent, '###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|\s][^|]*?)\s*\|', [System.Text.RegularExpressions.RegexOptions]::Singleline)
             if ($mxMatch.Success) {
-                $mxValue = $mxMatch.Groups[1].Value.Trim()
+                $mxValue = $mxMatch.Groups[1].Value.Trim().Trim([char]96).Trim()
                 if (-not ($mxValue.StartsWith('<') -and $mxValue.EndsWith('>'))) {
                     $env:MX_APIKEY = $mxValue
                 }

@@ -94,7 +94,7 @@ def _key_from_config(section_re: str) -> str:
     m = re.search(section_re, txt, re.S)
     if not m:
         return ""
-    value = m.group(1).strip()
+    value = m.group(1).strip().strip("`").strip()
     if value.startswith("<") and value.endswith(">"):
         return ""
     return value
