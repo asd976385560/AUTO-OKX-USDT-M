@@ -1,0 +1,42 @@
+name: Update star statistics
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-star-statistics
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Generate aggregate star history
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/update_star_stats.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json-output docs/data/star-history.json \
+            --svg-output docs/assets/star-history.svg
+
+      - name: Commit changed statistics
+        run: |
+          if git diff --quiet -- docs/data/star-history.json docs/assets/star-history.svg; then
+            echo "Star statistics are unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- docs/data/star-history.json docs/assets/star-history.svg
+          git commit -m "chore: update star statistics [skip ci]"
+          git push

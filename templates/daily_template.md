@@ -4,7 +4,7 @@ role: 日/周/月复盘模板（reviewer / okx-reviewer -> account.db + reports/
 权威: skill.md（复盘/推送相关节）+ scripts/daily_report_writer.py
 落点: account.db（daily_reports / weekly_reports / monthly_reports）+ reports/daily-reports/daily-YYYY-MM-DD.md
 writer: <PROJECT_ROOT>\scripts\daily_report_writer.py（唯一通道，禁手写 INSERT；默认 dry-run，--apply 才真写）
-推送: 复盘推 QQ 731765529（**不是** 729624934）
+推送: 复盘推 QQ <REVIEW_QQ_TARGET>（**不是** <PUSH_QQ_TARGET>）
 -->
 
 > ⚠️ **2026-07-17 一致性审计校正**：本模板曾冻结在 ~2026-06-24 契约，以下已按现行实现修正；与 skill.md / 对应 writer·core 代码冲突时以后者为准。
@@ -82,9 +82,9 @@ writer 按 profile 优先读 `live_`/`demo_` 前缀字段（`pf()`），兼容�
 
 > 月报同形（按月聚合，PK 含月起始 ts + profile，同样禁覆盖 / 禁跳号）。
 
-## 3. 复盘正文（推 731765529 + 落盘 .md）
+## 3. 复盘正文（推 <REVIEW_QQ_TARGET> + 落盘 .md）
 
-复盘正文（落盘 `reports/daily-reports/daily-YYYY-MM-DD.md` + 推 QQ 731765529）建议结构：
+复盘正文（落盘 `reports/daily-reports/daily-YYYY-MM-DD.md` + 推 QQ <REVIEW_QQ_TARGET>）建议结构：
 
 ```
 # 复盘 YYYY-MM-DD（第N交易日）
@@ -110,7 +110,7 @@ writer 按 profile 优先读 `live_`/`demo_` 前缀字段（`pf()`），兼容�
 - 当期 stale 源 / 降级权重=0 的源（data_source_quality）
 ```
 
-> 推 731765529 群的复盘一律经 `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<YYYY-MM-DD>:<用途>`（禁 channels PUT 旧伪代码、禁直接用群号），发送前先 `validate_push_format.py` 自检；正文中文走 content 文件（**禁**进 cron message——cron 含中文 GBK 坏码）。长度下限由 `push_archive` rc=2 把关（`validate_push_format.py` 无 300B 阈值）。
+> 推 <REVIEW_QQ_TARGET> 群的复盘一律经 `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<YYYY-MM-DD>:<用途>`（禁 channels PUT 旧伪代码、禁直接用群号），发送前先 `validate_push_format.py` 自检；正文中文走 content 文件（**禁**进 cron message——cron 含中文 GBK 坏码）。长度下限由 `push_archive` rc=2 把关（`validate_push_format.py` 无 300B 阈值）。
 
 ## 4. 调用
 
@@ -133,6 +133,6 @@ pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\s
 | read-after-write 校验（按 `last_insert_rowid` 回读） | writer | 回读不到 -> `fail()` exit≠0 |
 | 输入 JSON 解析（含中文走 `--json-file`） | writer `load_payload` + `sanitize_text` | 解析失败 -> `fail()` |
 | 默认 dry-run 保护 | writer（`--apply` 才真写） | 无 `--apply` 只 print，不动库 |
-| 复盘推送格式 | `scripts/validate_push_format.py`（推 731765529 前自检；无 300B 阈值，长度下限由 push_archive rc=2 把关）；外发经 `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<日期>:<用途>` | 不过不推 |
+| 复盘推送格式 | `scripts/validate_push_format.py`（推 <REVIEW_QQ_TARGET> 前自检；无 300B 阈值，长度下限由 push_archive rc=2 把关）；外发经 `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<日期>:<用途>` | 不过不推 |
 
 成功：writer 退出码 `0`（且 read-after-write 通过）；落盘 `reports/daily-reports/daily-YYYY-MM-DD.md`。退出码非 0 -> Agent 视为 P0。
