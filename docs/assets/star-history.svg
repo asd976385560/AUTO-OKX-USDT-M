@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-labelledby="title desc">
   <title id="title">GitHub star history for asd976385560/AUTO-OKX-USDT-M</title>
-  <desc id="desc">0 stars recorded through 2026-07-24</desc>
+  <desc id="desc">0 stars recorded through 2026-07-25</desc>
   <defs>
     <linearGradient id="area" x1="0" x2="0" y1="0" y2="1">
       <stop offset="0%" stop-color="#2f81f7" stop-opacity="0.40"/>
@@ -20,12 +20,12 @@
   <rect class="bg" width="960" height="360" rx="12"/>
   <text x="36" y="38" class="title">asd976385560/AUTO-OKX-USDT-M · Stars</text>
   <text x="924" y="40" text-anchor="end" class="metric">0</text>
-  <text x="924" y="58" text-anchor="end" class="subtle">checked 2026-07-24 UTC</text>
+  <text x="924" y="58" text-anchor="end" class="subtle">checked 2026-07-25 UTC</text>
   <line x1="78" y1="66.0" x2="902" y2="66.0" class="grid"/><text x="66" y="70.0" text-anchor="end" class="axis">4</text><line x1="78" y1="121.0" x2="902" y2="121.0" class="grid"/><text x="66" y="125.0" text-anchor="end" class="axis">3</text><line x1="78" y1="176.0" x2="902" y2="176.0" class="grid"/><text x="66" y="180.0" text-anchor="end" class="axis">2</text><line x1="78" y1="231.0" x2="902" y2="231.0" class="grid"/><text x="66" y="235.0" text-anchor="end" class="axis">1</text><line x1="78" y1="286.0" x2="902" y2="286.0" class="grid"/><text x="66" y="290.0" text-anchor="end" class="axis">0</text>
   <polygon class="area" points="78,286 78.0,286.0 902.0,286.0 902,286"/>
   <polyline class="line" points="78.0,286.0 902.0,286.0"/>
   <circle cx="902.0" cy="286.0" r="4.5" fill="#58a6ff"/>
   <text x="78" y="313" class="axis">2026-07-24</text>
-  <text x="902" y="313" text-anchor="end" class="axis">2026-07-24</text>
+  <text x="902" y="313" text-anchor="end" class="axis">2026-07-25</text>
   <text x="480" y="340" text-anchor="middle" class="subtle">Daily cumulative GitHub stars · no user identities stored</text>
 </svg>
