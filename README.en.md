@@ -10,6 +10,7 @@
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/network/members"><img alt="GitHub Forks" src="https://img.shields.io/github/forks/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/asd976385560/AUTO-OKX-USDT-M?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
 V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo execution share the same hard risk limits and stop-loss requirements; only the execution environment changes.
@@ -29,6 +30,8 @@ V2.0 keeps market collection, risk checks, order execution, bookkeeping, push de
 - [Configuration and safe validation](#configuration-and-safe-validation)
 - [Risk summary](#risk-summary)
 - [Star history](#star-history)
+- [License](#license)
+- [Security reports](#security-reports)
 
 ## Public release boundary
 
@@ -223,6 +226,12 @@ The badge shows the current star count. The repository's own GitHub Actions work
 [![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
 The generator only uses the repository-scoped `GITHUB_TOKEN` while the workflow is running. It requires no personal PAT and never writes the token to files, logs, or the chart. Aggregate data is available in `docs/data/star-history.json`.
+
+## License
+
+This project is released under the [MIT License](LICENSE). Individuals and organizations may use it privately or commercially and may copy, modify, merge, publish, distribute, sublicense, or sell copies, provided that the original copyright and license notices are retained.
+
+The software is provided without any express or implied warranty. Users remain responsible for trading risk and legal or regulatory compliance.
 
 ## Security reports
 
