@@ -10,6 +10,7 @@
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/network/members"><img alt="GitHub Forks" src="https://img.shields.io/github/forks/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/asd976385560/AUTO-OKX-USDT-M?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
 V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用同一套硬风控和止损要求，只切换执行环境。
@@ -29,6 +30,8 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 - [配置与安全验证](#配置与安全验证)
 - [风控摘要](#风控摘要)
 - [Stars 趋势](#stars-趋势)
+- [许可证](#许可证)
+- [安全报告](#安全报告)
 
 ## 公开发布边界
 
@@ -223,6 +226,12 @@ python scripts/update_star_stats.py --self-test
 [![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
 统计脚本仅使用工作流运行期间的仓库级 `GITHUB_TOKEN`，不需要个人 PAT，也不会把 Token 写入文件、日志或图表。明细见 `docs/data/star-history.json`。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。任何个人或组织均可将本项目用于私人或商业用途，也可复制、修改、合并、发布、分发、再授权或销售副本，但须保留原版权声明和许可证声明。
+
+本软件不提供任何明示或默示担保；项目的交易风险与法律、监管合规责任仍由使用者自行承担。
 
 ## 安全报告
 
