@@ -55,6 +55,14 @@ def search(query: str, *, key: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC) ->
         )
         response.raise_for_status()
         payload = response.json()
+    code = (payload or {}).get("code")
+    if code not in (None, 0, "0"):
+        message = str(
+            (payload or {}).get("message")
+            or (payload or {}).get("msg")
+            or "unknown business error"
+        ).strip()
+        raise RuntimeError(f"MX business code={code}: {message[:110]}")
     rows = (
         ((payload or {}).get("data") or {})
         .get("data", {})

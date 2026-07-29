@@ -15,8 +15,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[2]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[2]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -81,6 +83,14 @@ def validate(registry: dict[str, Any]) -> list[str]:
             errors.append(f"{sid} required 须 bool")
         if not isinstance(s.get("enabled", True), bool):
             errors.append(f"{sid} enabled 须 bool")
+        poll_min = s.get("poll_interval_min")
+        if poll_min is not None:
+            if (isinstance(poll_min, bool) or not isinstance(poll_min, int)
+                    or poll_min < 15 or poll_min > 1440
+                    or poll_min % 15 != 0 or 1440 % poll_min != 0):
+                errors.append(
+                    f"{sid} poll_interval_min 须为可整除一天的 15 分钟倍数"
+                    f"（15..1440）: {poll_min}")
     # 至少 1 个 enabled 的 news required（§6 一期约束）
     news_req = [s for s in sources if s.get("type") == "news"
                 and s.get("required") and s.get("enabled")]

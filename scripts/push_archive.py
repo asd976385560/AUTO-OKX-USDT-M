@@ -6,19 +6,22 @@
 - 输出：<PROJECT_ROOT>\\reports\\agents\\v2-push-{YYYYMMDD-HHMMSS}.md，
   并以同内容覆盖 v2-push-latest.md。
 
-调用方（V2.0 现役）：scripts/push_pipeline.py 第 5 环（qq_push 之后必做，不因外发失败裁剪；
-  --no-send 时 --reports-dir 指向 dev 目录，不碰生产 latest.md）。
+调用方（V2.0 现役）：scripts/push_pipeline.py 在 qq_push 之前完成归档与内容硬校验；
+  归档或硬校验失败时禁止外发，外发失败仍保留已完成归档；
+  --no-send 时 --reports-dir 指向 dev 目录，不碰生产 latest.md。
 手动调试：中文 JSON 禁走 echo 管道（GBK 坏码），先写 tmp/*.json 再 --json-file，或用 content_file。
 
 退出码：0=成功；2=已归档但内容缺渲染模板指纹（<300 字符 / 缺『第N轮』/ 缺📊 段——T4 存证闸，
-        pipeline 只记入环节报告；外发把关在上游 validate_push_format）；其余非0=归档失败
+        pipeline 将其视为硬校验失败并禁止外发）；其余非0=归档失败
 """
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -135,7 +138,7 @@ def main():
             f.write(content)
     except Exception as e:
         fail(f"写入失败: {e}")
-    # T4 硬闸：归档永远完成（审计底线），
+    # T4 硬闸（2026-06-12 #2295 推送塌缩事故）：归档永远完成（审计底线），
     # 但内容缺渲染模板指纹时 rc=2 提醒 agent 重走 render→validate，不得外发当前内容。
     degraded_reasons = []
     if len(content) < 300:

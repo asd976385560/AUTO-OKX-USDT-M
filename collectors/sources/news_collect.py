@@ -15,8 +15,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[2]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[2]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -27,6 +29,7 @@ import importlib
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent            # collectors/sources
@@ -53,6 +56,19 @@ def _load_adapter(name: str):
         return None
 
 
+def _source_due(source: dict, cycle_id: str) -> bool:
+    """按 cycle 槽判断分源轮询是否到期；未配置时保持每个 news cron 都采。"""
+    interval_min = source.get("poll_interval_min")
+    if interval_min is None:
+        return True
+    try:
+        slot = datetime.strptime(cycle_id, "%Y-%m-%dT%H:%M")
+        minute_of_day = slot.hour * 60 + slot.minute
+        return minute_of_day % int(interval_min) == 0
+    except (TypeError, ValueError):
+        return True  # registry validate 会报非法值；运行期 fail-safe 保持旧行为
+
+
 def collect_all(db_root: str, apply: bool = False,
                 registry_path: str | None = None) -> dict:
     reg = _registry.load_registry(registry_path or _registry.DEFAULT_REGISTRY)
@@ -66,6 +82,14 @@ def collect_all(db_root: str, apply: bool = False,
     for s in sources:
         sid = s.get("id")
         adapter = s.get("adapter")
+        if not _source_due(s, cycle_id):
+            results.append({
+                "id": sid,
+                "adapter": adapter,
+                "status": "skipped",
+                "why": f"poll_interval_min={s.get('poll_interval_min')}",
+            })
+            continue
         if not adapter or adapter in SKIP_ADAPTERS:
             results.append({"id": sid, "status": "skipped", "why": "external/no-adapter"})
             continue

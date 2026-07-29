@@ -14,8 +14,10 @@
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -28,16 +30,23 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import trade_report_stats
+
 sys.stdout.reconfigure(encoding="utf-8")
 
-OPENCLAW_DB = os.environ.get(
-    "OKX_OPENCLAW_STATE_DB",
-    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"),
-)
-# trader 统一由 dispatcher 完成触发，无独立 cron。
+OPENCLAW_DB = str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite'))
+# trader 统一由 dispatcher 按业务产物就绪条件派发，无独立 cron。
 # 轮次可靠性/效率改聚合核心周期 cron。job_id 是 UUID、随 cron 重建会变——按 name 动态解析。
 CYCLE_CRON_NAMES = ("okx-fast-collect", "okx-slow-collect", "okx-analyst-cron", "okx-dispatcher")
 REPORTS_DIR = _project_path('reports', 'agents')
+REQUIRED_DECISION_CARD_FIELDS = frozenset({
+    "direction_evidence",
+    "opposing_evidence",
+    "execution_conditions",
+    "invalidation_point",
+    "risk_reward",
+    "portfolio_impact",
+})
 
 
 def ro(path):
@@ -63,14 +72,71 @@ def safe(title, fn):
         print(f"N/A（{type(e).__name__}: {str(e)[:60]}）")
 
 
+def _has_content(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def decision_card_quality(rows) -> dict:
+    """Return four non-overlapping weekly decision-card quality metrics."""
+    total_signals = len(rows)
+    card_rows = 0
+    complete_rows = 0
+    for row in rows:
+        try:
+            raw = row["decision_card"]
+            card = json.loads(raw) if raw else None
+        except (json.JSONDecodeError, TypeError, KeyError):
+            card = None
+        if not isinstance(card, dict):
+            continue
+        card_rows += 1
+        if (
+            REQUIRED_DECISION_CARD_FIELDS.issubset(card)
+            and all(_has_content(card[field])
+                    for field in REQUIRED_DECISION_CARD_FIELDS)
+        ):
+            complete_rows += 1
+
+    def pct(numerator: int, denominator: int):
+        return (
+            round(numerator / denominator * 100, 1)
+            if denominator else None
+        )
+
+    return {
+        "total_signals": total_signals,
+        "decision_card_rows": card_rows,
+        "complete_card_rows": complete_rows,
+        "decision_card_coverage_pct": pct(card_rows, total_signals),
+        "within_card_completeness_pct": pct(complete_rows, card_rows),
+        "overall_completeness_pct": pct(complete_rows, total_signals),
+    }
+
+
+def _format_pct(value) -> str:
+    return "N/A" if value is None else f"{float(value):.1f}%"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--days", type=int, default=7)
+    ap.add_argument(
+        "--as-of",
+        help="统计截止时点（UTC+8）；默认当前时间，便于历史复现",
+    )
     args = ap.parse_args()
     root, days = args.db_root, args.days
+    as_of = trade_report_stats.fmt_ts(
+        args.as_of or trade_report_stats.now_cst())
 
-    print(f"## 判断质量周报 @ {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')} (UTC+8)")
+    print(f"## 判断质量周报 @ {as_of[:16]} (UTC+8)")
 
     # 1) 六项卡与历史经验取舍
     def s_decision_cards():
@@ -80,20 +146,28 @@ def main():
             "WHERE cycle_id>=date('now','-30 days')"
         ).fetchall()
         ana.close()
-        required = {
-            "direction_evidence", "opposing_evidence", "execution_conditions",
-            "invalidation_point", "risk_reward", "portfolio_impact",
-        }
-        cards = []
-        for row in rows:
-            try:
-                card = json.loads(row["decision_card"]) if row["decision_card"] else None
-            except (json.JSONDecodeError, TypeError):
-                card = None
-            if isinstance(card, dict):
-                cards.append(card)
-        complete = sum(required.issubset(card) for card in cards)
-        print(f"决策卡 {len(cards)}/{len(rows)} 行；六项完整 {complete}/{len(cards) or 1}")
+        quality = decision_card_quality(rows)
+        total = quality["total_signals"]
+        card_rows = quality["decision_card_rows"]
+        complete = quality["complete_card_rows"]
+        print("| 质量指标 | 分子 | 分母 | 结果 |")
+        print("|---|---:|---:|---:|")
+        print(f"| 总信号数 | {total} | — | {total} 行 |")
+        print(
+            "| 决策卡覆盖率 | "
+            f"{card_rows} | {total} | "
+            f"{_format_pct(quality['decision_card_coverage_pct'])} |"
+        )
+        print(
+            "| 卡内六项完整率 | "
+            f"{complete} | {card_rows} | "
+            f"{_format_pct(quality['within_card_completeness_pct'])} |"
+        )
+        print(
+            "| 全体六项完整率 | "
+            f"{complete} | {total} | "
+            f"{_format_pct(quality['overall_completeness_pct'])} |"
+        )
 
         acc = ro(os.path.join(root, "account.db"))
         exps = acc.execute(
@@ -249,20 +323,49 @@ def main():
 
     safe(f"效率·token（{days} 天）", s_efficiency)
 
-    # 6) demo 周转率（N4 2026-06-14）：量化"ADJUST 僵持"——满仓微盈长持不交易
+    # 6) demo 周转率：当前 demo_trades.db 有效 fill + ledger 风控拒绝；
+    # drill.db 是只读归档，不再参与当前复盘事实。
     def s_turnover():
-        drl = ro(os.path.join(root, "drill.db"))
-        opened = drl.execute("SELECT COUNT(*) c FROM drill_trades WHERE ts >= datetime('now', ?)",
-                             (f"-{days} days",)).fetchone()["c"]
-        closed = drl.execute("SELECT COUNT(*) c FROM drill_trades WHERE status='closed' "
-                             "AND close_ts >= datetime('now', ?)", (f"-{days} days",)).fetchone()["c"]
-        avg_hold = drl.execute(
-            "SELECT AVG((julianday('now')-julianday(ts))*24) h FROM drill_trades WHERE status='open'"
-        ).fetchone()["h"]
-        drl.close()
+        start, end = trade_report_stats.rolling_window(as_of, days)
+        stats = trade_report_stats.profile_statistics(
+            "demo",
+            Path(root) / "demo_trades.db",
+            Path(root) / "ledger.db",
+            start,
+            end,
+            include_avg_hold=True,
+        )
+        opened = stats["open_count"]
+        closed = stats["close_count"]
+        rejected = stats["risk_rejected_open_attempts"]
+        avg_hold = stats.get("open_position_avg_hold_hours")
         ah = f"{avg_hold:.0f}h" if avg_hold is not None else "—"
-        print(f"demo {days} 天：开仓 {opened} / 平仓 {closed} 笔（日均开 {opened/days:.1f}）| 当前 open 平均持有 {ah}")
-        print("➤ 周转过低（日均开<1 且持有>24h）= ADJUST 僵持/学习闭环停滞；周转健康才有新 pnl 归因")
+        reason_text = "、".join(
+            f"{reason}×{count}"
+            for reason, count in rejected["reasons"].items()
+        ) or "无"
+        print(
+            f"demo 近 {days}×24h（{start}~{end}）："
+            f"成交开仓 {opened} / 成交平仓 {closed} 笔"
+            f"（日均开 {opened/days:.1f}）| 当前 open 平均持有 {ah}")
+        print(
+            "开仓尝试被风控拒绝 "
+            f"{rejected['count']} 笔（{reason_text}）"
+        )
+        excluded = (
+            stats["excluded_rejected_rows"]
+            + stats["excluded_incomplete_rows"]
+        )
+        if excluded:
+            print(
+                f"成交表另排除 rejected/不完整非 fill 行 {excluded} 条，"
+                "不计入开平仓。")
+        if opened / days < 1 and avg_hold is not None and avg_hold > 24:
+            print(
+                "➤ 周转过低（日均开<1 且持有>24h）= "
+                "ADJUST 僵持/学习闭环停滞。")
+        else:
+            print("➤ 周转存在有效成交，学习闭环未停滞。")
 
     safe(f"demo 周转率（{days} 天）", s_turnover)
 

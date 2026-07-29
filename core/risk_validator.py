@@ -12,7 +12,7 @@
   - **纯函数**：无网络 / 无 DB / 无副作用，全部输入显式传入 → 100% 可单测。
   - **现仓权威**：调用方（order_executor）必从 OKX API 取现仓传入；禁 position_snapshots
     GROUP BY（红线 #6）。
-  - **勿用 ctVal 直接比硬上限**（红线 #8 / MEMORY §3 bug）：先算「每张保证金 =
+  - **勿用 ctVal 直接比硬上限**（红线 #8）：先算「每张保证金 =
     mark_px × ct_val ÷ lev」再比预算。
   - **硬上限 = 模块级常量**（hardcoded）：仅主人改码才动，禁 registry/LLM 改
     （红线「不放宽风控自学」）。
@@ -336,14 +336,31 @@ def validate(
     math_box["same_side_existing_notional"] = same_side_existing
     math_box["open_position_count"] = len(open_positions)
 
-    # ── 止损距校验（与硬上限独立，填错保护；传了才校）──
+    # ── 止损校验（与硬上限独立；传了才校）──
+    # 止损不仅要“离 mark 不远”，还必须位于能真正止损的一侧。否则 long 的
+    # 止损高于 mark / short 的止损低于 mark 会变成方向反了的条件单。
     sl_dev = None
+    sl_value = None
     if sl_trigger_px is not None:
         try:
-            sl_dev = abs(float(sl_trigger_px) - mark_px) / mark_px
-            math_box["sl_deviation"] = sl_dev
-        except (TypeError, ValueError):
-            sl_dev = None
+            sl_value = float(sl_trigger_px)
+        except (TypeError, ValueError, OverflowError):
+            return _reject("bad_sl", f"止损价非法: {sl_trigger_px}")
+        if not math.isfinite(sl_value) or sl_value <= 0:
+            return _reject("bad_sl", f"止损价非有限正数: {sl_trigger_px}")
+        sl_dev = abs(sl_value - mark_px) / mark_px
+        math_box["sl_trigger_px"] = sl_value
+        math_box["sl_deviation"] = sl_dev
+        if side == "long" and sl_value >= mark_px:
+            return _reject(
+                "sl_direction_invalid",
+                f"long 止损价 {sl_value} 必须低于 mark {mark_px}",
+            )
+        if side == "short" and sl_value <= mark_px:
+            return _reject(
+                "sl_direction_invalid",
+                f"short 止损价 {sl_value} 必须高于 mark {mark_px}",
+            )
 
     # ===================================================================
     # live/demo：同一套硬上限闸（判定顺序短路，方案 §7）

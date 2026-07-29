@@ -29,8 +29,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -154,6 +156,20 @@ def _one(db_root, name, sql, args=()):
     return r[0] if r else None
 
 
+def _public_macro_snapshot(db_root):
+    """公开宏观观测表优先；读取失败时由调用方使用 cross_market 快照兜底。"""
+    try:
+        from public_macro import latest_snapshot
+
+        con = connect(db_root, "regime.db")
+        try:
+            return latest_snapshot(con)
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
 def _loads(s):
     if not s:
         return {}
@@ -190,6 +206,11 @@ def _px(v):
 def _r2(v):
     """金额/百分比保留 2 位小数，非数值原样。"""
     return round(v, 2) if isinstance(v, (int, float)) else v
+
+
+def _ratio_pct(v):
+    """数据库中的日变动比率（0.001）转为展示百分比（0.10）。"""
+    return round(v * 100, 2) if isinstance(v, (int, float)) else v
 
 
 def _float_or_none(v):
@@ -382,13 +403,30 @@ def _num_or_dash(v):
 
 
 def _short_dxy(dxy_trend: str) -> str:
-    """'EXTREME 120.69 (+0.0031 1d), USD 强势延续, crypto 持续承压' → 'DXY EXTREME 120.69 承压'。"""
+    """兼容 dxy_trend 键；实际指标为 FRED USD_BROAD(DTWEXBGS)，非 ICE DXY。"""
     t = str(dxy_trend or "").strip()
     if not t:
-        return "DXY -"
+        return "USD_BROAD -"
     head = t.split(",")[0].strip()
     tail = "承压" if ("承压" in t or "压制" in t) else ""
-    return f"DXY {head} {tail}".strip()
+    return f"USD_BROAD {head} {tail}".strip()
+
+
+def _usd_broad_summary(macro: dict) -> str:
+    """Render old and current USD_BROAD macro schemas without false missing."""
+    legacy = str(macro.get("dxy_trend") or "").strip()
+    if legacy:
+        return _short_dxy(legacy)
+    value = _float_or_none(
+        macro.get("dxy_broad_usd_trade_weighted",
+                  macro.get("usd_broad")))
+    zone = str(macro.get("dxy_zone") or "").strip()
+    parts = ["USD_BROAD"]
+    if value is not None:
+        parts.append(str(_r2(value)))
+    if zone:
+        parts.append(zone)
+    return " ".join(parts) if len(parts) > 1 else "USD_BROAD -"
 
 
 def latest_cycle(db_root: str) -> str | None:
@@ -398,19 +436,32 @@ def latest_cycle(db_root: str) -> str | None:
 
 
 def _action_from_trades(trades: list) -> str | None:
-    """一批 trades → 主枚举（首笔 live 优先，已在 caller 排序）。"""
+    """一批 trades → 去重后的动作枚举，保留成交顺序。
+
+    同轮既平仓又开仓时不能只取首笔动作，否则后续把全部 symbol 拼到首笔动作后，
+    会生成 ``CLOSE A/B/C`` 这类把新开仓误报成平仓的标题。
+    """
     if not trades:
         return None
-    t = trades[0]
-    act = str(t.get("action") or "").lower()
-    side = str(t.get("side") or "").lower()
-    if act in _OPEN:
-        return "OPEN_LONG" if side == "long" else "OPEN_SHORT" if side == "short" else "ADD"
-    if act == "stop_loss":
-        return "STOP_LOSS"
-    if act in _CLOSE:
-        return "REDUCE" if act == "reduce" else "CLOSE"
-    return "ADJUST"
+    actions = []
+    for t in trades:
+        act = str(t.get("action") or "").lower()
+        side = str(t.get("side") or "").lower()
+        if act in _OPEN:
+            label = (
+                "OPEN_LONG" if side == "long"
+                else "OPEN_SHORT" if side == "short"
+                else "ADD"
+            )
+        elif act == "stop_loss":
+            label = "STOP_LOSS"
+        elif act in _CLOSE:
+            label = "REDUCE" if act == "reduce" else "CLOSE"
+        else:
+            label = "ADJUST"
+        if label not in actions:
+            actions.append(label)
+    return "/".join(actions)
 
 
 def _map_decision(dec: str) -> str:
@@ -482,7 +533,10 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     _ACTION_CN = {"HOLD": "HOLD 维持", "WAIT": "WAIT 观望", "OPEN_LONG": "开多",
                   "OPEN_SHORT": "开空", "CLOSE": "平仓", "STOP_LOSS": "止损",
                   "ADJUST": "调整", "ADD": "加仓", "REDUCE": "减仓", "TRADED": "已成交"}
-    action_cn = _ACTION_CN.get(action, action)
+    def _action_cn(value):
+        return "/".join(_ACTION_CN.get(part, part) for part in str(value).split("/"))
+
+    action_cn = _action_cn(action)
     # 两盘动作逐盘推导（成交行优先、无成交回退 decision）；
     # 一致才冠“实盘/模拟双盘”，分歧则并列展示。
     book_acts = {}
@@ -492,8 +546,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     if book_acts["live"] == book_acts["demo"]:
         head_cn = f"双盘{action_cn}"
     else:
-        head_cn = (f"live {_ACTION_CN.get(book_acts['live'], book_acts['live'])}"
-                   f"/demo {_ACTION_CN.get(book_acts['demo'], book_acts['demo'])}")
+        head_cn = (f"live {_action_cn(book_acts['live'])}"
+                   f"/demo {_action_cn(book_acts['demo'])}")
     news_evts = news.get("events", []) if isinstance(news, dict) else []
     top_news = ""
     for e in news_evts:
@@ -502,7 +556,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             break
     if not top_news and news.get("summary"):
         top_news = f"；{str(news['summary'])[:36]}"
-    summary = (f"{head_cn}：regime={regime}，{_short_dxy(macro.get('dxy_trend'))}，"
+    summary = (f"{head_cn}：regime={regime}，{_usd_broad_summary(macro)}，"
                f"{len(open_cands)} 个 open 候选{top_news}")
 
     # ── decision.reason（主体=headline 币 analyst 理由，恒在且最相关；叠成交理由+宏观+校准+教训）──
@@ -520,10 +574,10 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             reason_bits.append(f"执行：{tr0}")
     macro_line = "；".join(
         str(x) for x in (
-            macro.get("dxy_trend"),
+            macro.get("dxy_trend") or _usd_broad_summary(macro),
             macro.get("risk_appetite"),
             macro.get("regime_stability_24h"),
-            macro.get("summary"),
+            macro.get("summary") or macro.get("verdict"),
         ) if x
     )
     if macro_line:
@@ -694,9 +748,20 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         return round(max(longn, total - longn) / total * 100, 1)
 
     live_lev = max((p["lev"] or 0 for p in live_pos), default="-")
+    position_margin_pcts = [
+        float(p["margin_pct"])
+        for p in positions
+        if isinstance(p.get("margin_pct"), (int, float)) and p["margin_pct"] >= 0
+    ]
     risk = {
         "margin_pct": _single_trade_margin_pct(),
         "margin_pct_scope": "max_current_cycle_open_trade",
+        # 无 OPEN/ADD 的轮次不能把存量仓位冒充“单笔 20%”硬闸值；另给一个
+        # 明确标注为观察口径的当前最大持仓保证金，避免简报长期显示裸 “-”。
+        "max_position_margin_pct": (
+            round(max(position_margin_pcts), 2) if position_margin_pcts else None
+        ),
+        "max_position_margin_pct_scope": "max_current_position_observation",
         "available_margin": {
             "live_usdt": assets["live"].get("availBal"),
             "demo_usdt": assets["demo"].get("availBal"),
@@ -715,7 +780,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     btc, eth = _tick("BTC-USDT-SWAP"), _tick("ETH-USDT-SWAP")
     cm = _one(db_root, "regime.db",
               "SELECT dxy,dxy_d1,vix,vix_d1,spx,spx_d1,btc_dominance,btc_etf_flow,"
-              "defillama_tvl_total FROM cross_market ORDER BY ts DESC LIMIT 1") or {}
+              "defillama_tvl_total,btc_etf_net_flow_usd,dxy_calc_ecb,"
+              "dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta "
+              "FROM cross_market ORDER BY ts DESC LIMIT 1") or {}
     market = {
         "btc": _px(btc.get("last")), "btc_chg24h": _r2(btc.get("chg24h")),
         "eth": _px(eth.get("last")), "eth_chg24h": _r2(eth.get("chg24h")),
@@ -738,12 +805,68 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     macro_block = {}
     if is_hh01:
         _etf, _tvl = cm.get("btc_etf_flow"), cm.get("defillama_tvl_total")
+        _public_macro = _public_macro_snapshot(db_root)
+        _dxy_calc_row = _public_macro.get("dxy_calc_ecb") or {}
+        _fear_row = _public_macro.get("fear_greed") or {}
+        _dxy_calc = _dxy_calc_row.get("value", cm.get("dxy_calc_ecb"))
+        _dxy_calc_d1 = _public_macro.get(
+            "dxy_calc_ecb_d1", cm.get("dxy_calc_ecb_d1")
+        )
+        _fear_value = _fear_row.get("value", cm.get("fear_greed"))
+        _fear_label = _fear_row.get("label", cm.get("fear_greed_label"))
+        try:
+            _macro_meta = json.loads(cm.get("source_meta") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            _macro_meta = {}
+        _etf_meta = _macro_meta.get("btc_etf_net_flow_usd") or {}
+        _etf_hard = cm.get("btc_etf_net_flow_usd")
+        _etf_provisional = _etf_meta.get("provisional_value_usd")
+        _etf_confirmed_row = _public_macro.get("etf_confirmed") or {}
+        _etf_provisional_row = _public_macro.get("etf_provisional") or {}
+        _etf_conflict_row = _public_macro.get("etf_conflict") or {}
+        if _etf_confirmed_row:
+            _etf_hard = _etf_confirmed_row.get("value")
+            _etf_provisional = None
+            _etf_meta = {
+                "status": "cross_checked",
+                "source_as_of": _etf_confirmed_row.get("observation_date"),
+            }
+        elif _etf_conflict_row:
+            _etf_hard = None
+            _etf_provisional = None
+            _etf_meta = {
+                "status": "conflict",
+                "source_as_of": _etf_conflict_row.get("observation_date"),
+            }
+        elif _etf_provisional_row:
+            _etf_hard = None
+            _etf_provisional = _etf_provisional_row.get("value")
+            _etf_meta = {
+                "status": "provisional_single_source",
+                "source_as_of": _etf_provisional_row.get("observation_date"),
+                "source": _etf_provisional_row.get("source"),
+            }
         macro_block = {
             "enabled": True,
-            "dxy": _r2(cm.get("dxy")), "dxy_d1": _r2(cm.get("dxy_d1")),
-            "vix": _r2(cm.get("vix")), "spx": _r2(cm.get("spx")), "spx_d1": _r2(cm.get("spx_d1")),
+            "dxy": _r2(cm.get("dxy")), "dxy_d1": _ratio_pct(cm.get("dxy_d1")),
+            "dxy_calc_ecb": _r2(_dxy_calc),
+            "dxy_calc_ecb_d1": _ratio_pct(_dxy_calc_d1),
+            "vix": _r2(cm.get("vix")), "spx": _r2(cm.get("spx")), "spx_d1": _ratio_pct(cm.get("spx_d1")),
+            "fear_greed": _r2(_fear_value),
+            "fear_greed_label": _fear_label or "-",
             "btc_dominance": _r2(cm.get("btc_dominance")),
             "btc_mcap_chg_24h_usd": (f"{_etf / 1e9:+.2f}B" if isinstance(_etf, (int, float)) else "-"),
+            "btc_etf_net_flow_usd": (
+                f"{_etf_hard / 1e6:+.1f}M"
+                if isinstance(_etf_hard, (int, float))
+                else (
+                    f"{_etf_provisional / 1e6:+.1f}M provisional"
+                    if isinstance(_etf_provisional, (int, float))
+                    else "-"
+                )
+            ),
+            "btc_etf_flow_status": _etf_meta.get("status") or "missing",
+            "btc_etf_flow_as_of": _etf_meta.get("source_as_of") or "-",
             "tvl": (f"{_tvl / 1e9:.1f}B" if isinstance(_tvl, (int, float)) else "-"),
             "degraded_sources": ",".join(f["source"] for f in faults) or "无",
         }

@@ -30,7 +30,7 @@ collect_data.py —— Job A 数据采集（每 15 分钟由 cron 调用）。
 
 
 
-    4) 通过 OKX CLI 拉取账户余额与持仓，写入 account.db
+    4) 不采集账户/持仓；该职责由 jobb_live_account_check.py 单写
 
 
 
@@ -38,7 +38,7 @@ collect_data.py —— Job A 数据采集（每 15 分钟由 cron 调用）。
 
 
 
-    6) 在 cycle_runs 表追加一行轮次审计
+    6) 采集轮次审计由 fast_collect/ledger 统一维护
 
 
 
@@ -58,7 +58,7 @@ collect_data.py —— Job A 数据采集（每 15 分钟由 cron 调用）。
 
 
 
-    - 不写 daily-reports / records / trade-events
+    - 不写 account.db / daily-reports / records / trade-events
 
 
 
@@ -87,8 +87,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -1348,353 +1350,13 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
 
 
 
-def normalize_profile_label(profile: str | None) -> str:
-
-
-
-    """将 OKX CLI profile 名归一化为 'live' / 'demo'。"""
-
-
-
-    if not profile:
-
-
-
-        return "live"
-
-
-
-    return "demo" if "demo" in str(profile).lower() else "live"
-
-
-
-
-
-
-
-
-
-
-
-def collect_account(account_con: sqlite3.Connection, ts: str, cli_global_args: list[str], profile: str) -> tuple[int, dict]:
-
-
-
-    profile_label = normalize_profile_label(profile)
-
-    # C3（2026-07-03）UTC-Z 写方统一：account.db（account_snapshots/position_snapshots）落库
-    # 一律 CST 'YYYY-MM-DD HH:MM:SS'——传入 ts 为本轮 Z 格式 ts_start，这里换算同一时刻的 CST；
-    # 不改调用方 ts_start（market.db tick/kline/derivatives 全 Z 表内自洽，本次不动）。
-    # 本函数内 INSERT 与 DELETE(position_snapshots WHERE ts=?) 全部用 ts 变量，整体切换自洽。
-    ts = iso_to_cst_str(ts) or cst_now_str()
-
-
-
-    balance_rows = okx_json("account", "balance", global_args=cli_global_args)
-
-
-
-    positions = okx_json("account", "positions", "--instType", "SWAP", global_args=cli_global_args)
-
-
-
-    balance = balance_rows[0] if balance_rows else {}
-
-
-
-    details = balance.get("details") or []
-
-
-
-    usdt_row = next((row for row in details if row.get("ccy") == "USDT"), {})
-
-
-
-    upl = to_float(balance.get("upl"))
-
-
-
-    if upl is None:
-
-
-
-        upl = sum(to_float(row.get("upl")) or 0.0 for row in positions)
-
-
-
-
-
-
-
-    account_con.execute(
-
-
-
-        "INSERT OR REPLACE INTO account_snapshots "
-
-
-
-        "(ts, profile, totalEq, availBal, upl, daily_pnl, week_pnl, month_pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-
-
-
-        (
-
-
-
-            ts,
-
-
-
-            profile_label,
-
-
-
-            to_float(balance.get("totalEq")),
-
-
-
-            to_float(usdt_row.get("availBal") or usdt_row.get("availEq")),
-
-
-
-            upl,
-
-
-
-            None,
-
-
-
-            None,
-
-
-
-            None,
-
-
-
-        ),
-
-
-
-    )
-
-
-
-
-
-
-
-    # 同 ts + profile 的旧 position 行先清掉，避免上一轮残留；新一轮无持仓时也表示"该 profile 此刻无持仓"
-
-
-
-    account_con.execute(
-
-
-
-        "DELETE FROM position_snapshots WHERE ts = ? AND profile = ?",
-
-
-
-        (ts, profile_label),
-
-
-
-    )
-
-
-
-    position_rows = []
-
-
-
-    for item in positions:
-
-
-
-        symbol = item.get("instId")
-
-
-
-        if symbol not in SYMBOLS:
-
-
-
-            continue
-
-
-
-        pos_side = (item.get("posSide") or "").lower()
-
-
-
-        side = pos_side if pos_side in {"long", "short"} else ("long" if (to_float(item.get("pos")) or 0.0) >= 0 else "short")
-
-
-
-        position_rows.append(
-
-
-
-            (
-
-
-
-                ts,
-
-
-
-                profile_label,
-
-
-
-                symbol,
-
-
-
-                side,
-
-
-
-                abs(to_float(item.get("pos")) or 0.0),
-
-
-
-                to_float(item.get("avgPx") or item.get("markPx")),
-
-
-
-                to_float(item.get("lever")),
-
-
-
-                to_float(item.get("liqPx")),
-
-
-
-                to_float(item.get("upl")),
-
-
-
-                to_float(item.get("mgnRatio")),
-
-
-
-            )
-
-
-
-        )
-
-
-
-    if position_rows:
-
-
-
-        account_con.executemany(
-
-
-
-            "INSERT OR REPLACE INTO position_snapshots "
-
-
-
-            "(ts, profile, symbol, side, sz, avgPx, lev, liqPx, upl, marginRatio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-
-
-
-            position_rows,
-
-
-
-        )
-
-
-
-
-
-
-
-    account_con.commit()
-
-
-
-    snapshot = {
-
-
-
-        "totalEq": to_float(balance.get("totalEq")),
-
-
-
-        "availBal": to_float(usdt_row.get("availBal") or usdt_row.get("availEq")),
-
-
-
-        "upl": upl,
-
-
-
-        "positionCount": len(position_rows),
-
-
-
-    }
-
-
-
-    return 1 + len(position_rows), snapshot
-
-
-
-
-
-
-
-
-
-
-
-def write_cycle_run(account_con: sqlite3.Connection, ts_start: str, ts_end: str, error: str | None, profile: str) -> None:
-
-
-
-    account_con.execute(
-
-
-
-        "INSERT OR REPLACE INTO cycle_runs "
-
-
-
-        "(ts_start, ts_end, job_id, profile, state_before, state_after, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
-
-
-
-        (ts_start, ts_end, "collect_fast", profile, None, None, error),
-
-
-
-    )
-
-
-
-    account_con.commit()
-
-
-
-
-
-
-
-
-
-
-
-def update_state(state_path: Path, ts: str, ticker_snapshot: dict[str, dict], cross_market: dict, account_snapshot: dict, regime: str | None) -> None:
+def update_state(
+    state_path: Path,
+    ts: str,
+    ticker_snapshot: dict[str, dict],
+    cross_market: dict,
+    regime: str | None,
+) -> None:
 
 
 
@@ -1788,34 +1450,6 @@ def update_state(state_path: Path, ts: str, ticker_snapshot: dict[str, dict], cr
 
 
 
-    state["account_summary"] = {
-
-
-
-        **(state.get("account_summary") or {}),
-
-
-
-        "totalEq": account_snapshot.get("totalEq"),
-
-
-
-        "availBal": account_snapshot.get("availBal"),
-
-
-
-        "ccy": "USDT",
-
-
-
-        "pos": account_snapshot.get("positionCount"),
-
-
-
-    }
-
-
-
     write_state(state_path, state)
 
 
@@ -1854,8 +1488,6 @@ def main() -> int:
 
     parser.add_argument("--skip-news", action="store_true", help=argparse.SUPPRESS)
 
-
-
     args = parser.parse_args()
 
 
@@ -1880,7 +1512,7 @@ def main() -> int:
 
 
 
-    account_cli_global_args = build_cli_global_args(args.profile, args.demo)
+    # Account/profile reads are isolated in jobb_live_account_check.py.
 
 
 
@@ -1957,7 +1589,7 @@ def main() -> int:
 
 
 
-    market_con = account_con = None
+    market_con = None
 
 
 
@@ -1969,7 +1601,8 @@ def main() -> int:
 
 
 
-        account_con = open_db(db_root, "account.db")
+        # V2.0 的账户/持仓快照唯一权威写入方是
+        # scripts/jobb_live_account_check.py；collect_data 仅写 market.db。
 
 
 
@@ -2016,35 +1649,12 @@ def main() -> int:
         summary["wrote"]["news"] = 0
         summary["wrote"]["news_mx"] = 0
         summary["wrote"]["news_geo"] = 0
-        try:
+        # 账户/持仓快照由 jobb_live_account_check.py 单独写入。
+        summary["wrote"]["account"] = 0
 
 
 
-            account_count, account_snapshot = collect_account(account_con, ts_start, account_cli_global_args, args.profile)
-
-
-
-            summary["wrote"]["account"] = account_count
-
-
-
-        except Exception as acc_exc:
-
-
-
-            account_count = 0
-
-
-
-            account_snapshot = {}
-
-
-
-            warnings.append(f"account_degraded: {type(acc_exc).__name__}: {acc_exc}")
-
-
-
-        update_state(state_path, ts_start, ticker_snapshot, cross_snapshot, account_snapshot, regime)
+        update_state(state_path, ts_start, ticker_snapshot, cross_snapshot, regime)
 
 
 
@@ -2061,30 +1671,6 @@ def main() -> int:
 
 
     finally:
-
-
-
-        ts_end = utc_now_iso()
-
-
-
-        try:
-
-
-
-            if account_con is not None:
-
-
-
-                write_cycle_run(account_con, ts_start, ts_end, error, args.profile)
-
-
-
-        except sqlite3.Error as exc:
-
-
-
-            print(f"[collect_data] cycle_runs 写入失败: {exc}", file=sys.stderr)
 
 
 
@@ -2107,7 +1693,7 @@ def main() -> int:
         except Exception as _pe:
             print(f"[collect_data] market prune 跳过（不阻断采集）: {_pe}", file=sys.stderr)
 
-        for connection in (market_con, account_con):
+        for connection in (market_con,):
 
 
 

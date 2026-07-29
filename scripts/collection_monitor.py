@@ -9,10 +9,11 @@ r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯�
     · 必需源断流/超时（source_freshness abort_sources：required 缺数据 OR 超其 staleness_sec）→ P0
     · 同源连续 ≥3 轮 error/timeout → P1
     · 派单丢轮 ≥2（form① decision_fired_no_analysis + form② 采集齐但从未派过窗）→ P1
+    · trader 已派但超宽限仍未落 trade_cycles：单轮即 P1
     · 单槽 ≥2 源同时 error/timeout（齐活率成片塌陷）→ P1
     · 注入话术命中（脚本关键词扫，非 LLM 语义）→ P1
     · 执行 journal 已成交未入账 >15min：live → P1 人工；demo 自动
-      重放失败/含糊 → P1
+      重放失败/含糊/ordId 身份冲突 → P1
   audit-only（不推 QQ）：非必需源 stale、孤立单轮丢轮、push 未送达、周末稀疏、
       demo journal 自动重放成功（自愈留痕）。
 
@@ -25,6 +26,7 @@ r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯�
 **唯一例外**：demo 执行 journal 未入账自动经
 trades_writer --from-journal 补账本行——补的是账（写 demo_trades.db，经硬化 writer
 合并闸幂等），非补派/拉起 agent；live 永远只 dry+P1 人工。
+账本不变量命中只同步 account.db.repair_queue 元数据（幂等开/闭工单），不改交易事实。
 
 用法：
   collection_monitor.py --db-root <PROJECT_ROOT>\db            # 真跑（超阈会真推 QQ）
@@ -35,8 +37,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -52,6 +56,8 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import ledger_invariants as li
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -74,7 +80,7 @@ SIMULTANEOUS_ERR_THRESHOLD = 2                  # 单槽同时 error 源数（�
 PUSH_VERIFY_MIN_SEC, PUSH_VERIFY_MAX_SEC = 900, 2400
 SLOT_MIN = 15
 NEVER_DISPATCH_GRACE_SEC = SLOT_MIN * 60 + 900  # 采集齐后过窗判从未派（一个槽长 + 15min）
-COMPLETION_LOOKBACK_SEC = 2 * 3600              # 成片/从未派/trader核验只看最近 2h（陈旧交每日复盘）
+COMPLETION_LOOKBACK_SEC = 24 * 3600             # on-demand 运行也覆盖当日 trader 失败；cycle 去重防重复告警
 TRADER_GRACE_SEC = 900                          # trader 派后给 15min 写 trade_cycles，超则判 launch-but-failed
 UNIFIED_LIVE_GRACE_SEC = 1800                   # 合并分析+实盘首棒给 30min；full live/demo 仍 15min
 JOURNAL_GRACE_SEC = 900                         # journal 落痕后给 15min 让 trader 正常喂 writer，超则判未入账
@@ -85,7 +91,9 @@ PROD_DB_ROOT = _project_path('db')                     # journal 自动重放仅
 # 表不存在/库不可读一律 fail-safe 回退单态口径，不影响告警本体）
 OPENCLAW_STATE_DB = os.environ.get(
     "OKX_OPENCLAW_STATE_DB",
-    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"))
+    str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite')))
+STAGE_STATUS_DIR = Path(os.environ.get(
+    "OKX_STAGE_STATUS_DIR", _project_path('logs', 'stage-status')))
 
 # 注入话术关键词（脚本级，非 LLM 语义）。匹配文本仅报"命中模式名"，不回灌原文（防自激）。
 INJECTION_PATTERNS = {
@@ -147,10 +155,12 @@ def _cycle_in_dreaming(cycle_id: str) -> bool:
     return DREAM_START <= (dt.hour, dt.minute) <= DREAM_END
 
 
-def _sig(key, sev, detail, *, cycles=None, source_like=False, audit_only=False, is_lost=False):
+def _sig(key, sev, detail, *, cycles=None, source_like=False, audit_only=False,
+         is_lost=False, force_alert_single=False):
     return {"key": key, "sev": sev, "detail": detail, "cycles": cycles or [],
             "cycle": (cycles[0] if cycles else None), "source_like": source_like,
-            "audit_only": audit_only, "is_lost": is_lost}
+            "audit_only": audit_only, "is_lost": is_lost,
+            "force_alert_single": force_alert_single}
 
 
 # ── 检测 ────────────────────────────────────────────────────────────────────
@@ -282,9 +292,25 @@ _ATTR_HINT = {
 
 
 def _audit_attribution(book: str, cyc: str) -> str:
-    """P13 三态归因（2026-07-14）：直读 OpenClaw audit_events（metadata-only 账本，mode=ro）
+    """优先读 stage_runner 确定性终态，再回退 OpenClaw audit_events 三态归因。
+
+    P13（2026-07-14）：直读 OpenClaw audit_events（metadata-only 账本，mode=ro）
     判 launch-but-failed 属哪层。session_key 复刻 trigger_agent.session_key 规则
-    （'agent:okx-live-trader:live-20260714-1945'）。任何异常返 'audit-unavailable'（fail-safe）。"""
+    （例如 `<SESSION_KEY>`）。任何异常返 'audit-unavailable'（fail-safe）。"""
+    status_path = STAGE_STATUS_DIR / f"{book}-{cyc.replace(':', '-')}.json"
+    try:
+        runner = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        runner = {}
+    runner_status = runner.get("status")
+    if (runner_status == "failed"
+            and runner.get("failure_kind") == "business_output_missing"):
+        return "run-ok-no-db-row"
+    if runner_status in ("failed", "running"):
+        return "run-failed"
+    if runner_status == "succeeded":
+        return "run-ok-no-db-row"
+
     safe = cyc.replace("-", "").replace(":", "").replace("T", "-")
     sk = f"agent:okx-{book}-trader:{book}-{safe}"
     try:
@@ -367,7 +393,8 @@ def detect_trader_incomplete(db_root: str, now: datetime) -> list[dict]:
     hints = "；".join(sorted({_ATTR_HINT[a] for _, _, a in missing}))
     return [_sig("trader_incomplete", sev,
                  f"trader 已派 >15min 但 trade_cycles 缺行（launch-but-failed，决策蒸发）: "
-                 f"{shown}；归因：{hints}", cycles=cycles, is_lost=True)]
+                 f"{shown}；归因：{hints}", cycles=cycles, is_lost=True,
+                 force_alert_single=True)]
 
 
 def detect_push_undelivered(db_root: str, now: datetime) -> list[dict]:
@@ -464,6 +491,21 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
             sigs.append(_sig(f"journal_corrupt:{profile}", "P1",
                              f"journal 含 {plan['bad_lines']} 条无法解析行"
                              f"（可能藏未入账成交）: {jf}｜人工查该文件"))
+        conflicts = plan.get("identity_conflicts") or []
+        if conflicts:
+            cycles = sorted({str(c.get("cycle") or "") for c in conflicts
+                             if c.get("cycle")})
+            shown = "; ".join(
+                f"{c.get('cycle')} {c.get('symbol')} sz={c.get('sz')} "
+                f"journal={c.get('journal_ordId')} ledger={c.get('ledger_ordId')}"
+                for c in conflicts[:6]
+            )
+            sigs.append(_sig(
+                f"journal_identity_conflict:{profile}", "P1",
+                f"{profile} journal/账本 ordId 身份冲突 {len(conflicts)} 笔，"
+                f"重放已硬阻断: {shown}｜禁止重放，人工核交易所订单真值",
+                cycles=cycles,
+            ))
         entries = [dict(e, cycle=cyc)
                    for cyc, es in (plan.get("plan") or {}).items() for e in es]
         aged = []
@@ -525,6 +567,27 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
                              f"demo journal 自动重放成功 {len(autoable)} 笔: "
                              f"{_desc(autoable)}", audit_only=True))
     return sigs
+
+
+def detect_ledger_invariants(
+    db_root: str, now: datetime
+) -> tuple[list[dict], list[dict]]:
+    """I. 主账负净额、重复成交及未决执行意图；只读事实检测。"""
+    root = Path(db_root)
+    since = (now - timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
+    findings: list[dict] = []
+    for profile in ("live", "demo"):
+        findings.extend(li.trade_net_findings(root, profile))
+        findings.extend(li.duplicate_execution_findings(root, profile, since))
+        findings.extend(li.execution_intent_findings(root, profile, now))
+    sigs = []
+    for finding in findings:
+        cycle = finding.get("cycle_id")
+        sigs.append(_sig(
+            finding["check_name"], "P1", finding["issue"],
+            cycles=[cycle] if cycle else None,
+            force_alert_single=True))
+    return sigs, findings
 
 
 # ── 降噪 ────────────────────────────────────────────────────────────────────
@@ -607,11 +670,16 @@ def denoise(sigs: list[dict], state: dict, now: datetime) -> tuple[list[dict], l
             continue
         # 丢轮/缺槽类：按 cycle 槽时刻剔 Dreaming 窗内的，再判 ≥2（Dreaming 只作用丢轮类）
         if s.get("is_lost"):
-            fresh = [c for c in s["cycles"] if not _cycle_in_dreaming(c)]
-            dreamed = [c for c in s["cycles"] if _cycle_in_dreaming(c)]
+            # trader_incomplete 是“已派后失败”的确定性故障，不属于 Dreaming 计划性缺槽；
+            # 即使 cycle 恰落 Dreaming 窗也必须保留，且单轮即告警。
+            force_single = bool(s.get("force_alert_single"))
+            fresh = (list(s["cycles"]) if force_single
+                     else [c for c in s["cycles"] if not _cycle_in_dreaming(c)])
+            dreamed = ([] if force_single
+                       else [c for c in s["cycles"] if _cycle_in_dreaming(c)])
             if dreamed:
                 s["detail"] += f"｜known-dreaming 剔除 {len(dreamed)} 槽: {dreamed[:3]}"
-            if len(fresh) < 2:
+            if len(fresh) < 2 and not force_single:
                 s["suppressed_reason"] = (f"孤立丢轮（去 Dreaming 后 {len(fresh)}<2 静默记 audit）"
                                           if not dreamed or fresh else "全部 known-dreaming")
                 suppressed.append(s)
@@ -690,6 +758,7 @@ def main() -> int:
         return 0
     try:
         sigs: list[dict] = []
+        invariant_findings: list[dict] = []
         for fn, need_now in ((detect_source_freshness, False), (detect_error_streak, False),
                              (detect_completion, True), (detect_lost_cycles, False),
                              (detect_trader_incomplete, True),
@@ -703,6 +772,32 @@ def main() -> int:
             sigs.extend(detect_journal_unaccounted(args.db_root, now, dry_run=args.dry_run))
         except Exception as e:
             log(f"detect_journal_unaccounted 异常（跳过）: {e}")
+        try:
+            invariant_sigs, invariant_findings = detect_ledger_invariants(
+                args.db_root, now)
+            sigs.extend(invariant_sigs)
+        except Exception as e:
+            log(f"detect_ledger_invariants 异常（跳过）: {e}")
+
+        queue_sync = None
+        if not args.dry_run:
+            try:
+                account = sqlite3.connect(
+                    str(Path(args.db_root) / "account.db"), timeout=8)
+                try:
+                    account.execute("BEGIN IMMEDIATE")
+                    queue_sync = li.sync_repair_queue(
+                        account, family_prefix="ledger_invariant:",
+                        findings=invariant_findings,
+                        ts=now.strftime("%Y-%m-%d %H:%M:%S"))
+                    account.commit()
+                except Exception:
+                    account.rollback()
+                    raise
+                finally:
+                    account.close()
+            except Exception as e:
+                log(f"repair_queue 不变量同步失败（不影响告警）: {e}")
 
         triage_source_signals(sigs)
         state = load_state()
@@ -713,6 +808,7 @@ def main() -> int:
             "to_alert": [{"key": s["key"], "sev": s["sev"], "detail": s["detail"]} for s in to_alert],
             "suppressed": [{"key": s["key"], "reason": s.get("suppressed_reason")} for s in suppressed],
             "dry_run": args.dry_run,
+            "repair_queue": queue_sync,
         }
 
         if to_alert and not args.dry_run:

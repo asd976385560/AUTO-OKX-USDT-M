@@ -14,17 +14,20 @@ introspect-safe：运行时取两库 cross_market 的**非生成列**交集来�
 
 用法：
   # 干跑（只报将拷多少行、列交集，不写）
-  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db --dry-run
+  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db [--dry-run]
   # 真迁 + 校验
-  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db --verify
+  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db --apply \
+      --backup-dir <BACKUP_DIR> --verify
 """
 from __future__ import annotations
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -35,7 +38,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, _project_path('scripts'))
 import ledger  # noqa: E402  复用 connect()（WAL/ro 单一来源）
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -59,7 +68,11 @@ def copyable_columns(src_con, dst_con) -> list[str]:
     return [c["name"] for c in src if not c["generated"] and c["name"] in dst_names]
 
 
-def migrate(db_root: Path, dry_run: bool = False) -> dict:
+def migrate(
+    db_root: Path,
+    dry_run: bool = True,
+    backup_dir: Path | None = None,
+) -> dict:
     market = db_root / "market.db"
     regime = db_root / "regime.db"
     if not market.exists():
@@ -67,8 +80,15 @@ def migrate(db_root: Path, dry_run: bool = False) -> dict:
     if not regime.exists():
         return {"ok": False, "error": f"regime.db 不存在（先跑 init_v20_dbs）: {regime}"}
 
+    if not dry_run and backup_dir is None:
+        raise ValueError("backup_dir is required when dry_run=False")
+    backups = (
+        backup_databases([regime], backup_dir, "regime-split")
+        if not dry_run
+        else {}
+    )
     src = ledger.connect(market, readonly=True)
-    dst = ledger.connect(regime)
+    dst = ledger.connect(regime, readonly=dry_run)
     try:
         cols = copyable_columns(src, dst)
         if "ts" not in cols:
@@ -90,7 +110,8 @@ def migrate(db_root: Path, dry_run: bool = False) -> dict:
         dst_n_after = dst.execute("SELECT COUNT(*) FROM cross_market").fetchone()[0]
         return {"ok": True, "columns": cols, "src_rows": src_n,
                 "dst_rows_before": dst_n_before, "dst_rows_after": dst_n_after,
-                "copied": len(rows)}
+                "copied": len(rows),
+                "backups": [str(path) for path in backups.values()]}
     finally:
         src.close()
         dst.close()
@@ -116,17 +137,22 @@ def verify(db_root: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 regime 真拆迁移")
     ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    add_migration_arguments(ap)
     args = ap.parse_args()
+    apply_changes = resolve_apply(ap, args)
     root = Path(args.db_root)
 
     import json
-    res = migrate(root, dry_run=args.dry_run)
+    res = migrate(
+        root,
+        dry_run=not apply_changes,
+        backup_dir=Path(args.backup_dir) if args.backup_dir else None,
+    )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if not res.get("ok"):
         return 1
-    if args.verify and not args.dry_run:
+    if args.verify and apply_changes:
         v = verify(root)
         print("-- verify --")
         print(json.dumps(v, ensure_ascii=False, indent=2))

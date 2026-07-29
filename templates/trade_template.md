@@ -1,25 +1,29 @@
 <!--
 doc: trade_template
+doc-version: V2.0-template
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: 对齐交易前全账户未决意图闸、止损身份、部分成交、权威成交时间与writer提交时间契约。
 role: 交易回执模板（live/demo trader -> live_trades.db / demo_trades.db）
 权威: skill.md（交易执行契约节）+ core/order_executor.py + core/risk_validator.py + collectors/trades_writer.py
 落点: <PROJECT_ROOT>\db\live_trades.db / demo_trades.db（trade_cycles + trades）
 writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 INSERT）
 -->
 
-> ⚠️ **2026-07-17 一致性审计校正**：本模板曾冻结在 ~2026-06-24 契约，以下已按现行实现修正；与 skill.md / 对应 writer·core 代码冲突时以后者为准。
+> ⚠️ **2026-07-29 一致性审计校正**：本模板已对齐成交前决策卡校验、同 profile 全局未决执行意图闸、交易主账与 OKX API 全仓一致性闸、部分成交和原子落账契约；与 skill.md / 对应 writer·core 代码冲突时以后者为准。
 
 # 交易回执模板 — live/demo trader -> *_trades.db
 
 > live 下单**唯一路径** = `core/order_executor.open_position()` / `close_position()`，其内部**强制调** `core/risk_validator.validate()`（LLM 物理越不过闸，红线 #7）。
-> 执行器产出**回执 dict**（兼容 trades_writer）；trader 据此装配 cycle 级回执，用文件工具写入无冒号的 tmp UTF-8 JSON，再经 `trades_writer.py --json-file ... --profile live|demo` 落库。
+> 执行器产出已携完整 cycle/决策卡的**回执 dict**。任何确认成交轮都必须在调用 executor 的同一确定性 Python 进程内立即调用 `collectors.trades_writer.commit_receipt(receipt, profile)`；禁止先退出、再由模型下一次工具调用补落账。HOLD/ADJUST 等无成交回执才可走 `--json-file`。
 > 红线：写库必走 writer，禁手写 INSERT；现仓以 OKX API 为准（禁 position_snapshots GROUP BY）；勿用 ctVal 直接比硬上限（先算每张保证金）。零模型名。
 
 ## 1. order_executor 回执 dict（每笔执行产物）
 
-`open_position(symbol, side, intended_sz, lev, sl_trigger_px, profile, mgn_mode='cross', mark_px, equity, open_positions, reasoning, db_root, cycle_id, available_margin=None)`
-`close_position(symbol, profile, pos_side, mgn_mode='cross', reasoning, db_root, cycle_id)`
+`open_position(symbol, side, intended_sz, lev, sl_trigger_px, profile, mgn_mode='cross', mark_px, equity, open_positions, reasoning, db_root, cycle_id, available_margin=None, receipt_context=None)`
+`close_position(symbol, profile, pos_side, mgn_mode='cross', reasoning, db_root, cycle_id, receipt_context=None)`
 
-> `cycle_id` 必传——执行 journal 归账用（成交即留痕 `db/journal/exec_{profile}.jsonl`，2026-07-16 rank1）。签名里为可选参数（默认 None），但 trader 配方一律显式传本轮 cycle_id。
+> 非 dry-run 的 `cycle_id` 与 `receipt_context` 必传。`receipt_context` 必须是有效 JSON dict，含 `status=ok`、同一 `cycle_id`、`decision_protocol=decision_card_v1` 和完整 `decision_card`；执行器在任何 OKX I/O 前校验，失败直接 reject。
 
 返回统一回执（OPEN/CLOSE 同形）：
 
@@ -56,9 +60,9 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 | `reduce_only_fallback`/`fills_ok` | CLOSE 专属：是否经 reduceOnly 市价单完成平仓（2026-07-03 起为主路径，正常情况即 True；False=降级走 swap close CLI 兜底）/ fills 是否回读成功 |
 | `note` | 如 `no_open_position`（已平，幂等成功） |
 
-> **OPEN 不变量**：装配现场 -> 强制 risk_validator -> 市价开仓即附挂 SL（原子无裸仓窗口）-> 附挂失败独立 algo SL（重试1）-> 仍失败立即市价平掉裸仓 unwind(p0) -> 回读 fills 求真成交（拉不到 -> repair_queue + reject + p0）。
-> **CLOSE 不变量**（2026-07-03 主路径反转）：OKX API 现仓确认 posSide -> reduceOnly 反向市价单（主路径，拿 ordId 即时确认，绝不翻反向仓）-> 被拒（51023/51169 等）转 swap close CLI 兜底 -> 51087 下架/51001 不存在明确拒因 -> 回读 fills 求真 pnl。
-> **live/demo 开仓必须传 `sl_trigger_px`**，否则 reject `no_sl`（双盘一致）。
+> **OPEN 不变量**：装配现场 -> 强制 risk_validator -> 市价开仓即附挂 SL -> 按 symbol、posSide、平仓 side、reduceOnly、数量、触发价和 live 状态回读，独立 algo 必须命中本次精确 algoId -> 附挂失败独立 algo SL（重试1）-> 仍失败立即市价平掉裸仓 unwind(p0) -> 从 fills/订单状态/订单历史端点求真实际成交（均失败 -> repair_queue + reject + p0）。
+> **CLOSE 不变量**（2026-07-03 主路径反转）：OKX API 现仓确认 posSide -> reduceOnly 反向市价单（主路径，拿 ordId 即时确认，绝不翻反向仓）-> 被拒（51023/51169 等）转 swap close CLI 兜底 -> 51087 下架/51001 不存在明确拒因 -> 权威端点回读真实 pnl、实际 `fill_sz` 和 `fill_ts`。
+> **live/demo 开仓必须传 `sl_trigger_px`**；缺失或非有限、long 不低于 mark、short 不高于 mark、偏离超过 30% 均 reject（双盘一致）。
 
 ## 2. trades[] 每笔成交字段（喂 trades_writer.trades 表）
 
@@ -70,6 +74,8 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
   "action": "open",
   "side": "long",
   "sz": 1,
+  "fill_sz": 1,
+  "approved_sz": 2,
   "fill_px": 62500.0,
   "px": 62500.0,
   "lev": 5,
@@ -84,12 +90,14 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
   "sl_mode": "attached",
   "sl_verified": true,
   "fill_source": "fills",
+  "fill_ts": "2026-07-29 10:15:04",
+  "ts_source": "fills.fillTime",
   "ct_val": 0.01,
   "ordId": "<ordId>"
 }
 ```
 
-> 补键释义（2026-07-17 补齐至现行回执）：`sl_mode`=`'attached'`（随开仓附挂）/`'algo'`（独立 algo SL belt）/`'none'`（S2d 如实标注）；`sl_verified`=SL 挂单回读确认真挂上（2026-07-07 #5，dryrun 跳过）；`fill_source`=成交确认来源（`'fills'` 主源，回退订单状态/orders-history 双源，`'approx_agg'` 兜底标记，CLOSE 另有 `'unconfirmed'`）；`ct_val`=本环境真实合约面值（2026-07-07 起回执携带，writer 补算优先行内值——demo 分列合约与 market.db 缓存的 live 口径可差 100x）；`ordId`=成交订单号（合并闸/journal 重放按此精确匹配）。示例数字已按 `notional = sz*ctVal*fill_px` 自洽（1×0.01×62500=625）。
+> 补键释义（2026-07-29）：`sl_mode`=`'attached'`（随开仓附挂）/`'algo'`（独立 algo SL belt）/`'none'`（仅 dry-run/明确降级留痕）；`sl_verified`=同一张 SL 挂单经严格身份字段回读确认；confirmed 的 `fill_source` 只接受真实确认来源 `fills|order_status|orders_history`。confirmed 的 `sz` 是权威端点实际 `fill_sz`，`approved_sz` 只记录风控批准上限，部分成交时两者可以不同；`fill_ts/ts_source` 记录权威成交时间与来源。fills 取最后一笔 `fillTime`（缺失用该 fill `ts`），订单状态取 `fillTime`（缺失用终态 `uTime`），禁止用 `cTime` 冒充。OPEN 所有权威端点都无法确认时必须 reject，不得以 mark price、历史聚合或估算值伪造成交；CLOSE 可记录仓位已消失但成交事实待对账的 `unconfirmed` 状态，此时 `fill_sz/fill_px/pnl/fill_ts=null`，`sz` 仅保留仓前请求量用于审计，不计作已确认成交统计。`ct_val`=本环境真实合约面值；`ordId`=成交订单号（合并闸/journal 重放按此精确匹配）。示例数字按 `notional = sz*ctVal*fill_px` 自洽。
 
 CLOSE 产出：`action="close"`、`pnl`=回读 fills 真实 pnl（拉不到为 null）、`reduce_only_fallback`、无 `lev/margin/notional`。
 
@@ -98,11 +106,12 @@ CLOSE 产出：`action="close"`、`pnl`=回读 fills 真实 pnl（拉不到为 n
 | `symbol` | `symbol` | 必填，writer 校验非空 |
 | `action` | `action` | `'open'`/`'close'`/`'add'`/`'reduce'`/`'none'`。**`none` 行 writer 跳过不落** |
 | `side` | `side` | long/short |
-| `sz` | `sz` | 张数（risk_validator 已按 lot_sz 取整的 approved_sz） |
-| `fill_px` | `fill_px` | 回读 fills 真实成交价（拉不到回退 mark_px） |
+| `sz` | `sz` | confirmed 时为权威成交端点确认的实际 `fill_sz`；unconfirmed close/reduce 时仅为仓前请求量审计，禁止计作已确认成交 |
+| `fill_sz` | trade raw 审计字段 | confirmed 时必须与 `sz` 相等；unconfirmed 时必须为 null，等待对账 |
+| `fill_px` | `fill_px` | 权威成交端点确认的真实成交价；OPEN 缺失即拒绝，禁止回退 mark price/历史聚合。CLOSE 仅 `fill_source=unconfirmed` 时可为 null，等待对账且不计入已确认成交统计 |
 | `lev` | `lev` | 杠杆 |
 | `margin` | `margin` | 每仓保证金 = notional / lev |
-| `notional` | `notional` | 名义 = approved_sz * ctVal * fill_px |
+| `notional` | `notional` | 名义 = 实际 `sz * ctVal * fill_px` |
 | `score_total` | null | 历史兼容列；decision_card_v1 不再回填评分 |
 | `reasoning` | `reasoning`（执行器用 `reason`，trader 装配时映射） | 决策依据 |
 | `deviation` | `deviation` | 偏离信号留痕（可选） |
@@ -156,7 +165,7 @@ trader 聚合本轮各币执行回执，装配 cycle 级 JSON 喂 writer（落 `
 {
   "cycle_id": "2026-06-24T14:00",
   "ts": "2026-06-24 14:06:10",
-  "mode": "full",
+  "mode": "live",
   "decision": "traded",
   "action": "BTC/USDT: open_long",
   "regime": "risk_on",
@@ -189,11 +198,13 @@ trader 聚合本轮各币执行回执，装配 cycle 级 JSON 喂 writer（落 `
 }
 ```
 
+> 正常生产写入时 `trade_cycles.ts` 由 writer 取当前 CST 提交时间；调用方传入的 `ts` 只保留在 raw 作为 `reported_ts`，不得控制业务时间。每笔 `trades.ts` 优先用 executor 的权威 `fill_ts`；缺失时 writer 才使用提交时间，并在 raw 写明 `ts_source=writer_commit_fallback`。只有受控 journal/维护入口可以显式使用可信内部时间覆盖。
+
 | `trade_cycles` 落库列 | 取自 cycle 字段 | 说明 |
 |---|---|---|
 | `cycle_id` | `cycle_id` | 必填（writer 校验），UTC+8 槽位 |
 | `ts` | `ts`（缺则 now UTC+8） | 完成时刻 |
-| `mode` | `mode`（固定 full） | full |
+| `mode` | writer 按 `profile` 固定 | `live` 或 `demo`；payload 中自填的 `full` 不作为落库事实 |
 | `decision` | `decision`（归一：traded/hold/skip/degraded/error；open->traded、none/空->hold） | writer `normalize_decision` |
 | `n_orders` | `n_orders` | 实际写出订单数（writer 按落库 trades 计） |
 | `equity` | `equity` | 账户权益（OKX API，禁 position_snapshots） |
@@ -222,21 +233,25 @@ trader 决策前搜相似经验，把盈利、亏损与错失机会写进决策�
 
 ## 6. 调用与校验
 
-```powershell
-# 先用 write 文件工具直接写 <PROJECT_ROOT>/tmp/_receipt_live_YYYY-MM-DDTHH-MM.json
-# （文件名用 HH-MM；raw cycle 的 HH:MM 会在 NTFS 上变成 ADS，禁止）
-pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\collectors\trades_writer.py --json-file <PROJECT_ROOT>\tmp\_receipt_live_YYYY-MM-DDTHH-MM.json --cycle-id YYYY-MM-DDTHH:MM --profile live
-# demo 同形，文件名/profile 换 demo
-# 执行器干跑（不真下单）：先 OKX_EXECUTOR_DRYRUN=1
+```python
+# 该片段必须与 open_position/close_position 调用处于同一临时 Python 进程。
+from collectors.trades_writer import commit_receipt
+
+receipt = open_position(..., cycle_id=cycle_id, receipt_context=receipt_context)
+result = commit_receipt(receipt, profile)
+if not result.get("ok") or result.get("refused"):
+    raise RuntimeError(result)
 ```
+
+无成交 HOLD/ADJUST 才可把完整 cycle 回执写入 `<PROJECT_ROOT>/tmp/_receipt_<profile>_YYYY-MM-DDTHH-MM.json`，再调 `trades_writer.py --json-file ...`。文件名中的 `:` 必须换成 `-`，防止 NTFS ADS。
 
 | 校验项 | 由谁 | 失败行为 |
 |---|---|---|
 | 风控硬闸（live 越不过） | `core/risk_validator.validate`（执行器内部强制调） | reject -> 执行器回执 `ok=false action_taken=REJECT`，**不下单** |
-| SL 保障（live 必带且必挂上） | `core/order_executor.open_position` | 无 SL reject；挂单全败 -> 市价平裸仓 UNWIND + p0 |
+| SL 保障（live/demo 必带、方向正确且必须挂上） | `core/risk_validator.validate` + `core/order_executor.open_position` | 无效/反向 SL reject；严格身份回读失败后重试独立 SL；挂单全败 -> 市价平裸仓 UNWIND + p0 |
 | 现仓真伪 | OKX API（`fetch_open_positions`） | 禁 position_snapshots GROUP BY（红线 #6） |
-| 成交真伪 | 回读 fills（`_read_fills`，重试 3） | 拉不到 -> repair_queue + reject + p0 |
-| 回执 schema（必填 `cycle_id`；`decision` 可归一；`trades` 是 list 且每元素含 `symbol`） | `trades_writer.validate` | 错误列表 -> exit 1，**不写库** |
+| 成交真伪 | fills → order status / orders-history 双源确认 | OPEN 均确认不了 -> repair_queue + reject + p0；禁止 mark/聚合估算兜底。CLOSE 未确认只留 null 待对账，不计确认成交 |
+| 回执 schema（必填 `cycle_id`；完整 decision_card；`trades` 是 list；动作合法；拒单不得进 trades；成交 `sz>0`；OPEN `fill_px>0`） | `trades_writer.validate` | 错误列表 -> exit 1，**不写库** |
 | 落地核对 | 读 `*_trades.db` trade_cycles/trades + `ledger.py show` | 账本核对真落地 |
 
 成功输出：`{"ok": true, "cycle_id": "...", "n_orders": N}`（exit 0）。

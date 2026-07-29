@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-r"""交易所侧平仓（SL 触发等）落账对账（F2，2026-07-06）。
+r"""交易所侧/执行后平仓漏落账对账（F2，2026-07-06）。
 
-背景：algo 止损单被交易所执行后，账本（live/demo trades.db）无任何落账路径——
+背景：algo 止损或主动平仓已在交易所成交后，账本（live/demo trades.db）可能漏写——
 仓位从 position_snapshots 消失、trades 表却无 close 行，形成「幽灵仓」：
-  - 账本轧差净持仓 > OKX API 现仓 → 幽灵（多为 SL 触发平仓漏记账）；
+  - 账本轧差净持仓 > OKX API 现仓 → 幽灵；
+  - 实证：live LINK-USDT-SWAP 11.4 张（2026-07-05 10:11:55 SL 卖出 pnl=-1.5276）、
+    demo LAB-USDT-SWAP 110 张（2026-07-06 04:22:40 SL 卖出 pnl=-5.346）。
 
-逻辑：
+逻辑（先例＝2026-07-04 demo ATOM 补账：fills 实证 → trades_writer.write_trades 直调）：
   1. 读该 profile trades 轧差净持仓（open/add 加、close/stop_loss/reduce 减，按 symbol+side）；
   2. 对比 OKX API 现仓（`account positions --instType SWAP`）；
   3. 账本多出的幽灵仓 → 按 symbol 回读 fills（recent + --archive 合并去重），
@@ -18,7 +20,8 @@ r"""交易所侧平仓（SL 触发等）落账对账（F2，2026-07-06）。
      两者都不满足 → 模糊，只报告；
   6. --apply：精确匹配项经 collectors/trades_writer.write_trades 直调补一行 close
      （action='close'，pnl=fills fillPnl 合计，cycle_id=平仓时刻所在 15min 槽，
-      raw 标 reconcile_source='exchange_fills_sl'）；目标 cycle 已存在时先读原行，
+      优先用执行 journal 还原主动平仓语义，否则中性标记 exchange fills）；
+      目标 cycle 已存在时先读原行，
       原有 trades 行合并进 payload（write_trades 是 REPLACE+DELETE 语义，不合并会销账）。
 
 只报告不写的类别：
@@ -38,8 +41,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -242,6 +247,199 @@ def consume_recorded(groups, rows, t0_dt):
     return remaining, notes
 
 
+def find_journal_close(db_path, profile, sym, ord_ids):
+    """按 ordId 从 append-only 执行 journal 找已确认 close；找不到返回 None。"""
+    wanted = {str(value) for value in ord_ids if value not in (None, "")}
+    if not wanted:
+        return None
+    path = Path(db_path).parent / "journal" / f"exec_{profile}.jsonl"
+    if not path.is_file():
+        return None
+    found = None
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line_no, line in enumerate(stream, 1):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            trade = record.get("trade")
+            if not isinstance(trade, dict):
+                continue
+            if str(trade.get("symbol") or "") != str(sym):
+                continue
+            if str(trade.get("action") or "").lower() != "close":
+                continue
+            trade_ord_ids = {
+                str(trade.get("ordId") or ""),
+                *[
+                    str(value)
+                    for value in ((trade.get("raw") or {}).get("ord_ids") or [])
+                ],
+            }
+            if wanted.isdisjoint(trade_ord_ids):
+                continue
+            found = {
+                "line_no": line_no,
+                "record": record,
+                "trade": trade,
+                "path": str(path),
+            }
+    return found
+
+
+def repair_existing_from_journal(db_path, profile, ord_id, con_ro):
+    """把已补账但误标为 SL 的 close 元数据改为执行 journal 实情。
+
+    仅在唯一 trade 行明确含目标 ordId、且 journal 的 symbol/side/sz/px/pnl
+    与主账一致时允许写；成交事实不变，仍经 trades_writer 整 cycle 重写。
+    """
+    matches = []
+    rows = con_ro.execute(
+        "SELECT id,cycle_id,ts,symbol,action,side,sz,fill_px,lev,margin,notional,"
+        "score_total,reasoning,deviation,degradation,pnl,raw "
+        "FROM trades ORDER BY rowid"
+    ).fetchall()
+    for row in rows:
+        try:
+            raw = json.loads(row["raw"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            raw = {}
+        row_ord_ids = {
+            str(raw.get("ordId") or ""),
+            *[str(value) for value in (raw.get("ord_ids") or [])],
+        }
+        if str(ord_id) in row_ord_ids:
+            matches.append((row, raw))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"ordId={ord_id} 主账命中 {len(matches)} 行，拒绝元数据校正"
+        )
+    target, target_raw = matches[0]
+
+    journal = find_journal_close(
+        db_path, profile, target["symbol"], [str(ord_id)]
+    )
+    if not journal:
+        raise RuntimeError(f"ordId={ord_id} 未找到执行 journal close，拒绝校正")
+    jt = journal["trade"]
+    comparisons = (
+        ("side", str(target["side"]), str(jt.get("side"))),
+        ("sz", f(target["sz"], 0.0), f(jt.get("sz"), 0.0)),
+        ("fill_px", f(target["fill_px"], 0.0), f(jt.get("fill_px"), 0.0)),
+        ("pnl", f(target["pnl"], 0.0), f(jt.get("pnl"), 0.0)),
+    )
+    for name, actual, expected in comparisons:
+        if name == "side":
+            equal = actual == expected
+        else:
+            equal = abs(actual - expected) <= SZ_TOL
+        if not equal:
+            raise RuntimeError(
+                f"ordId={ord_id} journal {name} 不一致: ledger={actual} journal={expected}"
+            )
+
+    cycle_id = target["cycle_id"]
+    prev = con_ro.execute(
+        "SELECT cycle_id,ts,decision,n_orders,equity,note,raw "
+        "FROM trade_cycles WHERE cycle_id=?",
+        (cycle_id,),
+    ).fetchone()
+    if not prev:
+        raise RuntimeError(f"cycle={cycle_id} trade_cycles 缺失，拒绝校正")
+    clean_note = f"execution journal 已核验主动平仓 ordId={ord_id}"
+    if (
+        target_raw.get("reconcile_source") == "execution_journal_recovery"
+        and clean_note in (prev["note"] or "")
+        and "exchange-side SL" not in (prev["note"] or "")
+        and (target["reasoning"] or "") == (jt.get("reason") or "")
+    ):
+        return {"status": "already_consistent", "cycle_id": cycle_id}
+    cycle_trades = [
+        dict(row)
+        for row in con_ro.execute(
+            "SELECT symbol,action,side,sz,fill_px,lev,margin,notional,"
+            "score_total,reasoning,deviation,degradation,pnl,raw "
+            "FROM trades WHERE cycle_id=? ORDER BY rowid",
+            (cycle_id,),
+        ).fetchall()
+    ]
+    replaced = 0
+    for trade in cycle_trades:
+        try:
+            raw = json.loads(trade.get("raw") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            raw = {}
+        row_ord_ids = {
+            str(raw.get("ordId") or ""),
+            *[str(value) for value in (raw.get("ord_ids") or [])],
+        }
+        if str(ord_id) not in row_ord_ids:
+            continue
+        raw.setdefault("original_reconcile_source", raw.get("reconcile_source"))
+        raw["reconcile_source"] = "execution_journal_recovery"
+        raw["journal_path"] = journal["path"]
+        raw["journal_line"] = journal["line_no"]
+        raw["journal_ts"] = journal["record"].get("ts")
+        raw["action_taken"] = journal["record"].get("action_taken")
+        trade["raw"] = raw
+        trade["reasoning"] = jt.get("reason") or trade.get("reasoning")
+        replaced += 1
+    if replaced != 1:
+        raise RuntimeError(f"ordId={ord_id} cycle 内替换行数={replaced}，拒绝校正")
+
+    try:
+        cycle_raw = json.loads(prev["raw"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        cycle_raw = {}
+    if not isinstance(cycle_raw, dict):
+        cycle_raw = {"original_raw": cycle_raw}
+    cycle_raw.setdefault("original_note", prev["note"])
+    cycle_raw.setdefault(
+        "original_reconcile_source", cycle_raw.get("reconcile_source")
+    )
+    cycle_raw["reconcile_source"] = "execution_journal_recovery"
+    cycle_raw["journal_evidence"] = {
+        "path": journal["path"],
+        "line": journal["line_no"],
+        "ts": journal["record"].get("ts"),
+        "ord_id": str(ord_id),
+    }
+    data = {
+        "cycle_id": cycle_id,
+        "ts": prev["ts"],
+        "decision": prev["decision"],
+        "action": (
+            f"journal recovery: {target['symbol']} {target['side']} "
+            f"close {target['sz']:g} @ {target['fill_px']:.6g}"
+        ),
+        "note": (
+            clean_note
+        ),
+        "n_orders": len(cycle_trades),
+        "equity": prev["equity"],
+        "trades": cycle_trades,
+        "raw": cycle_raw,
+        "_profile": profile,
+    }
+    result = trades_writer.maintenance_write_trades(
+        data,
+        Path(db_path),
+        trusted_timestamp=data.get("ts"),
+        preserve_equity_none=True,
+    )
+    if not result.get("ok") or result.get("refused"):
+        raise RuntimeError(f"trades_writer 拒绝 journal 元数据校正: {result}")
+    return {
+        "status": "repaired",
+        "cycle_id": cycle_id,
+        "ord_id": str(ord_id),
+        "journal_line": journal["line_no"],
+        "writer": result,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 补账（--apply，经硬化 writer；目标 cycle 已存在时合并原行防销账）
 # ---------------------------------------------------------------------------
@@ -262,6 +460,11 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
     close_ts = close_dt.strftime(TS_FMT)
     cycle_id = slot_cycle_id(close_dt)
     ord_ids = sorted({g["ordId"] for g in matched})
+    journal = find_journal_close(db_path, profile, sym, ord_ids)
+    journal_trade = journal["trade"] if journal else {}
+    reconcile_source = (
+        "execution_journal_recovery" if journal else "exchange_fills_reconcile"
+    )
 
     # 目标 cycle 原行（只读连接查）
     prev = con_ro.execute(
@@ -288,14 +491,28 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
         "margin": None,
         "notional": None,
         "score_total": None,
-        "reasoning": (f"reconcile_exchange_closes 补账：交易所侧平仓（SL 触发）漏落账；"
-                      f"fills 实证 {len(all_fills)} 笔 ordId={','.join(ord_ids)} "
-                      f"平仓时刻={close_ts} pnl={tot_pnl}"),
+        "reasoning": (
+            journal_trade.get("reason")
+            or (
+                f"reconcile_exchange_closes 补账：交易所侧平仓漏落账；"
+                f"fills 实证 {len(all_fills)} 笔 ordId={','.join(ord_ids)} "
+                f"平仓时刻={close_ts} pnl={tot_pnl}"
+            )
+        ),
         "deviation": None,
         "degradation": None,
         "pnl": tot_pnl,
-        "raw": {"reconcile_source": "exchange_fills_sl", "close_ts": close_ts,
-                "ord_ids": ord_ids, "fills": fills_evidence},
+        "raw": {
+            "reconcile_source": reconcile_source,
+            "close_ts": close_ts,
+            "ord_ids": ord_ids,
+            "fills": fills_evidence,
+            "journal_path": journal.get("path") if journal else None,
+            "journal_line": journal.get("line_no") if journal else None,
+            "journal_ts": (
+                journal["record"].get("ts") if journal else None
+            ),
+        },
     }
     trades.append(reconcile_trade)
 
@@ -309,12 +526,21 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
             prev_raw_obj = {"_unparsed": str(prev["raw"])[:2000]}
 
     raw_obj = {
-        "reconcile_source": "exchange_fills_sl",
+        "reconcile_source": reconcile_source,
         "reconciled_at": datetime.now(CST).strftime(TS_FMT),
         "symbol": sym, "side": side, "ghost_sz": ghost_sz,
         "close_ts": close_ts, "pnl": tot_pnl, "wavg_px": wavg_px,
         "ord_ids": ord_ids,
         "fills": fills_evidence,
+        "journal_evidence": (
+            {
+                "path": journal["path"],
+                "line": journal["line_no"],
+                "ts": journal["record"].get("ts"),
+            }
+            if journal
+            else None
+        ),
         "prev_cycle": ({"decision": prev["decision"], "n_orders": prev["n_orders"],
                         "ts": prev["ts"], "note": prev_note[:1000],
                         "raw": prev_raw_obj} if prev else None),
@@ -326,7 +552,10 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
         # 否则用 fills 实证的平仓时刻。
         "ts": (prev["ts"] if (prev and prev_trades) else close_ts),
         "decision": "traded",
-        "action": f"reconcile: {sym} {side} close {tot_sz:g} @ {wavg_px:.6g} (exchange-side SL)",
+        "action": (
+            f"reconcile: {sym} {side} close {tot_sz:g} @ {wavg_px:.6g} "
+            f"({'execution journal' if journal else 'exchange fills'})"
+        ),
         "note": (f"reconcile_exchange_closes 补账 pnl={tot_pnl}"
                  + (f" | 原行 note: {prev_note[:300]}" if prev_note else "")),
         "n_orders": len(trades),
@@ -335,7 +564,14 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
         "raw": raw_obj,
         "_profile": profile,
     }
-    result = trades_writer.write_trades(data, Path(db_path))
+    result = trades_writer.maintenance_write_trades(
+        data,
+        Path(db_path),
+        trusted_timestamp=data.get("ts"),
+        preserve_equity_none=True,
+    )
+    if not result.get("ok") or result.get("refused"):
+        raise RuntimeError(f"trades_writer 拒绝补账: {result}")
     # 经验库闭环（非致命）：只喂 reconcile 那一行，防止合并进来的原 trades 重复写经验
     exp = trades_writer.write_experiences(
         {"cycle_id": cycle_id, "trades": [reconcile_trade]}, profile, close_ts)
@@ -348,12 +584,18 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
 # 主流程
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="交易所侧平仓（SL 触发）落账对账")
+    ap = argparse.ArgumentParser(description="交易所侧/执行后平仓漏落账对账")
     ap.add_argument("--profile", choices=["live", "demo"], required=True)
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--apply", action="store_true",
                     help="对精确匹配幽灵经 trades_writer 补 close 行（默认 dry-run 只报告）")
+    ap.add_argument("--ordid",
+                    help="仅 apply 含该 ordId 的唯一 GHOST-EXACT；live --apply 必填")
     args = ap.parse_args()
+    if args.apply and args.profile == "live" and not args.ordid:
+        print("[reconcile][ERROR] live --apply 必须同时给 --ordid；"
+              "禁止宽口径一次补全部精确项")
+        return 2
 
     db_root = Path(args.db_root)
     db_path = db_root / f"{args.profile}_trades.db"
@@ -408,6 +650,28 @@ def main():
             print(f"  {sym} {side} venue={sz:g} ledger={nets.get((sym, side), 0.0):g}")
 
     if not ghosts:
+        if args.apply and args.ordid:
+            try:
+                metadata_result = repair_existing_from_journal(
+                    db_path, args.profile, args.ordid, con
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n[reconcile][ERROR] journal 元数据校正失败: {exc}")
+                con.close()
+                return 2
+            if metadata_result is None:
+                print(
+                    f"\n[reconcile][ERROR] ordId={args.ordid} 未命中已落账 close；"
+                    "拒绝把无幽灵仓误报为修复成功"
+                )
+                con.close()
+                return 2
+            print(
+                "\n[JOURNAL-METADATA] "
+                f"ordId={args.ordid} status={metadata_result['status']} "
+                f"cycle={metadata_result['cycle_id']} "
+                f"journal_line={metadata_result.get('journal_line', '-')}"
+            )
         print("\n结论: 无幽灵仓（账本 ≤ 现仓）✓")
         con.close()
         return 0
@@ -471,10 +735,22 @@ def main():
         for line in detail:
             print(f"  {line}")
 
+    apply_exact = exact
+    if args.ordid:
+        apply_exact = [
+            row for row in exact
+            if str(args.ordid) in {str(g.get("ordId")) for g in row[2]}
+        ]
+        if len(apply_exact) != 1:
+            con.close()
+            print(f"\n结论: --ordid={args.ordid} 必须唯一命中 1 个 "
+                  f"GHOST-EXACT，实际={len(apply_exact)}（exit 2）")
+            return 2
+
     rc_apply_err = False
     if args.apply and exact:
-        print(f"\n== APPLY：补账 {len(exact)} 项（经 trades_writer.write_trades）==")
-        for (sym, side), ghost_sz, matched, _ in exact:
+        print(f"\n== APPLY：补账 {len(apply_exact)} 项（经 trades_writer.write_trades）==")
+        for (sym, side), ghost_sz, matched, _ in apply_exact:
             open_lev = None
             for r in reversed(by_key[(sym, side)]):
                 if (r["action"] or "").lower() in ("open", "add") and r["lev"]:
@@ -502,6 +778,10 @@ def main():
         return 3
     if exact and not args.apply:
         print("\n结论: 有精确可补幽灵（exit 1，加 --apply 补账）")
+        return 1
+    if args.apply and len(apply_exact) < len(exact):
+        print(f"\n结论: 指定 ordId 已补，但仍有 "
+              f"{len(exact) - len(apply_exact)} 个其他 GHOST-EXACT 未处理（exit 1）")
         return 1
     print("\n结论: 精确幽灵已全部补账 ✓（复跑 dry 验证轧差与现仓一致）")
     return 0

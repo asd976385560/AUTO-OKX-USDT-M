@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""采集高价值币种的50档订单簿与最近逐笔成交影子特征。
+"""采集高价值币种的盘口、逐笔成交与多空账户比影子特征。
 
 覆盖范围：
   BTC/ETH/SOL + focus.md关注币 + 最新快照按美元成交额动态补足。
@@ -7,14 +7,17 @@
 
 本脚本只生成影子特征，不改变分析评分和交易风控。
 历史默认保留30天；每日04:45槽由本脚本自己的写连接裁剪，避免50档原始JSON无界增长。
+多空账户比优先走 OKX CLI，每小时 :00 槽采动态重点集；失败不阻断盘口/逐笔主路径。
 """
 from __future__ import annotations
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -25,11 +28,12 @@ import json
 import re
 import sqlite3
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _okx_http import fetch_orderbooks_batch_sync, fetch_recent_trades_batch_sync
+from _okxcli import okx_json
 
 CST = timezone(timedelta(hours=8))
 ROOT = Path(_project_path())
@@ -37,6 +41,8 @@ BASE_SYMBOLS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP")
 DEPTH_BPS = (10, 25, 50)
 SLIPPAGE_USD = (100, 500, 1000)
 DEFAULT_RETENTION_DAYS = 30
+DEFAULT_POSITIONING_SYMBOLS = 20
+DEFAULT_POSITIONING_WORKERS = 6
 
 
 def utc_now_iso() -> str:
@@ -212,12 +218,116 @@ def flow_features(trades: list, ct_val: float, cycle_id: str, collected_ts: str,
     )
 
 
+def positioning_due(cycle_id: str, mode: str) -> bool:
+    """auto 仅在整点周期采；always 供隔离验证/人工补采，off 明确关闭。"""
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:00", cycle_id))
+
+
+def positioning_row(payload, cycle_id: str, collected_ts: str,
+                    requested_symbol: str) -> tuple:
+    """解析 OKX CLI top-long-short --list 的最新 1H 账户比。"""
+    roots = payload if isinstance(payload, list) else [payload]
+    candidates: list[tuple[int, str, dict, dict]] = []
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        for block in root.get("data") or []:
+            if not isinstance(block, dict):
+                continue
+            symbol = str(block.get("instId") or requested_symbol)
+            records = (
+                ((block.get("timeframes") or {}).get("1H") or {})
+                .get("indicators") or {}
+            ).get(
+                "TOPLONGSHORT", []
+            )
+            for rec in records or []:
+                if not isinstance(rec, dict):
+                    continue
+                try:
+                    ts_ms = int(rec.get("ts"))
+                except (TypeError, ValueError):
+                    continue
+                values = rec.get("values") or {}
+                candidates.append((ts_ms, symbol, values, rec))
+    if not candidates:
+        raise ValueError("TOPLONGSHORT 1H 数据为空")
+    ts_ms, symbol, values, raw_record = max(candidates, key=lambda item: item[0])
+    long_ratio = to_float(values.get("longRatio"))
+    short_ratio = to_float(values.get("shortRatio"))
+    ratio = to_float(values.get("longShortRatio"))
+    if long_ratio is None or short_ratio is None or ratio is None:
+        raise ValueError("TOPLONGSHORT 比例字段缺失")
+    source_ts = ms_to_iso(ts_ms)
+    if not source_ts:
+        raise ValueError("TOPLONGSHORT 时间戳非法")
+    return (
+        source_ts, collected_ts, cycle_id, symbol, "1H",
+        long_ratio, short_ratio, ratio,
+        json.dumps(raw_record, ensure_ascii=False),
+        "okx_cli_top_long_short",
+    )
+
+
+def fetch_positioning_rows(symbols: list[str], cycle_id: str, collected_ts: str,
+                           workers: int) -> tuple[list[tuple], list[str]]:
+    """并发启动只读 CLI；每币零重试，避免小时槽因单币网络问题拖长。"""
+    rows: list[tuple] = []
+    errors: list[str] = []
+
+    def fetch_one(symbol: str) -> tuple:
+        payload = okx_json(
+            "market", "indicator", "top-long-short", symbol,
+            "--list", "--limit", "1",
+            timeout_sec=12.0, retries=0,
+        )
+        return positioning_row(payload, cycle_id, collected_ts, symbol)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 12))) as ex:
+        futures = {ex.submit(fetch_one, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:  # noqa: BLE001 - 单币失败隔离
+                errors.append(f"{symbol}:positioning:{type(exc).__name__}:{exc}")
+    rows.sort(key=lambda row: row[3])
+    return rows, errors
+
+
+def write_positioning_rows(con: sqlite3.Connection, rows: list[tuple]) -> int:
+    if not rows:
+        return 0
+    exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='market_positioning'"
+    ).fetchone()
+    if not exists:
+        raise RuntimeError("market_positioning table missing")
+    con.executemany(
+        "INSERT OR REPLACE INTO market_positioning "
+        "(ts,collected_ts,cycle_id,symbol,timeframe,long_ratio,short_ratio,"
+        "long_short_ratio,raw,source) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
 def prune_feature_history(con: sqlite3.Connection, retention_days: int) -> dict[str, int]:
     """由本表权威writer裁剪历史；新表ts固定为UTC-Z，可直接交给SQLite datetime解析。"""
     if not 7 <= retention_days <= 365:
         raise ValueError("retention_days必须在7..365之间")
     out = {}
-    for table in ("market_microstructure", "market_trade_flow"):
+    for table in ("market_microstructure", "market_trade_flow", "market_positioning"):
+        exists = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not exists:
+            continue
         cur = con.execute(
             f"DELETE FROM {table} WHERE datetime(ts) < datetime('now', ?)",
             (f"-{retention_days} days",),
@@ -235,6 +345,20 @@ def main() -> int:
     ap.add_argument("--trades-limit", type=int, default=500)
     ap.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     ap.add_argument("--cycle", default=None)
+    ap.add_argument(
+        "--positioning", choices=("auto", "always", "off"), default="auto",
+        help="OKX CLI 多空账户比：auto=仅整点，always=本轮，off=关闭",
+    )
+    ap.add_argument(
+        "--positioning-max-symbols", type=int, default=DEFAULT_POSITIONING_SYMBOLS
+    )
+    ap.add_argument(
+        "--positioning-workers", type=int, default=DEFAULT_POSITIONING_WORKERS
+    )
+    ap.add_argument(
+        "--positioning-only", action="store_true",
+        help="仅采多空账户比，不抓/写盘口和逐笔；用于隔离验证或人工补采",
+    )
     args = ap.parse_args()
     if args.depth != 50:
         print(json.dumps({"ok": False, "error": "生产深度固定为50档"}, ensure_ascii=False))
@@ -244,6 +368,28 @@ def main() -> int:
     con = sqlite3.connect(str(db_path), timeout=20)
     try:
         symbols = select_symbols(con, max(3, min(args.max_symbols, 100)), Path(args.focus_file))
+        collected_ts = utc_now_iso()
+        cycle = args.cycle or cycle_id_now()
+        if args.positioning_only:
+            positioning_symbols = symbols[
+                :max(3, min(args.positioning_max_symbols, len(symbols)))
+            ]
+            positioning_rows, errors = fetch_positioning_rows(
+                positioning_symbols, cycle, collected_ts, args.positioning_workers
+            )
+            wrote = write_positioning_rows(con, positioning_rows)
+            con.commit()
+            print(json.dumps({
+                "ok": bool(wrote),
+                "cycle": cycle,
+                "selected": positioning_symbols,
+                "wrote": {"positioning": wrote},
+                "positioning_due": True,
+                "positioning_only": True,
+                "errors": errors[:20],
+            }, ensure_ascii=False))
+            return 0 if wrote else 1
+
         specs = {
             r[0]: float(r[1] or 0)
             for r in con.execute(
@@ -257,10 +403,9 @@ def main() -> int:
             books = books_future.result()
             trades = trades_future.result()
 
-        collected_ts = utc_now_iso()
-        cycle = args.cycle or cycle_id_now()
         book_rows = []
         flow_rows = []
+        positioning_rows = []
         errors = []
         for symbol in symbols:
             ct_val = specs.get(symbol, 0)
@@ -278,6 +423,16 @@ def main() -> int:
             else:
                 errors.append(f"{symbol}:trades_empty")
 
+        do_positioning = positioning_due(cycle, args.positioning)
+        if do_positioning:
+            positioning_symbols = symbols[
+                :max(3, min(args.positioning_max_symbols, len(symbols)))
+            ]
+            positioning_rows, positioning_errors = fetch_positioning_rows(
+                positioning_symbols, cycle, collected_ts, args.positioning_workers
+            )
+            errors.extend(positioning_errors)
+
         con.executemany(
             "INSERT OR REPLACE INTO market_microstructure VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -288,6 +443,12 @@ def main() -> int:
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             flow_rows,
         )
+        if positioning_rows:
+            try:
+                write_positioning_rows(con, positioning_rows)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                positioning_rows = []
         pruned = {}
         if cycle.endswith("T04:45"):
             pruned = prune_feature_history(con, args.retention_days)
@@ -296,7 +457,12 @@ def main() -> int:
             "ok": bool(book_rows),
             "cycle": cycle,
             "selected": symbols,
-            "wrote": {"microstructure": len(book_rows), "trade_flow": len(flow_rows)},
+            "wrote": {
+                "microstructure": len(book_rows),
+                "trade_flow": len(flow_rows),
+                "positioning": len(positioning_rows),
+            },
+            "positioning_due": do_positioning,
             "depth_levels": 50,
             "retention_days": args.retention_days,
             "pruned": pruned,

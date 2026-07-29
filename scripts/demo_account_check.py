@@ -2,27 +2,29 @@
 """demo 虚拟盘账实核对 v2（T8 + 2026-06-13 首夜规划快修组）。
 
 v1（2026-06-12）：ghost / unrecorded / sz_diff 三类对账。
-v2（2026-06-13）新增三能力——
-  A. 权益落库（每次必做，不受 --apply 限制）：balance.totalEq/availBal + 持仓 upl 合计
-     → account.db.account_snapshots(profile='demo')。**此值 = demo equity 全系统唯一口径**
-     （P5 current_equity、推送资产段、基线全取此，保持单一口径）。
-  B. pnl 回填（--apply）：drill 里 close_reason LIKE 'demo-reconcile%' 且 pnl IS NULL 的行，
-     按 `swap fills` 真实平仓腿（fillPnl≠0）求和，按 sz 加权分摊回填 pnl/close_px。
-  C. SL 同步（--apply）：`swap algo orders` 在挂单的 slTriggerPx/triggerPx 写回 drill open 行
-     stop_loss_px（治"SL 挂了交易所但账本列空白"）。
+v2（2026-06-13）曾包含 demo 权益快照写入；V2.0 当前已收敛为
+`jobb_live_account_check.py --profile demo` 单一权威 writer。本脚本默认只做账实核对，
+不写 account_snapshots，也不写 drill.db。
+  B. pnl 回填预览：drill 里 close_reason LIKE 'demo-reconcile%' 且 pnl IS NULL 的行，
+     按 `swap fills` 真实平仓腿（fillPnl≠0）求和，按 sz 加权展示建议值。
+  C. SL 同步预览：`swap algo orders` 在挂单的 slTriggerPx/triggerPx 与 drill open 行
+     stop_loss_px 对比，只报告差异。
 
 v3（2026-07-03）：对账基准切 V2.0 真账本 demo_trades.db（trades 轧差净持仓；drill.db 只留
   B/C 段历史行维护）；GHOST 只报告不自动改账（V2.0 账本 writer 纪律）。
 
 退出码: 0=账实一致；1=仅 pnl 待回填（drill 历史行,良性）；3=ghost/unrecorded/sz_diff 账实差异；2=API/库错误
-用法: ... run_okx_python.ps1 scripts/demo_account_check.py [--db-root <PROJECT_ROOT>\\db] [--apply]
+用法: ... run_okx_python.ps1 scripts/demo_account_check.py [--db-root <PROJECT_ROOT>\\db]
+写维护不在公开版本中提供；请先备份，并通过经过复核的独立流程处理。
 """
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -32,6 +34,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, _project_path('scripts'))
@@ -88,21 +91,8 @@ def venue_state():
     return out, detail, upl_sum, total_eq, avail
 
 
-def snapshot_equity(acc_con, total_eq, avail, upl):
-    # C3（2026-07-03）UTC-Z 写方统一：account_snapshots.ts 切 CST 'YYYY-MM-DD HH:MM:SS'
-    # （消 ts 混 Z/CST 测量地雷；历史 Z 行由 apply_ts_cst_migration.py 幂等迁移）。
-    # 本脚本 drill.db 写入（ghost close_ts 等）不在本次范围，保持原格式。
-    ts = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    acc_con.execute(
-        "INSERT INTO account_snapshots (ts, profile, totalEq, availBal, upl) VALUES (?,?,?,?,?)",
-        (ts, "demo", total_eq, avail, upl),
-    )
-    acc_con.commit()
-    return ts
-
-
-def backfill_pnl(drl, apply_):
-    """close_reason LIKE 'demo-reconcile%' AND pnl IS NULL → fills 平仓腿按 sz 加权回填。"""
+def backfill_pnl(drl):
+    """只读预览历史 drill 行的 pnl/close_px 建议值。"""
     rows = drl.execute(
         "SELECT id, symbol, side, sz, ts FROM drill_trades "
         "WHERE status='closed' AND pnl IS NULL AND close_reason LIKE 'demo-reconcile%'"
@@ -150,21 +140,12 @@ def backfill_pnl(drl, apply_):
         for r in group:
             share = round(total_pnl * (f(r["sz"], 0.0) or 0.0) / tot_sz, 6)
             notes.append(f"{sym} id={r['id']} sz={r['sz']} → pnl={share:+.4f} px≈{wavg_px:.6g}")
-            if apply_:
-                drl.execute(
-                    "UPDATE drill_trades SET pnl=?, close_px=?, "
-                    "close_reason=close_reason||' [pnl-backfill fills "
-                    + datetime.now(timezone.utc).strftime("%Y%m%d") + "]' WHERE id=?",
-                    (share, wavg_px, r["id"]),
-                )
-                fixed += 1
-        if apply_:
-            drl.commit()
+            fixed += 1
     return fixed, notes
 
 
-def sync_sl(drl, apply_):
-    """algo 挂单 slTriggerPx/triggerPx → drill open 行 stop_loss_px。"""
+def sync_sl(drl):
+    """只读预览交易所 algo SL 与历史 drill 行的差异。"""
     try:
         algos = rows_of(okx_json("swap", "algo", "orders", global_args=BASE))
     except Exception as e:
@@ -185,20 +166,26 @@ def sync_sl(drl, apply_):
             continue
         if r["stop_loss_px"] is None or abs(f(r["stop_loss_px"], 0.0) - px) > 1e-12:
             notes.append(f"{r['symbol']} id={r['id']} stop_loss_px {r['stop_loss_px']} → {px}")
-            if apply_:
-                drl.execute("UPDATE drill_trades SET stop_loss_px=? WHERE id=?", (px, r["id"]))
-                n += 1
-    if apply_:
-        drl.commit()
+            n += 1
     return n, notes
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--apply", action="store_true",
-                    help="执行 ghost reconcile / pnl 回填 / SL 同步写库（默认 report-only；权益落库不受此限）")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="已停用；公开版本仅提供只读核对",
+    )
+    ap.add_argument("--backup-dir", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.apply:
+        print(
+            "[demo_check][ERROR] 本脚本只读；公开版本不提供自动写维护"
+        )
+        sys.exit(2)
 
     try:
         ven, ven_detail, upl_sum, total_eq, avail = venue_state()
@@ -206,20 +193,18 @@ def main():
         print(f"[demo_check][ERROR] 虚拟盘 API 失败: {e}")
         sys.exit(2)
 
-    acc = sqlite3.connect(f"{args.db_root}\\account.db", timeout=15)
-    drl = sqlite3.connect(f"{args.db_root}\\drill.db", timeout=15)
+    drill_path = Path(args.db_root) / "drill.db"
+    drl = sqlite3.connect(
+        f"file:{drill_path.as_posix()}?mode=ro", uri=True, timeout=15
+    )
     drl.row_factory = sqlite3.Row
 
-    # A. 权益落库（唯一口径，必做）
-    snap_ts = None
-    try:
-        snap_ts = snapshot_equity(acc, total_eq, avail, upl_sum)
-    except Exception as e:
-        print(f"[demo_check][WARN] 权益落库失败: {e}")
-
-    print(f"== demo 账实核对 v2 @ {datetime.now(timezone.utc).strftime('%H:%M:%S')}Z "
-          f"({'APPLY' if args.apply else 'REPORT-ONLY'}) ==")
-    print(f"DEMO_EQUITY totalEq={total_eq} availBal={avail} upl={round(upl_sum,4)} snapshot_ts={snap_ts}")
+    # demo 账户/持仓快照统一由 jobb_live_account_check.py --profile demo 写入。
+    print(
+        f"== demo 账实核对 v2 @ "
+        f"{datetime.now(timezone.utc).strftime('%H:%M:%S')}Z (REPORT-ONLY) =="
+    )
+    print(f"DEMO_EQUITY totalEq={total_eq} availBal={avail} upl={round(upl_sum,4)} source=OKX_API")
     print(f"（↑ demo equity 唯一口径：P5 current_equity / 推送『模拟盘资金』一律用 totalEq={total_eq}）")
     print(f"虚拟盘 {len(ven)} 仓: " + ("; ".join(ven_detail) if ven_detail else "空"))
 
@@ -265,23 +250,22 @@ def main():
             print(f"  {sym} {side} 账本={lsz} 虚拟盘={vsz} → 按 fills 修正 sz")
 
     # B. pnl 回填
-    fixed, notes = backfill_pnl(drl, args.apply)
+    fixed, notes = backfill_pnl(drl)
     if notes:
-        print(f"\n[PNL-BACKFILL]{'(APPLIED ' + str(fixed) + ')' if args.apply else '(预览)'}:")
+        print(f"\n[PNL-BACKFILL](预览 {fixed}):")
         for x in notes:
             print(f"  {x}")
 
     # C. SL 同步
-    n_sl, sl_notes = sync_sl(drl, args.apply)
+    n_sl, sl_notes = sync_sl(drl)
     if sl_notes:
-        print(f"\n[SL-SYNC]{'(APPLIED ' + str(n_sl) + ')' if args.apply else '(预览)'}:")
+        print(f"\n[SL-SYNC](预览 {n_sl}):")
         for x in sl_notes:
             print(f"  {x}")
 
-    acc.close()
     drl.close()
     # 退出码契约区分 ghost/unrecorded/sz_diff 与“仅 pnl 待回填”：
-    #   0=账实一致 / 1=仅 pnl 待回填（良性，--apply 自愈） / 3=ghost/unrecorded/sz_diff 账实差异。
+    #   0=账实一致 / 1=仅 pnl 待维护（良性，只读报告） / 3=ghost/unrecorded/sz_diff 账实差异。
     # 注（2026-07-15 修正）：对账基准自 v3 起已是 demo_trades.db 轧差（上一版注释失实）。
     # 07-13 起的恒 rc=3 实为账本漏记（ETH 三笔平仓+一对探针开平未回执）——07-15 已按 fills
     # 实录经 trades_writer 补账（RECON-20260715，备份 tmp/archive/20260715-eth-ghost-recon/）。
@@ -289,8 +273,8 @@ def main():
     if ghosts or unrecorded or sz_diff:
         print("\n结论: 账实差异（exit 3：ghost/unrecorded/sz_diff，基准=demo_trades.db 轧差）")
         sys.exit(3)
-    if notes and not args.apply and any("pnl=" in x for x in notes):
-        print("\n结论: 仅 pnl 待回填（exit 1，--apply 自愈）")
+    if notes and any("pnl=" in x for x in notes):
+        print("\n结论: 仅 pnl 待维护（exit 1；公开版本不自动写维护）")
         sys.exit(1)
     print("\n结论: 账实一致 ✓")
     sys.exit(0)

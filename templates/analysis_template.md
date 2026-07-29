@@ -1,12 +1,16 @@
 <!--
 doc: analysis_template
+doc-version: V2.0-template
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: 对齐严格status/protocol、writer提交时间、动作方向与Windows UTF-8调用契约。
 role: 分析回执模板（analyst -> analysis.db）
 权威: skill.md §8 + collectors/analyst_writer.py
 落点: <PROJECT_ROOT>\db\analysis.db（analysis_runs + analysis_signals）
 writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 INSERT）
 -->
 
-> ⚠️ **2026-07-17 一致性审计校正**：本模板曾冻结在 ~2026-06-24 契约，以下已按现行实现修正；与 skill.md / 对应 writer·core 代码冲突时以后者为准。
+> ⚠️ **2026-07-29 一致性审计校正**：本模板与 `analyst_writer.validate_receipt` 及推送消费者字段同步；与 skill.md / 对应 writer·core 代码冲突时以后者为准。
 
 # 分析回执模板 — analyst -> analysis.db
 
@@ -35,20 +39,20 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `cycle_id` | str | 是 | UTC+8 槽位 `'YYYY-MM-DDTHH:MM'`（`:00/:15/:30/:45`）。来自派单卡，禁自造。 |
-| `ts` | str | 是 | 完成时刻 UTC+8 `'YYYY-MM-DD HH:MM:SS'`。writer 的 `normalize_ts` 会把 ISO8601/带时区统一成此格式，但回执应直接给纯字符串（红线 #2，禁裸 UTC-Z）。 |
+| `ts` | str | 是 | Agent 报告时刻 UTC+8 `'YYYY-MM-DD HH:MM:SS'`，仅作为 raw 中的 `reported_ts` 留痕；`analysis_runs.ts` 由 writer 使用实际 CST 提交时间，调用方不得控制。 |
 | `mode` | str | 是 | 固定为 `'full'`，以 dispatcher 触发消息为准。writer 强校验其它值拒。 |
-| `decision_protocol` | str | 是（正常轮） | 固定 `decision_card_v1`；缺失仅用于切换前旧回执兼容。 |
+| `decision_protocol` | str | 是 | 固定 `decision_card_v1`；当前 writer 不再接受缺失或未知协议。 |
 | `regime` | str | - | `'risk_on'`/`'risk_off'`/`'range'`/… 慢采 regime 判定。`status=skipped/stale` 时可空。 |
 | `regime_stale` | int | - | `0`=新鲜；`1`=carry-forward 上一轮（regime 缺时禁伪装 range，必标 1）。默认 0。 |
-| `market_summary` | dict 或 null | - | 五段结构化报告（§2）。必须是 dict 或 null，writer 拒非 dict。 |
+| `market_summary` | dict 或 null | 正常轮是 | 五段结构化报告（§2）。`status=ok` 时必须为 dict，且 `macro/news/tech/sentiment/quant` 五段均存在并各自为 dict；仅 skipped/stale/error 可为 null。 |
 | `missing_sources` | list 或 null | - | 缺源 id 列表（如 `["x_search","fred_dxy"]`）或 null/`[]`（等价，无缺源）。缺源源自 registry `freshness_report` / 采集账本，只作证据披露，由 Agent 在六项决策卡中自主判断影响。 |
-| `signals` | list | - | 每币一行（§3）。`[]` 合法（无机会给全 hold）；缺省视为空。 |
+| `signals` | list | `status=ok` 时是 | 每币一行（§3）。`[]` 合法；非 ok 状态只允许 null/`[]`，当前 writer 不再替正常轮补默认值。 |
 | `raw` | any | - | 完整原始报告 JSON（留痕），writer JSON 序列化存 `analysis_runs.raw`。 |
-| `status` | str | - | `'ok'`（默认）/`'skipped'`/`'stale'`/`'error'`。gate 失败路径（skipped/stale）允许 regime/signals 空。 |
+| `status` | str | 是 | `'ok'`/`'skipped'`/`'stale'`/`'error'`；无默认值。gate 失败路径（skipped/stale）允许 regime/signals 空。 |
 
 ## 2. market_summary 五段（macro / news / tech / sentiment / quant）
 
-`market_summary` 是 dict，建议含以下五段。writer 仅校验其为 dict（不逐段强校验），五段是**约定结构**，便于 push/复盘/经验检索消费——缺段不报错但削弱下游可读性，应尽量给全。
+`market_summary` 是 dict。`status=ok` 时 writer **强制校验**以下五段全部存在且均为 dict；缺任一段或段类型错误都会拒写。skipped/stale/error 降级回执才允许置 null。
 
 ```json
 {
@@ -58,8 +62,8 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
     "summary": "美元指数走弱，风险资产承接"
   },
   "news": {
-    "top_events": [
-      {"symbol": "BTC-USDT-SWAP", "event_time": "2026-06-24 13:40:00", "severity": 3, "headline": "..."}
+    "events": [
+      {"src": "news_rss", "headline": "...", "severity": 3, "symbols": ["BTC-USDT-SWAP"], "event_time": "2026-06-24 13:40:00"}
     ],
     "sentiment_note": "BTC 情绪偏多，无重大利空",
     "stale": false
@@ -131,16 +135,16 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
 |---|---|---|---|
 | `symbol` | str | 是 | `'BTC-USDT-SWAP'` 等 OKX SWAP instId |
 | `dim1`..`dim5` / `total` / `confidence` | null | - | 旧协议兼容列。`decision_card_v1` 一律填 null；不用于排序、仓位或执行。 |
-| `action` | str | 是 | `'open_long'`/`'open_short'`/`'hold'`/`'close'`/`'wait'`。trader 据此决策。 |
-| `side` | str 或 null | - | `'long'`/`'short'`/null（hold/wait 给 null）。 |
+| `action` | str | 是 | 仅允许 `'open_long'`/`'open_short'`/`'hold'`/`'close'`/`'wait'`。未知动作必须由 writer 拒绝，trader 不得猜测。 |
+| `side` | str 或 null | - | `open_long` 必须 `long`，`open_short` 必须 `short`；hold/wait 必须 null；close 必须明确 `long` 或 `short`。 |
 | `entry_hint` | num 或 null | - | 建议入场价（trader 参考，非硬约束）。 |
-| `stop_hint` | num 或 null | - | 建议止损价。**live trader 开仓必带 SL**（order_executor 无 SL 直接 reject）；此 hint 供 trader 算 `sl_trigger_px`。 |
+| `stop_hint` | num 或 null | - | 建议止损价。**live/demo trader 开仓必带方向正确的 SL**：long 严格低于 mark、short 严格高于 mark，且偏离不超过 30%；此 hint 仅供 trader 形成 `sl_trigger_px`，最终由确定性风控复核。 |
 | `tp_hint` | num 或 null | - | 建议止盈价。 |
 | `reasoning` | str 或 null | - | 人读决策依据（push「决策依据」段与复盘消费）。 |
 | `decision_card` | dict | 是 | 六项卡 + 历史经验取舍 + Agent 最终裁决。writer 只校验完整性，不把内容变成交易闸。 |
 | `raw` | str/dict 或 null | - | 原始证据与来源留痕。 |
 
-> 对拟执行标的调用 `find_similar_experience.py`，把盈利、亏损、错失机会及 `usage` 取舍写入 `historical_experience`。统计只供参考。
+> 对拟执行标的调用 `find_similar_experience.py --compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`，再读取 UTF-8 文件，把盈利、亏损、错失机会及 `usage` 取舍写入 `historical_experience`；禁止管道、重定向或内联解析器。统计只供参考。
 
 ## 4. 写入路径与表落点
 
@@ -148,13 +152,10 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
 - `analysis_signals`：**先 DELETE 本 cycle 旧行再插**，`signals=[]` 时只删不插（重跑安全）。
 - `market_summary`/`missing_sources`/`raw` 由 writer `json.dumps(ensure_ascii=False)` 序列化存 TEXT。
 
-```bash
-# 调用（经 wrapper）：先把回执写成 UTF-8 文件（bash heredoc UTF-8-native；或用文件写入能力写 UTF-8），
-# 再 --input-file 喂 writer——禁 `echo '<中文JSON>' | pwsh … --stdin`（PowerShell 下 echo 按 GBK 出字节
-# 即坏成 U+FFFD，2026-07-09 简报乱码根因；writer 坏码哨兵会拒写）
-cat > <PROJECT_ROOT>/tmp/analyst_receipt.json <<'RECEIPT_EOF'
-<回执JSON>
-RECEIPT_EOF
+```powershell
+# 先用 Agent 文件写入能力把完整回执直接保存为 UTF-8：
+# <PROJECT_ROOT>/tmp/analyst_receipt.json
+# 再经项目 wrapper 喂 writer。禁止 echo/管道/here-string/重定向拼中文 JSON。
 pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/analyst_writer.py --input-file <PROJECT_ROOT>/tmp/analyst_receipt.json
 ```
 
@@ -162,7 +163,7 @@ pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/c
 
 | 校验项 | 由谁 | 失败行为 |
 |---|---|---|
-| schema 校验（必填 `cycle_id`/`ts`/`mode`；`mode=full`；`market_summary` 是 dict/null；`signals` 是 list/null；每 signal 含 `symbol`+`action`） | `analyst_writer.validate_receipt` | 返回错误列表 -> stdout `{"ok":false,"error":"..."}` + exit 1，**不写库** |
+| schema 校验（必填 `cycle_id`/`ts`/`mode`；`mode=full`；正常轮 `market_summary` 五段全部存在且为 dict；`signals` 是 list/null；每 signal 的 `action/side` 必须符合上表组合） | `analyst_writer.validate_receipt` | 返回错误列表 -> stdout `{"ok":false,"error":"..."}` + exit 1，**不写库** |
 | 坏码哨兵（输入解码后含 ≥3 个 U+FFFD `�` 替换符即判编码坏码，--input-file/--stdin 两路均设） | `analyst_writer`（2026-07-09） | stdout `{"ok":false,"error":"...编码坏码..."}` + exit 1，**不写库**——改用 UTF-8 文件（--input-file）重试 |
 | 只验不写预检 `--validate-only`（rank8 2026-07-16，复用同套硬校验+坏码哨兵；禁自写 `_preflight_*.py`） | `analyst_writer --validate-only` | 通过输出 `{"ok":true,"validate_only":true}` exit 0；失败同 schema 校验，**不写库** |
 | `ts` 归一化（ISO8601/带时区 -> UTC+8 纯字符串） | `analyst_writer.normalize_ts` | 解析失败原样返回（不致命）；回执应直接给纯字符串规避 |

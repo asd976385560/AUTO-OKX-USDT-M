@@ -1,3 +1,10 @@
+<!--
+doc-version: V2.0-security
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Reconfirm private reporting and credential rotation boundaries for the synchronized release.
+-->
+
 # Security Policy
 
 ## Public repository boundary

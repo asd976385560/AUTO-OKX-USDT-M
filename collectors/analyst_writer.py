@@ -24,7 +24,7 @@
         {
           "symbol": "BTC-USDT-SWAP",
           "action": "hold",            -- 'open_long'|'open_short'|'hold'|'close'|'wait'
-          "side": null,                -- 'long'|'short'|null
+          "side": null,                -- open_long=long/open_short=short/hold|wait=null/close=long|short
           "entry_hint": null,
           "stop_hint": null,
           "tp_hint": null,
@@ -48,12 +48,16 @@
         }
       ],
       "raw": "{...完整原始报告 JSON...}",
-      "status": "ok"                  -- 可选，默认 'ok'；'skipped'|'stale'|'error'
+      "status": "ok"                  -- 必填：'ok'|'skipped'|'stale'|'error'
     }
 
-- `status=skipped`/`status=stale`：regime/signals 可为空（gate 失败路径）
+- `decision_protocol=decision_card_v1`、`mode=full`、`status` 均为必填，缺失或未知即拒写
+- `status=ok`：market_summary 必须包含 5 个结构段，signals 必须是 list
+- `status=skipped|stale|error`：signals 必须为空；regime/market_summary 可为空
 - `signals=[]`：合法（无机会时给 trader 全 hold 信号）
 - `missing_sources=null` / `missing_sources=[]`：等价，无缺源
+- action/side 必须严格对应；未知 status/action 或组合冲突均拒写，下游不得猜测
+- CLI 与直接调用 `write_analysis()` 使用同一套规范化和校验，不能绕过当前回执契约
 
 输出（stdout）：
     {"ok": true, "cycle_id": "...", "signals_written": N}
@@ -68,8 +72,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -159,14 +165,55 @@ def connect(write: bool = False) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 # Schema 验证（与 init_v20_dbs.py DDL_ANALYSIS 对齐）
 # ---------------------------------------------------------------------------
-REQUIRED_RUN_COLS = ["cycle_id", "ts", "mode"]
-OPTIONAL_RUN_COLS = ["regime", "regime_stale", "market_summary", "missing_sources", "raw", "status"]
+REQUIRED_RUN_COLS = ["cycle_id", "ts", "mode", "status", "decision_protocol"]
+OPTIONAL_RUN_COLS = ["regime", "regime_stale", "market_summary", "missing_sources", "raw"]
 
 SIGNAL_COLS = [
     "symbol", "dim1", "dim2", "dim3", "dim4", "dim5",
     "total", "action", "side", "confidence",
     "entry_hint", "stop_hint", "tp_hint", "reasoning", "decision_card", "raw",
 ]
+ALLOWED_RUN_STATUSES = {"ok", "skipped", "stale", "error"}
+ALLOWED_SIGNAL_ACTIONS = {
+    "open_long",
+    "open_short",
+    "hold",
+    "close",
+    "wait",
+}
+
+
+def normalize_receipt(data: dict) -> dict:
+    """Return a canonical copy used by both validation and persistence.
+
+    Current receipts use lower-case machine labels.  Canonicalizing once keeps
+    the validator and dispatcher from disagreeing about values such as
+    ``OK``/``OPEN_LONG`` that would otherwise validate but be stored verbatim.
+    """
+    normalized = dict(data)
+    for key in ("mode", "status", "decision_protocol"):
+        value = normalized.get(key)
+        if value is not None:
+            normalized[key] = str(value).strip().lower()
+    signals = normalized.get("signals")
+    if isinstance(signals, list):
+        normalized_signals = []
+        for signal in signals:
+            if not isinstance(signal, dict):
+                normalized_signals.append(signal)
+                continue
+            item = dict(signal)
+            if item.get("action") is not None:
+                item["action"] = str(item["action"]).strip().lower()
+            raw_side = item.get("side")
+            item["side"] = (
+                None
+                if raw_side is None or not str(raw_side).strip()
+                else str(raw_side).strip().lower()
+            )
+            normalized_signals.append(item)
+        normalized["signals"] = normalized_signals
+    return normalized
 
 
 # 评分字段仅用于兼容格式校验；decision_card_v1 不要求或消费评分。
@@ -186,11 +233,14 @@ def normalize_symbol(sym: str) -> str:
 
 def validate_receipt(data: dict) -> list[str]:
     """返回错误列表；空=验证通过。"""
+    if not isinstance(data, dict):
+        return ["回执必须是 dict"]
+    data = normalize_receipt(data)
     errors = []
     protocol = data.get("decision_protocol")
-    if protocol not in (None, "", DECISION_PROTOCOL):
+    if protocol != DECISION_PROTOCOL:
         errors.append(
-            f"decision_protocol 不支持: {protocol!r}（当前仅支持 {DECISION_PROTOCOL}）"
+            f"decision_protocol 必须是 {DECISION_PROTOCOL}，got: {protocol!r}"
         )
     card_mode = protocol == DECISION_PROTOCOL
     for col in REQUIRED_RUN_COLS:
@@ -198,15 +248,30 @@ def validate_receipt(data: dict) -> list[str]:
             errors.append(f"缺少必填字段: {col}")
     if data.get("mode") != "full":
         errors.append(f"mode 必须是 'full'，got: {data.get('mode')!r}")
+    status = str(data.get("status") or "").strip().lower()
+    if status not in ALLOWED_RUN_STATUSES:
+        errors.append(
+            f"status 不支持: {status!r}（仅允许 "
+            f"{'|'.join(sorted(ALLOWED_RUN_STATUSES))}）"
+        )
+    if status == "ok" and not isinstance(data.get("market_summary"), dict):
+        errors.append("status=ok 时 market_summary 必须是 dict")
     if "market_summary" in data and data["market_summary"] is not None:
         if not isinstance(data["market_summary"], dict):
             errors.append("market_summary 必须是 dict 或 null")
-        elif data.get("status", "ok") == "ok":
+        elif status == "ok":
             for section in MARKET_SUMMARY_SECTIONS:
                 if section not in data["market_summary"]:
                     errors.append(f"market_summary 缺少结构段: {section}")
                 elif not isinstance(data["market_summary"][section], dict):
                     errors.append(f"market_summary.{section} 必须是 dict")
+    if status == "ok" and not isinstance(data.get("signals"), list):
+        errors.append("status=ok 时 signals 必须是 list")
+    if (
+        status in ALLOWED_RUN_STATUSES - {"ok"}
+        and data.get("signals") not in (None, [])
+    ):
+        errors.append(f"status={status} 时 signals 必须为空")
     if "signals" in data and data["signals"] is not None:
         if not isinstance(data["signals"], list):
             errors.append("signals 必须是 list 或 null")
@@ -219,6 +284,37 @@ def validate_receipt(data: dict) -> list[str]:
                     errors.append(f"signals[{i}] 缺少 symbol")
                 if "action" not in sig:
                     errors.append(f"signals[{i}] 缺少 action")
+                    action = ""
+                else:
+                    action = str(sig.get("action") or "").strip().lower()
+                    if action not in ALLOWED_SIGNAL_ACTIONS:
+                        errors.append(
+                            f"signals[{i}].action 不支持: {action!r}")
+                raw_side = sig.get("side")
+                side = (
+                    None
+                    if raw_side is None or not str(raw_side).strip()
+                    else str(raw_side).strip().lower()
+                )
+                expected_sides = {
+                    "open_long": {"long"},
+                    "open_short": {"short"},
+                    "hold": {None},
+                    "wait": {None},
+                    "close": {"long", "short"},
+                }.get(action)
+                if expected_sides is not None and side not in expected_sides:
+                    rendered = "null" if side is None else repr(side)
+                    allowed = ",".join(
+                        "null" if value is None else value
+                        for value in sorted(
+                            expected_sides,
+                            key=lambda value: "" if value is None else value,
+                        )
+                    )
+                    errors.append(
+                        f"signals[{i}].action={action} 与 side={rendered} "
+                        f"不一致（允许 {allowed}）")
                 if card_mode:
                     errors.extend(
                         validate_card(sig.get("decision_card"), f"signals[{i}].decision_card")
@@ -260,6 +356,13 @@ def write_analysis(data: dict) -> dict:
     - status='skipped'/'stale'/'error' 的旧行允许覆盖（失败重写是合法的）。
     - 写入用 INSERT OR REPLACE + 事务，保证原子性。
     """
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "回执必须是 dict"}
+    data = normalize_receipt(data)
+    errors = validate_receipt(data)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}
+
     cycle_id = data["cycle_id"]
     # ts 一律取 writer 落库时刻，不信 agent 自报值；原报 ts 仍在回执/raw 可溯源。
     ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
@@ -268,8 +371,18 @@ def write_analysis(data: dict) -> dict:
     regime_stale = data.get("regime_stale", 0)
     market_summary = data.get("market_summary")
     missing_sources = data.get("missing_sources")
-    raw = data.get("raw")
-    status = data.get("status", "ok")
+    reported_ts = normalize_ts(str(data.get("ts") or ""))
+    incoming_raw = data.get("raw")
+    if isinstance(incoming_raw, dict):
+        raw = {**incoming_raw, "reported_ts": reported_ts}
+    elif incoming_raw is None:
+        raw = {"reported_ts": reported_ts}
+    else:
+        raw = {
+            "reported_ts": reported_ts,
+            "payload_raw": incoming_raw,
+        }
+    status = data["status"]
 
     # JSON 序列化 dict 字段
     market_summary_json = json.dumps(market_summary, ensure_ascii=False) if market_summary is not None else None

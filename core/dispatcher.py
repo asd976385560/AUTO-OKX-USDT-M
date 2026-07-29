@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-r"""V2.0 §3/§8 —— 硬化派发器（完成触发 + DB 闩锁幂等）。
+r"""V2.0 §3/§8 —— 硬化派发器（就绪驱动派发 + DB 闩锁幂等）。
 
 unified-live/demo/push 的幂等统一使用
 `ledger.db.stage_dispatch(cycle_id,stage)` 唯一约束闩锁。
-完成触发而非定时（分析时长不定）。
+按上游业务产物就绪条件派发，而非把派发闩锁解释成完成证明
+（分析时长不定；阶段终态由 stage_runner/目标业务产物另行核验）。
 
 逻辑（对最近 LOOKBACK_SLOTS+1（当前=5）个 15min 槽，命令型 cron */2min）：
   - stage live（mode=unified）：`analysis_runs[cycle]` 未写且采集必需源齐且新鲜
@@ -19,16 +20,18 @@ unified-live/demo/push 的幂等统一使用
 零模型名（红线 #1）：起棒经 trigger_agent（agent-id 集中在那）。
 
 用法（OpenClaw 命令型 cron */2min）：
-    python <PROJECT_ROOT>\core\dispatcher.py --db-root <PROJECT_ROOT>\db
-    OKX_TRIGGER_DRYRUN=1 python ... dispatcher.py ...   # 只验逻辑不真起棒
+    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\core\dispatcher.py --db-root <PROJECT_ROOT>\db
+    OKX_TRIGGER_DRYRUN=1 + 上述 wrapper 命令   # 只验逻辑不真起棒
 """
 from __future__ import annotations
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -228,19 +231,21 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
         except Exception as e:
             log(f"{cycle}: unified live dispatch error (ignored): {e}")
         return out
-    mode = a.get("mode") or "full"
-    status = a.get("status") or "ok"
+    mode = str(a.get("mode") or "").strip().lower()
+    status = str(a.get("status") or "").strip().lower()
     age = _age_sec(a.get("ts"), now)
 
-    # analysis status 非 ok（stale/skipped/error）时，本 tick 不派 live/demo/push。
+    # analysis 只有精确 status=ok + mode=full 才可放行；旧库缺失值、未知值、
+    # failed/timeout 或非现役 mode 一律 fail-closed。
     # live/demo/push 闩锁不写、每 tick 重查；人工重写为 status=ok 后自然放行。
     # mode 固定为 full；是否允许下游仅由 analysis status 决定。
     # WARN 防刷屏：stage_dispatch 哨兵行 (cycle,'skip_warn') 唯一约束保每 cycle 只打一次。
-    if status in ("stale", "skipped", "error"):
+    if status != "ok" or mode != "full":
+        reason = f"status={status or '<missing>'},mode={mode or '<missing>'}"
         if (not ledger.stage_dispatched(ledger_path, cycle, "skip_warn")
                 and ledger.try_stage(ledger_path, cycle, "skip_warn")):
-            out.append(f"skip {cycle} analysis status={status}, no trader/push")
-            log(f"{cycle}: WARN analysis status={status} -> skip live/demo/push "
+            out.append(f"skip {cycle} analysis {reason}, no trader/push")
+            log(f"{cycle}: WARN analysis {reason} -> skip live/demo/push "
                 f"(re-check every tick; recovers if analyst rewrites status=ok)")
         return out
 
@@ -371,7 +376,8 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="V2.0 硬化派发器（完成触发 + DB 闩锁）")
+    ap = argparse.ArgumentParser(
+        description="V2.0 硬化派发器（就绪驱动派发 + DB 闩锁）")
     ap.add_argument("--db-root", required=True)
     ap.add_argument("--max-age", type=int, default=MAX_AGE_SEC)
     args = ap.parse_args()

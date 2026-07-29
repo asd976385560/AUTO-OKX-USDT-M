@@ -1,66 +1,92 @@
 # -*- coding: utf-8 -*-
-"""V2.0 权威文档版本登记与完整性检查。
+"""V2.0 文档头覆盖与既有 doc_versions 登记检查。
 
-扫描 2 份当前权威文档（skill.md/config.md，见下 DOCS）头部 doc-version +
-last-updated。默认只读比对；仅显式传入 --apply 且提供 --backup-dir 时同步
-doc_versions 并移除不再属于当前权威文档集的旧登记。
+两层职责严格分开：
+1. ``COVERAGE_DOCS``：只读校验当前文档、模板与角色手册均有版本头；
+2. ``DB_TRACKED_DOCS``：公开版本只比对可发布的 ``skill.md``；本地
+   ``config.md`` 不属于仓库，扩大的静态覆盖不会要求生产库新增记录。
+
+默认全程只读。``--apply`` 仅在显式提供 ``--backup-dir`` 后 UPSERT 既有登记
+子集；绝不删除、重排或接管其它 doc_versions 行。
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
-import os, re, sys, sqlite3
-from datetime import datetime, timezone, timedelta
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.stdout.reconfigure(encoding='utf-8')
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 CST = timezone(timedelta(hours=8))
-DB = _project_path('db', 'account.db')
 TS_FMT = "%Y-%m-%d %H:%M:%S"
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DB = ROOT / "db" / "account.db"
 
-# 当前仅登记 2 份运行权威文档。README 是系统地图、版本头自维护，不进入 DOCS。
-DOCS = [
-    (_project_path('skill.md'),  'skill.md'),
-    (_project_path('config.md'), 'config.md'),
-]
+COVERAGE_DOCS = (
+    "skill.md",
+    "README.md",
+    "README.en.md",
+    "config.example.md",
+    "PUBLIC_RELEASE.md",
+    "SECURITY.md",
+    "docs/README.md",
+    "docs/agent-deployment.zh-CN.md",
+    "docs/agent-deployment.en.md",
+    "templates/analysis_template.md",
+    "templates/trade_template.md",
+    "templates/push_template.md",
+    "templates/daily_template.md",
+    "agents/analyst.md",
+    "agents/live_trader.md",
+    "agents/demo_trader.md",
+    "agents/reviewer.md",
+    "agents/news_scout.md",
+)
+
+# 公开仓库只登记其可发布事实源。本地 config.md 永不纳入公开静态面。
+DB_TRACKED_DOCS = ("skill.md",)
 
 
-def strip_version_prefix(v: str) -> str:
-    """去除版本号前导 v/V，避免展示时出现 vV7.1.1 这种双前缀"""
-    s = (v or '').strip()
-    while s and s[0] in ('v', 'V'):
-        s = s[1:]
-    return s or v  # 全剥光则保留原值
+def strip_version_prefix(value: str) -> str:
+    value = (value or "").strip()
+    while value and value[0] in ("v", "V"):
+        value = value[1:]
+    return value
 
 
-def parse_doc_header(path: str) -> dict:
-    """解析 md 文件头部 HTML 注释里的 doc-version / last-updated / updated-by / change-summary"""
-    if not os.path.exists(path):
-        return {'version': 'MISSING', 'updated': '', 'by': '', 'summary': f'file not found: {path}'}
+def parse_doc_header(path: Path | str) -> dict[str, str]:
+    path = Path(path)
+    if not path.exists():
+        return {
+            "version": "MISSING",
+            "updated": "",
+            "by": "",
+            "summary": f"file not found: {path}",
+        }
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            text = f.read(4000)  # 头部 4KB 足够
-    except Exception as e:
-        return {'version': 'ERROR', 'updated': '', 'by': '', 'summary': f'read error: {e}'}
-    out = {'version': '?', 'updated': '', 'by': '', 'summary': ''}
-    for key, target in [
-        ('doc-version', 'version'),
-        ('last-updated', 'updated'),
-        ('updated-by', 'by'),
-        ('change-summary', 'summary'),
-    ]:
-        # 支持 doc-version: x.x 格式
-        m = re.search(rf'{key}\s*:\s*([^\n]*)', text, re.IGNORECASE)
-        if m:
-            out[target] = m.group(1).strip()
+        text = path.read_text(encoding="utf-8")[:4000]
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "version": "ERROR",
+            "updated": "",
+            "by": "",
+            "summary": f"read error: {exc}",
+        }
+    out = {"version": "?", "updated": "", "by": "", "summary": ""}
+    for key, target in (
+        ("doc-version", "version"),
+        ("last-updated", "updated"),
+        ("updated-by", "by"),
+        ("change-summary", "summary"),
+    ):
+        match = re.search(rf"{key}\s*:\s*([^\r\n]*)", text, re.IGNORECASE)
+        if match:
+            out[target] = match.group(1).strip()
     return out
 
 
@@ -78,131 +104,128 @@ def online_backup(source: Path, target: Path) -> None:
         src.close()
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="检查或同步当前权威文档版本登记")
-    ap.add_argument("--apply", action="store_true", help="显式同步 doc_versions；默认只读检查")
-    ap.add_argument("--backup-dir", default=None, help="--apply 必填；写 account.db 前做 SQLite 在线备份")
-    args = ap.parse_args()
+def _parse_coverage() -> tuple[dict[str, dict[str, str]], list[str]]:
+    parsed: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    for relative in COVERAGE_DOCS:
+        info = parse_doc_header(ROOT / relative)
+        parsed[relative] = info
+        if info["version"] in {"?", "MISSING", "ERROR"}:
+            errors.append(f"{relative}: {info['summary'] or '缺 doc-version'}")
+        if not info["updated"]:
+            errors.append(f"{relative}: 缺 last-updated")
+    return parsed, errors
 
-    print('== V2.0 doc_versions 校验 ==')
-    print(f'Now (CST): {datetime.now(CST).strftime(TS_FMT)}')
-    print()
 
-    if args.apply and not args.backup_dir:
-        print('[ERROR] --apply 必须同时提供 --backup-dir', file=sys.stderr)
-        return 2
-
-    if args.apply:
-        stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
-        backup_path = Path(args.backup_dir) / f"account-pre-doc-versions-{stamp}.db"
-        online_backup(Path(DB), backup_path)
-        print(f'[backup] {backup_path}')
-
-    print(f'[1/3] 解析 {len(DOCS)} 份文档头部')
-    parsed = []
-    for path, name in DOCS:
-        info = parse_doc_header(path)
-        print(f'  {name:35s} v{strip_version_prefix(info["version"]):8s}  {info["updated"]:10s}  by={info["by"]}')
-        parsed.append((name, path, info))
-
-    invalid = [
-        (name, info['summary'])
-        for name, _, info in parsed
-        if info['version'] in {'?', 'MISSING', 'ERROR'} or not info['updated']
-    ]
-    if invalid:
-        print('\n[ERROR] 文档头不完整，拒绝继续：')
-        for name, reason in invalid:
-            print(f'  - {name}: {reason or "缺 doc-version/last-updated"}')
-        return 2
-
-    if args.apply:
-        print('\n[2/3] 同步 doc_versions（显式 apply）')
-        c = sqlite3.connect(DB, timeout=30)
-        cur = c.cursor()
-        now = datetime.now(CST).strftime(TS_FMT)
-        doc_names = [name for _, name in DOCS]
-        placeholders = ','.join('?' for _ in doc_names)
-        try:
-            cur.execute('BEGIN IMMEDIATE')
-            cur.execute(
-                f"DELETE FROM doc_versions WHERE doc_path NOT IN ({placeholders})",
-                doc_names,
-            )
-            removed = cur.rowcount
-            for name, _, info in parsed:
-                cur.execute(
-                    "INSERT INTO doc_versions "
-                    "(doc_path, doc_version, last_updated, updated_by, change_summary) "
-                    "VALUES (?,?,?,?,?) "
-                    "ON CONFLICT(doc_path) DO UPDATE SET "
-                    "doc_version=excluded.doc_version, last_updated=excluded.last_updated, "
-                    "updated_by=excluded.updated_by, change_summary=excluded.change_summary",
-                    (name, info['version'], info['updated'] or now, info['by'], info['summary']),
-                )
-            c.commit()
-            print(f'  [UPSERT] {len(parsed)} rows; [REMOVE] {removed} legacy rows')
-        except Exception:
-            c.rollback()
-            raise
-        finally:
-            c.close()
-    else:
-        print('\n[2/3] 只读比对（未传 --apply，不写库）')
-
-    uri = Path(DB).resolve().as_uri() + '?mode=ro'
-    c = sqlite3.connect(uri, uri=True, timeout=10)
-    cur = c.cursor()
-    rows = cur.execute(
-        "SELECT doc_path, doc_version, last_updated, updated_by, change_summary "
-        "FROM doc_versions ORDER BY doc_path"
-    ).fetchall()
-    c.close()
-
-    actual = {
+def _read_db_rows(db_path: Path) -> dict[str, dict[str, str]]:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=10)
+    try:
+        rows = con.execute(
+            "SELECT doc_path, doc_version, last_updated, updated_by, change_summary "
+            "FROM doc_versions ORDER BY doc_path"
+        ).fetchall()
+    finally:
+        con.close()
+    return {
         row[0]: {
-            'version': row[1] or '',
-            'updated': row[2] or '',
-            'by': row[3] or '',
-            'summary': row[4] or '',
+            "version": row[1] or "",
+            "updated": row[2] or "",
+            "by": row[3] or "",
+            "summary": row[4] or "",
         }
         for row in rows
     }
-    expected = {
-        name: {
-            'version': info['version'],
-            'updated': info['updated'],
-            'by': info['by'],
-            'summary': info['summary'],
-        }
-        for name, _, info in parsed
-    }
-    differences = []
-    for name, wanted in expected.items():
-        if name not in actual:
-            differences.append(f'{name}: DB 缺行')
-            continue
-        for field, value in wanted.items():
-            if actual[name][field] != value:
-                differences.append(
-                    f'{name}.{field}: db={actual[name][field]!r} file={value!r}'
-                )
-    for name in sorted(set(actual) - set(expected)):
-        differences.append(f'{name}: 非当前权威文档的遗留登记')
 
-    print('\n[3/3] 比对结果')
+
+def _sync_tracked(db_path: Path, parsed: dict[str, dict[str, str]]) -> None:
+    con = sqlite3.connect(db_path, timeout=30)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for name in DB_TRACKED_DOCS:
+            info = parsed[name]
+            con.execute(
+                "INSERT INTO doc_versions "
+                "(doc_path, doc_version, last_updated, updated_by, change_summary) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(doc_path) DO UPDATE SET "
+                "doc_version=excluded.doc_version, last_updated=excluded.last_updated, "
+                "updated_by=excluded.updated_by, change_summary=excluded.change_summary",
+                (name, info["version"], info["updated"], info["by"], info["summary"]),
+            )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="检查当前文档版本头与既有 DB 登记")
+    parser.add_argument("--apply", action="store_true", help="仅同步既有 DB 登记子集")
+    parser.add_argument("--backup-dir", help="--apply 必填；写库前做 SQLite 在线备份")
+    parser.add_argument("--static-only", action="store_true", help="只校验文件头，不访问 DB")
+    parser.add_argument("--db", default=os.fspath(DEFAULT_DB), help="doc_versions 所在 account.db")
+    args = parser.parse_args(argv)
+
+    if args.apply and args.static_only:
+        parser.error("--apply 与 --static-only 互斥")
+    if args.apply and not args.backup_dir:
+        parser.error("--apply 必须同时提供 --backup-dir")
+
+    parsed, errors = _parse_coverage()
+    print(f"== 文档头覆盖：{len(COVERAGE_DOCS)} 份 ==")
+    for name in COVERAGE_DOCS:
+        info = parsed[name]
+        print(
+            f"  {name:52s} "
+            f"v{strip_version_prefix(info['version']):16s} {info['updated']:10s}"
+        )
+    if errors:
+        for item in errors:
+            print(f"[ERROR] {item}", file=sys.stderr)
+        return 2
+    if args.static_only:
+        print("OK 静态文档头完整；未访问生产 DB")
+        return 0
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"[ERROR] DB 不存在: {db_path}", file=sys.stderr)
+        return 2
+    if args.apply:
+        stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
+        backup = Path(args.backup_dir) / f"account-pre-doc-versions-{stamp}.db"
+        online_backup(db_path, backup)
+        _sync_tracked(db_path, parsed)
+        print(f"[backup] {backup}")
+        print(f"[UPSERT] {len(DB_TRACKED_DOCS)} 行；未删除或改动其它登记")
+
+    actual = _read_db_rows(db_path)
+    differences: list[str] = []
+    for name in DB_TRACKED_DOCS:
+        wanted = parsed[name]
+        found = actual.get(name)
+        if found is None:
+            differences.append(f"{name}: DB 缺既有登记")
+            continue
+        for field in ("version", "updated", "by", "summary"):
+            if found[field] != wanted[field]:
+                differences.append(
+                    f"{name}.{field}: db={found[field]!r} file={wanted[field]!r}"
+                )
+
+    print(f"== DB 既有登记：{len(DB_TRACKED_DOCS)} 份 ==")
     if differences:
         for item in differences:
-            print(f'  [DIFF] {item}')
+            print(f"[DIFF] {item}")
         if not args.apply:
-            print('  需要同步时使用 --apply --backup-dir <目录>')
+            print("需要同步时使用 --apply --backup-dir <目录>")
         return 1
-
-    for row in rows:
-        print(f'  {row[0]:35s} v{strip_version_prefix(row[1]):8s}  {row[2]:20s}  by={row[3]}')
-    print('\nOK V2.0 doc_versions 与文件头一致')
+    print("OK 文档头完整，既有 doc_versions 登记一致；其它 DB 行未纳入也未改动")
     return 0
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())

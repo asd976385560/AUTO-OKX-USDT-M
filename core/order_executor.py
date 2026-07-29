@@ -26,8 +26,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -38,6 +40,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,6 +58,8 @@ import risk_validator as rv          # noqa: E402  core/risk_validator.py
 import account_capacity as ac        # noqa: E402  core/account_capacity.py
 import _okxorder as ox               # noqa: E402  core/lib/_okxorder.py
 import ledger                        # noqa: E402  collectors/ledger.py（connect ro/WAL）
+import execution_intent as ei         # noqa: E402  core/execution_intent.py
+from decision_card import validate_card  # noqa: E402
 
 DEFAULT_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _project_path('db')))
 FILLS_RETRY = 3
@@ -65,10 +70,17 @@ ORDER_CONFIRM_RETRY = 3
 ORDER_CONFIRM_WAIT = 1.0
 _EPS = 1e-9
 _FILL_TS_SKEW_MS = 60000  # 本地/交易所时钟偏差容差（fills 时间窗；60s 容 RDP/云主机时钟漂移）
+_CONFIRMED_OPEN_FILL_SOURCES = frozenset(
+    {"fills", "order_status", "orders_history"})
+_CST = timezone(timedelta(hours=8))
 
 
 class PositionsUnavailable(RuntimeError):
     """OKX 现仓 API 失败 —— 敞口未知，禁按「零仓」放行（S2a fail-safe，2026-07-02）。"""
+
+
+class TradeLedgerUnavailable(RuntimeError):
+    """profile 交易账本缺失、不可读或含无法安全轧差的数据。"""
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +93,145 @@ def _to_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _exchange_fill_time(
+    rows: list[dict[str, Any]],
+    *,
+    fields: tuple[str, ...],
+    source_prefix: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """取交易所回包中最后一个权威成交/完成时间，归一为 CST 秒级字符串。
+
+    fields 按权威优先级排列：每行只使用第一个有效字段，再跨行取最大值。
+    cTime 是订单创建时间，不是成交时间，调用方不得把它放进 fields。
+    """
+    latest_ms: Optional[float] = None
+    latest_field: Optional[str] = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_ms = None
+        row_field = None
+        for field in fields:
+            candidate = _to_float(row.get(field))
+            if candidate is None or not math.isfinite(candidate) or candidate <= 0:
+                continue
+            # OKX 当前返回毫秒；兼容明确的秒级 epoch，但拒绝臆测其他格式。
+            row_ms = candidate * 1000.0 if candidate < 100_000_000_000 else candidate
+            row_field = field
+            break
+        if row_ms is not None and (latest_ms is None or row_ms > latest_ms):
+            latest_ms = row_ms
+            latest_field = row_field
+    if latest_ms is None or latest_field is None:
+        return None, None
+    try:
+        fill_ts = datetime.fromtimestamp(
+            latest_ms / 1000.0, tz=_CST).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return None, None
+    return fill_ts, f"{source_prefix}.{latest_field}"
+
+
+def _validate_confirmed_open_fill(
+    fill: dict[str, Any],
+    fill_source: str,
+    *,
+    dryrun: bool = False,
+    approved_sz: Optional[float] = None,
+) -> tuple[bool, Optional[str]]:
+    """确认 OPEN 成交只接受交易所成交/订单端点，并要求真实数量与均价。
+
+    仓位增量、历史全量近似只能证明“需要修复”，不能合成 confirmed OPEN。
+    dry-run 没有真实成交，显式保留其模拟回执兼容性。
+    """
+    if fill_source not in _CONFIRMED_OPEN_FILL_SOURCES:
+        return False, f"untrusted_fill_source:{fill_source}"
+    if not fill.get("ok"):
+        return False, "fill_not_confirmed"
+    if dryrun and fill.get("dryrun"):
+        return True, None
+    fill_sz = _to_float(fill.get("fill_sz"))
+    fill_px = _to_float(fill.get("fill_px"))
+    if fill_sz is None or not math.isfinite(fill_sz) or fill_sz <= 0:
+        return False, "invalid_fill_sz"
+    if fill_px is None or not math.isfinite(fill_px) or fill_px <= 0:
+        return False, "invalid_fill_px"
+    approved = _to_float(approved_sz)
+    if approved is not None and math.isfinite(approved) and approved > 0:
+        size_tol = max(_EPS, approved * 1e-9)
+        if fill_sz > approved + size_tol:
+            return False, "fill_sz_exceeds_approved"
+    return True, None
+
+
+def _validate_confirmed_close_fill(
+    fill: dict[str, Any],
+    fill_source: str,
+    *,
+    dryrun: bool = False,
+    requested_sz: Optional[float] = None,
+) -> tuple[bool, Optional[str]]:
+    """Validate the complete authoritative contract used for a confirmed close.
+
+    A disappearing position proves only that exposure is gone; it does not
+    identify this order's fill quantity, price, or fill time.  Confirmed close
+    accounting therefore requires one trusted order/fill endpoint plus all
+    fields required by the normal writer contract.
+    """
+    valid, error = _validate_confirmed_open_fill(
+        fill,
+        fill_source,
+        dryrun=dryrun,
+        approved_sz=requested_sz,
+    )
+    if not valid:
+        return valid, error
+    if dryrun and fill.get("dryrun"):
+        return True, None
+    fill_ts = str(fill.get("fill_ts") or "").strip()
+    if not fill_ts:
+        return False, "invalid_fill_ts"
+    try:
+        datetime.strptime(fill_ts, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False, "invalid_fill_ts"
+    if not str(fill.get("ts_source") or "").strip():
+        return False, "invalid_ts_source"
+    return True, None
+
+
+def _open_fill_accounting(
+    fill: dict[str, Any],
+    *,
+    approved_sz: float,
+    mark_px: float,
+    ct_val: float,
+    effective_lev: float,
+    dryrun: bool = False,
+) -> dict[str, Any]:
+    """按真实 fill_sz 计算 OPEN 数量、名义和保证金；approved_sz 仅作审计留痕。"""
+    actual_sz = _to_float(fill.get("fill_sz"))
+    fill_px = _to_float(fill.get("fill_px"))
+    if dryrun and fill.get("dryrun"):
+        actual_sz = actual_sz or approved_sz
+        fill_px = fill_px or mark_px
+    if actual_sz is None or not math.isfinite(actual_sz) or actual_sz <= 0:
+        raise ValueError("confirmed OPEN missing positive fill_sz")
+    if fill_px is None or not math.isfinite(fill_px) or fill_px <= 0:
+        raise ValueError("confirmed OPEN missing positive fill_px")
+    notional = actual_sz * ct_val * fill_px
+    margin = (notional / effective_lev) if effective_lev else None
+    return {
+        "sz": actual_sz,
+        "approved_sz": approved_sz,
+        "fill_px": fill_px,
+        "notional": notional,
+        "margin": margin,
+        "partial_fill": actual_sz < approved_sz - _EPS,
+        "fill_ratio": actual_sz / approved_sz if approved_sz > 0 else None,
+    }
 
 
 def fetch_equity(profile: str) -> Optional[float]:
@@ -206,7 +357,7 @@ def fetch_instrument_specs(symbol: str, profile: str,
 
 
 def _avg_fill(fills: list[dict[str, Any]]) -> dict[str, Any]:
-    """聚合 fills → 加权均价 fill_px / 总 fillSz / 总 pnl。"""
+    """聚合 fills → 加权均价/数量/pnl，并取最后一笔权威成交时间。"""
     tot_sz = 0.0
     tot_quote = 0.0
     tot_pnl = 0.0
@@ -218,7 +369,12 @@ def _avg_fill(fills: list[dict[str, Any]]) -> dict[str, Any]:
         tot_quote += sz * px
         tot_pnl += pnl
     fill_px = (tot_quote / tot_sz) if tot_sz > 0 else None
-    return {"fill_px": fill_px, "fill_sz": tot_sz, "pnl": tot_pnl, "n": len(fills)}
+    fill_ts, ts_source = _exchange_fill_time(
+        fills, fields=("fillTime", "ts"), source_prefix="fills")
+    return {
+        "fill_px": fill_px, "fill_sz": tot_sz, "pnl": tot_pnl,
+        "n": len(fills), "fill_ts": fill_ts, "ts_source": ts_source,
+    }
 
 
 def _filter_fills_since(fills: list[dict[str, Any]],
@@ -246,7 +402,7 @@ def _read_fills(symbol: str, profile: str, ord_id: Optional[str],
     """
     if ox.is_dryrun():
         return {"ok": True, "fill_px": None, "fill_sz": None, "pnl": 0.0,
-                "n": 0, "dryrun": True}
+                "n": 0, "fill_ts": None, "ts_source": None, "dryrun": True}
 
     last_raw: list = []
 
@@ -263,8 +419,8 @@ def _read_fills(symbol: str, profile: str, ord_id: Optional[str],
             agg = _avg_fill(fills)
             agg["ok"] = True
             return agg
-        # 时间窗滤空不再第一拍即 approx——demo fills 端点可能延迟，
-        # 历史成交会污染 fill_px。继续重试等新 fill
+        # 2026-07-03 改：时间窗滤空不再第一拍即 approx——demo fills 端点延迟 6-52s 下
+        # 历史成交会污染 fill_px（昨夜实测 approx 64476 vs 真实 61733）。继续重试等新 fill
         # 落端点；最终仍失败时把全量聚合作为 approx_agg 附带返回，是否采用由调用点决策
         # （调用点先试订单状态第二权威源，approx 只做最后兜底且带标）。
         last_raw = raw
@@ -284,22 +440,30 @@ def _read_fills(symbol: str, profile: str, ord_id: Optional[str],
     if last_raw:
         approx_agg = _avg_fill(last_raw)
         approx_agg["approx"] = True
-    return {"ok": False, "fill_px": None, "fill_sz": None, "pnl": None, "n": 0,
-            "approx_agg": approx_agg}
+    return {
+        "ok": False, "fill_px": None, "fill_sz": None, "pnl": None, "n": 0,
+        "fill_ts": None, "ts_source": None, "approx_agg": approx_agg,
+    }
 
 
 def _fill_from_order(o: dict[str, Any]) -> Optional[dict[str, Any]]:
     """订单状态行 → 合成 fill 聚合（CLI 字段全字符串，显式转 float）。
 
-    accFillSz>0 即视为有成交——含 canceled 部分成交（部分成交后撤销不得落
-    fills_missing 造幽灵 reject，标 partial）。accFillSz<=0 返 None。"""
+    仅 terminal 状态可确认：filled，或 canceled 且 accFillSz>0 的已撤部分成交。
+    live/partially_filled 仍可能继续成交，不能过早把当下数量写成最终 OPEN。"""
     acc = _to_float(o.get("accFillSz")) or 0.0
     if acc <= 0:
         return None
+    state = str(o.get("state") or "").lower()
+    if state not in ("filled", "canceled"):
+        return None
+    fill_ts, ts_source = _exchange_fill_time(
+        [o], fields=("fillTime", "uTime"), source_prefix="order_status")
     return {"ok": True, "fill_px": _to_float(o.get("avgPx")), "fill_sz": acc,
             "pnl": _to_float(o.get("pnl")) or 0.0, "n": 1,
             "source": "order_status",
-            "partial": str(o.get("state")) == "canceled"}
+            "partial": state == "canceled",
+            "fill_ts": fill_ts, "ts_source": ts_source}
 
 
 def _confirm_order_filled(symbol: str, profile: str,
@@ -331,8 +495,8 @@ def _find_orders_since(symbol: str, profile: str, pos_side: str,
     """无 ordId 路径（`swap close` 不返 ordId / 开仓超时恢复）的第二权威源：
     orders-history 按 时间窗+posSide+reduceOnly 反查本次操作产生的订单并聚合。
 
-    `swap close` 的平仓单以独立 ordId+reduceOnly=true 出现在 orders-history，
-    avgPx/pnl 字段用于与聚合近似值区分。
+    实测 `swap close` 的平仓单以独立 ordId+reduceOnly=true 出现在 orders-history，
+    avgPx/pnl 字段完整（2026-07-03 verified 61733.2/0.16874 vs 被污染 approx 64476）。
     无命中 → None（caller 决定 approx 兜底或拒单）。"""
     for attempt in range(ORDER_CONFIRM_RETRY):
         rows = ox.get_orders_history(symbol, profile)
@@ -353,13 +517,129 @@ def _find_orders_since(symbol: str, profile: str, pos_side: str,
             tot_quote = sum((_to_float(o.get("accFillSz")) or 0.0)
                             * (_to_float(o.get("avgPx")) or 0.0) for o in hits)
             tot_pnl = sum(_to_float(o.get("pnl")) or 0.0 for o in hits)
+            fill_ts, ts_source = _exchange_fill_time(
+                hits, fields=("fillTime", "uTime"),
+                source_prefix="orders_history")
             return {"ok": True,
                     "fill_px": (tot_quote / tot_sz) if tot_sz > 0 else None,
                     "fill_sz": tot_sz, "pnl": tot_pnl, "n": len(hits),
-                    "source": "orders_history"}
+                    "source": "orders_history",
+                    "fill_ts": fill_ts, "ts_source": ts_source}
         if attempt < ORDER_CONFIRM_RETRY - 1:
             time.sleep(ORDER_CONFIRM_WAIT)
     return None
+
+
+_LEDGER_POSITION_ACTIONS = {
+    "open": 1.0,
+    "add": 1.0,
+    "close": -1.0,
+    "stop_loss": -1.0,
+    "reduce": -1.0,
+}
+_POSITION_SZ_TOL = 1e-8
+
+
+def _trade_ledger_path(profile: str, db_root: Path) -> Path:
+    profile_label = (
+        "demo" if str(profile).lower() == "demo"
+        or "demo" in str(profile).lower() else "live")
+    return Path(db_root) / f"{profile_label}_trades.db"
+
+
+def _read_trade_ledger_positions(
+    profile: str,
+    db_root: Path,
+) -> dict[tuple[str, str], float]:
+    """只读轧差 profile trades；相关成交行损坏时 fail-closed。"""
+    path = _trade_ledger_path(profile, db_root)
+    if not path.is_file():
+        raise TradeLedgerUnavailable(f"{path.name}:missing")
+    try:
+        con = ledger.connect(path, readonly=True)
+        try:
+            rows = con.execute(
+                "SELECT symbol,action,side,sz FROM trades ORDER BY rowid"
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:
+        raise TradeLedgerUnavailable(
+            f"{path.name}:query_failed:{type(exc).__name__}") from exc
+
+    positions: dict[tuple[str, str], float] = {}
+    for index, row in enumerate(rows, start=1):
+        action = str(row["action"] or "").strip().lower()
+        sign = _LEDGER_POSITION_ACTIONS.get(action)
+        if sign is None:
+            continue
+        symbol = str(row["symbol"] or "").strip().upper()
+        side = str(row["side"] or "").strip().lower()
+        size = _to_float(row["sz"])
+        if not symbol or side not in ("long", "short"):
+            raise TradeLedgerUnavailable(
+                f"{path.name}:invalid_key:row={index}")
+        if size is None or not math.isfinite(size) or size <= 0:
+            raise TradeLedgerUnavailable(
+                f"{path.name}:invalid_sz:row={index}")
+        key = (symbol, side)
+        positions[key] = positions.get(key, 0.0) + sign * size
+    return {
+        key: size for key, size in positions.items()
+        if abs(size) > _POSITION_SZ_TOL
+    }
+
+
+def _api_position_sizes(
+    api_positions: list[dict[str, Any]],
+) -> dict[tuple[str, str], float]:
+    """已由 OKX API 取得的全仓列表归一为 symbol+side 数量全集。"""
+    out: dict[tuple[str, str], float] = {}
+    for index, item in enumerate(api_positions or [], start=1):
+        symbol = str(item.get("symbol") or item.get("instId") or "").strip().upper()
+        side = str(item.get("side") or item.get("posSide") or "").strip().lower()
+        size = _to_float(item.get("sz") if item.get("sz") is not None
+                         else item.get("pos"))
+        if not symbol or side not in ("long", "short"):
+            raise PositionsUnavailable(f"invalid normalized position key at row {index}")
+        if size is None or not math.isfinite(size) or size <= 0:
+            raise PositionsUnavailable(f"invalid normalized position size at row {index}")
+        key = (symbol, side)
+        out[key] = out.get(key, 0.0) + abs(size)
+    return out
+
+
+def _verify_pretrade_ledger_positions(
+    profile: str,
+    db_root: Path,
+    api_positions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """交易前以全集合比较账本轧差与本次 OKX API 全仓。"""
+    ledger_positions = _read_trade_ledger_positions(profile, db_root)
+    exchange_positions = _api_position_sizes(api_positions)
+    diffs: list[dict[str, Any]] = []
+    for symbol, side in sorted(set(ledger_positions) | set(exchange_positions)):
+        ledger_sz = ledger_positions.get((symbol, side), 0.0)
+        exchange_sz = exchange_positions.get((symbol, side), 0.0)
+        delta = ledger_sz - exchange_sz
+        if abs(delta) <= _POSITION_SZ_TOL:
+            continue
+        diffs.append({
+            "symbol": symbol,
+            "side": side,
+            "ledger_sz": round(ledger_sz, 12),
+            "exchange_sz": round(exchange_sz, 12),
+            "delta": round(delta, 12),
+        })
+    return {
+        "ok": not diffs,
+        "profile": (
+            "demo" if str(profile).lower() == "demo"
+            or "demo" in str(profile).lower() else "live"),
+        "ledger_groups": len(ledger_positions),
+        "exchange_groups": len(exchange_positions),
+        "diffs": diffs,
+    }
 
 
 def _position_size(positions: list[dict[str, Any]], symbol: str, side: str) -> float:
@@ -389,23 +669,41 @@ def _verify_open_settled(symbol: str, side: str, profile: str, pre_sz: float,
     return None
 
 
-def _verify_sl_placed(symbol: str, pos_side: str, profile: str,
-                      sl_trigger_px: Optional[float] = None,
-                      tol_pct: float = 0.03, retries: int = 2) -> dict[str, Any]:
-    """#5（2026-07-07）：开仓后回读确认 SL 真挂上——`okx swap algo orders --instId` 列 pending
-    algo（附挂 SL 以仓位关联条件单出现），找 slTriggerPx 非空的单（传 sl_trigger_px 则还需 ±tol
-    匹配）。带重试吸收下单后 algo 短暂延迟，降误判致重复挂 belt SL 的风险。
-    返回 {verified, found}。verified=True ⟺ 找到匹配的 pending SL algo。
+def _verify_sl_placed(
+    symbol: str,
+    pos_side: str,
+    profile: str,
+    sl_trigger_px: Optional[float] = None,
+    tol_pct: float = 0.001,
+    retries: int = 2,
+    *,
+    expected_sz: Optional[float] = None,
+    since_ms: Optional[float] = None,
+    expected_algo_id: Optional[str] = None,
+    expected_ord_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """回读 pending algo，确认是“本次、同侧、足量、有效”的保护性止损。
 
-    OKX/调用方的价格字段常是字符串。比较前必须先归一化；非数值、非有限值、
-    <=0 均按「未验证」安全失败，不让类型异常穿透中断后续 belt SL/unwind。"""
-    expected_sl = None
-    if sl_trigger_px is not None:
-        expected_sl = _to_float(sl_trigger_px)
-        if (expected_sl is None or not math.isfinite(expected_sl)
-                or expected_sl <= 0):
-            return {"verified": False, "found": [],
-                    "error": "invalid_sl_trigger_px"}
+    附挂 SL 没有调用方已知的 algoId，因此必须以 cTime>=本次下单时刻识别，旧的
+    同价单不能通过。独立 algo 必须精确匹配刚返回的 algoId；即使个别展示字段缺失，
+    这个强身份仍可兼容，但只要字段存在就必须与本次请求一致。
+    """
+    expected_sl = _to_float(sl_trigger_px)
+    if (expected_sl is None or not math.isfinite(expected_sl)
+            or expected_sl <= 0):
+        return {"verified": False, "found": [],
+                "error": "invalid_sl_trigger_px"}
+    expected_size = _to_float(expected_sz)
+    if (expected_size is None or not math.isfinite(expected_size)
+            or expected_size <= 0):
+        return {"verified": False, "found": [], "error": "invalid_expected_sz"}
+    start_ms = _to_float(since_ms)
+    if start_ms is None or not math.isfinite(start_ms) or start_ms <= 0:
+        return {"verified": False, "found": [], "error": "invalid_since_ms"}
+    pos_side = str(pos_side or "").lower()
+    if pos_side not in ("long", "short"):
+        return {"verified": False, "found": [], "error": "invalid_pos_side"}
+    close_side = "sell" if pos_side == "long" else "buy"
     tolerance = _to_float(tol_pct)
     if tolerance is None or not math.isfinite(tolerance) or tolerance < 0:
         return {"verified": False, "found": [], "error": "invalid_tolerance"}
@@ -413,6 +711,11 @@ def _verify_sl_placed(symbol: str, pos_side: str, profile: str,
         retry_count = max(1, int(retries))
     except (TypeError, ValueError, OverflowError):
         return {"verified": False, "found": [], "error": "invalid_retries"}
+
+    expected_algo = (
+        str(expected_algo_id) if expected_algo_id not in (None, "") else None)
+    expected_order = (
+        str(expected_ord_id) if expected_ord_id not in (None, "") else None)
     found: list[dict[str, Any]] = []
     for attempt in range(retry_count):
         try:
@@ -423,20 +726,85 @@ def _verify_sl_placed(symbol: str, pos_side: str, profile: str,
         for a in algos:
             if not isinstance(a, dict):
                 continue
-            slpx = a.get("slTriggerPx")
-            if slpx in (None, "", "0", 0):
+            slpx = _to_float(a.get("slTriggerPx"))
+            if slpx is None or not math.isfinite(slpx) or slpx <= 0:
                 continue
-            slpx_f = _to_float(slpx)
-            if slpx_f is None or not math.isfinite(slpx_f) or slpx_f <= 0:
-                continue
-            found.append({"algoId": a.get("algoId"), "slTriggerPx": slpx_f,
-                          "side": str(a.get("side", "")).lower(), "state": a.get("state")})
-        matched = found
-        if expected_sl is not None and found:
-            matched = [f for f in found
-                       if abs(f["slTriggerPx"] - expected_sl) / expected_sl <= tolerance]
-        if matched:
-            return {"verified": True, "found": found}
+            algo_id = str(a.get("algoId") or "")
+            exact_algo = bool(expected_algo and algo_id == expected_algo)
+            errors: list[str] = []
+
+            inst_id = str(a.get("instId") or "")
+            if inst_id and inst_id != symbol:
+                errors.append("symbol")
+            if expected_algo and not exact_algo:
+                errors.append("algoId")
+
+            # pending 端点本身代表活动单；有 state 时仍必须显式是 live。
+            state = str(a.get("state") or "").lower()
+            if state and state != "live":
+                errors.append("state")
+            elif not state and not exact_algo:
+                errors.append("state_missing")
+
+            row_pos_side = str(a.get("posSide") or "").lower()
+            if row_pos_side and row_pos_side != pos_side:
+                errors.append("posSide")
+            elif not row_pos_side and not exact_algo:
+                errors.append("posSide_missing")
+            row_side = str(a.get("side") or "").lower()
+            if row_side and row_side != close_side:
+                errors.append("side")
+            elif not row_side and not exact_algo:
+                errors.append("side_missing")
+
+            raw_reduce_only = a.get("reduceOnly")
+            if raw_reduce_only not in (None, ""):
+                if str(raw_reduce_only).lower() not in ("true", "1"):
+                    errors.append("reduceOnly")
+            elif not exact_algo:
+                errors.append("reduceOnly_missing")
+
+            created_ms = _to_float(
+                a.get("cTime") or a.get("createTime") or a.get("ts"))
+            if created_ms is not None:
+                # 不放宽到历史时间窗；稍有时钟疑义就走 belt SL，而不是让旧单过闸。
+                if created_ms < start_ms:
+                    errors.append("created_before_request")
+            elif not exact_algo:
+                errors.append("cTime_missing")
+
+            row_sz = _to_float(a.get("sz"))
+            if row_sz is not None:
+                size_tol = max(_EPS, expected_size * 1e-9)
+                if abs(row_sz - expected_size) > size_tol:
+                    errors.append("sz")
+            elif not exact_algo:
+                errors.append("sz_missing")
+
+            if abs(slpx - expected_sl) / expected_sl > tolerance:
+                errors.append("slTriggerPx")
+
+            linked = a.get("linkedOrd")
+            linked_ord_id = ""
+            if isinstance(linked, dict):
+                linked_ord_id = str(linked.get("ordId") or "")
+            if expected_order and linked_ord_id and linked_ord_id != expected_order:
+                errors.append("linkedOrd")
+
+            summary = {
+                "algoId": algo_id or None,
+                "slTriggerPx": slpx,
+                "posSide": row_pos_side or None,
+                "side": row_side or None,
+                "reduceOnly": raw_reduce_only,
+                "state": state or None,
+                "cTime": created_ms,
+                "sz": row_sz,
+                "errors": errors,
+            }
+            found.append(summary)
+            if not errors:
+                return {"verified": True, "found": found, "matched": summary}
         if attempt < retry_count - 1:
             time.sleep(1.0)
     return {"verified": False, "found": found}
@@ -445,6 +813,39 @@ def _verify_sl_placed(symbol: str, pos_side: str, profile: str,
 # ---------------------------------------------------------------------------
 # OPEN
 # ---------------------------------------------------------------------------
+def validate_receipt_context(
+    context: Optional[dict[str, Any]],
+    *,
+    cycle_id: Optional[str] = None,
+    required: bool = True,
+) -> list[str]:
+    """Validate the full decision envelope before any exchange side effect.
+
+    Agents pass a JSON-decoded dict here.  This deliberately moves JSON/Python
+    syntax and decision-card failures in front of ``place_market_open``.
+    """
+    if context is None:
+        return ["receipt_context 必填"] if required else []
+    if not isinstance(context, dict):
+        return ["receipt_context 必须是 dict（建议先 json.loads 有效 JSON）"]
+    errors: list[str] = []
+    if str(context.get("status") or "").strip().lower() != "ok":
+        errors.append("receipt_context.status 必须是 ok")
+    if context.get("decision_protocol") != "decision_card_v1":
+        errors.append("receipt_context.decision_protocol 必须是 decision_card_v1")
+    errors.extend(validate_card(context.get("decision_card"),
+                                "receipt_context.decision_card"))
+    ctx_cycle = context.get("cycle_id")
+    if cycle_id and ctx_cycle != cycle_id:
+        errors.append(
+            f"receipt_context.cycle_id={ctx_cycle!r} 与参数 cycle_id={cycle_id!r} 不一致")
+    try:
+        json.dumps(context, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"receipt_context 不是有效 JSON 数据: {exc}")
+    return errors
+
+
 def open_position(
     symbol: str,
     side: str,
@@ -460,21 +861,81 @@ def open_position(
     db_root: Path = DEFAULT_DB_ROOT,
     cycle_id: Optional[str] = None,
     available_margin: Optional[float] = None,
+    receipt_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
+    profile_label = "demo" if is_demo else "live"
     side = str(side or "").lower()
     action_taken = "OPEN_LONG" if side == "long" else "OPEN_SHORT"
     capacity_audit: Optional[dict[str, Any]] = None
+    position_reconciliation_audit: Optional[dict[str, Any]] = None
+    intent_path = Path(db_root) / "ledger.db"
+    intent_fingerprint: Optional[str] = None
+    intent_ord_id: Optional[str] = None
 
     def receipt(ok: bool, **kw) -> dict[str, Any]:
-        base = {"profile": "demo" if is_demo else "live", "ok": ok,
+        # receipt_context 已在下单前完整验证；返回时直接携带，调用方只需
+        # json.dump(result)，不再在成交后手拼 JSON/Python 字面量。
+        base = dict(receipt_context or {})
+        base.update({"profile": profile_label, "ok": ok,
                 "action_taken": kw.pop("action_taken", action_taken),
                 "symbol": symbol, "side": side, "trades": kw.pop("trades", []),
-                "p0": kw.pop("p0", False)}
+                "p0": kw.pop("p0", False), "cycle_id": cycle_id})
         if capacity_audit is not None:
             base["capacity"] = dict(capacity_audit)
+        if position_reconciliation_audit is not None:
+            base["position_reconciliation"] = dict(position_reconciliation_audit)
         base.update(kw)
         return base
+
+    def _intent_kwargs(now_ts: Optional[str] = None) -> dict[str, Any]:
+        return {
+            "profile": profile_label,
+            "cycle_id": str(cycle_id),
+            "symbol": symbol,
+            "side": side,
+            "fingerprint": str(intent_fingerprint),
+            "now_ts": now_ts or ledger.now_cst(),
+        }
+
+    def _finish_clean(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_failed_clean(intent_path, error=error, **_intent_kwargs())
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    f"failed_clean transition failed: {type(exc).__name__}: {exc}")
+                result["p0"] = True
+        return result
+
+    def _finish_uncertain(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_uncertain(
+                    intent_path, ord_id=intent_ord_id, error=error,
+                    **_intent_kwargs())
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    f"uncertain transition failed: {type(exc).__name__}: {exc}")
+        result["p0"] = True
+        return result
+
+    def _finish_completed(result: dict[str, Any]) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_completed(
+                    intent_path, ord_id=intent_ord_id, receipt=result,
+                    error=None, **_intent_kwargs())
+            except Exception as exc:
+                # 先前 reserved/submitting/submitted 状态仍会阻断重下；成交回执
+                # 继续返给 writer，避免因幂等存储告警反而丢主账事实。
+                result["intent_persist_warning"] = (
+                    f"completed transition failed: {type(exc).__name__}: {exc}")
+                result["p0"] = True
+                _enqueue_repair(
+                    profile_label, symbol, intent_ord_id,
+                    "execution_intent_complete_failed", db_root)
+        return result
 
     # 字符串数字是 CLI/JSON 常态，入口统一成有限正数。非法 SL 在任何
     # 账户/下单 I/O 前 fail-safe 拒绝，避免已成交后才在回读比较处爆类型异常。
@@ -493,6 +954,98 @@ def open_position(
         return receipt(False, action_taken="REJECT", reject_reason="bad_lev",
                        reject_detail=f"杠杆非法: {lev}")
     lev = normalized_lev
+    normalized_sz = _to_float(intended_sz)
+    if (normalized_sz is None or not math.isfinite(normalized_sz)
+            or normalized_sz <= 0):
+        return receipt(False, action_taken="REJECT", reject_reason="bad_sz",
+                       reject_detail=f"开仓张数非法: {intended_sz}")
+    intended_sz = normalized_sz
+
+    # 非 dry-run 必须把完整执行决策卡作为上下文传入，并在任何账户/交易所
+    # I/O 前完成 JSON 与卡片校验。这样 Python 中误写 JSON 的 true/false 会在
+    # 调 open_position 之前失败，而不是成交后组回执时失败。
+    ctx_errors = validate_receipt_context(
+        receipt_context, cycle_id=cycle_id, required=not ox.is_dryrun())
+    if ctx_errors:
+        return receipt(
+            False, action_taken="REJECT",
+            reject_reason="receipt_context_invalid",
+            reject_detail="；".join(ctx_errors))
+    if not ox.is_dryrun() and not cycle_id:
+        return receipt(
+            False, action_taken="REJECT", reject_reason="cycle_id_required",
+            reject_detail="非 dry-run 开仓必须提供调度 cycle_id")
+
+    # 先于任何交易所读取占住逻辑意图；相同已完成请求直接返回原回执。
+    # 同 profile 任一标的存在 in-flight/uncertain 时全局 fail-closed，避免在
+    # 前一笔交易真实状态尚未对清时继续扩大账户状态分叉。
+    if not ox.is_dryrun():
+        request = {
+            "profile": profile_label,
+            "cycle_id": cycle_id,
+            "symbol": symbol,
+            "action": "open",
+            "side": side,
+            "intended_sz": intended_sz,
+            "lev": lev,
+            "sl_trigger_px": sl_trigger_px,
+            "mgn_mode": mgn_mode,
+        }
+        try:
+            reserved = ei.reserve(
+                intent_path, profile=profile_label, cycle_id=str(cycle_id),
+                symbol=symbol, side=side, request=request,
+                now_ts=ledger.now_cst())
+        except Exception as exc:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="execution_intent_store_failed",
+                reject_detail=f"幂等意图库不可用，拒绝触发订单: {type(exc).__name__}: {exc}",
+                p0=True)
+        if reserved["status"] == "replay":
+            cached = dict(reserved["receipt"])
+            cached["idempotent_replay"] = True
+            cached["intent_state"] = "completed"
+            return cached
+        if reserved["status"] != "reserved":
+            blocker = reserved.get("blocking_intent")
+            blocker = blocker if isinstance(blocker, dict) else {}
+            blocker_ref = (
+                f"profile={blocker.get('profile') or profile_label},"
+                f"cycle={blocker.get('cycle_id')},"
+                f"symbol={blocker.get('symbol')},"
+                f"action={blocker.get('action')},side={blocker.get('side')},"
+                f"state={blocker.get('state') or reserved.get('state')},"
+                f"ordId={blocker.get('ord_id') or reserved.get('ord_id')}"
+            )
+            is_profile_block = (
+                reserved.get("reason") == "profile_pending_intent")
+            _enqueue_repair(
+                profile_label, symbol, reserved.get("ord_id"),
+                f"execution_intent_blocked:{reserved.get('reason')}:"
+                f"{blocker_ref}:pending_count={reserved.get('pending_count')}",
+                db_root)
+            if is_profile_block:
+                reject_reason = "execution_intent_profile_blocked"
+                reject_detail = (
+                    "同一 profile 存在尚未完成或未确认清洁失败的执行意图；"
+                    f"已在任何交易所读取/下单前全局阻断。阻塞项: {blocker_ref}。"
+                    "需先核对 execution_intents、journal、交易所与主账并完成对账")
+            else:
+                reject_reason = "execution_intent_blocked"
+                reject_detail = (
+                    "同一 cycle/symbol/side 已有未决或冲突执行意图；"
+                    "已阻断重复下单，需先核对 journal/交易所/主账")
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason=reject_reason,
+                reject_detail=reject_detail,
+                intent_state=reserved.get("state"),
+                intent_reason=reserved.get("reason"),
+                blocking_intent=blocker or None,
+                pending_intent_count=reserved.get("pending_count"),
+                p0=True)
+        intent_fingerprint = str(reserved["fingerprint"])
 
     # ── 装配现场：硬闸输入一律以 OKX API 为权威，禁 caller 注入绕闸 ──
     # 非 dryrun 一律以 API 真值为准，caller 传值仅留作偏差留痕。
@@ -521,14 +1074,16 @@ def open_position(
         if (not capacity.get("ok") or api_available_margin is None
                 or not math.isfinite(api_available_margin)
                 or api_available_margin < 0):
-            return receipt(False, action_taken="REJECT",
+            return _finish_clean(receipt(False, action_taken="REJECT",
                            reject_reason="available_margin_fetch_failed",
                            reject_detail="USDT 可用保证金不可用，拒开（禁回退 totalEq/caller）: "
-                                         f"{capacity.get('error')}", p0=True)
+                                         f"{capacity.get('error')}", p0=True),
+                                 "available_margin_fetch_failed")
         if api_equity is None or not math.isfinite(api_equity) or api_equity <= 0:
-            return receipt(False, action_taken="REJECT",
+            return _finish_clean(receipt(False, action_taken="REJECT",
                            reject_reason="equity_fetch_failed",
-                           reject_detail="totalEq 非法，拒开（禁回退 caller）", p0=True)
+                           reject_detail="totalEq 非法，拒开（禁回退 caller）", p0=True),
+                                 "equity_fetch_failed")
         if (caller_equity is not None
                 and abs((_to_float(caller_equity) or 0.0) - api_equity) > 1.0):
             input_divergence.append(f"equity caller={caller_equity} → API={api_equity}")
@@ -542,19 +1097,92 @@ def open_position(
         try:
             api_positions = fetch_open_positions(profile)
         except PositionsUnavailable as exc:
-            return receipt(False, action_taken="REJECT",
+            return _finish_clean(receipt(False, action_taken="REJECT",
                            reject_reason="positions_fetch_failed",
-                           reject_detail=f"现仓 API 失败，拒开（不当零仓放行）: {exc}", p0=True)
+                           reject_detail=f"现仓 API 失败，拒开（不当零仓放行）: {exc}", p0=True),
+                                 "positions_fetch_failed")
         if open_positions is not None and len(open_positions) != len(api_positions):
             input_divergence.append(
                 f"positions caller={len(open_positions)} → API={len(api_positions)}")
         open_positions = api_positions
+        # 交易前账仓闸：只使用本次 OKX API 全仓与 profile 真账本轧差，不采信
+        # caller 快照。必须在 mark/规格/杠杆/下单前完成，任何不可读或差异都
+        # failed_clean，修账/对账后方可重试同一 intent。
+        try:
+            position_check = _verify_pretrade_ledger_positions(
+                profile_label, db_root, api_positions)
+        except TradeLedgerUnavailable as exc:
+            _enqueue_repair(
+                profile_label, symbol, None,
+                f"pretrade_ledger_unavailable:{exc}", db_root)
+            return _finish_clean(
+                receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="ledger_unavailable",
+                    reject_detail=(
+                        "交易前 profile 交易账本缺失、不可读或含非法成交行；"
+                        f"已在 mark/下单前阻断: {exc}"),
+                    position_reconciliation={
+                        "ok": False, "profile": profile_label,
+                        "error": str(exc),
+                    },
+                    p0=True,
+                ),
+                "pretrade_ledger_unavailable",
+            )
+        except PositionsUnavailable as exc:
+            _enqueue_repair(
+                profile_label, symbol, None,
+                f"pretrade_api_positions_invalid:{exc}", db_root)
+            return _finish_clean(
+                receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="positions_fetch_failed",
+                    reject_detail=(
+                        "OKX API 全仓归一结果非法，无法执行交易前账仓核对: "
+                        f"{exc}"),
+                    p0=True,
+                ),
+                "pretrade_api_positions_invalid",
+            )
+        position_reconciliation_audit = position_check
+        if not position_check["ok"]:
+            diffs = position_check["diffs"]
+            compact = ";".join(
+                f"{d['symbol']}/{d['side']}:"
+                f"db={d['ledger_sz']},okx={d['exchange_sz']},"
+                f"delta={d['delta']}"
+                for d in diffs[:4]
+            )
+            if len(diffs) > 4:
+                compact += f";...+{len(diffs) - 4}"
+            _enqueue_repair(
+                profile_label, symbol, None,
+                f"pretrade_ledger_position_mismatch:"
+                f"count={len(diffs)}:{compact}", db_root)
+            return _finish_clean(
+                receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="pretrade_ledger_position_mismatch",
+                    reject_detail=(
+                        "交易前账本轧差与 OKX API 全仓不一致；"
+                        f"已在 mark/下单前阻断，共 {len(diffs)} 项: {compact}"),
+                    position_reconciliation={
+                        **position_check,
+                        "diffs": diffs[:20],
+                        "truncated": len(diffs) > 20,
+                    },
+                    p0=True,
+                ),
+                "pretrade_ledger_position_mismatch",
+            )
         # mark_px：API 失败一律拒（同 fail-safe，防注入架空价影响 sz/notional/SL 偏离校验）
         api_mark = ox.get_mark_price(symbol, profile)
         if api_mark is None:
-            return receipt(False, action_taken="REJECT",
+            return _finish_clean(receipt(False, action_taken="REJECT",
                            reject_reason="mark_px_fetch_failed",
-                           reject_detail="mark_px API 失败，拒开（禁回退 caller 值）", p0=True)
+                           reject_detail="mark_px API 失败，拒开（禁回退 caller 值）", p0=True),
+                                 "mark_px_fetch_failed")
         mark_px = api_mark
         if input_divergence:  # 注入尝试可观测（不阻断，已用真值）
             print(f"[order_executor] WARN input_divergence: {input_divergence}", file=sys.stderr)
@@ -601,9 +1229,10 @@ def open_position(
         available_margin=available_margin,
     )
     if not v["approved"]:
-        return receipt(False, action_taken="REJECT",
+        return _finish_clean(receipt(False, action_taken="REJECT",
                        reject_reason=v["reject_reason"],
-                       reject_detail=v["reject_detail"], risk=v)
+                       reject_detail=v["reject_detail"], risk=v),
+                             f"risk_reject:{v['reject_reason']}")
     approved_sz = v["approved_sz"]
     # 加仓时 OKX 不允许在有仓状态随意改杠杆；validator 已用现仓实际杠杆
     # 重算本笔预算。成交回执必须沿用同一口径，禁用 caller lev 低估 margin。
@@ -620,18 +1249,40 @@ def open_position(
         if not lr.get("ok"):
             # live：杠杆设失败 → 不在未知杠杆下开仓
             if not is_demo:
-                return receipt(False, action_taken="REJECT",
+                return _finish_clean(receipt(False, action_taken="REJECT",
                                reject_reason="set_leverage_failed",
                                reject_detail=str(lr.get("sMsg") or lr.get("error")),
-                               risk=v)
+                               risk=v), "set_leverage_failed")
             lev_warn = f"demo set_leverage failed: {lr.get('sMsg') or lr.get('error')}"
 
     # ── 市价开仓（附挂 SL，原子）──
     pre_sz = _position_size(open_positions, symbol, side)
     pre_place_ms = int(time.time() * 1000)
-    pr = ox.place_market_open(
-        symbol, side, approved_sz, profile, mgn_mode=mgn_mode,
-        sl_trigger_px=sl_trigger_px)
+    if intent_fingerprint:
+        try:
+            ei.mark_submitting(intent_path, error=None, **_intent_kwargs())
+        except Exception as exc:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="execution_intent_transition_failed",
+                reject_detail=(
+                    "订单前幂等状态无法固化，已 fail-closed，未触发订单: "
+                    f"{type(exc).__name__}: {exc}"), p0=True)
+    try:
+        pr = ox.place_market_open(
+            symbol, side, approved_sz, profile, mgn_mode=mgn_mode,
+            sl_trigger_px=sl_trigger_px)
+    except Exception as exc:
+        _enqueue_repair(profile_label, symbol, None,
+                        "place_exception_ambiguous", db_root)
+        return _finish_uncertain(
+            receipt(False, action_taken="REJECT",
+                    reject_reason="place_exception_ambiguous",
+                    reject_detail=(
+                        "下单调用异常，是否到达交易所未知；已阻断重试并入 repair_queue: "
+                        f"{type(exc).__name__}: {exc}"),
+                    risk=v),
+            "place_exception_ambiguous")
     recovered_timeout = False
     if not pr.get("ok"):
         sc = pr.get("sCode")
@@ -643,13 +1294,15 @@ def open_position(
             if settled is None:
                 _enqueue_repair(profile, symbol, None,
                                 "place_ambiguous_unverifiable", db_root)
-                return receipt(False, action_taken="REJECT",
+                return _finish_uncertain(receipt(False, action_taken="REJECT",
                                reject_reason="place_ambiguous",
                                reject_detail="下单写超时且现仓回读不可判定，已写 repair_queue 待人工核对",
-                               risk=v, p0=True)
+                               risk=v, p0=True), "place_ambiguous_unverifiable")
             if not settled:
-                return receipt(False, action_taken="REJECT", reject_reason="place_failed",
-                               reject_detail="下单写超时，现仓回读确认未成交", risk=v)
+                return _finish_clean(
+                    receipt(False, action_taken="REJECT", reject_reason="place_failed",
+                            reject_detail="下单写超时，现仓回读确认未成交", risk=v),
+                    "place_timeout_confirmed_no_fill")
             recovered_timeout = True  # 实际成交 → 落正常流程（无 ordId，靠时间窗回读 fills）
         else:
             if sc == ox.SCODE_DELISTED:
@@ -658,15 +1311,27 @@ def open_position(
                 reason = "instrument_not_exist"
             else:
                 reason = "place_failed"
-            return receipt(False, action_taken="REJECT", reject_reason=reason,
+            return _finish_clean(receipt(False, action_taken="REJECT", reject_reason=reason,
                            reject_detail=f"sCode={sc} {pr.get('sMsg') or pr.get('error')}",
-                           risk=v)
+                           risk=v), f"place_rejected:{reason}")
 
     ord_id = None
     for row in pr.get("data", []):
         if isinstance(row, dict) and row.get("ordId"):
             ord_id = row["ordId"]
             break
+    intent_ord_id = str(ord_id) if ord_id not in (None, "") else None
+    if intent_fingerprint:
+        try:
+            ei.mark_submitted(
+                intent_path, ord_id=intent_ord_id, error=None,
+                **_intent_kwargs())
+        except Exception as exc:
+            # submitting 已固化，重跑仍会被拦；继续保护 SL/回读/journal，
+            # 最终 completed 再尝试补齐状态。
+            print(
+                f"[order_executor] WARN execution intent submitted 写失败 "
+                f"{symbol}: {exc}", file=sys.stderr)
 
     # fill 求真可能在正常返回或 SL 失败 unwind 分支被需要，进程内只做一次并
     # memo，避免重试窗口与 journal 重复。正常路径保护完成后再求真；SL 全失败
@@ -687,6 +1352,13 @@ def open_position(
             fa0 = {"ok": False, "fill_px": None, "fill_sz": None,
                    "pnl": None, "n": 0}
         source0 = "fills"
+        contract_errors: list[str] = []
+        initial_valid, initial_error = _validate_confirmed_open_fill(
+            fa0, source0, dryrun=ox.is_dryrun(), approved_sz=approved_sz)
+        if fa0.get("ok") and not initial_valid:
+            contract_errors.append(f"{source0}:{initial_error}")
+            fa0 = dict(fa0, ok=False,
+                       fill_validation_error=initial_error)
         if not fa0.get("ok") and not ox.is_dryrun():
             try:
                 alt = (_confirm_order_filled(symbol, profile, ord_id) if ord_id
@@ -698,34 +1370,52 @@ def open_position(
                 alt = None
             if alt and alt.get("ok"):
                 fa0, source0 = alt, str(alt.get("source") or "order_status")
+                alt_valid, alt_error = _validate_confirmed_open_fill(
+                    fa0, source0, approved_sz=approved_sz)
+                if not alt_valid:
+                    contract_errors.append(f"{source0}:{alt_error}")
+                    fa0 = dict(fa0, ok=False,
+                               fill_validation_error=alt_error)
             elif alt and alt.get("state") == "canceled":
+                contract_errors.clear()
                 fa0 = {"ok": False, "state": "canceled", "fill_px": None,
                        "fill_sz": 0.0, "pnl": 0.0, "n": 0}
         if (not fa0.get("ok") and recovered_timeout
                 and fa0.get("approx_agg")):
-            # 现仓回读已确证仓位存在，两成交端点延迟时才允许带标 approx。
+            # 现仓/历史聚合只证明“需要人工修复”，不得合成 confirmed OPEN。
             _enqueue_repair(profile, symbol, ord_id,
-                            "position_verified_fills_missing", db_root)
-            fa0 = dict(fa0["approx_agg"], ok=True)
-            source0 = "approx_agg"
+                            "position_verified_fills_missing:"
+                            "approx_agg_repair_evidence", db_root)
+        if not fa0.get("ok") and contract_errors:
+            _enqueue_repair(
+                profile, symbol, ord_id,
+                "open_fill_contract_invalid:" + ",".join(contract_errors),
+                db_root)
         fill_resolution = (fa0, source0)
         return fill_resolution
 
     def make_open_trade(fa0: dict[str, Any], fill_source0: str,
                         sl_mode0: str, sl_verified0: bool,
                         algo_id0: Optional[str]) -> dict[str, Any]:
-        fill_px0 = fa0.get("fill_px") or mark_px
-        notional0 = approved_sz * (ct_val or 0) * (fill_px0 or 0)
-        margin0 = (notional0 / effective_lev) if effective_lev else None
+        accounting = _open_fill_accounting(
+            fa0, approved_sz=approved_sz, mark_px=mark_px,
+            ct_val=ct_val, effective_lev=effective_lev,
+            dryrun=ox.is_dryrun())
         return {
-            "symbol": symbol, "action": "open", "side": side, "sz": approved_sz,
-            "fill_px": fill_px0, "px": fill_px0, "lev": effective_lev,
-            "margin": margin0,
-            "notional": notional0, "pnl": 0.0,
+            "symbol": symbol, "action": "open", "side": side,
+            "sz": accounting["sz"],
+            "approved_sz": accounting["approved_sz"],
+            "partial_fill": accounting["partial_fill"],
+            "fill_ratio": accounting["fill_ratio"],
+            "fill_px": accounting["fill_px"], "px": accounting["fill_px"],
+            "lev": effective_lev, "margin": accounting["margin"],
+            "notional": accounting["notional"], "pnl": 0.0,
             "channel": "demo" if is_demo else "live",
             "reason": reasoning, "open_id": ord_id, "sl_trigger_px": sl_trigger_px,
             "algo_id": algo_id0, "sl_mode": sl_mode0,
             "sl_verified": sl_verified0, "fill_source": fill_source0,
+            "fill_ts": fa0.get("fill_ts"),
+            "ts_source": fa0.get("ts_source"),
             # 回执带本环境真实 ct_val，writer 补算优先用行内值。
             "ct_val": ct_val, "ordId": ord_id,
         }
@@ -741,7 +1431,7 @@ def open_position(
 
     # ── 止损保障（sl_mode 如实标注）──
     #   attached：随主单附挂，`sl_attached` 只表示带参下单成功；必须回读确认真挂上；
-    #   algo：独立 reduceOnly algo，返回 algoId = 交易所已受理 → sl_verified=True。
+    #   algo：独立 reduceOnly algo，返回 algoId 后仍须 pending 回读通过才算 verified。
     #   超时恢复路径 attached 状态未知 → 不采信附挂，强制走独立 algo 补挂（belt）。
     algo_id = None
     attached_ok = bool(pr.get("sl_attached")) and not recovered_timeout
@@ -751,7 +1441,10 @@ def open_position(
     sl_verified = False
     if attached_ok and sl_trigger_px is not None and not ox.is_dryrun():
         try:
-            _vsl = _verify_sl_placed(symbol, side, profile, sl_trigger_px)
+            _vsl = _verify_sl_placed(
+                symbol, side, profile, sl_trigger_px,
+                expected_sz=approved_sz, since_ms=pre_place_ms,
+                expected_ord_id=ord_id)
         except Exception as exc:
             # 回读是证明层，异常不得穿透跳过 belt SL/journal/unwind。
             _vsl = {"verified": False, "found": [],
@@ -768,6 +1461,7 @@ def open_position(
     sl_secured = attached_ok or sl_trigger_px is None
     if sl_trigger_px is not None and not sl_secured:
         for _ in range(2):  # 首次 + 重试 1
+            algo_place_ms = int(time.time() * 1000)
             try:
                 ar = ox.place_algo_sl(symbol, side, approved_sz, sl_trigger_px,
                                       profile, mgn_mode=mgn_mode)
@@ -778,13 +1472,33 @@ def open_position(
                       file=sys.stderr)
                 ar = {"ok": False, "error": str(exc)}
             if ar.get("ok"):
-                sl_secured = True
-                sl_mode, sl_verified = "algo", True
+                candidate_algo_id = None
                 for row in ar.get("data", []):
                     if isinstance(row, dict) and row.get("algoId"):
-                        algo_id = row["algoId"]
+                        candidate_algo_id = str(row["algoId"])
                         break
-                break
+                try:
+                    _vsl = _verify_sl_placed(
+                        symbol, side, profile, sl_trigger_px,
+                        expected_sz=approved_sz, since_ms=algo_place_ms,
+                        expected_algo_id=candidate_algo_id)
+                except Exception as exc:
+                    _vsl = {
+                        "verified": False, "found": [],
+                        "error": f"verify_exception:{type(exc).__name__}",
+                    }
+                    print(
+                        f"[order_executor] WARN 独立 SL 回读异常 {symbol}: {exc}",
+                        file=sys.stderr)
+                if _vsl.get("verified"):
+                    sl_secured = True
+                    sl_mode, sl_verified = "algo", True
+                    algo_id = candidate_algo_id
+                    break
+                print(
+                    f"[order_executor] WARN 独立 SL 已受理但回读未确认 {symbol} "
+                    f"algoId={candidate_algo_id}",
+                    file=sys.stderr)
         if not sl_secured:
             # S2e：进入 UNWIND 即先落 repair_queue。为了既不丢已成交 open，
             # 又不让 demo 自动重放单独补 open 造成幽灵仓，open 与后续 close 都带
@@ -797,45 +1511,41 @@ def open_position(
                 journal_open_once(trade_unwind_open, unwind=True,
                                   journal_action="UNWIND_OPEN")
             elif fa_unwind.get("state") != "canceled":
-                # fills/订单列表延迟时，现仓增量也是已成交的权威证据。
+                # 现仓增量只写 repair 证据，禁止合成 confirmed OPEN。
                 try:
                     post_sz = _position_size(fetch_open_positions(profile), symbol, side)
                 except Exception:
                     post_sz = None
                 if post_sz is not None and post_sz > pre_sz + _EPS:
-                    position_fa = {"ok": True, "fill_px": mark_px,
-                                   "fill_sz": post_sz - pre_sz, "pnl": 0.0, "n": 0}
-                    trade_unwind_open = make_open_trade(
-                        position_fa, "position_delta", "none", False, None)
-                    journal_open_once(trade_unwind_open, unwind=True,
-                                      journal_action="UNWIND_OPEN")
+                    _enqueue_repair(
+                        profile, symbol, ord_id,
+                        "open_position_delta_repair_evidence:"
+                        f"{post_sz - pre_sz}", db_root)
             unwind = close_position(symbol, profile, pos_side=side,
                                     mgn_mode=mgn_mode, db_root=db_root,
                                     reasoning="unwind: SL 挂单失败，平掉裸仓",
-                                    cycle_id=cycle_id, _unwind=True)
+                                    cycle_id=cycle_id, _unwind=True,
+                                    receipt_context=receipt_context)
             if (not open_fill_journaled and unwind.get("ok")
                     and unwind.get("trades")):
-                # close_position 能产生成交回执，证明它在平前权威读到了现仓。
-                # 即使 open fills 端点仍延迟，也补一条带 unwind 标记的 open 与 close 成对。
+                # unwind 确认曾有仓位，但不能替代 OPEN 成交端点；只进入 repair。
                 close_trade = unwind["trades"][0]
-                inferred_fa = {"ok": True, "fill_px": mark_px,
-                               "fill_sz": close_trade.get("sz") or approved_sz,
-                               "pnl": 0.0, "n": 0}
-                trade_unwind_open = make_open_trade(
-                    inferred_fa, "position_confirmed_by_unwind", "none", False, None)
-                journal_open_once(trade_unwind_open, unwind=True,
-                                  journal_action="UNWIND_OPEN_RECOVERED")
+                _enqueue_repair(
+                    profile, symbol, ord_id,
+                    "open_unwind_repair_evidence:"
+                    f"close_sz={close_trade.get('sz')}", db_root)
             if not unwind.get("ok"):
                 _enqueue_repair(profile, symbol, ord_id,
                                 "naked_position_unwind_failed", db_root)
-                return receipt(False, action_taken="UNWIND",
+                return _finish_uncertain(receipt(False, action_taken="UNWIND",
                                reject_reason="naked_position_unwind_failed",
                                reject_detail="SL 全失败且平裸仓也失败 → 无止损裸仓，已双写 repair_queue",
-                               risk=v, unwind=unwind, p0=True)
-            return receipt(False, action_taken="UNWIND",
+                               risk=v, unwind=unwind, p0=True),
+                                         "naked_position_unwind_failed")
+            return _finish_completed(receipt(False, action_taken="UNWIND",
                            reject_reason="sl_failed_unwound",
                            reject_detail="附挂+独立 SL 均失败，已市价平掉裸仓",
-                           risk=v, unwind=unwind, p0=True)
+                           risk=v, unwind=unwind, p0=True))
 
     # ── 回读真实成交（ord_id 缺失=超时恢复路径 → 用下单时刻做时间窗，防历史成交混入）──
     fa, fill_source = resolve_open_fill()
@@ -845,30 +1555,30 @@ def open_position(
         if algo_id:
             _enqueue_repair(profile, symbol, ord_id,
                             "open_canceled_dangling_algo_sl", db_root)
-        return receipt(False, action_taken="REJECT",
+        return _finish_clean(receipt(False, action_taken="REJECT",
                        reject_reason="open_not_filled",
                        reject_detail="订单状态确认未成交（canceled, accFillSz=0）",
-                       risk=v, ord_id=ord_id)
+                       risk=v, ord_id=ord_id), "open_canceled_no_fill")
     if not fa.get("ok"):
         # 两端点都确认不了 → 原 fail-safe：repair_queue + reject + P0
         _enqueue_repair(profile, symbol, ord_id, "open_fills_missing", db_root)
-        return receipt(False, action_taken="REJECT",
+        return _finish_uncertain(receipt(False, action_taken="REJECT",
                        reject_reason="fills_missing",
                        reject_detail="开仓后 fills/订单状态均拉不到，已写 repair_queue",
-                       risk=v, ord_id=ord_id, p0=True)
+                       risk=v, ord_id=ord_id, p0=True), "open_fills_missing")
 
     # 从这里开始已是权威确认的成交，立即落一次 journal；后面只组回执，
     # 不再进入任何 SL I/O，故 SL 回读/补挂异常无法跳过此留痕。
     trade = make_open_trade(fa, fill_source, sl_mode, sl_verified, algo_id)
     journal_open_once(trade)
-    return receipt(True, trades=[trade], risk=v, ord_id=ord_id,
+    return _finish_completed(receipt(True, trades=[trade], risk=v, ord_id=ord_id,
                    clamped=v.get("clamped"), adjustments=v.get("adjustments"),
                    lev_warn=lev_warn,
                    sl_mode=sl_mode, sl_verified=sl_verified,
                    recovered_timeout=recovered_timeout,
                    fill_source=fill_source,
                    spec_source=specs.get("spec_source"),
-                   input_divergence=input_divergence or None)
+                   input_divergence=input_divergence or None))
 
 
 # ---------------------------------------------------------------------------
@@ -883,16 +1593,38 @@ def close_position(
     db_root: Path = DEFAULT_DB_ROOT,
     cycle_id: Optional[str] = None,
     _unwind: bool = False,
+    receipt_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
+    resolved_side = pos_side
 
     def receipt(ok: bool, **kw) -> dict[str, Any]:
-        base = {"profile": "demo" if is_demo else "live", "ok": ok,
+        # 与 OPEN 相同：执行前完整验证，执行后只原样携带决策上下文，
+        # 禁止 Agent 在成交后再手工拼 status/protocol/card/cycle。
+        base = dict(receipt_context or {})
+        base.update({"profile": "demo" if is_demo else "live", "ok": ok,
+                "cycle_id": cycle_id,
                 "action_taken": kw.pop("action_taken", "CLOSE"),
                 "symbol": symbol, "trades": kw.pop("trades", []),
-                "p0": kw.pop("p0", False)}
+                "p0": kw.pop("p0", False)})
+        if resolved_side:
+            base["side"] = resolved_side
         base.update(kw)
         return base
+
+    # 非 dry-run 与 OPEN 共用同一个完整回执上下文校验器，且必须发生在
+    # fetch_open_positions / 下单等任何 OKX I/O 之前。
+    ctx_errors = validate_receipt_context(
+        receipt_context, cycle_id=cycle_id, required=not ox.is_dryrun())
+    if ctx_errors:
+        return receipt(
+            False, action_taken="REJECT",
+            reject_reason="receipt_context_invalid",
+            reject_detail="；".join(ctx_errors))
+    if not ox.is_dryrun() and not cycle_id:
+        return receipt(
+            False, action_taken="REJECT", reject_reason="cycle_id_required",
+            reject_detail="非 dry-run 平仓必须提供调度 cycle_id")
 
     # ── OKX API 现仓确认 posSide（S2a：API 失败 → 拒，禁当"无仓已平"假成功）──
     try:
@@ -909,7 +1641,14 @@ def close_position(
         return receipt(True, action_taken="CLOSE", note="no_open_position",
                        reject_detail=f"{symbol} 无对应现仓（可能已平）")
     side = match["side"]
-    pos_sz = match["sz"]
+    resolved_side = side
+    pos_sz = _to_float(match.get("sz"))
+    if pos_sz is None or not math.isfinite(pos_sz) or pos_sz <= 0:
+        return receipt(
+            False, action_taken="REJECT",
+            reject_reason="invalid_position_size",
+            reject_detail=f"OKX 现仓数量非法，拒绝发送平仓单: {match.get('sz')!r}",
+            p0=True)
 
     # ── 平仓下单（2026-07-03 主路径反转：reduceOnly 市价单优先，swap close 降兜底）──
     # swap close（close-position 端点）不返回 ordId，而 demo 的 fills / orders-history
@@ -1021,8 +1760,40 @@ def close_position(
         pnl_approx = True  # 沿用标记语义：该 pnl/fill_px 不可信（此处为 None）
         print(f"[order_executor] WARN close 成交确认两端点均未见,pnl 记 unconfirmed "
               f"sym={symbol} ordId={reduce_ord_id}", file=sys.stderr)
-    pnl = fa.get("pnl") if fa.get("ok") else None
-    fill_px = fa.get("fill_px") if fa.get("ok") else None
+
+    # 位置归零不等于本订单成交事实完整。若权威端点缺数量/均价/成交时间，
+    # 降级为 unconfirmed 并等待对账，绝不拿请求前仓位 pos_sz 合成 fill_sz。
+    fill_contract_error = None
+    if fa.get("ok"):
+        confirmed_valid, fill_contract_error = _validate_confirmed_close_fill(
+            fa,
+            fill_source,
+            dryrun=ox.is_dryrun(),
+            requested_sz=pos_sz,
+        )
+        if not confirmed_valid and not ox.is_dryrun():
+            _enqueue_repair(
+                profile, symbol, reduce_ord_id,
+                f"close_fill_contract_invalid:{fill_contract_error}", db_root)
+            fill_source = "unconfirmed"
+            pnl_approx = True
+            fa = {
+                "ok": False,
+                "fill_px": None,
+                "fill_sz": None,
+                "pnl": None,
+                "fill_ts": None,
+                "ts_source": None,
+            }
+
+    confirmed_fill = bool(fa.get("ok"))
+    actual_fill_sz = _to_float(fa.get("fill_sz")) if confirmed_fill else None
+    if confirmed_fill and ox.is_dryrun() and fa.get("dryrun"):
+        actual_fill_sz = pos_sz
+    pnl = fa.get("pnl") if confirmed_fill else None
+    fill_px = fa.get("fill_px") if confirmed_fill else None
+    fill_ts = fa.get("fill_ts") if confirmed_fill else None
+    ts_source = fa.get("ts_source") if confirmed_fill else None
     # 2026-07-07: close 行也带本环境真实 ct_val（fail-safe：拉不到不带，writer 回退缓存）
     close_ct_val = None
     try:
@@ -1030,18 +1801,30 @@ def close_position(
     except Exception:
         pass
     trade = {
-        "symbol": symbol, "action": "close", "side": side, "sz": pos_sz,
+        "symbol": symbol, "action": "close", "side": side,
+        # confirmed：sz 与 fill_sz 同取交易所权威实际成交数量；
+        # unconfirmed：sz 仅是本次请求/仓前审计量，fill_sz 保持 NULL。
+        "sz": actual_fill_sz if confirmed_fill else pos_sz,
+        "fill_sz": actual_fill_sz,
+        "requested_sz": pos_sz,
+        "pre_position_sz": pos_sz,
         "fill_px": fill_px, "px": fill_px, "pnl": pnl,
         "channel": "demo" if is_demo else "live", "reason": reasoning,
         "reduce_only_fallback": used_reduce_only,
         "fill_source": fill_source, "pnl_approx": pnl_approx,
+        "fill_ts": fill_ts, "ts_source": ts_source,
         "ct_val": close_ct_val, "ordId": reduce_ord_id,
     }
+    if confirmed_fill:
+        trade["partial_fill"] = actual_fill_sz < pos_sz - _EPS
+        trade["fill_ratio"] = actual_fill_sz / pos_sz
+    elif fill_contract_error:
+        trade["fill_contract_error"] = fill_contract_error
     _journal_fill("demo" if is_demo else "live", trade, db_root, cycle_id,
                   "UNWIND_CLOSE" if _unwind else "CLOSE", unwind=_unwind)
     return receipt(True, action_taken="CLOSE", trades=[trade],
                    reduce_only_fallback=used_reduce_only,
-                   fills_ok=bool(fa.get("ok")),
+                   fills_ok=confirmed_fill,
                    fill_source=fill_source)
 
 
@@ -1113,13 +1896,28 @@ def _enqueue_repair(profile: str, symbol: str, ord_id: Optional[str],
     try:
         ts = ledger.now_cst()
         issue = f"[{profile}] {symbol} ord={ord_id}: {reason}"
-        fix = f"okx --profile {profile} swap fills --instId {symbol} --archive"
+        fills_file = _project_path(
+            "tmp", f"repair_{profile}_{symbol}_fills.json")
+        wrapper = "'" + _project_path(
+            "scripts", "run_okx_python.ps1").replace("'", "''") + "'"
+        cli = "'" + _project_path(
+            "scripts", "_okxcli.py").replace("'", "''") + "'"
+        fix = (
+            f"pwsh -NoProfile -File {wrapper} {cli} "
+            f"--profile {profile} --compact --out-file {fills_file} "
+            f"swap fills --instId {symbol} --archive"
+        )
         con = ledger.connect(account_db)
         try:
-            con.execute(
-                "INSERT INTO repair_queue (ts, check_name, issue, fix_action, "
-                "status, created_utc) VALUES (?,?,?,?,?,?)",
-                (ts, "order_executor", issue, fix, "pending", ts))
+            exists = con.execute(
+                "SELECT 1 FROM repair_queue WHERE check_name='order_executor' "
+                "AND issue=? AND status IN ('open','pending') LIMIT 1",
+                (issue,)).fetchone()
+            if not exists:
+                con.execute(
+                    "INSERT INTO repair_queue (ts, check_name, issue, fix_action, "
+                    "status, created_utc) VALUES (?,?,?,?,?,?)",
+                    (ts, "order_executor", issue, fix, "pending", ts))
             con.commit()
         finally:
             con.close()

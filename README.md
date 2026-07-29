@@ -1,3 +1,10 @@
+<!--
+doc-version: V2.0
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Sync the latest sanitized execution, reconciliation, macro, report, lifecycle and regression contracts.
+-->
+
 <p align="center">
   <strong>简体中文</strong> · <a href="README.en.md">English</a>
 </p>
@@ -10,9 +17,11 @@
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/network/members"><img alt="GitHub Forks" src="https://img.shields.io/github/forks/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/asd976385560/AUTO-OKX-USDT-M?style=flat-square"></a>
+  <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/asd976385560/AUTO-OKX-USDT-M/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用同一套硬风控和止损要求，只切换执行环境。
+V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用同一套硬风控、执行意图幂等、账仓一致性和止损要求，只切换执行环境。
 
 > [!WARNING]
 > 本项目包含真实交易执行能力。首次部署必须保持 `OKX_EXECUTOR_DRYRUN=1` 和 `OKX_TRIGGER_DRYRUN=1`，并在隔离数据库中完成验证。本项目不构成投资建议，也不保证盈利。
@@ -21,14 +30,18 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 
 - [公开发布边界](#公开发布边界)
 - [版本线说明](#版本线说明)
+- [本次同步](#本次同步)
 - [架构](#架构)
 - [Agent 角色](#agent-角色)
 - [快速开始](#快速开始)
 - [部署 Agent](#部署-agent)
 - [配置定时任务](#配置定时任务)
 - [配置与安全验证](#配置与安全验证)
+- [测试边界](#测试边界)
 - [风控摘要](#风控摘要)
 - [Stars 趋势](#stars-趋势)
+- [许可证](#许可证)
+- [安全报告](#安全报告)
 
 ## 公开发布边界
 
@@ -47,6 +60,18 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 
 当前源码事实源自称 `V2.0`。GitHub 远端旧 README 曾使用 `v3.1` 标识，两者不是本次同步中自动推导出的可比较语义版本。本次不创建标签或 Release；最终公开版本号由维护者另行决定。
 
+## 本次同步
+
+2026-07-29 的公开同步带出以下生产语义，同时保留公开版的动态路径和空凭证默认值：
+
+- `execution_intents` 全局未决意图闸，以及已完成同参请求的幂等重放；
+- 下单前 OKX 全量现仓与本 profile 交易账本的全集合一致性校验；
+- 只接受权威端点的成交数量、均价、成交时间和来源，禁止用仓位变化伪造成交；
+- `stage_runner.py` 在子进程退出后核验真实业务产物，避免把 `rc=0` 误当业务完成；
+- Alternative.me、ECB 复算 DXY 和 ETF 双源确认的公开宏观管道；
+- daily maintenance ready 清单、reviewer 哈希校验、有效 fill 与风控拒绝分栏统计；
+- 公开脚本生命周期清单和分层隔离回归。
+
 ## 架构
 
 ```text
@@ -58,7 +83,7 @@ OpenClaw cron
                                       v
                               core/dispatcher.py
                                       │
-                    stage_dispatch 唯一键幂等闩锁
+                    stage_dispatch 阶段幂等闩锁
                                       │
                  ┌────────────────────┴───────────────────┐
                  v                                        v
@@ -66,6 +91,9 @@ OpenClaw cron
        analysis + live execution                   demo execution
                  │                                        │
                  └───────────────┬────────────────────────┘
+                                 v
+                    stage_runner 终态/业务产物核验
+                                 │
                                  v
                      scripts/push_pipeline.py
                      render -> validate -> archive/send
@@ -75,10 +103,13 @@ OpenClaw cron
 
 - `skill.md` 是 V2.0 业务事实源，本文是公开系统地图；
 - `ledger.db.stage_dispatch(cycle_id, stage)` 是阶段派发幂等真值；
+- `ledger.db.execution_intents` 在任何交易所 I/O 前阻断每个 profile 的未决或含糊意图；
 - 每张表或明确键域只有一个权威 writer，读者使用 SQLite `mode=ro`；
 - live 开仓只经 `core/order_executor.py`，内部强制调用 `core/risk_validator.py`；
+- 下单前必须使 OKX 全量现仓与该 profile 的已确认交易账本一致；
 - live/demo 都要求止损，并共用同一套硬上限；
 - 当前持仓以 OKX API 为准，不能由本地快照推断；
+- confirmed fill 必须具备权威 `fill_sz`、`fill_px`、`fill_ts` 和 `ts_source`；
 - push 固定走 `scripts/push_pipeline.py`，不由 Agent 临时拼接执行链。
 
 ## Agent 角色
@@ -101,7 +132,7 @@ OpenClaw cron
 - `httpx`；
 - SQLite（Python 标准库）；
 - Agent 调度需要 OpenClaw；
-- 实际下单需要在仓库外配置 OKX CLI profile；
+- 实际下单需要在仓库外配置 OKX CLI profile；当前代码按 OKX CLI 1.4.2 命令契约验证；
 - Windows 包装器和运维脚本使用 PowerShell 7。
 
 ```powershell
@@ -112,7 +143,6 @@ python -m pip install -r requirements.txt
 Copy-Item config.example.md config.md
 
 $env:OKX_ROOT = (Resolve-Path .).Path
-$env:OKX_DB_ROOT = Join-Path $env:OKX_ROOT 'db'
 $env:OKX_EXECUTOR_DRYRUN = '1'
 $env:OKX_TRIGGER_DRYRUN = '1'
 ```
@@ -120,11 +150,15 @@ $env:OKX_TRIGGER_DRYRUN = '1'
 首次验证必须使用隔离数据库：
 
 ```powershell
-$isolatedDb = Join-Path $env:TEMP 'auto-okx-v20-db'
+$isolatedDb = Join-Path $env:TEMP ('auto-okx-v20-db-' + [guid]::NewGuid())
+$env:OKX_DB_ROOT = $isolatedDb
 python scripts/init_v20_dbs.py --root $isolatedDb --verify
 python collectors/sources/_registry.py --validate
 python scripts/check_trader_docs_sync.py
 ```
+
+`init_v20_dbs.py` 目前只初始化它负责的 V2.0 schema 子集；成功退出不代表
+`market.db`、`news.db` 和 `account.db` 已由采集链完整创建，也不代表可直接开启实盘。
 
 ## 部署 Agent
 
@@ -195,13 +229,22 @@ openclaw cron create '*/2 * * * *' `
 不访问交易所、不推送、不写运行数据库的基础检查：
 
 ```powershell
-python -m compileall -q collectors core scripts
+python -m compileall -q collectors core scripts tests
+python -m unittest discover -s tests -p "test_*.py" -v
 python collectors/sources/_registry.py --validate
+python scripts/check_script_lifecycle.py --json
 python scripts/check_trader_docs_sync.py
+python scripts/check_doc_versions.py --static-only
 python scripts/update_star_stats.py --self-test
 ```
 
 涉及数据库的工具必须传入隔离目录。涉及 Agent、QQ、OpenClaw 或 OKX 的入口只允许 dry-run，或在缺少外部环境时明确跳过。
+
+## 测试边界
+
+`tests/` 是最小、分层、无生产副作用的回归集，覆盖执行意图、账仓一致性、
+成交和止损契约、writer/dispatcher、报告、公开宏观和运行修复。它不连接生产数据库，
+不发送消息，也不代表完整 money-path、真实交易所或 OpenClaw 端到端验收已恢复。
 
 ## 风控摘要
 
@@ -212,6 +255,9 @@ python scripts/update_star_stats.py --self-test
 - 杠杆不超过 10x（`MAX_LEVERAGE`）；
 - 单笔名义价值不低于权益的 1%（`MIN_NOTIONAL_PCT`）；
 - 止损偏离 mark price 不超过 30%（`MAX_SL_DEVIATION`）；
+- 同一 profile 存在未决交易意图时，新交易在任何交易所 I/O 前 fail-closed；
+- OKX 现仓与本地交易账本不一致时，在读取 mark 或下单前 fail-closed；
+- 独立止损必须回读本次 `algoId`，confirmed fill 必须来自权威端点；
 - 合约规格、余额、可用保证金或成交确认缺失时 fail-safe 拒绝。
 
 这些限制没有因公开发布、文档国际化或 Stars 统计而修改。
@@ -223,6 +269,12 @@ python scripts/update_star_stats.py --self-test
 [![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
 统计脚本仅使用工作流运行期间的仓库级 `GITHUB_TOKEN`，不需要个人 PAT，也不会把 Token 写入文件、日志或图表。明细见 `docs/data/star-history.json`。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。任何个人或组织均可将本项目用于私人或商业用途，也可复制、修改、合并、发布、分发、再授权或销售副本，但须保留原版权声明和许可证声明。
+
+本软件不提供任何明示或默示担保；项目的交易风险与法律、监管合规责任仍由使用者自行承担。
 
 ## 安全报告
 

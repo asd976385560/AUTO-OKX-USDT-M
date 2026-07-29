@@ -19,8 +19,9 @@ query_state.py — V2.0 数据校验聚合查询
       <PROJECT_ROOT>\\scripts\\query_state.py --check regime --db-root <PROJECT_ROOT>\\db --json
 
 参数：
-  --check {all|tickers|regime|news|account|kline|volume_anomaly|degraded|cycle_fresh|playbook|lost_cycles}
+  --check {all|tickers|regime|analysis_macro|news|account|kline|volume_anomaly|degraded|cycle_fresh|playbook|lost_cycles|collection_failures}
          all = 跑全部可用检查
+         analysis_macro = 交易侧 regime/DXY 权威（analysis.db.analysis_runs，非 system_state.live_*）
   --db-root <PROJECT_ROOT>\\db   (硬编码默认)
   --stale-min 15          (新鲜度阈值分钟；FRESH<10 / STALE 10-15 / STALE+ >15)
   --hh01-only             (regime HH:01 必检；非 HH:01 复制 cross_market 最新行视为合规)
@@ -34,12 +35,19 @@ query_state.py — V2.0 数据校验聚合查询
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
 
 from _db_ro import connect_ro
 
 CST = timezone(timedelta(hours=8))
+_REGISTRY_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "collectors", "sources"
+)
+if _REGISTRY_DIR not in sys.path:
+    sys.path.insert(0, _REGISTRY_DIR)
+import _registry  # noqa: E402
 
 
 def now_cst() -> datetime:
@@ -72,6 +80,38 @@ def safe_connect(path):
         return connect_ro(path)  # 只读 mode=ro（2026-07-03：防可写打开静默建 0 字节假库）
     except Exception as e:
         return e  # caller 检查
+
+
+def load_public_macro_snapshot(db_root):
+    """读取公开宏观权威观测表；失败时返回空字典，由 cross_market 旧字段兜底。"""
+    regime = os.path.join(db_root, "regime.db")
+    try:
+        from public_macro import latest_snapshot
+
+        con = connect_ro(regime, row_factory=sqlite3.Row)
+        try:
+            return latest_snapshot(con)
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def _openclaw_state_db() -> str:
+    """允许巡检/隔离测试覆盖；默认只读当前用户 OpenClaw 状态库。"""
+    return os.environ.get(
+        "OPENCLAW_STATE_DB",
+        os.path.join(os.path.expanduser("~"), ".openclaw", "state", "openclaw.sqlite"),
+    )
+
+
+def _ms_to_cst_str(value):
+    try:
+        return datetime.fromtimestamp(int(value) / 1000.0, CST).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def check_tickers(db_root, stale_min, hh01_only, results):
@@ -152,7 +192,23 @@ def check_regime(db_root, stale_min, hh01_only, results):
     src = latest_source(db_root)
     ts_raw = row.get("ts")
     regime = row.get("regime")
-    dxy, vix, spx, etf = row.get("dxy"), row.get("vix"), row.get("spx"), row.get("btc_etf_flow")
+    dxy, vix, spx = row.get("dxy"), row.get("vix"), row.get("spx")
+    btc_mcap_chg = row.get("btc_mcap_chg_24h_usd")
+    if btc_mcap_chg is None:
+        btc_mcap_chg = row.get("btc_etf_flow")
+    btc_etf_net = row.get("btc_etf_net_flow_usd")
+    dxy_calc_ecb = row.get("dxy_calc_ecb")
+    fear_greed = row.get("fear_greed")
+    fear_greed_label = row.get("fear_greed_label")
+    public_macro = load_public_macro_snapshot(db_root)
+    if public_macro:
+        dxy_calc_row = public_macro.get("dxy_calc_ecb") or {}
+        fear_row = public_macro.get("fear_greed") or {}
+        etf_confirmed = public_macro.get("etf_confirmed") or {}
+        dxy_calc_ecb = dxy_calc_row.get("value", dxy_calc_ecb)
+        fear_greed = fear_row.get("value", fear_greed)
+        fear_greed_label = fear_row.get("label", fear_greed_label)
+        btc_etf_net = etf_confirmed.get("value")
     age = fmt_age_minutes(parse_utc_iso(ts_raw))
     # regime 必非空
     if not regime or str(regime).strip() in ("", "null", "None"):
@@ -168,8 +224,174 @@ def check_regime(db_root, stale_min, hh01_only, results):
     results.append({
         "name": "regime", "status": status, "msg": msg,
         "regime": regime, "ts": ts_raw, "age_min": age,
-        "dxy": dxy, "vix": vix, "spx": spx, "btc_etf_flow": etf, "src": src,
+        "dxy": dxy, "vix": vix, "spx": spx,
+        "btc_mcap_chg_24h_usd": btc_mcap_chg,
+        "btc_etf_net_flow_usd": btc_etf_net,
+        "dxy_calc_ecb": dxy_calc_ecb,
+        "fear_greed": fear_greed,
+        "fear_greed_label": fear_greed_label,
+        "src": src,
     })
+
+
+def _macro_pick(macro: dict, *keys):
+    """从 market_summary.macro 多别名取第一个非空值。"""
+    if not isinstance(macro, dict):
+        return None
+    for key in keys:
+        value = macro.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() in ("", "-", "null", "None"):
+            continue
+        return value
+    return None
+
+
+def _parse_macro_json(raw):
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def check_analysis_macro(db_root, stale_min, hh01_only, results):
+    """交易侧 regime/DXY 监控权威：analysis.db.analysis_runs（最新 ok 行）。
+
+    2026-07-28：V2 push_pipeline 不再回写 system_state.live_dxy / live_regime，
+    这两键自 07-07 起冻结，不得再当监控源。慢源采集仍走 regime.db（check_regime）；
+    交易/巡检当前判断以 analysis_runs 为准。
+    """
+    path = os.path.join(db_root, "analysis.db")
+    con = safe_connect(path)
+    if not con or isinstance(con, Exception):
+        results.append({
+            "name": "analysis_macro",
+            "status": "FAIL",
+            "msg": f"analysis.db 不可读: {con}",
+        })
+        return
+    try:
+        row = con.execute(
+            "SELECT cycle_id, ts, regime, regime_stale, market_summary, status "
+            "FROM analysis_runs WHERE status='ok' ORDER BY ts DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            row = con.execute(
+                "SELECT cycle_id, ts, regime, regime_stale, market_summary, status "
+                "FROM analysis_runs ORDER BY ts DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            results.append({
+                "name": "analysis_macro",
+                "status": "FAIL",
+                "msg": "analysis_runs 为空（交易侧 regime/DXY 无权威行）",
+            })
+            return
+        cycle_id, ts_raw, regime, regime_stale, market_summary, status = row
+        summary = _parse_macro_json(market_summary)
+        macro = summary.get("macro") if isinstance(summary.get("macro"), dict) else summary
+        if not isinstance(macro, dict):
+            macro = {}
+        dxy = _macro_pick(
+            macro,
+            "usd_broad_dtwexbgs", "usd_broad", "dxy_broad_dtwbxgs",
+            "dxy", "dxy_value", "live_dxy",
+        )
+        dxy_zone = _macro_pick(
+            macro,
+            "dxy_zone", "usd_broad_zone", "usd_broad_zone_label",
+        )
+        dxy_d1 = _macro_pick(macro, "usd_broad_d1", "dxy_d1")
+        if not regime or str(regime).strip() in ("", "null", "None"):
+            regime = _macro_pick(macro, "regime", "regime_label")
+        age = fmt_age_minutes(parse_utc_iso(ts_raw))
+        # 交易轮 15m 节奏：>45m WARN，>75m FAIL（与 cycle_fresh 同阶）
+        if not regime or str(regime).strip() in ("", "null", "None"):
+            results.append({
+                "name": "analysis_macro",
+                "status": "FAIL",
+                "msg": f"analysis regime 为空 @ {cycle_id} ts={ts_raw} status={status}",
+                "cycle_id": cycle_id, "ts": ts_raw, "age_min": age,
+            })
+            return
+        if age is None:
+            st, msg = "WARN", (
+                f"analysis regime={regime} dxy={dxy} zone={dxy_zone} "
+                f"@ {cycle_id} ts 无法解析 ts={ts_raw}"
+            )
+        elif age > 75:
+            st, msg = "FAIL", (
+                f"analysis regime={regime} dxy={dxy} zone={dxy_zone} "
+                f"@ {cycle_id} age={age}m > 75m（交易侧宏观断更）"
+            )
+        elif age > 45:
+            st, msg = "WARN", (
+                f"analysis regime={regime} dxy={dxy} zone={dxy_zone} "
+                f"@ {cycle_id} age={age}m > 45m"
+            )
+        else:
+            st, msg = "PASS", (
+                f"analysis regime={regime} dxy={dxy} zone={dxy_zone} "
+                f"@ {cycle_id} age={age}m"
+            )
+        # 废弃缓存：仅标注漂移，不参与权威判定、不因漂移 FAIL
+        deprecated = {}
+        acc = os.path.join(db_root, "account.db")
+        acon = safe_connect(acc)
+        if acon and not isinstance(acon, Exception):
+            try:
+                for key in ("live_dxy", "live_regime"):
+                    kr = acon.execute(
+                        "SELECT value, updated_utc FROM system_state WHERE key=?", (key,)
+                    ).fetchone()
+                    if kr:
+                        deprecated[key] = {"value": kr[0], "updated_utc": kr[1]}
+            finally:
+                acon.close()
+        drift_bits = []
+        if deprecated.get("live_regime") and str(deprecated["live_regime"]["value"]).strip() != str(regime).strip():
+            drift_bits.append(
+                f"system_state.live_regime={deprecated['live_regime']['value']}@{deprecated['live_regime']['updated_utc']}(deprecated)"
+            )
+        if deprecated.get("live_dxy") and dxy is not None:
+            try:
+                old_v = float(deprecated["live_dxy"]["value"])
+                new_v = float(dxy)
+                if abs(old_v - new_v) > 1e-6:
+                    drift_bits.append(
+                        f"system_state.live_dxy={deprecated['live_dxy']['value']}@{deprecated['live_dxy']['updated_utc']}(deprecated)"
+                    )
+            except Exception:
+                if str(deprecated["live_dxy"]["value"]).strip() != str(dxy).strip():
+                    drift_bits.append(
+                        f"system_state.live_dxy={deprecated['live_dxy']['value']}@{deprecated['live_dxy']['updated_utc']}(deprecated)"
+                    )
+        if drift_bits:
+            msg = msg + " | ignore " + "; ".join(drift_bits)
+        results.append({
+            "name": "analysis_macro",
+            "status": st,
+            "msg": msg,
+            "cycle_id": cycle_id,
+            "ts": ts_raw,
+            "age_min": age,
+            "regime": regime,
+            "regime_stale": regime_stale,
+            "dxy": dxy,
+            "dxy_zone": dxy_zone,
+            "dxy_d1": dxy_d1,
+            "analysis_status": status,
+            "authority": "analysis.db.analysis_runs",
+            "deprecated_system_state": deprecated or None,
+        })
+    finally:
+        con.close()
 
 
 def check_news(db_root, stale_min, hh01_only, results):
@@ -310,7 +532,7 @@ def check_volume_anomaly(db_root, stale_min, hh01_only, results):
 
 
 def check_degraded(db_root, stale_min, hh01_only, results):
-    """P3-7: 已知降级源（FRED 冻结 / ETF proxy 振幅）"""
+    """P3-7: 已知降级源（FRED 真时效 / BTC市值24h振幅 / 真实ETF缺口）"""
     # 2026-06-27 regime 拆库收尾：cross_market 迁 regime.db（market.db 表已 DROP）
     regime = os.path.join(db_root, "regime.db")
     con = safe_connect(regime)
@@ -319,13 +541,32 @@ def check_degraded(db_root, stale_min, hh01_only, results):
         return
     try:
         r = con.execute(
-            "SELECT ts, dxy, dxy_d1, vix, vix_d1, spx, spx_d1, btc_etf_flow, gold, gold_d1 "
+            "SELECT ts,dxy,dxy_d1,vix,vix_d1,spx,spx_d1,"
+            "btc_mcap_chg_24h_usd,btc_etf_net_flow_usd,gold,gold_d1,"
+            "dxy_calc_ecb,dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta "
             "FROM cross_market ORDER BY ts DESC LIMIT 1"
         ).fetchone()
         if not r:
             results.append({"name": "degraded", "status": "WARN", "msg": "cross_market 空，跳过"})
             return
-        ts_raw, dxy, dxy_d1, vix, vix_d1, spx, spx_d1, etf, gold, gold_d1 = r
+        (
+            ts_raw, dxy, dxy_d1, vix, vix_d1, spx, spx_d1,
+            btc_mcap_chg, btc_etf_net, gold, gold_d1,
+            dxy_calc_ecb, dxy_calc_ecb_d1, fear_greed, fear_greed_label,
+            source_meta,
+        ) = r
+        public_macro = load_public_macro_snapshot(db_root)
+        if public_macro:
+            dxy_calc_row = public_macro.get("dxy_calc_ecb") or {}
+            fear_row = public_macro.get("fear_greed") or {}
+            etf_confirmed = public_macro.get("etf_confirmed") or {}
+            dxy_calc_ecb = dxy_calc_row.get("value", dxy_calc_ecb)
+            dxy_calc_ecb_d1 = public_macro.get(
+                "dxy_calc_ecb_d1", dxy_calc_ecb_d1
+            )
+            fear_greed = fear_row.get("value", fear_greed)
+            fear_greed_label = fear_row.get("label", fear_greed_label)
+            btc_etf_net = etf_confirmed.get("value")
         marks = []
         # v7.0e.4 (2026-06-07 主人指令) A 方案：美股周末/节假日 FRED 无 d1 是正常的
         # cst_now.weekday() 5=周六 6=周日；只在工作日 d1=None 才标冻结
@@ -348,11 +589,51 @@ def check_degraded(db_root, stale_min, hh01_only, results):
                 fred_marks.append(f"FRED 值缺失: {name}=None（拉取失败，权重=0）")
             elif d1 is not None and abs(d1) < 1e-6:
                 fred_marks.append(f"FRED 冻结嫌疑: {name}={v} 连续同值")
+        try:
+            meta = json.loads(source_meta or "{}")
+            dxy_as_of = str((meta.get("dxy") or {}).get("source_as_of") or "")
+            etf_meta = meta.get("btc_etf_net_flow_usd") or {}
+        except (TypeError, json.JSONDecodeError):
+            dxy_as_of = ""
+            etf_meta = {}
+        if public_macro:
+            etf_confirmed = public_macro.get("etf_confirmed") or {}
+            etf_provisional = public_macro.get("etf_provisional") or {}
+            etf_conflict = public_macro.get("etf_conflict") or {}
+            if etf_confirmed:
+                etf_meta = {
+                    "status": "cross_checked",
+                    "source_as_of": etf_confirmed.get("observation_date"),
+                }
+            elif etf_conflict:
+                etf_meta = {
+                    "status": "conflict",
+                    "source_as_of": etf_conflict.get("observation_date"),
+                }
+            elif etf_provisional:
+                etf_meta = {
+                    "status": "provisional_single_source",
+                    "provisional_value_usd": etf_provisional.get("value"),
+                    "source_as_of": etf_provisional.get("observation_date"),
+                    "source": etf_provisional.get("source"),
+                }
+        dxy_last_seen = f"{dxy_as_of} 23:59:59" if len(dxy_as_of) == 10 else None
+        if dxy_last_seen and _registry.is_stale(
+            "weekday", dxy_last_seen, now=cst_now
+        ):
+            fred_marks.append(
+                "USD_BROAD(DTWEXBGS)源旧: "
+                f"source_as_of={dxy_as_of}（legacy字段=dxy；非ICE DXY）"
+            )
         # (2026-06-11 阈值修正) btc_etf_flow 实为 BTC 24h 市值变化 USD——1.2T 市值
         # 日波动 ±2%（±2.4e10）属正常行情。旧阈值 1e9（市值 0.08%）几乎天天误报
         # "异常"并被 agent 用来压置信度。新阈值 6e10（≈市值 5%）仅极端值才疑数据质量。
-        if etf is not None and abs(etf) > 6e10:
-            marks.append(f"ETF proxy 振幅: btc_etf_flow={etf:.2e}（>5% BTC 市值，疑数据质量）")
+        if btc_mcap_chg is not None and abs(btc_mcap_chg) > 6e10:
+            marks.append(
+                "BTC市值24h振幅: "
+                f"btc_mcap_chg_24h_usd={btc_mcap_chg:.2e}"
+                "（>5% BTC 市值，疑数据质量）"
+            )
         # v7.1.3（2026-06-11 体检 3.7）：FRED 冻结是长期已知降级，每轮 WARN 全天 96 次
         # 纯噪音。降为只在每日 08:00-08:30（P7 复盘窗口）报 WARN；其余轮次 PASS，
         # 但 msg 与 fred_frozen 字段保留——agent 仍按 决策权重=0 处理。
@@ -364,12 +645,43 @@ def check_degraded(db_root, stale_min, hh01_only, results):
             status = "PASS"
             msg = "; ".join(fred_marks) + " (已知降级，权重=0，仅每日 08:00-08:30 报 WARN)"
         elif is_weekend and (dxy_d1 is None or spx_d1 is None or vix_d1 is None):
-            status, msg = "PASS", f"周末美股休市，DXY={dxy} | VIX={vix} | SPX={spx} (FRED d1 缺省属正常)"
+            status, msg = (
+                "PASS",
+                f"周末美股休市，USD_BROAD(DTWEXBGS)={dxy} | "
+                f"VIX={vix} | SPX={spx} (FRED d1 缺省属正常)",
+            )
         else:
-            status, msg = "PASS", f"无降级标记（DXY={dxy} d1={dxy_d1} | VIX={vix} d1={vix_d1} | SPX={spx} d1={spx_d1} | ETF={etf}）"
+            etf_s = (
+                str(btc_etf_net)
+                if btc_etf_net is not None
+                else (
+                    f"NULL(provisional={etf_meta.get('provisional_value_usd')},"
+                    f" as_of={etf_meta.get('source_as_of')})"
+                    if etf_meta.get("status") == "provisional_single_source"
+                    else "NULL(尚无双源一致值)"
+                )
+            )
+            status, msg = (
+                "PASS",
+                f"无降级标记（USD_BROAD(DTWEXBGS)={dxy} d1={dxy_d1} | "
+                f"DXY_CALC_ECB={dxy_calc_ecb} d1={dxy_calc_ecb_d1}"
+                "（非ICE官方报价） | "
+                f"VIX={vix} d1={vix_d1} | SPX={spx} d1={spx_d1} | "
+                f"BTC_MCAP_CHG_24H_USD={btc_mcap_chg} | "
+                f"BTC_ETF_NET_FLOW_USD={etf_s} | "
+                f"FEAR_GREED={fear_greed}/{fear_greed_label}）",
+            )
         results.append({
             "name": "degraded", "status": status, "msg": msg,
-            "ts": ts_raw, "dxy": dxy, "vix": vix, "spx": spx, "btc_etf_flow": etf,
+            "ts": ts_raw, "dxy": dxy, "vix": vix, "spx": spx,
+            "btc_mcap_chg_24h_usd": btc_mcap_chg,
+            "btc_etf_net_flow_usd": btc_etf_net,
+            "btc_etf_flow_status": etf_meta.get("status"),
+            "dxy_calc_ecb": dxy_calc_ecb,
+            "dxy_calc_ecb_d1": dxy_calc_ecb_d1,
+            "fear_greed": fear_greed,
+            "fear_greed_label": fear_greed_label,
+            "dxy_source_as_of": dxy_as_of or None,
             "fred_frozen": bool(fred_marks),
         })
     finally:
@@ -377,9 +689,10 @@ def check_degraded(db_root, stale_min, hh01_only, results):
 
 
 def check_cycle_fresh(db_root, stale_min, hh01_only, results):
-    """P3-8: V2.0 交易账本新鲜度——读 live_trades.db.trade_cycles 最近一行 ts。
+    """P3-8: V2.0 交易账本新鲜度——读 live_trades.db.trade_cycles 最新槽位 ts。
     （account.db.cycle_runs.cycle_count 不再推进——V2.0 trader
-    只写 trade_cycles 不调 phase5_writer；权威账本＝trade_cycles 槽位 cycle_id。）"""
+    只写 trade_cycles，不旁路调用其他 writer；权威账本＝trade_cycles 槽位 cycle_id。
+    历史补账会 INSERT OR REPLACE 旧槽位并改变 rowid，故不能按 rowid 判断最新周期。）"""
     ltdb = os.path.join(db_root, "live_trades.db")
     con = safe_connect(ltdb)
     if not con or isinstance(con, Exception):
@@ -387,7 +700,7 @@ def check_cycle_fresh(db_root, stale_min, hh01_only, results):
         return
     try:
         r = con.execute(
-            "SELECT cycle_id, ts FROM trade_cycles ORDER BY rowid DESC LIMIT 1"
+            "SELECT cycle_id, ts FROM trade_cycles ORDER BY cycle_id DESC LIMIT 1"
         ).fetchone()
         if not r:
             results.append({"name": "cycle_fresh", "status": "FAIL", "msg": "trade_cycles 为空（交易账本断链）"})
@@ -518,11 +831,138 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
                                f"[{never_detail}]。只告警、不自动补派。"})
 
 
+def check_collection_failures(db_root, stale_min, hh01_only, results):
+    """近24h采集/cron失败审计；只告警，不补采、不重跑、不改变调度状态。
+
+    lost_cycles 只覆盖“采集成功后未派发”，本检查专门覆盖：
+      1. collection_runs 已明确记为 error/timeout/fail/failed；
+      2. 外层 OpenClaw 命令在落账前超时/失败；
+      3. 当前仍有 consecutive_errors 的 OKX cron。
+    """
+    failure_states = ("error", "timeout", "fail", "failed")
+    ledger_db = os.path.join(db_root, "ledger.db")
+    collection_errors = []
+    con = safe_connect(ledger_db)
+    if not con or isinstance(con, Exception):
+        results.append({
+            "name": "collection_failures",
+            "status": "WARN",
+            "msg": f"ledger.db 不可读，无法核对采集失败: {con}",
+        })
+        return
+    try:
+        placeholders = ",".join("?" for _ in failure_states)
+        collection_errors = con.execute(
+            "SELECT cycle_id,source,status,ts,COALESCE(err,'') "
+            "FROM collection_runs "
+            f"WHERE lower(status) IN ({placeholders}) "
+            "AND cycle_id NOT LIKE 'TEST-%' "
+            "AND datetime(ts) >= datetime('now','+8 hours','-24 hours') "
+            "ORDER BY datetime(ts)",
+            failure_states,
+        ).fetchall()
+    finally:
+        con.close()
+
+    cron_errors = []
+    active_errors = []
+    cron_db_error = None
+    cron_db = _openclaw_state_db()
+    ocon = safe_connect(cron_db)
+    if not ocon or isinstance(ocon, Exception):
+        cron_db_error = f"OpenClaw 状态库不可读: {ocon or cron_db}"
+    else:
+        try:
+            placeholders = ",".join("?" for _ in failure_states)
+            since_ms = int((datetime.now(timezone.utc).timestamp() - 86400) * 1000)
+            cron_errors = ocon.execute(
+                "SELECT j.name,l.status,COALESCE(l.error,''),l.run_at_ms,l.duration_ms "
+                "FROM cron_run_logs l JOIN cron_jobs j "
+                "ON j.store_key=l.store_key AND j.job_id=l.job_id "
+                "WHERE j.name LIKE 'okx-%' "
+                f"AND lower(COALESCE(l.status,'')) IN ({placeholders}) "
+                "AND l.ts>=? ORDER BY l.ts",
+                (*failure_states, since_ms),
+            ).fetchall()
+            active_errors = ocon.execute(
+                "SELECT name,last_run_status,COALESCE(last_error,''),"
+                "COALESCE(consecutive_errors,0) "
+                "FROM cron_jobs WHERE name LIKE 'okx-%' "
+                "AND (COALESCE(consecutive_errors,0)>0 "
+                f"OR lower(COALESCE(last_run_status,'')) IN ({placeholders})) "
+                "ORDER BY name",
+                failure_states,
+            ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            cron_db_error = f"OpenClaw cron 表核对失败: {exc}"
+        finally:
+            ocon.close()
+
+    if not collection_errors and not cron_errors and not active_errors and not cron_db_error:
+        results.append({
+            "name": "collection_failures",
+            "status": "PASS",
+            "msg": "近24h 无采集失败、OpenClaw cron 错误或当前连续错误",
+            "collection_errors": [],
+            "cron_errors": [],
+            "active_cron_errors": [],
+        })
+        return
+
+    collection_detail = [
+        {
+            "cycle_id": row[0],
+            "source": row[1],
+            "status": row[2],
+            "ts": row[3],
+            "err": str(row[4] or "")[:160],
+        }
+        for row in collection_errors[:10]
+    ]
+    cron_detail = [
+        {
+            "job": row[0],
+            "status": row[1],
+            "error": str(row[2] or "")[:160],
+            "run_at": _ms_to_cst_str(row[3]),
+            "duration_ms": row[4],
+        }
+        for row in cron_errors[:10]
+    ]
+    active_detail = [
+        {
+            "job": row[0],
+            "status": row[1],
+            "error": str(row[2] or "")[:160],
+            "consecutive_errors": row[3],
+        }
+        for row in active_errors
+    ]
+    msg = (
+        f"近24h 采集失败={len(collection_errors)}，"
+        f"OpenClaw cron 错误={len(cron_errors)}，"
+        f"当前连续错误={len(active_errors)}。只告警、不自动补采。"
+    )
+    if cron_db_error:
+        msg += f" {cron_db_error}"
+    results.append({
+        "name": "collection_failures",
+        "status": "WARN",
+        "msg": msg,
+        "collection_errors": collection_detail,
+        "cron_errors": cron_detail,
+        "active_cron_errors": active_detail,
+        "cron_db_error": cron_db_error,
+    })
+
+
 CHECK_FUNCS = {
     "tickers": check_tickers,
     "lost_cycles": check_lost_cycles,
+    "collection_failures": check_collection_failures,
     "kline": check_kline,
     "regime": check_regime,
+    "analysis_macro": check_analysis_macro,
     "news": check_news,
     "account": check_account,
     "volume_anomaly": check_volume_anomaly,

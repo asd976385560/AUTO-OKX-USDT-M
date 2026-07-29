@@ -23,8 +23,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -45,6 +47,15 @@ RAW = ROOT / "scripts" / "qq_push_raw.py"
 DB = ROOT / "db" / "qq_push_dedupe.db"
 EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
 CST = timezone(timedelta(hours=8))
+SENT_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS sent ("
+    "k TEXT PRIMARY KEY, "
+    "content_hash TEXT, "
+    "status TEXT, "
+    "first_seen TEXT, "
+    "updated_at TEXT, "
+    "preview TEXT)"
+)
 
 
 def _now() -> str:
@@ -97,21 +108,24 @@ def _dedupe_key(content: str) -> tuple[str, str, str | None, str]:
     return key, content_hash, dkey, target
 
 
-def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: str) -> bool:
+def _connect() -> sqlite3.Connection:
+    """统一 dedupe 连接策略；NORMAL 为每条写连接显式设置，禁止依赖默认值。"""
     DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB, timeout=10)
     try:
         con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA busy_timeout=5000")
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS sent ("
-            "k TEXT PRIMARY KEY, "
-            "content_hash TEXT, "
-            "status TEXT, "
-            "first_seen TEXT, "
-            "updated_at TEXT, "
-            "preview TEXT)"
-        )
+        return con
+    except Exception:
+        con.close()
+        raise
+
+
+def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: str) -> bool:
+    con = _connect()
+    try:
+        con.execute(SENT_TABLE_DDL)
         now = _now()
         con.execute("BEGIN IMMEDIATE")
         row = con.execute("SELECT status, updated_at FROM sent WHERE k=?", (key,)).fetchone()
@@ -163,7 +177,7 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
 
 
 def _mark(key: str, status: str, dkey: str | None, target: str, exit_code: int | None = None) -> None:
-    con = sqlite3.connect(DB, timeout=10)
+    con = _connect()
     try:
         now = _now()
         con.execute("UPDATE sent SET status=?, updated_at=? WHERE k=?", (status, now, key))

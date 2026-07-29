@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""V2.0 §8.5 —— 经验相似度工具。
 
-本模块严格对齐两处消费者的事实契约：
+本模块严格对齐两处公开消费者的调用契约：
   - find_similar_experience.py / trade_experience_writer.py 调
     `experience_vector(dict)` -> 定长 10 维 list[float]；`cosine(a, b)` -> float。
   - 入参 dict 键（消费者实际传）：symbol / side / regime / action /

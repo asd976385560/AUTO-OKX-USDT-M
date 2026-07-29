@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""通用 HTTP 工具。
 
-对齐 collect_slow.py 事实契约：
+对齐 collect_slow.py 的公开调用契约：
     from _http import TokenBucket, get_json, load_coingecko_key, load_fred_key, make_client
 
 用于宏观数据源（FRED / CoinGecko / DefiLlama / frankfurter）——这些站点经系统代理
@@ -13,8 +13,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -92,12 +94,7 @@ def _key_from_config(section_re: str) -> str:
     except OSError:
         return ""
     m = re.search(section_re, txt, re.S)
-    if not m:
-        return ""
-    value = m.group(1).strip().strip("`").strip()
-    if value.startswith("<") and value.endswith(">"):
-        return ""
-    return value
+    return m.group(1).strip() if m else ""
 
 
 def load_fred_key() -> str:

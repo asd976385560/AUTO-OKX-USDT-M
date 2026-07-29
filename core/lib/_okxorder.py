@@ -5,7 +5,7 @@
 `_okxcli.okx_json` 调（复用节流/超时/崩溃重试）。order_executor 只调本模块函数，
 不再手拼命令字符串。
 
-**命令已对 OKX CLI 1.3.x / 1.3.9 对齐确认**（初测 2026-06-24 `okx swap/algo/market --help`；CLI 包 2026-07-18 核实 `@okx_ai/okx-trade-cli@1.3.9`）：
+**命令已在 OKX CLI 1.4.2 复核兼容**（初测 2026-06-24，2026-07-27 升级后复核）：
   - place: okx swap place --instId <id> --side <buy|sell> --ordType <market|limit> --sz <n>
            [--posSide long|short] [--tdMode cross|isolated] [--tgtCcy base_ccy|quote_ccy|margin]
            [--reduceOnly] [--slTriggerPx <px>] [--slOrdPx <px|-1>] [--slTriggerPxType last|index|mark]
@@ -29,8 +29,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[2]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[2]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))

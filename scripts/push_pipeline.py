@@ -3,7 +3,7 @@
 
 一条确定性链，无 LLM 参与：
   build_push_payload → render_push_report → validate_push_format
-    → qq_push（--no-send 跳过）→ push_archive → system_state_writer → 环节报告
+    → push_archive hard-check → qq_push（--no-send 跳过）→ system_state_writer → 环节报告
 
 幂等：dispatcher 的 ledger.stage_dispatch(cycle,'push') 闩锁保每 cycle 单发；
 qq_push 层用显式 --dedupe-key push:{cycle}。
@@ -22,8 +22,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -75,6 +77,33 @@ def _load_build():
     m = ilu.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def _archive_hard_check(
+    rc: int, receipt: dict, content_file: str
+) -> tuple[bool, str | None]:
+    """确认时间戳归档真实存在且完整包含本轮渲染正文，成功前禁止 send。"""
+    if rc != 0:
+        return False, f"archive_rc_{rc}"
+    if receipt.get("ok") is not True:
+        return False, "archive_receipt_not_ok"
+    if receipt.get("degraded"):
+        return False, "archive_degraded"
+    archive_path = receipt.get("path")
+    if not isinstance(archive_path, str) or not archive_path.strip():
+        return False, "archive_path_missing"
+    try:
+        source = Path(content_file).read_text(encoding="utf-8")
+        archived = Path(archive_path).read_text(encoding="utf-8")
+        actual_bytes = Path(archive_path).stat().st_size
+        declared_bytes = int(receipt.get("bytes"))
+    except (OSError, TypeError, ValueError):
+        return False, "archive_file_unreadable"
+    if not source or not archived.endswith(source):
+        return False, "archive_content_mismatch"
+    if actual_bytes <= 0 or declared_bytes != actual_bytes:
+        return False, "archive_size_mismatch"
+    return True, None
 
 
 def run(cycle: str, db_root: str, no_send: bool) -> dict:
@@ -131,17 +160,8 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
         rep["fatal"] = "validate_failed"       # 不外发残缺内容（阶段二在此写 repair_queue + 告警）
         return _finish(rep)
 
-    # 4. 外发（--no-send 跳过）
-    if no_send:
-        rep["steps"]["send"] = {"skipped": True, "reason": "--no-send"}
-    else:
-        # 显式身份键 push:{cycle}：同 cycle 任何 content 同键，重跑幂等。
-        rc, out, err = _run(_project_path('scripts', 'qq_push.py'),
-                            ["--content-file", content_f, "--dedupe-key", f"push:{cycle}"])
-        rep["steps"]["send"] = {"rc": rc, "out": out[:500], "err": err[:200] if rc else None}
-        # 外发失败 ≠ 交易失败：不中断，继续归档
-
-    # 5. 归档（必做，不因外发失败裁剪）。--no-send 下归到 dev 目录，不覆写生产 latest.md
+    # 4. 归档前置硬闸：归档返回成功且文件内容核验完成，才允许进入 send。
+    # --no-send 下归到 dev 目录，不覆写生产 latest.md。
     title = receipt.get("title") or f"push {cycle}"
     arch_in = json.dumps({"ts": now_ts(), "content_file": content_f, "title": title},
                          ensure_ascii=False)
@@ -154,8 +174,40 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
         ares = json.loads(out) if out else {}
     except Exception:
         pass
+    archive_ok, archive_reason = _archive_hard_check(rc, ares, content_f)
     rep["steps"]["archive"] = {"rc": rc, "path": ares.get("path"), "bytes": ares.get("bytes"),
-                               "degraded": ares.get("degraded")}
+                               "degraded": ares.get("degraded"),
+                               "hard_check": archive_ok}
+    if archive_reason:
+        rep["steps"]["archive"]["hard_check_error"] = archive_reason
+    if not archive_ok:
+        rep["steps"]["send"] = {"skipped": True, "reason": "archive_hard_check_failed"}
+        rep["fatal"] = "archive_hard_check_failed"
+        return _finish(rep)
+
+    # 5. 外发（--no-send 跳过）。发送失败时，前置时间戳归档已经完整保留。
+    if no_send:
+        rep["steps"]["send"] = {"skipped": True, "reason": "--no-send"}
+    else:
+        # 显式身份键 push:{cycle}：同 cycle 任何 content 同键，重跑幂等。
+        try:
+            rc, out, err = _run(
+                _project_path('scripts', 'qq_push.py'),
+                ["--content-file", content_f, "--dedupe-key", f"push:{cycle}"],
+            )
+            rep["steps"]["send"] = {
+                "rc": rc,
+                "out": out[:500],
+                "err": err[:200] if rc else None,
+            }
+        except Exception as exc:
+            # 归档已过硬闸；即使子进程启动/超时异常，也保留存证并继续写 failed 状态。
+            rc, out = 1, ""
+            rep["steps"]["send"] = {
+                "rc": rc,
+                "out": "",
+                "err": f"{type(exc).__name__}: {exc}"[:200],
+            }
 
     # 6. 状态落库（--no-send 下不真写生产 account.db，只报告将写什么）
     if no_send:
@@ -182,8 +234,10 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
         rc, out, err = _run(_project_path('scripts', 'system_state_writer.py'), ["--json-file", state_json])
         rep["steps"]["system_state"] = {"rc": rc}
 
-    rep["ok"] = True
     rep["send_status"] = status
+    rep["ok"] = no_send or status in {"sent", "duplicate_skip"}
+    if not rep["ok"]:
+        rep["fatal"] = "send_failed"
     return _finish(rep)
 
 

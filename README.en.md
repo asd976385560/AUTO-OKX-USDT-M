@@ -1,3 +1,10 @@
+<!--
+doc-version: V2.0
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Sync the latest sanitized execution, reconciliation, macro, report, lifecycle and regression contracts.
+-->
+
 <p align="center">
   <a href="README.md">简体中文</a> · <strong>English</strong>
 </p>
@@ -10,9 +17,11 @@
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/network/members"><img alt="GitHub Forks" src="https://img.shields.io/github/forks/asd976385560/AUTO-OKX-USDT-M?style=flat-square&logo=github"></a>
   <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/asd976385560/AUTO-OKX-USDT-M?style=flat-square"></a>
+  <a href="https://github.com/asd976385560/AUTO-OKX-USDT-M/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/asd976385560/AUTO-OKX-USDT-M/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo execution share the same hard risk limits and stop-loss requirements; only the execution environment changes.
+V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo execution share the same hard risk limits, execution-intent idempotency, ledger-position consistency, and stop-loss requirements; only the execution environment changes.
 
 > [!WARNING]
 > This project can execute real trades. Keep `OKX_EXECUTOR_DRYRUN=1` and `OKX_TRIGGER_DRYRUN=1` during initial deployment, and validate everything against isolated databases. This project is not investment advice and does not guarantee profit.
@@ -21,14 +30,18 @@ V2.0 keeps market collection, risk checks, order execution, bookkeeping, push de
 
 - [Public release boundary](#public-release-boundary)
 - [Version lineage](#version-lineage)
+- [Latest synchronization](#latest-synchronization)
 - [Architecture](#architecture)
 - [Agent roles](#agent-roles)
 - [Quick start](#quick-start)
 - [Deploy Agents](#deploy-agents)
 - [Configure scheduled jobs](#configure-scheduled-jobs)
 - [Configuration and safe validation](#configuration-and-safe-validation)
+- [Test boundary](#test-boundary)
 - [Risk summary](#risk-summary)
 - [Star history](#star-history)
+- [License](#license)
+- [Security reports](#security-reports)
 
 ## Public release boundary
 
@@ -47,6 +60,18 @@ Copy `config.example.md` to a local `config.md` before filling it in. Environmen
 
 The synchronized source identifies itself as `V2.0`. The previous remote README used a `v3.1` label. Those labels are not automatically comparable semantic versions. This synchronization does not create a tag or Release; the maintainer will choose the final public version separately.
 
+## Latest synchronization
+
+The 2026-07-29 public synchronization carries these production semantics while preserving portable paths and empty credential defaults:
+
+- a global `execution_intents` gate and idempotent replay of completed identical requests;
+- full-set consistency checks between OKX positions and the selected profile's trade ledger before order placement;
+- authoritative fill quantity, price, timestamp, and source requirements, with no synthetic fills from position deltas;
+- `stage_runner.py` verification of real business outputs after a child process exits;
+- public macro collection for Alternative.me, an ECB-derived DXY calculation, and two-source ETF-flow confirmation;
+- maintenance-ready manifests, reviewer hash validation, and separate valid-fill/risk-rejection reporting;
+- a public script lifecycle manifest and layered isolated regressions.
+
 ## Architecture
 
 ```text
@@ -58,7 +83,7 @@ OpenClaw cron
                                       v
                               core/dispatcher.py
                                       │
-                    unique stage_dispatch lock
+                    stage_dispatch stage lock
                                       │
                  ┌────────────────────┴───────────────────┐
                  v                                        v
@@ -66,6 +91,9 @@ OpenClaw cron
        analysis + live execution                   demo execution
                  │                                        │
                  └───────────────┬────────────────────────┘
+                                 v
+                    stage_runner terminal/output check
+                                 │
                                  v
                      scripts/push_pipeline.py
                      render -> validate -> archive/send
@@ -75,10 +103,13 @@ Core invariants:
 
 - `skill.md` is the V2.0 business fact source; this README is the public system map;
 - `ledger.db.stage_dispatch(cycle_id, stage)` is the idempotent stage-dispatch truth;
+- `ledger.db.execution_intents` blocks unresolved or ambiguous intents for an entire profile before any exchange I/O;
 - every table or explicit key domain has one authoritative writer, while readers use SQLite `mode=ro`;
 - live opens only pass through `core/order_executor.py`, which always calls `core/risk_validator.py`;
+- the complete OKX position set must match the confirmed local trade ledger before ordering;
 - live and demo opens both require stop loss and share the same hard limits;
 - current positions come from the OKX API, never from inferred local snapshots;
+- a confirmed fill requires authoritative `fill_sz`, `fill_px`, `fill_ts`, and `ts_source`;
 - push delivery always goes through `scripts/push_pipeline.py`.
 
 ## Agent roles
@@ -101,7 +132,7 @@ Runtime requirements:
 - `httpx`;
 - SQLite from the Python standard library;
 - OpenClaw for Agent scheduling;
-- an OKX CLI profile configured outside the repository for order execution;
+- an OKX CLI profile configured outside the repository for order execution; the current code is validated against the OKX CLI 1.4.2 command contract;
 - PowerShell 7 for Windows wrappers and operations scripts.
 
 ```powershell
@@ -112,7 +143,6 @@ python -m pip install -r requirements.txt
 Copy-Item config.example.md config.md
 
 $env:OKX_ROOT = (Resolve-Path .).Path
-$env:OKX_DB_ROOT = Join-Path $env:OKX_ROOT 'db'
 $env:OKX_EXECUTOR_DRYRUN = '1'
 $env:OKX_TRIGGER_DRYRUN = '1'
 ```
@@ -120,11 +150,16 @@ $env:OKX_TRIGGER_DRYRUN = '1'
 Use isolated databases for the first validation:
 
 ```powershell
-$isolatedDb = Join-Path $env:TEMP 'auto-okx-v20-db'
+$isolatedDb = Join-Path $env:TEMP ('auto-okx-v20-db-' + [guid]::NewGuid())
+$env:OKX_DB_ROOT = $isolatedDb
 python scripts/init_v20_dbs.py --root $isolatedDb --verify
 python collectors/sources/_registry.py --validate
 python scripts/check_trader_docs_sync.py
 ```
+
+`init_v20_dbs.py` currently initializes only the V2.0 schema subset it owns.
+A successful exit does not prove that `market.db`, `news.db`, and `account.db`
+have been fully created by the collector chain, and it does not authorize live trading.
 
 ## Deploy Agents
 
@@ -195,13 +230,23 @@ Main environment variables:
 Safe checks that do not contact OKX, send messages, or write runtime databases:
 
 ```powershell
-python -m compileall -q collectors core scripts
+python -m compileall -q collectors core scripts tests
+python -m unittest discover -s tests -p "test_*.py" -v
 python collectors/sources/_registry.py --validate
+python scripts/check_script_lifecycle.py --json
 python scripts/check_trader_docs_sync.py
+python scripts/check_doc_versions.py --static-only
 python scripts/update_star_stats.py --self-test
 ```
 
 Pass an isolated directory to every database-writing tool. Agent, QQ, OpenClaw, and OKX entry points must remain in dry-run unless external execution is separately approved.
+
+## Test boundary
+
+`tests/` is a minimal, layered, production-safe regression set for execution intents,
+ledger-position consistency, fill and stop-loss contracts, writers/dispatcher, reports,
+public macro data, and runtime repairs. It does not connect to production databases or
+send messages, and it is not a restored full money-path, exchange, or OpenClaw end-to-end suite.
 
 ## Risk summary
 
@@ -212,6 +257,9 @@ Authoritative values live in `core/risk_validator.py`:
 - leverage is capped at 10x (`MAX_LEVERAGE`);
 - notional per trade is at least 1% of equity (`MIN_NOTIONAL_PCT`);
 - stop-loss deviation from mark price is capped at 30% (`MAX_SL_DEVIATION`);
+- any unresolved intent for a profile fails closed before exchange I/O;
+- any mismatch between OKX positions and the local trade ledger fails closed before mark-price or order calls;
+- an independent stop loss must read back the current `algoId`, and confirmed fills must come from authoritative endpoints;
 - missing contract specifications, balances, available margin, or fill confirmation fail safe.
 
 These limits are unchanged by public release work, documentation internationalization, or star statistics.
@@ -223,6 +271,12 @@ The badge shows the current star count. The repository's own GitHub Actions work
 [![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
 The generator only uses the repository-scoped `GITHUB_TOKEN` while the workflow is running. It requires no personal PAT and never writes the token to files, logs, or the chart. Aggregate data is available in `docs/data/star-history.json`.
+
+## License
+
+This project is released under the [MIT License](LICENSE). Individuals and organizations may use it privately or commercially and may copy, modify, merge, publish, distribute, sublicense, or sell copies, provided that the original copyright and license notices are retained.
+
+The software is provided without any express or implied warranty. Users remain responsible for trading risk and legal or regulatory compliance.
 
 ## Security reports
 

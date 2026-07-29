@@ -33,6 +33,8 @@ tmp/
 *.bak*
 *.tmp
 *.swp
+.tmp/
+.vs/
 .DS_Store
 Thumbs.db
 
@@ -54,13 +56,24 @@ Thumbs.db
 /scripts/gateway_rss_sample.ps1
 /scripts/snapshot_source.ps1
 
+# Separate host/network tooling is not part of this trading-system release
+/tools/ant-clash-bridge/
+
 # Compatibility and one-off maintenance tools
 /scripts/backfill_rank5_history.py
+/scripts/backfill_account_bills.py
 /scripts/drill_reconcile.py
 /scripts/microtest_order.py
 /scripts/phase5_writer.py
 /scripts/query_cross_market.ps1
 /scripts/validate_receipt.py
+/scripts/_okx_private_http.py
+/scripts/migrate_ledger_integrity.py
+/scripts/migrate_weekly_win_rate_pct.py
+/scripts/rebuild_trade_experiences.py
+/scripts/repair_trade_metadata.py
+/scripts/repair_verified_journal_open.py
+/scripts/restore_trade_cycle_metadata.py
 
 # Local security scan artifacts
 /.gitleaks-*.json

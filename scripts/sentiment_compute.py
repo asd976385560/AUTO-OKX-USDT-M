@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""V2.0 §6/P5 —— 确定性币种情绪统计（OKX sentiment-rank 的确定性备援；2026-07-18 CLI 1.3.9 下 okx news 已可返回，本模块角色不变）。
+r"""V2.0 §6/P5 —— 确定性币种情绪统计（OKX sentiment-rank 的确定性备援；2026-07-27 CLI 1.4.2 下 okx news 已复核可返回，本模块角色不变）。
 
 从 **本系统自有** news.db.news_items（+ news_events_index 多币 + source='x_search' 的 X 提及）
 按币种聚合：news_mention_cnt / x_mention_cnt / 规则极性（bullish/bearish 词典）→ label。
@@ -16,8 +16,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))

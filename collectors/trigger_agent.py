@@ -12,7 +12,7 @@ Agent stage（analyst/live/demo）与纯脚本 push stage 均由 core/dispatcher
 1. **零模型名**（红线 #8）：本模块只含 agent-id / session-key（路由标识，非模型）。
    模型分配只在 `openclaw config agents.list.<id>.model`，本桥永不碰。
 2. **每 cycle 独立 session**：session-key 带 cycle 槽位 → 每轮每 agent 一个新会话，
-   单轮跑完即弃，避免持久会话 context overflow。
+   单轮跑完即弃，避免持久会话发生 context overflow。
    所有跨轮状态在 DB（analysis.db / *_trades.db），不靠会话记忆。
 3. **detached 异步启动**：闩锁赢家立即返回，不阻塞等 agent turn 跑完——采集脚本有
    硬超时（快采 ≤240s），analyst turn 可能数分钟。Gateway 服务端跑 turn，CLI 客户端
@@ -33,6 +33,7 @@ Agent stage（analyst/live/demo）与纯脚本 push stage 均由 core/dispatcher
     OKX_ANALYST_AGENT  OKX_LIVE_AGENT  OKX_DEMO_AGENT
     OKX_OPENCLAW_BIN（默认 'openclaw'）
     OKX_LAUNCH_PROBE_S（默认 3 秒；检测子进程启动后立即非零退出）
+    OKX_STAGE_RUNNER / OKX_STAGE_STATUS_DIR（终态监督脚本 / 状态目录）
     OKX_TRIGGER_DRYRUN=1（不真起 agent，只把命令写日志，用于 tmp 验证 plumbing）
 """
 from __future__ import annotations
@@ -40,8 +41,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -95,7 +98,7 @@ UNIFIED_LIVE_TIMEOUT = int(os.environ.get("OKX_UNIFIED_LIVE_TIMEOUT_S", "1500"))
 _NODE_BIN = os.environ.get("OKX_NODE_BIN", r"C:\Program Files\nodejs\node.exe")
 _OPENCLAW_MJS = os.environ.get(
     "OKX_OPENCLAW_MJS",
-    str(Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "openclaw" / "openclaw.mjs"),
+    str(_ProjectPath.home().joinpath('AppData', 'Roaming', 'npm', 'node_modules', 'openclaw', 'openclaw.mjs')),
 )
 # 兼容：设了 OKX_OPENCLAW_BIN 则仍用单一 bin（自定义 wrapper）；否则走 node+mjs。
 OPENCLAW_BIN = os.environ.get("OKX_OPENCLAW_BIN", "")
@@ -105,9 +108,11 @@ OPENCLAW_BIN = os.environ.get("OKX_OPENCLAW_BIN", "")
 #   pwsh 跑 .ps1 在 DETACHED_PROCESS 下可能静默不执行。
 #   push_pipeline 自身只读库 + 内部各步仍走 wrapper（拿 UTF-8/PYTHONPATH/MX_APIKEY），故裸 python 起足够。
 _PUSH_PIPELINE = os.environ.get("OKX_PUSH_PIPELINE", _project_path('scripts', 'push_pipeline.py'))
-_PYTHON_EXE = os.environ.get(
-    "OKX_PYTHON_BIN",
-    sys.executable)
+_PYTHON_EXE = os.environ.get("OKX_PYTHON_BIN", sys.executable)
+_STAGE_RUNNER = os.environ.get(
+    "OKX_STAGE_RUNNER", _project_path('scripts', 'stage_runner.py'))
+_STAGE_STATUS_DIR = Path(os.environ.get(
+    "OKX_STAGE_STATUS_DIR", _project_path('logs', 'stage-status')))
 _OKX_DB_ROOT = os.environ.get("OKX_DB_ROOT", _project_path('db'))
 
 
@@ -122,7 +127,7 @@ def _launcher() -> list[str]:
         # （配合 fire() 的 DETACHED 无控制台）= 不弹窗。见 entry.js:86-90 spawn + :290 hasStackSizeConfigured。
         return [_NODE_BIN, "--stack-size=8192", _OPENCLAW_MJS]
     # 兜底（弹窗/坏码风险）：仅当 node/mjs 缺失
-    return ["openclaw"]
+    return [str(_ProjectPath.home().joinpath('AppData', 'Roaming', 'npm', 'openclaw.cmd'))]
 
 
 LOG_DIR = Path(_project_path('logs', 'trigger'))
@@ -154,9 +159,32 @@ def _probe_launch(proc: subprocess.Popen, stage: str, cycle_id: str, fh) -> None
     fh.write(f"  launch_probe: process exited during {probe_s:g}s probe rc={rc}\n")
     fh.flush()
     if rc != 0:
+        # supervised runner 已成功启动且明确记录 child=failed 时，属于业务终态失败：
+        # 闩锁必须保留（只告警不重试），不能让 dispatcher 当“起棒失败”释放后重派。
+        status_path = _STAGE_STATUS_DIR / f"{stage}-{cycle_id.replace(':', '-')}.json"
+        try:
+            state = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            state = {}
+        if (state.get("status") == "failed"
+                and int(state.get("runner_pid") or -1) == int(proc.pid)):
+            fh.write("  launch_probe: supervised child failed; stage latch retained "
+                     "(alert-only, no retry)\n")
+            fh.flush()
+            return
         raise RuntimeError(
             f"{stage} cycle={cycle_id} child exited during launch probe rc={rc}"
         )
+
+
+def _supervised_cmd(stage: str, cycle_id: str, mode: str,
+                    command: list[str]) -> list[str]:
+    """独立 runner 等待 detached 真子进程并持久化终态；不负责释放闩锁或重试。"""
+    return [
+        _PYTHON_EXE, _STAGE_RUNNER,
+        "--stage", stage, "--cycle", cycle_id, "--mode", mode,
+        "--", *command,
+    ]
 
 
 def now_cst() -> str:
@@ -171,7 +199,7 @@ def _safe_cycle(cycle_id: str) -> str:
 def session_key(stage: str, cycle_id: str) -> str:
     """bare key（不带 agent: 前缀）；交给 openclaw --agent 拼成 agent:<id>:<key>。
 
-    （MEMORY 教训：自己拼前缀会变 4 段双前缀 → setup timeout。）
+    调用方不得自行拼接 agent 前缀，否则会形成重复前缀并导致 setup timeout。
     """
     return f"{stage}-{_safe_cycle(cycle_id)}"
 
@@ -331,10 +359,32 @@ def _trader_preload(cycle_id: str, stage: str) -> str:
     else:
         parts.append("【决策简报缺块——按 AGENTS.md 自跑 decision_briefing.py 兜底】")
     # ⑤ 必须自取项（防预载诱导偷懒）
-    parts.append("【你仍需自取（唯一权威，禁用预载替代）】\n"
-                 "  OKX API 现仓/余额：okx --profile "
-                 f"{'live' if stage == 'live' else 'demo'} account positions --instType SWAP"
-                 "（现仓真值喂 order_executor；预载里没有它，别猜）")
+    profile = "live" if stage == "live" else "demo"
+    safe_cycle = cycle_id.replace(":", "-")
+    positions_file = _project_path(
+        "tmp", f"okx_{profile}_{safe_cycle}_positions.json")
+    balance_file = _project_path(
+        "tmp", f"okx_{profile}_{safe_cycle}_balance.json")
+    wrapper = "'" + _project_path(
+        "scripts", "run_okx_python.ps1").replace("'", "''") + "'"
+    cli = "'" + _project_path(
+        "scripts", "_okxcli.py").replace("'", "''") + "'"
+    parts.append(
+        "【你仍需自取（唯一权威，禁用预载替代）】\n"
+        "  OKX API 现仓：pwsh -NoProfile -File "
+        f"{wrapper} {cli} "
+        f"--profile {profile} --compact --out-file {positions_file} "
+        "account positions --instType SWAP；随后 read "
+        f"{positions_file}\n"
+        "  OKX API 余额：pwsh -NoProfile -File "
+        f"{wrapper} {cli} "
+        f"--profile {profile} --compact --out-file {balance_file} "
+        "account balance；随后 read "
+        f"{balance_file}\n"
+        "  两条命令均须原样直跑；stdout 仅为写入回执，完整 JSON 在 out-file。"
+        "禁止改成 scripts/okx.py、裸 okx、管道或重定向；"
+        "现仓真值喂 order_executor，预载里没有它，别猜。"
+    )
     return "\n\n" + "\n\n".join(parts) + "\n"
 
 
@@ -432,7 +482,9 @@ def _fire_push_script(cycle_id: str) -> str:
     起棒失败抛异常由 _fire_stage 释放闩锁重试。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     key = session_key("push", cycle_id)
-    cmd = [_PYTHON_EXE, _PUSH_PIPELINE, "--cycle", cycle_id, "--db-root", _OKX_DB_ROOT]
+    inner_cmd = [_PYTHON_EXE, _PUSH_PIPELINE, "--cycle", cycle_id,
+                 "--db-root", _OKX_DB_ROOT]
+    cmd = _supervised_cmd("push", cycle_id, "script", inner_cmd)
     logf = LOG_DIR / f"{key}.log"
     dry = os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
     with open(logf, "a", encoding="utf-8") as fh:
@@ -478,7 +530,8 @@ def fire(stage: str, cycle_id: str, mode: str = "full") -> str:
                      f"agent={STAGE_AGENTS[stage]} dry=True\n")
             fh.write("  (dry-run: 未组消息/未真起 agent)\n")
         return key
-    cmd = build_cmd(stage, cycle_id, mode)
+    inner_cmd = build_cmd(stage, cycle_id, mode)
+    cmd = _supervised_cmd(stage, cycle_id, mode, inner_cmd)
     with open(logf, "a", encoding="utf-8") as fh:
         fh.write(f"\n[{now_cst()}] stage={stage} cycle={cycle_id} mode={mode} "
                  f"agent={STAGE_AGENTS[stage]} dry={dry}\n")
