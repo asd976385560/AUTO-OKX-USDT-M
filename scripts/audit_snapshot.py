@@ -21,8 +21,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -40,10 +42,7 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-STATE_DB = os.environ.get(
-    "OKX_OPENCLAW_STATE_DB",
-    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"),
-)
+STATE_DB = str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite'))
 OUT_DIR = Path(_project_path('reports', 'audit_snapshots'))
 CURSOR_FILE = OUT_DIR / "_cursor.json"
 LOCK_FILE = OUT_DIR / "_lock"

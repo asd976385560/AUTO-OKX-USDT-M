@@ -15,8 +15,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -37,6 +39,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 import _registry  # noqa: E402
+from public_macro import source_dates as _public_macro_source_dates  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 
@@ -76,6 +79,59 @@ def _to_cst_str(ts: Optional[str]) -> Optional[str]:
         return None
 
 
+def _source_meta_as_of(source_meta: Optional[str], key: str) -> Optional[str]:
+    """从 cross_market.source_meta 取独立源日期；date-only 按当日末 CST。"""
+    if not source_meta:
+        return None
+    try:
+        meta = json.loads(source_meta)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict) or not isinstance(meta.get(key), dict):
+        return None
+    raw = str(meta[key].get("source_as_of") or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 10:
+        raw += " 23:59:59"
+    return _to_cst_str(raw)
+
+
+def _macro_source_timestamps(
+    macro_ts: Optional[str],
+    source_meta: Optional[str] = None,
+    public_dates: Optional[dict[str, Optional[str]]] = None,
+) -> dict[str, Optional[str]]:
+    """公共行与独立日频事实分别赋真时效；禁止借共享行伪造新鲜。"""
+    out = {
+        mid: macro_ts
+        for mid in (
+            "macro_dxy_vix_spx",
+            "macro_btc_dominance",
+            "macro_btc_mcap_change",
+            "macro_tvl",
+        )
+    }
+    public_dates = public_dates or {}
+    for source_id in (
+        "macro_dxy_calc_ecb",
+        "macro_etf_flow",
+        "macro_fear_greed",
+    ):
+        observed = str(public_dates.get(source_id) or "").strip()
+        out[source_id] = (
+            _to_cst_str(observed + " 23:59:59")
+            if len(observed) == 10
+            else _to_cst_str(observed)
+        )
+    # DXY 的日频源日期已写在 source_meta；公共 cross_market 行每小时更新，不能
+    # 用它掩盖 DXY 本身多日未更新。组合源以已知最慢成员 DXY 的日期为准。
+    out["macro_dxy_vix_spx"] = (
+        _source_meta_as_of(source_meta, "dxy") or macro_ts
+    )
+    return out
+
+
 def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
     """按 registry source_id 从真实数据表推导 last_seen（CST 串）。"""
     mkt = _ro(db_root / "market.db")
@@ -93,14 +149,28 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
             mkt, "SELECT MAX(ts) FROM market_microstructure"))
         ls["okx_recent_trades"] = _to_cst_str(_max_ts(
             mkt, "SELECT MAX(ts) FROM market_trade_flow"))
+        ls["okx_top_long_short"] = _to_cst_str(_max_ts(
+            mkt, "SELECT MAX(collected_ts) FROM market_positioning"))
         ls["okx_instruments"] = ls["okx_klines"]  # instruments_cache 无 ts，借慢采节奏代理
         # macro 源共享 cross_market 行（regime.db 优先）
         macro_ts = _to_cst_str(_max_ts(reg, "SELECT MAX(ts) FROM cross_market")) or \
             _to_cst_str(_max_ts(mkt, "SELECT MAX(ts) FROM cross_market"))
-        for mid in ("macro_dxy_vix_spx", "macro_btc_dominance", "macro_btc_mcap_change",
-                    "macro_etf_flow",
-                    "macro_fear_greed", "macro_tvl"):
-            ls[mid] = macro_ts
+        macro_meta = _max_ts(
+            reg,
+            "SELECT source_meta FROM cross_market "
+            "ORDER BY datetime(ts) DESC, rowid DESC LIMIT 1",
+        ) or _max_ts(
+            mkt,
+            "SELECT source_meta FROM cross_market "
+            "ORDER BY datetime(ts) DESC, rowid DESC LIMIT 1",
+        )
+        # Alternative.me / ECB复算DXY / ETF证据各读 macro_observations 自身日期，
+        # 不借 cross_market 每小时公共行掩盖旧值。
+        try:
+            public_dates = _public_macro_source_dates(reg) if reg else {}
+        except sqlite3.OperationalError:
+            public_dates = {}
+        ls.update(_macro_source_timestamps(macro_ts, macro_meta, public_dates))
         ls["macro_economic_calendar"] = _to_cst_str(_max_ts(
             reg, "SELECT MAX(fetched_at) FROM macro_events"))
         # news 源（按 source 串归桶）。2026-07-03 修：news_items 混 UTC-Z 与 CST-space
@@ -113,6 +183,8 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
             news, f"SELECT MAX({_n}) FROM news_items WHERE source LIKE 'rss%'"))
         ls["mx_search"] = _to_cst_str(_max_ts(
             news, f"SELECT MAX({_n}) FROM news_items WHERE source LIKE 'mx%'"))
+        ls["geo_political"] = _to_cst_str(_max_ts(
+            news, f"SELECT MAX({_n}) FROM news_items WHERE source='geo-political'"))
         # 2026-06-27 registry news 源（news_collect 经各 adapter 落库）逐源判时效
         for _nsid in ("odaily", "panews", "jinse", "blockbeats"):
             ls[_nsid] = _to_cst_str(_max_ts(
@@ -120,6 +192,9 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
                 (_nsid,)))
         ls["x_search"] = _to_cst_str(_max_ts(
             news, f"SELECT MAX({_n}) FROM news_items WHERE source='x_search'"))
+        ls["x_authoritative_supplement"] = _to_cst_str(_max_ts(
+            news, f"SELECT MAX({_n}) FROM news_items "
+            "WHERE source='x_search' AND tags LIKE '%authoritative_data%'"))
         ls["okx_news"] = _to_cst_str(_max_ts(
             news, f"SELECT MAX({_n}) FROM news_items WHERE source='okx_news'"))
     finally:

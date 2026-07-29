@@ -49,7 +49,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 $env:PYTHONPYCACHEPREFIX = Join-Path $okxRoot 'tmp\pycache'
 # v2 (2026-06-29)：同时把 $okxRoot 入 PYTHONPATH，让 tmp/* 探针脚本可 `import collectors.*/core.*/scripts.*`。
 # 根因：wrapper 原只加 site-packages；agent 写的 tmp 脚本 sys.path[0]=脚本自身的 tmp 目录、cwd(<PROJECT_ROOT>)
-# 不自动入 sys.path，故 `from collectors.ledger import ...` 报 ModuleNotFoundError（见 v2-agent-phantom-reads）。
+# 不自动入 sys.path，故 `from collectors.ledger import ...` 会报 ModuleNotFoundError。
 # 有本地依赖目录时优先加载；公开版默认不包含 Lib/，会直接使用所选 Python 的环境。
 $ppParts = @()
 if (Test-Path -LiteralPath $okxSitePackages) { $ppParts += $okxSitePackages }

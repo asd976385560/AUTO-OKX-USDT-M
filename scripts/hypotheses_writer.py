@@ -5,7 +5,7 @@
 .py 脚本（hypo2185.py、hypo2201.py…）ad-hoc 写入——还出现过写错库
 （lessons.db 旁路表，P7 update_playbook_stats 读不到，已于 2026-06-11
 迁移回 account.db 并把旁路表改名 hypotheses_migrated_20260611）。
-本脚本与 phase5_writer.py 同级：唯一合法的 hypotheses 写入口。
+本脚本是公开版本唯一合法的 hypotheses 写入口。
 
 权威表：**account.db.hypotheses**（不是 lessons.db！）
 schema: id, cycle_id TEXT, ts TEXT, hypothesis_id TEXT, hypothesis TEXT,

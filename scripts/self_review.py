@@ -19,8 +19,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -844,120 +846,7 @@ def write_repair_queue(okx_root: Path, db_root: Path, review_day: date) -> tuple
 
 # -------- 历史审计（错失机会由 missed_opps_writer 的 decision_card_v1 路径负责） --------
 
-def reflective_lookback(
-    review_day: date,
-    db_root: Path,
-    lessons_con: sqlite3.Connection,
-) -> dict[str, int]:
-    """扫当日 scoring_history WHERE total∈[30,37] AND action LIKE 'IDLE%'，
-    用之后 4h 的 1H K 线估算 |最大顺向幅度|，写入 missed_opportunities。
-    冷启动（无 scoring/无 K 线）graceful 返回。"""
-    account_path = db_root / "account.db"
-    market_path = db_root / "market.db"
-    summary = {"scanned": 0, "written": 0, "would_hit_1R": 0}
-    if not account_path.exists():
-        return summary
-
-    day_str = review_day.isoformat()
-    scon = connect_readonly(account_path)
-    try:
-        scon.row_factory = sqlite3.Row
-        try:
-            rows = scon.execute(
-                """
-                SELECT ts, symbol, dim4, total, action, regime, ai_reasoning
-                FROM scoring_history
-                WHERE substr(ts,1,10) = ?
-                  AND total BETWEEN 30 AND 37
-                  AND action LIKE 'IDLE%'
-                ORDER BY ts
-                """,
-                (day_str,),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return summary
-    finally:
-        scon.close()
-
-    summary["scanned"] = len(rows)
-    if not rows or not market_path.exists():
-        return summary
-
-    reviewed_utc = utc_now_iso()
-    mcon = connect_readonly(market_path)
-    try:
-        mcon.row_factory = sqlite3.Row
-        for row in rows:
-            ts_dt = parse_iso_ts(row["ts"])
-            if not ts_dt:
-                continue
-            upper_ts = (ts_dt + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            try:
-                ks = mcon.execute(
-                    """
-                    SELECT high, low, close FROM kline_cache
-                    WHERE symbol = ? AND timeframe = '1H'
-                      AND ts >= ? AND ts <= ?
-                    ORDER BY ts
-                    """,
-                    (row["symbol"], row["ts"], upper_ts),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            if not ks:
-                continue
-            try:
-                entry = float(ks[0]["close"])
-            except (TypeError, ValueError):
-                continue
-            if entry <= 0:
-                continue
-            highs = [float(k["high"]) for k in ks if k["high"] is not None]
-            lows = [float(k["low"]) for k in ks if k["low"] is not None]
-            if not highs or not lows:
-                continue
-
-            regime = row["regime"]
-            ai_text = row["ai_reasoning"] or ""
-            if regime == "trend_up":
-                direction = "long"
-            elif regime == "trend_down":
-                direction = "short"
-            elif any(token in ai_text for token in ("看涨", "做多", "long", "Long", "LONG")):
-                direction = "long"
-            elif any(token in ai_text for token in ("看跌", "做空", "short", "Short", "SHORT")):
-                direction = "short"
-            else:
-                direction = "long"  # 缺方向时默认按多向估算，避免噪声
-
-            if direction == "long":
-                actual_pct = (max(highs) - entry) / entry * 100.0
-            else:
-                actual_pct = (entry - min(lows)) / entry * 100.0
-            would_hit = 1 if actual_pct >= 1.0 else 0  # 1R≈1% 顺向作保守近似
-
-            try:
-                lessons_con.execute(
-                    """
-                    INSERT INTO missed_opportunities(
-                        ts, symbol, score, regime, direction_hint,
-                        actual_4h_pct, would_hit_1R, notes, reviewed_utc
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (row["ts"], row["symbol"], int(row["total"]), regime, direction,
-                     actual_pct, would_hit, row["action"], reviewed_utc),
-                )
-                summary["written"] += 1
-                if would_hit:
-                    summary["would_hit_1R"] += 1
-            except sqlite3.Error:
-                pass
-        lessons_con.commit()
-    finally:
-        mcon.close()
-
-    return summary
-
+# 错失机会只允许由 scripts/missed_opps_writer.py 写入。
 
 def weekly_activity(
     review_day: date,
@@ -1178,99 +1067,16 @@ def write_daily_report_row(
     repair_issues: list[dict[str, str]],
     warning: str | None = None,
 ) -> None:
-    """Upsert account.db.daily_reports for Job C's report contract.
+    """Legacy compatibility no-op.
 
-    The table is an audit/report table only; this function never creates trade records and never
-    changes system_state or risk settings.
+    `daily_reports` 的唯一权威写入方是 `daily_report_writer.py`。历史 Job C
+    仍调用本函数，但这里只保留明确的审计提示，绝不直接写 account.db。
     """
-    account_path = db_root / "account.db"
-    con = connect_rw(account_path)
-    try:
-        con.row_factory = sqlite3.Row
-        day_start_local = datetime.combine(review_day, time.min, tzinfo=timezone(timedelta(hours=8)))
-        day_end_local = day_start_local + timedelta(days=1)
-        start_utc = day_start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_utc = day_end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        open_count = 0
-        close_count = 0
-        total_pnl = 0.0
-        try:
-            row = con.execute(
-                """
-                SELECT
-                    SUM(CASE WHEN UPPER(action) LIKE 'OPEN%' THEN 1 ELSE 0 END) AS open_count,
-                    SUM(CASE WHEN UPPER(action) LIKE 'CLOSE%' THEN 1 ELSE 0 END) AS close_count,
-                    SUM(CASE WHEN UPPER(action) LIKE 'CLOSE%' THEN COALESCE(pnl, 0) ELSE 0 END) AS total_pnl
-                FROM trade_events
-                WHERE (CASE WHEN ts LIKE '%Z' THEN datetime(ts)
-                            ELSE datetime(ts, '-8 hours') END) >= datetime(?)
-                  AND (CASE WHEN ts LIKE '%Z' THEN datetime(ts)
-                            ELSE datetime(ts, '-8 hours') END) < datetime(?)
-                """,
-                (start_utc, end_utc),
-            ).fetchone()
-            if row:
-                open_count = int(row["open_count"] or 0)
-                close_count = int(row["close_count"] or 0)
-                total_pnl = float(row["total_pnl"] or 0.0)
-        except sqlite3.Error:
-            # 冷启动/旧 schema 时仍写入复盘摘要，交易计数降级为 0。
-            pass
-
-        best_sample = max(samples, key=lambda s: normalize_pnl(s), default=None)
-        worst_sample = min(samples, key=lambda s: normalize_pnl(s), default=None)
-        actionable = [issue for issue in repair_issues if issue.get("severity") in ("P0", "P1", "P2")]
-        reflective = audit.get("reflective") if isinstance(audit, dict) else None
-        buckets = audit.get("buckets") if isinstance(audit, dict) else None
-        summary = (
-            f"JobC daily review {review_day.isoformat()}: samples={len(samples)}, "
-            f"open_count={open_count}, close_count={close_count}, total_pnl={total_pnl:.4f}, "
-            f"repair_actionable={len(actionable)}"
-        )
-        if warning:
-            summary += f", warning={warning}"
-        lessons = json.dumps(
-            {
-                "audit_reflective": reflective,
-                "legacy_score_audit": buckets,
-                "repair_actionable": len(actionable),
-                "sample_count": len(samples),
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-        raw = json.dumps(
-            {
-                "review_day": review_day.isoformat(),
-                "window_utc": [start_utc, end_utc],
-                "warning": warning,
-                "audit": audit,
-                "repair_issue_count": len(repair_issues),
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-        con.execute(
-            """
-            INSERT OR REPLACE INTO daily_reports
-                (ts, profile, open_count, close_count, total_pnl, total_fees, best_trade, worst_trade, summary, lessons, raw)
-            VALUES (?, 'live', ?, ?, ?, 0, ?, ?, ?, ?, ?)
-            """,
-            (
-                review_day.isoformat(),
-                open_count,
-                close_count,
-                total_pnl,
-                best_sample.symbol if best_sample else None,
-                worst_sample.symbol if worst_sample else None,
-                summary,
-                lessons,
-                raw,
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
+    _ = (db_root, review_day, samples, audit, repair_issues, warning)
+    print(
+        "[self_review] daily_reports write skipped: "
+        "use scripts/daily_report_writer.py"
+    )
 
 
 def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, object]:

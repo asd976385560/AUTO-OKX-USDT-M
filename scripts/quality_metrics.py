@@ -21,16 +21,20 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
 
 
 import json
+import os
 import sqlite3
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,9 +48,17 @@ CST = timezone(timedelta(hours=8))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-DB_ROOT = Path(_project_path('db'))
-REPORT_DIR = Path(_project_path('reports', 'quality'))
+DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _project_path('db')))
+REPORT_DIR = Path(os.environ.get(
+    "OKX_QUALITY_REPORT_DIR", _project_path('reports', 'quality')))
 WINDOW_DAYS = 14
+FAILURE_STATUSES = frozenset({
+    "error",
+    "failed",
+    "fail",
+    "timeout",
+    "timed_out",
+})
 
 
 def now_cst() -> str:
@@ -76,6 +88,52 @@ def cycle_window_clause(col: str = "cycle_id", days: int = WINDOW_DAYS) -> tuple
     return f"{col} >= ?", [ws]
 
 
+def normalize_run_status(value: object) -> str:
+    """Map equivalent terminal failures to one reporting bucket.
+
+    The raw status remains available in ``raw_status_counts``.  Unknown and
+    partial states are deliberately not reclassified as failures without an
+    explicit producer contract.
+    """
+    status = str(value or "unknown").strip().lower()
+    if (
+        status in FAILURE_STATUSES
+        or status.startswith(("error:", "error_"))
+        or status.startswith(("failed:", "failed_"))
+        or status.startswith(("timeout:", "timeout_"))
+    ):
+        return "failure"
+    if status in {"ok", "degraded"}:
+        return status
+    return "other"
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    """Publish one complete JSON snapshot; readers never see a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
 # ── 1. 必需源 fresh 达标率 ──────────────────────────────────────────
 def metric_source_health() -> dict:
     con = connect("ledger.db")
@@ -91,24 +149,40 @@ def metric_source_health() -> dict:
     finally:
         con.close()
 
-    by_source: dict[str, dict] = defaultdict(lambda: {"ok": 0, "degraded": 0, "error": 0, "total": 0})
+    by_source: dict[str, dict] = defaultdict(
+        lambda: {
+            "ok": 0,
+            "degraded": 0,
+            "failure": 0,
+            "other": 0,
+            "total": 0,
+            "raw_status_counts": Counter(),
+        }
+    )
     for r in rows:
         s = r["source"]
-        st = r["status"] or "unknown"
-        if st in ("ok", "degraded", "error"):
-            by_source[s][st] += r["n"]
-            by_source[s]["total"] += r["n"]
-        else:
-            by_source[s]["total"] += r["n"]
+        raw_status = str(r["status"] or "unknown").strip().lower()
+        bucket = normalize_run_status(raw_status)
+        by_source[s][bucket] += r["n"]
+        by_source[s]["raw_status_counts"][raw_status] += r["n"]
+        by_source[s]["total"] += r["n"]
 
     result = {}
     for s, counts in sorted(by_source.items()):
         t = counts["total"] or 1
+        failure_pct = round(counts["failure"] / t * 100, 1)
         result[s] = {
             "ok_pct": round(counts["ok"] / t * 100, 1),
             "degraded_pct": round(counts["degraded"] / t * 100, 1),
-            "error_pct": round(counts["error"] / t * 100, 1),
+            "failure_pct": failure_pct,
+            "failure_runs": counts["failure"],
+            "other_runs": counts["other"],
             "total_runs": counts["total"],
+            "raw_status_counts": dict(sorted(
+                counts["raw_status_counts"].items())),
+            # Backward-compatible alias.  It now has the same unified
+            # failed/error/timeout denominator as ``failure_pct``.
+            "error_pct": failure_pct,
         }
     return result
 
@@ -314,7 +388,7 @@ def main() -> int:
     }
 
     out = REPORT_DIR / f"quality_metrics_{today_str()}.json"
-    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(out, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print(f"\n--- written to {out} ---", file=sys.stderr)
     return 0

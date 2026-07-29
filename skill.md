@@ -1,7 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-07-24
-change-summary: Public release baseline; host identifiers, credentials, targets, runtime data and incident history removed.
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Sync execution intent, ledger reconciliation, stage supervision, public macro, report handoff, lifecycle and regression contracts.
 -->
 
 # OKX 自主交易系统 V2.0 · 事实源
@@ -15,7 +16,7 @@ change-summary: Public release baseline; host identifiers, credentials, targets,
 | 可移植 | 核心逻辑使用 Python、SQLite 和明确契约；项目根目录从 `OKX_ROOT` 或源码位置推导 |
 | 确定性管道 | 采集、风控、下单、记账、推送和触发由代码完成；LLM 只做判断或结构化取数 |
 | 单 writer | 每张表或明确键域只有一个权威 writer；读者使用 `mode=ro` |
-| 幂等 | `ledger.db.stage_dispatch(cycle_id, stage)` 唯一约束是阶段派发真值 |
+| 幂等 | `stage_dispatch` 约束阶段派发；`execution_intents` 在交易所 I/O 前约束每个 profile 的全局未决交易意图 |
 | 模板化 | 分析、交易、推送和日报都有固定回执或模板并在写入前校验 |
 | 角色隔离 | 每个 Agent 只加载自己的 `agents/<role>.md`；cron 消息只描述本轮工作 |
 | fail-safe | 权威字段、凭证、合约规格、余额或成交确认缺失时拒绝执行，不使用猜测默认值 |
@@ -52,8 +53,9 @@ analysis+trade      demo trade
 4. dispatcher 在采集齐全且新鲜时抢 `stage_dispatch(live)`；
 5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，经过风控和订单执行层；
 6. analysis 就绪后 dispatcher 派 demo；
-7. 双盘 trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
-8. reviewer 与日频维护独立于 15 分钟事件链。
+7. `stage_runner.py` 等待子进程终态并回读真实业务产物，`rc=0` 但缺业务行仍判失败；
+8. 双盘 trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
+9. 日频维护完成对账、账单和质量文件后发布带 SHA-256 的 ready 清单，reviewer 校验后再生成报告。
 
 `cycle_id` 使用 UTC+8 的 `YYYY-MM-DDTHH:MM` 槽位。过窗周期只告警，不自动补单或恢复。
 
@@ -119,14 +121,14 @@ Agent 不得直接写表，不得绕过 writer，不得手拼 OKX 下单命令�
 
 | 数据库 | 关键表 | 权威写入方 |
 |---|---|---|
-| market.db | tick_snapshots, kline_cache, derivatives, market_microstructure, market_trade_flow, instruments_cache | fast/slow collectors |
-| regime.db | cross_market, macro_events | slow collector / macro maintenance |
+| market.db | tick_snapshots, kline_cache, derivatives, market_microstructure, market_trade_flow, market_positioning, instruments_cache | fast/slow collectors |
+| regime.db | cross_market, macro_observations, macro_events | slow collector / macro maintenance |
 | news.db | news_items, coin_sentiment, news_events_index | `collectors/news_writer.py` |
 | analysis.db | analysis_runs, analysis_signals | `collectors/analyst_writer.py` |
 | live_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile live` |
 | demo_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile demo` |
 | account.db | snapshots, trade_experiences, bills, reports, playbook, system_state | 对应表或键域 writer |
-| ledger.db | collection_runs, stage_dispatch | `collectors/ledger.py` / dispatcher |
+| ledger.db | collection_runs, stage_dispatch, execution_intents | `collectors/ledger.py` / dispatcher / `core/execution_intent.py` |
 | lessons.db | error_patterns, missed_opportunities, signal_perf | reviewer |
 | drill.db | drill_* | 只读兼容数据 |
 
@@ -149,6 +151,8 @@ staleness_sec / enabled / auth_env / adapter / timeout_sec
 - optional 源失败只记降级；
 - event 源不因无新事件自动判 stale；
 - `event_time` 使用源发布时间，缺失时保持 NULL，不能伪造为当前时间；
+- Alternative.me 与 ECB 复算 DXY 分别按自己的 observation date 判时效；
+- ETF 净流单源只记 provisional，只有两个独立来源同日一致才进入 cross-checked 字段；
 - news-scout 只取数和结构化，方向与影响判断仍归分析阶段。
 
 ## 8. 风控契约
@@ -174,12 +178,16 @@ notional = mark_px * size * ct_val
 
 其他不变量：
 
+- 非 dry-run 交易在任何交易所 I/O 前必须验证同 cycle 的完整 `receipt_context`；
+- 每个 profile 只要存在 pending/submitted/uncertain 等未决意图，所有标的的新交易都 fail-closed；已完成同参重放只返回缓存回执；
+- 交易前将 OKX 全量现仓与本 profile 已确认交易账本做全集合核对，不一致、坏行或账本不可读时在取 mark/下单前拒绝；
 - `ctVal` 和 `lotSz` 来自 instruments cache，缺失时现拉，仍缺则 reject；
 - 当前持仓来自 OKX API，不能由 position snapshot 聚合推断；
 - 可用 USDT 保证金字段缺失时 fail-safe reject；
 - live/demo 开仓都必须提供止损；
-- 附挂止损回读失败时尝试独立止损，仍失败则立即平掉裸仓并报告 P0；
-- 成交优先由 fills 确认，失败时查订单状态；两者均无法确认时进入 repair queue；
+- 附挂止损必须按本次保护单身份回读；独立保护单还必须精确匹配新 `algoId`，仍失败则立即平掉裸仓并报告 P0；
+- 成交只接受 fills、订单状态或订单历史等权威端点；`fill_sz/fill_px/fill_ts/ts_source` 不完整时不得伪造成交；
+- 成交回执必须在执行交易的同一确定性进程内提交 writer；同 cycle 只允许完整重发或完全不相交的增量，部分重叠拒写；
 - 写命令超时后不能盲目重试，以免重复下单；
 - 组合集中度与持仓数量只作观察，不改变上述硬闸。
 
@@ -204,10 +212,14 @@ push 顺序固定为：
 
 ```text
 build_push_payload -> render_push_report -> validate_push_format
--> optional send -> push_archive -> system_state_writer
+-> push_archive -> optional send -> system_state_writer
 ```
 
 公开代码不包含目标。未配置 `OKX_QQ_TARGET` 时，发送入口必须返回配置错误，不能使用隐藏 fallback。
+
+日报/周报只统计 `action=open|close`、数量和成交价为正且未 rejected 的有效 fill。
+`risk_reject:*` 作为“开仓尝试被风控拒绝”单列；live 对账未清零时允许生成
+provisional 报告，但不得标成最终事实。
 
 ## 11. 失败与安全响应
 
@@ -229,7 +241,8 @@ build_push_payload -> render_push_report -> validate_push_format
 - analysis、trade、news、report 和 system state 都有明确 writer；
 - 新闻采集由 registry 驱动，news-scout 是解耦旁路；
 - push 固定为纯脚本管道；
-- 项目当前没有完整 `tests/` 目录；
-- 无生产数据库时的发布验证为全量 `py_compile`、registry/schema/doc 静态检查、dry-run 和独立敏感扫描。
+- `scripts/lifecycle.json` 记录公开脚本的 runtime/helper/manual/research/migration 生命周期；
+- `tests/` 提供分层隔离回归，覆盖执行安全、writer、dispatcher、报告、公开宏观和运行修复；这不是完整 money-path 环境回归；
+- 无生产数据库时的发布验证为全量 `py_compile`、隔离测试、registry/schema/doc/lifecycle 静态检查、dry-run 和独立敏感扫描。
 
 公开发布不改变风控、订单执行、writer、账本幂等或交易业务判断逻辑。

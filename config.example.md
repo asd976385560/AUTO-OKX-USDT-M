@@ -1,3 +1,10 @@
+<!--
+doc-version: V2.0-public-example
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Keep all configuration values inert and document the latest public environment surface.
+-->
+
 # V2.0 本地配置示例
 
 本文件只包含占位符。复制为 `config.md` 后填写本机值：

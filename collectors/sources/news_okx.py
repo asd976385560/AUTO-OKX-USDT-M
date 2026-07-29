@@ -4,8 +4,8 @@
 挂在 okx-news-rss cron（news_collect registry 驱动），与 RSS/中文快讯同链、
 **不进 fast_collect**（避免拖 15m 行情预算）。
 
-2026-07-18：CLI `@okx_ai/okx-trade-cli@1.3.9` 复核 `okx news latest|important`
-已可返回数据；registry `okx_news` 由此 adapter 复活（required=false）。
+2026-07-27：OKX CLI 1.4.2 复核 `okx news latest|important`
+可返回数据；registry `okx_news` 由此 adapter 提供（required=false）。
 
 契约（与其它 news_* 一致）：
   - 写库只经 news_writer（禁手写 INSERT）
@@ -20,8 +20,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[2]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[2]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))

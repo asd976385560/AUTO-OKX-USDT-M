@@ -21,8 +21,10 @@
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -119,7 +121,7 @@ def main():
     if bad_ts:
         problems.append(f"存在 {bad_ts} 行新行(cycle_count>=1476)非 UTC+8 格式 ts_start，需规范化")
 
-    # T4 劣化金丝雀：最近 3 个推送归档全部 <300B = 推送塌缩特征。
+    # T4 劣化金丝雀（2026-06-12 #2295 事故）：最近 3 个推送归档全部 <300B = 推送塌缩特征。
     # 只 WARN 不阻断（推送劣化是 P2，不应卡 P7 复盘）；由维护者查 push_pipeline 环节报告，
     # 不在本检查器内自动重置会话或重跑外发。
     try:

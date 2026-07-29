@@ -1,5 +1,5 @@
 -- OKX 永续合约自主交易系统 - 数据库 Schema
--- 导出时间: 2026-07-23 20:29:46 CST
+-- 导出时间: 2026-07-28 23:09:19 CST
 -- 版本: V2.0
 -- 数据库目录: <PROJECT_ROOT>\db\
 -- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）
@@ -97,6 +97,20 @@ CREATE TABLE market_microstructure (
     PRIMARY KEY (ts, symbol)
 );
 
+CREATE TABLE market_positioning (
+    ts               TEXT NOT NULL,
+    collected_ts     TEXT NOT NULL,
+    cycle_id         TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    timeframe        TEXT NOT NULL DEFAULT '1H',
+    long_ratio       REAL,
+    short_ratio      REAL,
+    long_short_ratio REAL,
+    raw              TEXT,
+    source           TEXT NOT NULL DEFAULT 'okx_cli_top_long_short',
+    PRIMARY KEY (ts, symbol, timeframe)
+);
+
 CREATE TABLE market_trade_flow (
     ts                 TEXT NOT NULL,
     cycle_id           TEXT NOT NULL,
@@ -144,6 +158,12 @@ CREATE INDEX idx_micro_cycle
 
 CREATE INDEX idx_micro_symbol_ts
     ON market_microstructure(symbol, ts);
+
+CREATE INDEX idx_positioning_cycle
+    ON market_positioning(cycle_id);
+
+CREATE INDEX idx_positioning_symbol_ts
+    ON market_positioning(symbol, ts);
 
 CREATE INDEX idx_tick_symbol_ts ON tick_snapshots(symbol, ts);
 
@@ -413,7 +433,7 @@ CREATE TABLE trade_experiences (
     status             TEXT DEFAULT 'open',  -- open | closed
     raw                TEXT,                 -- 完整回执 JSON（事实正本）
     experience_summary TEXT                  -- L2 异步：LLM 1-2 行教训（maintainer 落）
-);
+, open_sz REAL, remaining_sz REAL, realized_pnl REAL NOT NULL DEFAULT 0, close_count INTEGER NOT NULL DEFAULT 0, closed_at TEXT);
 
 CREATE TABLE weekly_reports (
     week_start_ts   TEXT NOT NULL,
@@ -444,6 +464,8 @@ CREATE INDEX idx_cycle_jobid_ts ON cycle_runs(job_id, ts_start);
 CREATE INDEX idx_cycle_runs_baseline ON cycle_runs(baseline_set_at);
 
 CREATE INDEX idx_dr_ts ON daily_reports(ts);
+
+CREATE INDEX idx_experience_open_qty ON trade_experiences(profile,symbol,side,status,ts);
 
 CREATE INDEX idx_playbook_category ON playbook(category);
 
@@ -639,7 +661,7 @@ CREATE TABLE cross_market (
     gold_d1       REAL,
     spx_d1        REAL,
     btc_mcap_chg_24h_usd REAL GENERATED ALWAYS AS (btc_etf_flow) VIRTUAL
-, btc_etf_net_flow_usd REAL, source_meta TEXT, carried_forward TEXT);
+, btc_etf_net_flow_usd REAL, source_meta TEXT, carried_forward TEXT, dxy_calc_ecb REAL, dxy_calc_ecb_d1 REAL, fear_greed REAL, fear_greed_label TEXT);
 
 CREATE TABLE macro_events (
     calendar_id TEXT PRIMARY KEY,
@@ -659,11 +681,31 @@ CREATE TABLE macro_events (
     raw         TEXT
 );
 
+CREATE TABLE macro_observations (
+    metric           TEXT NOT NULL,
+    observation_date TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    collected_at     TEXT NOT NULL,
+    value            REAL,
+    unit             TEXT,
+    label            TEXT,
+    status           TEXT NOT NULL,
+    source_url       TEXT,
+    raw              TEXT,
+    PRIMARY KEY (metric, observation_date, source)
+);
+
 CREATE INDEX idx_macro_events_importance_ts
     ON macro_events(importance, event_ts);
 
 CREATE INDEX idx_macro_events_ts
     ON macro_events(event_ts);
+
+CREATE INDEX idx_macro_observations_metric_date
+    ON macro_observations(metric, observation_date DESC);
+
+CREATE INDEX idx_macro_observations_source_date
+    ON macro_observations(source, observation_date DESC);
 
 -- ============================================================
 -- 数据库: analysis.db
@@ -791,6 +833,25 @@ CREATE TABLE collection_runs (
                 PRIMARY KEY (cycle_id, source)
             );
 
+CREATE TABLE execution_intents (
+                profile             TEXT NOT NULL,
+                cycle_id            TEXT NOT NULL,
+                symbol              TEXT NOT NULL,
+                action              TEXT NOT NULL,
+                side                TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                request_json        TEXT NOT NULL,
+                state               TEXT NOT NULL,
+                reserved_at         TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                submitted_at        TEXT,
+                completed_at        TEXT,
+                ord_id              TEXT,
+                receipt_json        TEXT,
+                error               TEXT,
+                PRIMARY KEY (profile, cycle_id, symbol, action, side)
+            );
+
 CREATE TABLE stage_dispatch (
                 cycle_id      TEXT NOT NULL,
                 stage         TEXT NOT NULL,      -- 'live' | 'demo' | 'push'
@@ -801,4 +862,13 @@ CREATE TABLE stage_dispatch (
 
 CREATE INDEX idx_cr_cycle ON collection_runs(cycle_id);
 
+CREATE INDEX idx_execution_intents_state
+                ON execution_intents(state, updated_at);
+
 CREATE INDEX idx_sd_cycle ON stage_dispatch(cycle_id);
+
+-- ============================================================
+-- 数据库: qq_push_dedupe.db
+-- ============================================================
+
+CREATE TABLE sent (k TEXT PRIMARY KEY, content_hash TEXT, status TEXT, first_seen TEXT, updated_at TEXT, preview TEXT);

@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
-r"""确定性累计收益（2026-06-26）。
+r"""确定性累计交易 PnL（2026-06-26）。
 
-模型（主人拍板）：累计收益 = **冻结历史基线** + **V2.0 期实现盈亏增量**
+模型：累计交易 PnL = **冻结历史基线** + **V2.0 期 trades.pnl 增量**
   baseline = account.db.system_state.{profile}_cum_pnl（冻结的累计收益基线）
   v2_delta = SUM({profile}_trades.db.trades.pnl WHERE ts>=reset_ts)（V2.0 期已平仓真实 pnl；
              reset_ts = system_state.{profile}_cum_pnl_reset_ts，缺省则全量）
   cum_pnl  = baseline + v2_delta
 
+该指标不是账户净收益：不扣交易手续费，不含资金费/利息与浮动盈亏。账户净变动
+应从 account_bills 的交易/资金费账单 ``bal_change`` 单独展示，并注明覆盖区间。
+
 为何用脚本：push.md 红线「累计收益禁 agent 自查 SQL 算」——本脚本是确定性 writer/reader，
 agent 取本脚本**回执**（非自己拼 SQL），既得真值又守红线。trades.db 仅含 V2.0 期成交，
 故必须叠加冻结基线才是终生累计（裸 SUM(trades.pnl) 会丢 −281/−282 历史）。
 
-权威基线键＝`{profile}_cum_pnl`（其余 *_realized_pnl* 为历史僵尸键，已清理，见 memory）。
+权威基线键＝`{profile}_cum_pnl`（其余 *_realized_pnl* 为已弃用历史键）。
 
 用法：
   python cum_pnl.py --profile live --db-root <PROJECT_ROOT>/db
@@ -22,8 +25,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -104,12 +109,15 @@ def cum_for(db_root, profile: str, as_of_ts=None) -> dict:
         "v2_delta": round(delta, 4),
         "n_v2_trades": n,
         "cum_pnl": round(cum, 4),
+        "metric": "cumulative_trade_pnl",
+        "excludes": ["trading_fees", "funding", "interest", "unrealized_pnl"],
         "note": None if baseline is not None else "baseline 缺（system_state.{p}_cum_pnl 无）→ 仅增量",
     }
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="确定性累计收益 = 冻结基线 + V2.0 trades.pnl 增量")
+    ap = argparse.ArgumentParser(
+        description="累计交易PnL（未扣手续费/资金费）= 冻结基线 + V2.0 trades.pnl 增量")
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--profile", choices=["live", "demo"])
     ap.add_argument("--both", action="store_true")

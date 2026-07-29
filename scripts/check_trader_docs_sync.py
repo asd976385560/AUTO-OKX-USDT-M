@@ -4,8 +4,9 @@ r"""check_trader_docs_sync.py — live/demo trader 手册同步块防漂移校�
 背景：两手册 44% 机械重复，规则改动要双改（07-15 同侧闸取消实测要改 4 份文档，漏一份
 = agent 跑矛盾规则）。机制：共享块用 `<!-- SYNC:<name> -->` … `<!-- /SYNC:<name> -->`
 标注（HTML 注释，agent 渲染无感），本脚本校验两文档同名块在 profile 词归一
-（live/demo → §P§）后**逐字节一致**；并守住 money-path 回执文件契约（write 工具、
-HH-MM 普通文件、组合保证金不冒充单笔字段）。不一致 → exit 1 + 打差异。
+（live/demo → §P§）后**逐字节一致**；并守住 money-path 回执文件契约（普通 HOLD
+使用 write 工具；live 成交脚本允许同进程 Path.write_text→commit_receipt；
+文件名一律 HH-MM、组合保证金不冒充单笔字段）。不一致 → exit 1 + 打差异。
 
 选择"同步校验"而非"base+overlay 生成管线"（读图原案）的原因：手册是高频直编的
 money-path 文档，生成管线引入"编辑生成物被下次 compose 覆盖"的新事故面；校验器
@@ -18,7 +19,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 
 def _project_path(*parts: str) -> str:
@@ -87,11 +91,17 @@ def receipt_contract_problems(label: str, text: str) -> list[str]:
     """防止再次引入 shell JSON 转义失败或 raw cycle 冒号/NTFS ADS。"""
     problems: list[str] = []
     required = {
-        "write 文件工具": "write path=<PROJECT_ROOT>/tmp/_receipt_",
         "安全文件名": "YYYY-MM-DDTHH-MM.json",
         "单笔字段为空": "risk.single_trade_margin_pct=null",
         "组合观察字段": "risk.portfolio_observation.estimated_margin_pct_equity",
     }
+    file_write_tokens = [f"write path=<PROJECT_ROOT>/tmp/_receipt_{label}_"]
+    if label == "live":
+        file_write_tokens.append(
+            'Path("<PROJECT_ROOT>/tmp/_receipt_live_YYYY-MM-DDTHH-MM.json").write_text')
+    if not any(token in text for token in file_write_tokens):
+        problems.append(
+            f"{label} 回执契约缺安全文件写入路径: {file_write_tokens}")
     for name, token in required.items():
         if token not in text:
             problems.append(f"{label} 回执契约缺 {name}: {token}")
@@ -101,6 +111,30 @@ def receipt_contract_problems(label: str, text: str) -> list[str]:
         problems.append(f"{label} 仍含嵌套 pwsh -Command 示例")
     if f"_receipt_{label}_<cycle_id>" in text:
         problems.append(f"{label} 回执文件仍直接拼 raw cycle_id（冒号会变 NTFS ADS）")
+    if label == "live":
+        problems.extend(live_money_path_problems(text))
+    return problems
+
+
+def live_money_path_problems(text: str) -> list[str]:
+    """守住 live 成交执行与主账提交的同进程边界。"""
+    match = re.search(
+        r"(?ms)^## 7\. 强制流程（每轮）\s*$.*?(?=^## 8\. 失败 / 降级\s*$)",
+        text,
+    )
+    if not match:
+        return ["live 手册缺 §7 强制流程，无法核验同进程落账契约"]
+    section = match.group(0)
+    problems: list[str] = []
+    if 'commit_receipt(receipt, "live")' not in section:
+        problems.append(
+            'live §7 缺同进程 commit_receipt(receipt, "live") 强制步骤')
+    if re.search(
+            r"交易回执喂 writer[^\n]*trades_writer\.py --json-file "
+            r"<tmp 回执文件>",
+            section):
+        problems.append(
+            "live §7 仍要求成交后分步调用 trades_writer.py --json-file")
     return problems
 
 

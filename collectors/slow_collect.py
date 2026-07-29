@@ -16,8 +16,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -25,6 +27,7 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -45,10 +48,44 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = Path(_project_path())
 SCRIPTS = ROOT / "scripts"
-WRAPPER = SCRIPTS / "run_okx_python.ps1"
 CST = timezone(timedelta(hours=8))
 # 子进程隐藏窗口：本脚本被 wscript 以无窗口起，console 子进程(pwsh)默认会新开可见窗口——加此 flag 抑制
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _hour_cycle_id(now: datetime | None = None) -> str:
+    """慢采固定归入当前小时 :00，禁止退避重跑按 15 分钟槽漂到 :15/:30/:45。"""
+    current = now or datetime.now(CST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=CST)
+    current = current.astimezone(CST).replace(minute=0, second=0, microsecond=0)
+    return current.strftime("%Y-%m-%dT%H:00")
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """终止超时子任务及其后代，避免只杀 wrapper 后遗留 collect_slow.py。"""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception:  # noqa: BLE001
+            proc.kill()
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        if proc.poll() is None:
+            proc.kill()
 
 
 def _verify_regime_write(db_root: Path, cycle_id: str) -> tuple[str, str | None]:
@@ -94,27 +131,74 @@ def _verify_regime_write(db_root: Path, cycle_id: str) -> tuple[str, str | None]
 
 
 def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
-    cmd = ["pwsh", "-NoProfile", "-File", str(WRAPPER), str(script), *sargs]
+    # slow_collect.py 本身已由 run_okx_python.ps1 启动，sys.executable 与 env/PYTHONPATH/
+    # 凭证均已受控。内层直接起 Python，消除 pwsh→python 管道继承导致 TimeoutExpired
+    # 只杀 pwsh、真正 collect_slow.py 继续存活的问题。
+    cmd = [sys.executable, str(script), *sargs]
     t0 = time.time()
+    proc = None
     try:
-        p = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout,
-                           creationflags=CREATE_NO_WINDOW)
-        out = {"name": name, "ok": p.returncode == 0, "rc": p.returncode,
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+        stdout, stderr = proc.communicate(timeout=timeout)
+        out = {"name": name, "ok": proc.returncode == 0, "rc": proc.returncode,
                "dur_s": round(time.time() - t0, 2),
-               "stderr_tail": (p.stderr or "")[-500:]}
+               "stderr_tail": (stderr or "")[-500:]}
         # collect_slow.py 的降级 WARN/FAIL 走 stdout；提取含 [WARN]/[FAIL] 的行
         #（尾 5 行、每行截 200 字）。
         # 并入 summary；禁灌全量 stdout（summary 有体积上限风险）。
-        warn_lines = [ln.strip()[:200] for ln in (p.stdout or "").splitlines()
+        warn_lines = [ln.strip()[:200] for ln in (stdout or "").splitlines()
                       if "[WARN]" in ln or "[FAIL]" in ln]
         if warn_lines:
             out["warn_tail"] = warn_lines[-5:]
         return out
-    except subprocess.TimeoutExpired:
-        return {"name": name, "ok": False, "rc": 124,
-                "dur_s": round(time.time() - t0, 2), "stderr_tail": "timeout"}
+    except subprocess.TimeoutExpired as exc:
+        partial_stdout = exc.stdout or ""
+        partial_stderr = exc.stderr or ""
+        if proc is not None:
+            _terminate_process_tree(proc)
+            try:
+                tail_stdout, tail_stderr = proc.communicate(timeout=1)
+                if tail_stdout:
+                    partial_stdout = tail_stdout
+                if tail_stderr:
+                    partial_stderr = tail_stderr
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(partial_stdout, bytes):
+            partial_stdout = partial_stdout.decode("utf-8", errors="replace")
+        if isinstance(partial_stderr, bytes):
+            partial_stderr = partial_stderr.decode("utf-8", errors="replace")
+        warn_lines = [
+            ln.strip()[:200]
+            for ln in str(partial_stdout).splitlines()
+            if "[WARN]" in ln or "[FAIL]" in ln
+        ]
+        result = {
+            "name": name,
+            "ok": False,
+            "rc": 124,
+            "dur_s": round(time.time() - t0, 2),
+            "stderr_tail": (
+                f"timeout after {timeout}s; process tree terminated"
+                + (f" | child_stderr={str(partial_stderr)[-240:]}"
+                   if partial_stderr else "")
+            )[:500],
+        }
+        if warn_lines:
+            result["warn_tail"] = warn_lines[-5:]
+        return result
     except Exception as e:  # noqa: BLE001 —— OSError/FileNotFoundError 等 spawn 失败：
+        if proc is not None and proc.poll() is None:
+            _terminate_process_tree(proc)
         # 捕获 spawn 失败，确保 main 仍能写 collection_runs 归因。
         return {"name": name, "ok": False, "rc": -1,
                 "dur_s": round(time.time() - t0, 2),
@@ -124,7 +208,8 @@ def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 慢采（系统层）")
     ap.add_argument("--db-root", default=str(ROOT / "db"))
-    ap.add_argument("--cycle", default=None, help="覆盖 cycle_id（默认按当前时刻归槽）")
+    ap.add_argument("--cycle", default=None,
+                    help="覆盖 cycle_id（默认固定归当前小时 :00，退避重跑不漂移到 15 分钟槽）")
     # 子步骤超时必须小于 cron 总超时，保证 record_collection 有时间执行。
     # → :00 槽 slow/regime 账本无行、丢轮无归因。收到 450s：wrapper 启动 ~1-3s + 步级 450s
     # + regime 验证/记账/nudge ~1s，最坏 <460s < 480s 必能走到落账（正常 ~220s 不受影响）。
@@ -138,10 +223,11 @@ def main() -> int:
     db_root = Path(args.db_root)
     ledger_db = db_root / "ledger.db"
     ledger.init_ledger(ledger_db)
-    cycle = args.cycle or ledger.cycle_id_for()
+    cycle = args.cycle or _hour_cycle_id()
 
     t0 = time.time()
     steps = []
+    slow_err = None
     regime_err = None
     if args.dry_collect:
         slow_status, regime_status = "ok", "ok"
@@ -158,6 +244,8 @@ def main() -> int:
             slow_status = "degraded"
         else:
             slow_status = "error"
+            slow_err = (step_result.get("stderr_tail")
+                        or f"collect_slow rc={rc}")[:500]
         # regime 独立验证解耦：只要 collect_slow 真跑完(rc 0/2)就验 regime.db 是否有新行；
         # 崩溃/超时(其它 rc)则 regime 记 degraded。
         if rc in (0, 2):
@@ -167,11 +255,12 @@ def main() -> int:
                       flush=True)
         else:
             regime_status = "degraded"
+            regime_err = slow_err or f"collect_slow rc={rc}"
     latency_ms = int((time.time() - t0) * 1000)
 
     # 两行账本：slow + regime。
     ledger.record_collection(ledger_db, cycle, ledger.SRC_SLOW, slow_status,
-                             latency_ms=latency_ms)
+                             latency_ms=latency_ms, err=slow_err)
     ledger.record_collection(ledger_db, cycle, ledger.SRC_REGIME, regime_status,
                              latency_ms=latency_ms, err=regime_err)
 
@@ -185,8 +274,10 @@ def main() -> int:
 
     out = {"ok": slow_status in ledger.DONE_STATUS, "cycle": cycle,
            "status_slow": slow_status, "status_regime": regime_status,
+           "error": slow_err,
            "latency_ms": latency_ms,
-           "steps": [{k: s[k] for k in ("name", "ok", "rc", "dur_s", "warn_tail")
+           "steps": [{k: s[k] for k in (
+                          "name", "ok", "rc", "dur_s", "warn_tail", "stderr_tail")
                       if k in s} for s in steps],
            "dispatch": None}
     print(json.dumps(out, ensure_ascii=False))

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      OKX_ROOT: ${{ github.workspace }}
+      OKX_EXECUTOR_DRYRUN: "1"
+      OKX_TRIGGER_DRYRUN: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q collectors core scripts tests
+
+      - name: Run isolated regressions
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Validate public contracts
+        shell: pwsh
+        run: |
+          python collectors/sources/_registry.py --validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check_script_lifecycle.py --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check_trader_docs_sync.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check_doc_versions.py --static-only
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/update_star_stats.py --self-test
+          exit $LASTEXITCODE

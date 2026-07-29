@@ -1,87 +1,137 @@
 # -*- coding: utf-8 -*-
 """导出 V2.0 业务数据库 schema 到 db/schema.sql。"""
+from __future__ import annotations
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
 
-import os
+
+import argparse
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
 
 from _db_ro import connect_ro
 
-SCHEMA_VERSION = 'V2.0'
-db_dir = _project_path('db')
-# V2.0 规范库；drill.db 暂保留为只读兼容库，待现役 reviewer 读依赖迁走后再清理。
-dbs = [
-    'market.db', 'news.db', 'account.db', 'lessons.db', 'drill.db',
-    'regime.db', 'analysis.db', 'live_trades.db', 'demo_trades.db', 'ledger.db',
-]
+SCHEMA_VERSION = "V2.0"
+DEFAULT_DB_ROOT = Path(_project_path('db'))
+# V2.0 规范库；drill.db 永久保留为业务只读历史归档。
+# 公开版本不提供该归档库的自动写维护入口。
+DBS = (
+    "market.db",
+    "news.db",
+    "account.db",
+    "lessons.db",
+    "drill.db",
+    "regime.db",
+    "analysis.db",
+    "live_trades.db",
+    "demo_trades.db",
+    "ledger.db",
+    "qq_push_dedupe.db",
+)
 # 排除 sqlite 系统表
-EXCLUDE = ('sqlite_sequence', 'sqlite_stat1')
+EXCLUDE = ("sqlite_sequence", "sqlite_stat1")
+CST = timezone(timedelta(hours=8))
 
 
 def normalize_schema_comments(db_name: str, table_name: str, sql: str) -> str:
     """清理旧 DDL 内嵌注释；只改注释，不改表、列、约束或索引。"""
-    if db_name in {'live_trades.db', 'demo_trades.db'} and table_name == 'trade_cycles':
+    if db_name in {"live_trades.db", "demo_trades.db"} and table_name == "trade_cycles":
         return re.sub(
-            r'(?m)^(\s*mode\s+TEXT,\s+--\s*).*$',
-            r'\1live|demo（由 trades_writer 按 profile 写入）',
+            r"(?m)^(\s*mode\s+TEXT,\s+--\s*).*$",
+            r"\1live|demo（由 trades_writer 按 profile 写入）",
             sql,
         )
     return sql
 
 
-CST = timezone(timedelta(hours=8))
-now = datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')
+def export_schema(
+    db_root: Path,
+    out_path: Path,
+    *,
+    db_names: Iterable[str] = DBS,
+    exported_at: str | None = None,
+) -> tuple[int, int]:
+    """只读各业务库并写出权威 DDL；返回（字符数，逻辑行数）。"""
+    root = Path(db_root)
+    stamp = exported_at or datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "-- OKX 永续合约自主交易系统 - 数据库 Schema",
+        f"-- 导出时间: {stamp} CST",
+        f"-- 版本: {SCHEMA_VERSION}",
+        f"-- 数据库目录: {root}\\",
+        "-- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）",
+        "-- 核心拆分库由 init_v20_dbs.py 初始化；增量变更走 apply_* 幂等迁移脚本",
+        "",
+    ]
 
-lines = []
-lines.append('-- OKX 永续合约自主交易系统 - 数据库 Schema')
-lines.append(f'-- 导出时间: {now} CST')
-lines.append(f'-- 版本: {SCHEMA_VERSION}')
-lines.append('-- 数据库目录: <PROJECT_ROOT>\\db\\')
-lines.append('-- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）')
-lines.append('-- 核心拆分库由 init_v20_dbs.py 初始化；增量变更走 apply_* 幂等迁移脚本')
-lines.append('')
-
-for db_name in dbs:
-    db_path = os.path.join(db_dir, db_name)
-    if not os.path.exists(db_path):
-        lines.append(f'-- 数据库 {db_name} 不存在')
-        lines.append('')
-        continue
-    lines.append('-- ' + '=' * 60)
-    lines.append(f'-- 数据库: {db_name}')
-    lines.append('-- ' + '=' * 60)
-    lines.append('')
-    conn = connect_ro(db_path)  # 只读 mode=ro（2026-07-03）
-    cursor = conn.cursor()
-    # 表
-    cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL ORDER BY name")
-    for name, sql in cursor.fetchall():
-        if name in EXCLUDE:
+    for db_name in db_names:
+        db_path = root / db_name
+        if not db_path.exists():
+            lines.append(f"-- 数据库 {db_name} 不存在")
+            lines.append("")
             continue
-        lines.append(normalize_schema_comments(db_name, name, sql) + ';')
-        lines.append('')
-    # 索引
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
-    for (sql,) in cursor.fetchall():
-        # 排除自动 UNIQUE 索引（已含在 CREATE TABLE 里）和 sqlite 内部
-        if 'sqlite_autoindex' in (sql or ''):
-            continue
-        lines.append(sql + ';')
-        lines.append('')
-    conn.close()
+        lines.extend(
+            [
+                "-- " + "=" * 60,
+                f"-- 数据库: {db_name}",
+                "-- " + "=" * 60,
+                "",
+            ]
+        )
+        conn = connect_ro(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='table' AND sql IS NOT NULL ORDER BY name"
+            )
+            for name, sql in cursor.fetchall():
+                if name in EXCLUDE:
+                    continue
+                lines.append(normalize_schema_comments(db_name, name, sql) + ";")
+                lines.append("")
 
-output = '\n'.join(lines)
-out_path = os.path.join(db_dir, 'schema.sql')
-with open(out_path, 'w', encoding='utf-8') as f:
-    f.write(output)
-print(f'schema.sql written to {out_path}')
-print(f'  {len(output)} chars, {len(lines)} lines, {SCHEMA_VERSION}')
+            cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+            )
+            for name, sql in cursor.fetchall():
+                # 自动索引的约束已经包含在 CREATE TABLE 中。
+                if name.startswith("sqlite_autoindex"):
+                    continue
+                lines.append(sql + ";")
+                lines.append("")
+        finally:
+            conn.close()
+
+    output = "\n".join(lines)
+    Path(out_path).write_text(output, encoding="utf-8")
+    return len(output), len(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="导出 V2.0 SQLite 权威 DDL")
+    ap.add_argument("--db-root", default=str(DEFAULT_DB_ROOT))
+    ap.add_argument("--out", help="输出文件；默认 <db-root>/schema.sql")
+    args = ap.parse_args(argv)
+    db_root = Path(args.db_root)
+    out_path = Path(args.out) if args.out else db_root / "schema.sql"
+    chars, lines = export_schema(db_root, out_path)
+    print(f"schema.sql written to {out_path}")
+    print(f"  {chars} chars, {lines} lines, {SCHEMA_VERSION}, {len(DBS)} databases")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

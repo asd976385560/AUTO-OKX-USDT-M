@@ -1,8 +1,8 @@
 {
   "_meta": {
-    "doc": "V2.0 声明式源注册表。确定性新闻采集器只迭代 enabled news 源；market/macro 段中的 registered-only 项由现有采集模块实现。",
-    "version": "2.2.0",
-    "updated": "2026-07-24T00:45",
+    "doc": "V2.0 §6 声明式源注册表（弃 OKX news 单点）。news 采集器（news_collect）读本表只迭代 enabled news 源；market/macro 段为 registered-only 声明；增/停/换源＝on-demand 维护会话（主人对话触发）灰度改本表，安全可审计，改采集器代码仍走灰度+人工确认。",
+    "version": "2.4.0",
+    "updated": "2026-07-27T22:40",
     "cadence_values": [
       "15m",
       "hourly",
@@ -17,7 +17,7 @@
       "macro",
       "social"
     ],
-    "fields": "id/type/endpoint/native_cadence/required/staleness_sec(null=按cadence默认)/enabled/auth_env(env名,不存值)/adapter/timeout_sec/note",
+    "fields": "id/type/endpoint/native_cadence/poll_interval_min(可选，按15分钟cycle槽限频)/required/staleness_sec(null=按cadence默认)/enabled/auth_env(env名,不存值)/adapter/timeout_sec/note",
     "cadence_default_staleness_sec": {
       "15m": 1800,
       "hourly": 7200,
@@ -39,7 +39,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 25,
-      "note": "全 USDT-M 行情；实际采集由 collect_data/collect_slow 实现。"
+      "note": "全 USDT-M 一次拉；生产级，复用 _okx_http。registered-only：实采在 collect_data/collect_slow（market 真函数=scripts/_okx_http.fetch_*_sync）"
     },
     {
       "id": "okx_klines",
@@ -52,7 +52,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 60,
-      "note": "多周期 K 线与指标；实际采集由 collect_data/collect_slow 实现。"
+      "note": "15m/1H/4H/1D/1W/1M + 指标。registered-only：实采在 collect_data/collect_slow（market 真函数=scripts/_okx_http.fetch_*_sync）"
     },
     {
       "id": "okx_funding",
@@ -65,7 +65,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 60,
-      "note": "资金费率与 premium；OI 使用独立数据源。"
+      "note": "当前/下次资金费率与premium。OI已拆为okx_open_interest；多空账户比已拆为okx_top_long_short，禁止混称"
     },
     {
       "id": "okx_open_interest",
@@ -78,7 +78,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "全市场 OI，写入 market.db.derivatives，作为软参考。"
+      "note": "全市场OI/oiCcy/oiUsd一次拉取，写market.db.derivatives；影子软参考，不阻断主链"
     },
     {
       "id": "okx_orderbook_50",
@@ -91,7 +91,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 40,
-      "note": "重点合约每侧 50 档订单簿，写入 market_microstructure。"
+      "note": "BTC/ETH/SOL+focus+高流动性动态集合，每侧50档；写market_microstructure，影子软参考"
     },
     {
       "id": "okx_recent_trades",
@@ -104,7 +104,20 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 40,
-      "note": "重点合约最近成交样本，写入 market_trade_flow。"
+      "note": "与50档订单簿同一动态币集；最近最多500笔样本，写market_trade_flow；不是完整15分钟CVD"
+    },
+    {
+      "id": "okx_top_long_short",
+      "type": "market",
+      "endpoint": "okx market indicator top-long-short <symbol> --list --limit 1",
+      "native_cadence": "hourly",
+      "required": false,
+      "staleness_sec": 10800,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": null,
+      "timeout_sec": 40,
+      "note": "OKX CLI优先；整点采BTC/ETH/SOL+focus+高流动性动态前20币的1H多空账户比，写market_positioning；仅软证据，不改变全部USDT-M永续交易范围"
     },
     {
       "id": "okx_instruments",
@@ -117,7 +130,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 25,
-      "note": "合约 ctVal/lotSz 缓存；实际采集由 collect_slow 实现。"
+      "note": "ctVal/lotSz → instruments_cache（慢采每小时）。registered-only：实采在 collect_data/collect_slow（market 真函数=scripts/_okx_http.fetch_*_sync）"
     },
     {
       "id": "rss_en",
@@ -130,7 +143,7 @@
       "auth_env": null,
       "adapter": "news_rss",
       "timeout_sec": 20,
-      "note": "英文 RSS 聚合；event_time 使用源发布时间。"
+      "note": "英文 RSS——2026-06-25 探测 4 源全 200 OK ~101 条/48h，event_time 来自 pubDate；**当前唯一实测可靠 news 源故设 required**；adapter=collectors/sources/news_rss.py（已建+测）。2026-06-26 维护：实测 4 feed 自然发布周期 1-2h/feed（~0.5 篇/feed/h），原 15m 节奏默认 30min stale 阈值过严误报，staleness_sec 调为 7200（2h）；2026-06-27 再调 86400（24h）：稀疏发布（深夜/周末）2h 阈值仍把『新闻发布稀疏』误判为『源断流』致整轮 abort，改按『每天有新闻即可』——管道彻底断流（24h+）才判 stale，短时无新相关新闻属正常不降级"
     },
     {
       "id": "blockbeats",
@@ -143,7 +156,7 @@
       "auth_env": null,
       "adapter": "news_blockbeats",
       "timeout_sec": 15,
-      "note": "适配器保留；源恢复并验证前保持禁用。"
+      "note": "2026-06-27：适配器 news_blockbeats.py 已建（解析/symbol/severity 已对合成 payload 验证）但 keyless open API 被运营方清空——穷举 type/size/page/lang/GET+POST 全 data[]=0，/v1/open-api/flash 需 key。enabled=false 待端点恢复真数据即开（适配器现成）"
     },
     {
       "id": "odaily",
@@ -156,7 +169,7 @@
       "auth_env": null,
       "adapter": "news_odaily",
       "timeout_sec": 15,
-      "note": "中文快讯源；按原生发布节奏设置时效阈值。"
+      "note": "2026-06-27 复活：旧 v1/openapi/* 路由全死；逆向 Next.js App Router 找到真端点 web-api.odaily.news/newsflash/page?page=1&pageSize=16（JSON data.list）。news_odaily.py 已建+实测 20 条/轮（event_time/symbol/severity 齐）。2026-06-30 05:40 维护：实测 7d 分布显典型深夜静默（02/03/05 Asia/Shanghai 整点 0 条、04/06 个位数条）白天稳定 15-30 条/小时；默认 15m→30min stale 阈值过严误报（类 rss_en 路径），staleness_sec 调为 14400（4h）覆盖深夜静默窗。2026-06-30 07:25 维护：6h10m 持续静默（last_seen 01:15→07:25）触发 stale，但源实活（collect 137ms/rows=0，非 outage）→ 静默窗实际延伸到 ~07h；staleness_sec 再调到 28800（8h）完整覆盖 01-07h 静默窗+2h 余量；若 9h+ 仍静默则视为真断流"
     },
     {
       "id": "panews",
@@ -169,7 +182,7 @@
       "auth_env": null,
       "adapter": "news_panews",
       "timeout_sec": 15,
-      "note": "中文 RSS 快讯源；按原生发布节奏设置时效阈值。"
+      "note": "2026-06-27 复活：站点迁 Nuxt，旧 /webapi/flashnews 全 404、api/m 子域 SSL EOF；改用 RSS https://www.panewslab.com/rss.xml（200 rss+xml，100 条中文快讯，pubDate 可靠）。news_panews.py 已建+实测 100 条/轮。2026-06-30 维护：实测 7d 分布显典型深夜静默（02/03/04/05 Asia/Shanghai 7 日累计 2/2/1/1 条、06/07 个位数），白天 13/21 峰 113/27 条/小时；默认 15m→30min stale 阈值过严误报（类 rss_en/odaily 路径），staleness_sec 调为 14400（4h）覆盖深夜静默窗（odaily 同日同路径已调过，复用相同阈值）"
     },
     {
       "id": "jinse",
@@ -182,7 +195,7 @@
       "auth_env": null,
       "adapter": "news_jinse",
       "timeout_sec": 15,
-      "note": "中文快讯源；按原生发布节奏设置时效阈值。"
+      "note": "2026-06-27 复活：jinse.cn/.com 全 SSL EOF（本机受阻），唯一可达 TLD = api.jinse.com.cn → noah/v3/lives?limit=30（JSON 快讯）。news_jinse.py 已建+实测 30 条/轮。2026-07-03 维护：实测近 3 轮 ledger 全 ok rows=0（latency 2.7-3.3s，源活），last_seen 01:47→02:26 仅 39min 即触发默认 30min stale 阈值——类同 rss_en/odaily/panews 的中文快讯深夜晚静默路径，默认 15m→30min 过严；staleness_sec 调为 14400（4h）覆盖 02-06h Asia/Shanghai 静默窗（与 panews 同值同源类型）"
     },
     {
       "id": "mx_search",
@@ -194,8 +207,9 @@
       "enabled": true,
       "auth_env": "MX_APIKEY",
       "adapter": "news_mxsearch",
+      "poll_interval_min": 60,
       "timeout_sec": 30,
-      "note": "需 MX_APIKEY；统一经 news_writer 落库，失败不阻断主链。"
+      "note": "2026-07-24 收口：由 news_mxsearch.py 在 okx-news-rss cron 中采集，统一经 news_writer 落库；已从 fast collect 旁路移除。2026-07-26 按共享新闻额度150次/日降为每小时1次（24次/日）；与 geo_political 合计72次/日，给其他共享调用与重试预留78次。required=false，失败不阻断主链。"
     },
     {
       "id": "geo_political",
@@ -207,8 +221,9 @@
       "enabled": true,
       "auth_env": "MX_APIKEY",
       "adapter": "news_geo",
+      "poll_interval_min": 120,
       "timeout_sec": 45,
-      "note": "需 MX_APIKEY；统一经 news_writer 落库，失败不阻断主链。"
+      "note": "2026-07-24 收口：4 个地缘查询由 news_geo.py 承接，统一经 news_writer 落 news_items(source='geo-political')。每2小时一轮（12轮×4查询=48次/日）；2026-07-26 与每小时 mx_search 24次合计72次/日，按共享新闻额度150次/日保留78次给其他调用与重试。金融接口使用独立额度，不计入本预算。"
     },
     {
       "id": "okx_news",
@@ -221,12 +236,12 @@
       "auth_env": null,
       "adapter": "news_okx",
       "timeout_sec": 30,
-      "note": "OKX 新闻补充源；统一经 news_writer 落库。"
+      "note": "OKX CLI 1.4.2下okx news latest|important已复核可用；adapter=collectors/sources/news_okx.py（经news_writer落库）。挂okx-news-rss cron，不进fast。required=false；staleness 4h覆盖稀疏窗。失败隔离不影响RSS/中文源。"
     },
     {
       "id": "x_search",
       "type": "social",
-      "endpoint": "news-scout via configured search-capable model",
+      "endpoint": "news-scout agent 经配置的取数通道（非 registry 采集器，独立解耦 cron）",
       "native_cadence": "event",
       "required": false,
       "staleness_sec": null,
@@ -234,12 +249,25 @@
       "auth_env": null,
       "adapter": "EXTERNAL_SCOUT",
       "timeout_sec": 0,
-      "note": "由独立 news-scout 取数并经 news_writer 落库；主链不依赖。"
+      "note": "X+无API新闻由 news-scout agent 取数→news_writer 落 source=x_search；本表仅登记，采集器不迭代它（gate 不因它缺/旧 abort）"
+    },
+    {
+      "id": "x_authoritative_supplement",
+      "type": "social",
+      "endpoint": "news-scout每日权威数据补充（X官方/权威账号，必要时官方网页）",
+      "native_cadence": "daily",
+      "required": false,
+      "staleness_sec": 172800,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": "EXTERNAL_SCOUT",
+      "timeout_sec": 0,
+      "note": "主要补无稳定脚本直连的ETF流复核证据；写news_items(source=x_search,tags含authoritative_data)。恐慌贪婪和ECB复算DXY已改由collect_public_macro.py直采；ETF单源仅provisional，同日Farside+SoSoValue一致才写硬字段"
     },
     {
       "id": "macro_dxy_vix_spx",
       "type": "macro",
-      "endpoint": "FRED/yahoo (DXY/VIX/SPX/gold)",
+      "endpoint": "FRED DTWEXBGS/VIXCLS/SP500 + gold sources",
       "native_cadence": "weekday",
       "required": false,
       "staleness_sec": null,
@@ -247,7 +275,20 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "工作日宏观数据；实际采集由 collect_data 实现。"
+      "note": "legacy id/字段含dxy，但实际美元绝对指数为FRED DTWEXBGS=Nominal Broad U.S. Dollar Index，非ICE DXY。工作日更；时效读source_meta.dxy.source_as_of，禁止公共行掩盖旧值。ICE官方报价仍缺；另有独立macro_dxy_calc_ecb可审计计算值"
+    },
+    {
+      "id": "macro_dxy_calc_ecb",
+      "type": "macro",
+      "endpoint": "ECB eurofxref-hist-90d.xml + ICE USDX public formula",
+      "native_cadence": "weekday",
+      "required": false,
+      "staleness_sec": null,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": null,
+      "timeout_sec": 30,
+      "note": "用ECB六币种官方日参考汇率按ICE公布公式复算，写macro_observations/cross_market.dxy_calc_ecb；是可审计计算值，不是ICE官方实时或收盘报价，禁止混称"
     },
     {
       "id": "macro_btc_dominance",
@@ -260,7 +301,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "BTC 占比与总市值统计；实际采集由 collect_data 实现。"
+      "note": "BTC.D / total mcap / total vol。registered-only：adapter 模块未建，实采在 collect_data"
     },
     {
       "id": "macro_btc_mcap_change",
@@ -273,20 +314,20 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "BTC 24h 市值变化；不得解释为 ETF 净流。"
+      "note": "BTC市值24h变化USD，写cross_market.btc_etf_flow旧存储列、正式读btc_mcap_chg_24h_usd；绝非ETF净流"
     },
     {
       "id": "macro_etf_flow",
       "type": "macro",
-      "endpoint": "pending verified ETF flow source",
+      "endpoint": "SoSoValue API(optional key) + x_authoritative_supplement Farside/SoSoValue evidence",
       "native_cadence": "weekday",
       "required": false,
       "staleness_sec": null,
-      "enabled": false,
+      "enabled": true,
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "等待已验证的 ETF 净流数据源；目标列保持 NULL。"
+      "note": "美国现货BTC ETF日净流写macro_observations。Farside脚本直连受Cloudflare限制，导入08:20权威证据；配置SOSOVALUE_API_KEY时额外直调官方API。单源保留provisional，只有同日双源在容差内才写cross_market.btc_etf_net_flow_usd"
     },
     {
       "id": "macro_fear_greed",
@@ -299,7 +340,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 15,
-      "note": "尚未形成权威落库字段，保持禁用。"
+      "note": "Alternative.me自有指数API直采，写macro_observations并同步cross_market.fear_greed/fear_greed_label；日频、0-100、保留classification和原始timestamp，展示须注明来源"
     },
     {
       "id": "macro_economic_calendar",
@@ -308,11 +349,11 @@
       "native_cadence": "daily",
       "required": false,
       "staleness_sec": 172800,
-      "enabled": false,
+      "enabled": true,
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 45,
-      "note": "经济日历由 daily_maintenance 维护，当前注册项禁用。"
+      "note": "OKX CLI优先；未来7天importance=3经济事件由daily_maintenance采集，写regime.db.macro_events"
     },
     {
       "id": "macro_tvl",
@@ -325,7 +366,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "DefiLlama TVL；实际采集由 collect_data 实现。"
+      "note": "DefiLlama TVL。registered-only：adapter 模块未建，实采在 collect_data"
     }
   ]
 }

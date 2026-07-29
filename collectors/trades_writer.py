@@ -1,28 +1,30 @@
 # -*- coding: utf-8 -*-
-"""V2.0 trades 落库 writer（live/demo trader 写 live_trades.db/demo_trades.db 的唯一通道）。
+r"""V2.0 trades 落库 writer（live/demo trader 写 live_trades.db/demo_trades.db 的唯一通道）。
 
-trader agent 完成判断后，把回执 JSON 从 stdin 喂进来，写进对应 profile 的 trade_cycles + trades 表。
+trader agent 完成判断后，把当前回执 JSON 从 UTF-8 文件或 stdin 喂进来，写进对应
+profile 的 trade_cycles + trades 表。
 红线「写库必走 writer」：trader agent 严禁手写 INSERT，强制走本脚本。
 
 用法：
-    # stdin 模式（trader agent 专用）
-    echo '<回执JSON>' | python trades_writer.py --stdin --cycle-id 2026-06-18T14:00 --profile live
-    cat receipt.json | python trades_writer.py --stdin --cycle-id ... --profile demo
+    # 当前回执文件模式（推荐；receipt.json 必须满足下述完整契约）
+    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 \
+        <PROJECT_ROOT>\collectors\trades_writer.py --json-file receipt.json \
+        --cycle-id 2026-06-18T14:00 --profile demo
 
-    # 命令行 quick-write（测试/演示）
-    python trades_writer.py --cycle-id 2026-06-18T14:00 --profile live \
-        --decision traded --n-orders 1 --equity 998.50 \
-        --note "HOLD — no clear signal, regime=trend_down"
+    # stdin 模式（仅在调用方能保证 UTF-8 字节时使用）
+    经项目 wrapper 运行 trades_writer.py --stdin \
+        --cycle-id 2026-06-18T14:00 --profile live
 
-    # 直接写 hold（无交易）
-    python trades_writer.py --cycle-id 2026-06-18T14:00 --profile live \
-        --decision hold
+仅给 `--decision/--n-orders/...` 的旧简写入口不具备协议卡，入口层已明确拒绝，
+不得用于生产落库。历史修复/执行 journal 重放走独立 maintenance 入口，不能靠回执
+中的私有标记放宽当前校验。
 
-输入回执 JSON（从 stdin）：
+当前回执 JSON：
     {
       "cycle_id": "2026-06-18T14:00",
-      "ts": "2026-06-18 14:05:30",   -- 完成时刻（UTC+8）
-      "mode": "full",
+      "ts": "2026-06-18 14:05:30",   -- 调用方报告时刻，仅存 raw.reported_ts
+      "mode": "live",                 -- 必须与显式 --profile 一致：live|demo
+      "status": "ok",                 -- 必填：ok|skipped|degraded|error
       "decision": "HOLD",             -- 'traded'|'hold'|'skip'|'degraded'|'error'
       "action": "BTC/USDT: hold",    -- 简短动作描述
       "regime": "trend_down",        -- 供复盘用
@@ -43,23 +45,33 @@ trader agent 完成判断后，把回执 JSON 从 stdin 喂进来，写进对应
           "action": "open",          -- 'open'|'close'|'add'|'reduce'|'none'
           "side": "long",
           "sz": 1,
+          "approved_sz": 1,
+          "fill_sz": 1,
           "fill_px": 62500.00,
+          "fill_source": "fills",     -- fills|order_status|orders_history
+          "fill_ts": "2026-06-18T06:05:28Z",
+          "ts_source": "exchange_fill",
           "lev": 5,
           "margin": 12.50,
           "notional": 62500.00,
           "reasoning": "...",
           "deviation": null,
           "degradation": null,
-          "pnl": null
+          "pnl": 0.0
         }
       ],
-      "errors": [],
-      "status": "ok"
+      "errors": []
     }
 
-- `trades=[]` 或无 trades 字段：合法（hold/skip 路径）
-- `decision` 大小写不敏感（统一转小写对应对应 'traded'/'hold'/'skip'/'degraded'/'error'）
-- `mode` 由 writer 强制设为 profile（live|demo），回执里的 mode 字段被忽略
+- `decision_protocol=decision_card_v1` 与完整 decision_card 为当前回执必填项
+- `status=ok` 只允许 `decision=traded|hold`；其他 status 必须映射到同名失败决策且无 trades
+- `trades=[]` 或无 trades 字段只适用于无成交决策；`decision=traded` 必须有成交行
+- `decision`/status/action/side 等机器标签大小写不敏感，规范化后仍未知即拒写
+- `mode`/profile 若出现在回执中必须与显式 profile 一致，不能由 writer 静默覆盖矛盾值
+- open/add 只接受已确认成交；确认成交必须提供可信 fill_source、正 fill_sz、有效
+  fill_ts/ts_source，且 sz=fill_sz、open 的 sz 不得超过 approved_sz
+- 未确认 close/reduce 只能作为待对账占位，fill_px/pnl/fill_ts 必须同时为空
+- 当前写入和历史维护入口彼此隔离；`_trusted_timestamp` 等回执字段没有提权作用
 
 输出（stdout）：
     {"ok": true, "cycle_id": "...", "n_orders": N}
@@ -73,8 +85,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -82,6 +96,7 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -124,6 +139,29 @@ def normalize_ts(ts: str) -> str:
         norm_tz = tz if ":" in tz else tz[:3] + ":" + tz[3:]
         dt_obj = dt.fromisoformat(f"{date}T{time}{norm_tz}").astimezone(CST)
     return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_CST_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
+)
+
+
+def now_cst() -> str:
+    return dt.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def strict_cst_ts(value: object) -> Optional[str]:
+    """Return one valid canonical CST timestamp, otherwise ``None``."""
+    if value is None or not str(value).strip():
+        return None
+    normalized = normalize_ts(str(value))
+    if not _CST_TS_RE.fullmatch(normalized):
+        return None
+    try:
+        dt.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return normalized
 
 import sqlite3
 
@@ -171,9 +209,10 @@ DECISION_MAP = {
 
 
 def normalize_decision(raw: Optional[str]) -> str:
-    if not raw:
-        return "hold"
-    return DECISION_MAP.get(str(raw).lower().strip(), "hold")
+    if raw is None:
+        return ""
+    value = str(raw).lower().strip()
+    return DECISION_MAP.get(value, value)
 
 
 # ---------------------------------------------------------------------------
@@ -182,15 +221,74 @@ def normalize_decision(raw: Optional[str]) -> str:
 # 非空 trades[] 恒 traded；未知值 fail-safe 按 hold。已有 decision 值不覆盖。
 # ---------------------------------------------------------------------------
 _ACTION_TAKEN_TRADED = {"CLOSE", "STOP_LOSS", "REDUCE", "ADD"}
+_ACTION_TAKEN_NONTRADED = {"ADJUST", "HOLD", "WAIT", "NONE", "REJECT"}
+_ACTION_TAKEN_ALLOWED = (
+    _ACTION_TAKEN_TRADED
+    | _ACTION_TAKEN_NONTRADED
+    | {
+        "OPEN",
+        "OPEN_LONG",
+        "OPEN_SHORT",
+        "CLOSE_LONG",
+        "CLOSE_SHORT",
+        "UNWIND",
+    }
+)
+CURRENT_RECEIPT_STATUSES = {"ok", "skipped", "degraded", "error"}
+CONFIRMED_FILL_SOURCES = {"fills", "order_status", "orders_history"}
+_CURRENT_WRITE_CAPABILITY = object()
+_MAINTENANCE_CAPABILITY = object()
 
 
 def derive_cycle_decision(action_taken: Optional[str], incoming_trades: list) -> str:
     if incoming_trades:
         return "traded"
     at = str(action_taken or "").upper().strip()
-    if at.startswith("OPEN_") or at in _ACTION_TAKEN_TRADED:
+    if (
+        at.startswith(("OPEN_", "CLOSE_"))
+        or at in _ACTION_TAKEN_TRADED
+        or at in {"OPEN", "UNWIND"}
+    ):
         return "traded"
     return "hold"
+
+
+def normalize_receipt(data: dict) -> dict:
+    """Return a canonical copy for validation and persistence."""
+    normalized = dict(data)
+    for key in (
+        "mode",
+        "profile",
+        "_profile",
+        "status",
+        "decision",
+        "decision_protocol",
+    ):
+        value = normalized.get(key)
+        if value is not None:
+            normalized[key] = str(value).strip().lower()
+    if normalized.get("action_taken") is not None:
+        normalized["action_taken"] = str(
+            normalized["action_taken"]).strip().upper()
+    trades = normalized.get("trades")
+    if isinstance(trades, list):
+        normalized_trades = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                normalized_trades.append(trade)
+                continue
+            item = dict(trade)
+            for key in ("action", "side", "fill_source"):
+                if item.get(key) is not None:
+                    item[key] = str(item[key]).strip().lower()
+            if item.get("fill_ts") is not None:
+                item["fill_ts"] = (
+                    strict_cst_ts(item["fill_ts"]) or item["fill_ts"])
+            if item.get("ts_source") is not None:
+                item["ts_source"] = str(item["ts_source"]).strip()
+            normalized_trades.append(item)
+        normalized["trades"] = normalized_trades
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +338,7 @@ def _as_pos_float(v) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return f if f > 0 else None
+    return f if math.isfinite(f) and f > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -329,31 +427,240 @@ def _rows_match(a: tuple, b: tuple) -> bool:
 # ---------------------------------------------------------------------------
 # 验证
 # ---------------------------------------------------------------------------
-def validate(data: dict) -> list[str]:
-    errors = []
+_TRADE_ROW_ACTIONS = {"open", "close", "add", "reduce", "none"}
+
+
+def _trade_row_raw(t: dict) -> dict:
+    raw = t.get("raw")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _trade_row_is_rejected(t: dict) -> bool:
+    for obj in (t, _trade_row_raw(t)):
+        status = str(obj.get("status") or "").strip().lower()
+        if status in {"rejected", "reject", "failed", "error"}:
+            return True
+        if obj.get("ok") is False:
+            return True
+        if obj.get("success") is False:
+            return True
+        if str(obj.get("action_taken") or "").strip().upper() == "REJECT":
+            return True
+        if str(obj.get("reject_reason") or "").strip():
+            return True
+    return False
+
+
+def validate(data: dict, *, maintenance: bool = False) -> list[str]:
+    """Validate a current receipt, or a separately authorized history repair."""
+    if not isinstance(data, dict):
+        return ["回执必须是 dict"]
+    data = normalize_receipt(data)
+    errors: list[str] = []
     if not data.get("cycle_id"):
         errors.append("缺少 cycle_id")
-    decision = normalize_decision(data.get("decision"))
-    if decision not in ("traded", "hold", "skip", "degraded", "error"):
-        errors.append(f"decision 归一化后非法: {decision!r}")
-    if data.get("decision_protocol") == "decision_card_v1":
+
+    raw_trades = data.get("trades")
+    if raw_trades is None:
+        incoming_trades: list = []
+    elif not isinstance(raw_trades, list):
+        errors.append("trades 必须是 list")
+        incoming_trades = []
+    else:
+        incoming_trades = [
+            trade for trade in raw_trades
+            if isinstance(trade, dict)
+            and str(trade.get("action") or "none").strip().lower() != "none"
+        ]
+
+    raw_decision = data.get("decision")
+    if raw_decision is None or not str(raw_decision).strip():
+        decision = derive_cycle_decision(
+            data.get("action_taken"), incoming_trades)
+    else:
+        decision = normalize_decision(raw_decision)
+        if decision not in {"traded", "hold", "skip", "degraded", "error"}:
+            errors.append(f"decision 不支持: {raw_decision!r}")
+
+    action_taken = str(data.get("action_taken") or "").strip().upper()
+    if action_taken and action_taken not in _ACTION_TAKEN_ALLOWED:
+        errors.append(f"action_taken 不支持: {data.get('action_taken')!r}")
+
+    if not maintenance:
+        status = str(data.get("status") or "").strip().lower()
+        if status not in CURRENT_RECEIPT_STATUSES:
+            errors.append(
+                "status 必须是 ok|skipped|degraded|error，"
+                f"got: {data.get('status')!r}")
+        if data.get("ok") is not None and not isinstance(data.get("ok"), bool):
+            errors.append("ok 存在时必须是 bool")
+        if data.get("ok") is False:
+            errors.append("ok=false/rejected 执行回执不得写入交易账本")
+        if data.get("decision_protocol") != "decision_card_v1":
+            errors.append("decision_protocol 必须是 decision_card_v1")
         errors.extend(validate_card(data.get("decision_card"), "decision_card"))
-    if "trades" in data and data["trades"] is not None:
-        if not isinstance(data["trades"], list):
-            errors.append("trades 必须是 list")
-        else:
-            for i, t in enumerate(data["trades"]):
-                if not isinstance(t, dict):
-                    errors.append(f"trades[{i}] 必须是 dict")
-                    continue
-                if "symbol" not in t or not str(t.get("symbol", "")).strip():
-                    errors.append(f"trades[{i}] 缺少 symbol")
+
+        if status != "ok" and incoming_trades:
+            errors.append(f"status={status or '<missing>'} 时 trades 必须为空")
+        expected_failure_decision = {
+            "skipped": "skip",
+            "degraded": "degraded",
+            "error": "error",
+        }.get(status)
+        if expected_failure_decision and decision != expected_failure_decision:
+            errors.append(
+                f"status={status} 时 decision 必须是 "
+                f"{expected_failure_decision}")
+        if status == "ok" and decision not in {"traded", "hold"}:
+            errors.append(
+                "status=ok 时 decision 只能是 traded|hold")
+        if action_taken == "REJECT" and status != "error":
+            errors.append("action_taken=REJECT 时 status 必须是 error")
+
+        n_orders = data.get("n_orders")
+        if n_orders is not None:
+            if isinstance(n_orders, bool) or not isinstance(n_orders, int):
+                errors.append("n_orders 必须是整数")
+            elif n_orders != len(incoming_trades):
+                errors.append(
+                    "n_orders 必须等于实际 trades 行数 "
+                    f"{len(incoming_trades)}")
+    else:
+        protocol = data.get("decision_protocol")
+        if protocol not in (None, "", "decision_card_v1"):
+            errors.append(
+                f"decision_protocol 不支持: {protocol!r}")
+        elif protocol == "decision_card_v1":
+            errors.extend(
+                validate_card(data.get("decision_card"), "decision_card"))
+
+    if incoming_trades and decision != "traded":
+        errors.append("trades 非空时 decision 必须是 traded")
+    if not incoming_trades and decision == "traded":
+        errors.append("decision=traded 时 trades 不得为空")
+    if (
+        action_taken
+        and (
+            action_taken.startswith(("OPEN_", "CLOSE_"))
+            or action_taken in _ACTION_TAKEN_TRADED
+            or action_taken in {"OPEN", "UNWIND"}
+        )
+        and not incoming_trades
+    ):
+        errors.append(f"action_taken={action_taken} 时 trades 不得为空")
+
+    if isinstance(raw_trades, list):
+        for i, t in enumerate(raw_trades):
+            if not isinstance(t, dict):
+                errors.append(f"trades[{i}] 必须是 dict")
+                continue
+            if "symbol" not in t or not str(t.get("symbol", "")).strip():
+                errors.append(f"trades[{i}] 缺少 symbol")
+            action = str(t.get("action") or "none").strip().lower()
+            if action not in _TRADE_ROW_ACTIONS:
+                errors.append(
+                    f"trades[{i}].action 非成交动作: {action!r}；"
+                    "拒单/hold 必须留在 receipt 或 execution_intents，"
+                    "不得写入 trades")
+                continue
+            if action == "none":
+                continue
+            side = str(t.get("side") or "").strip().lower()
+            if side not in {"long", "short"}:
+                errors.append(f"trades[{i}].side 必须为 long|short")
+            if _trade_row_is_rejected(t):
+                errors.append(
+                    f"trades[{i}] 是 rejected/ok=false 回执，"
+                    "不得写入成交表")
+                continue
+
+            actual_sz = _as_pos_float(t.get("sz"))
+            if actual_sz is None:
+                errors.append(f"trades[{i}].sz 必须为正数")
+            fill_source = str(t.get("fill_source") or "").strip().lower()
+            fill_px = _as_pos_float(t.get("fill_px"))
+
+            if maintenance:
+                if fill_source and fill_source not in (
+                    CONFIRMED_FILL_SOURCES | {"unconfirmed"}
+                ):
+                    errors.append(
+                        f"trades[{i}].fill_source 不支持: "
+                        f"{fill_source!r}")
+                if action in {"open", "add"} and fill_px is None:
+                    errors.append(
+                        f"trades[{i}].fill_px 必须为正数（开仓成交）")
+                elif fill_px is None and fill_source != "unconfirmed":
+                    errors.append(
+                        f"trades[{i}].fill_px 缺失且未标 "
+                        "fill_source=unconfirmed")
+                continue
+
+            if not fill_source:
+                errors.append(f"trades[{i}].fill_source 必填")
+            elif fill_source == "unconfirmed":
+                if action not in {"close", "reduce"}:
+                    errors.append(
+                        f"trades[{i}] {action} 禁止 "
+                        "fill_source=unconfirmed")
+                if t.get("fill_sz") is not None:
+                    errors.append(
+                        f"trades[{i}] unconfirmed 时 fill_sz 必须为 null")
+                if t.get("fill_px") is not None:
+                    errors.append(
+                        f"trades[{i}] unconfirmed 时 fill_px 必须为 null")
+                if t.get("pnl") is not None:
+                    errors.append(
+                        f"trades[{i}] unconfirmed 时 pnl 必须为 null")
+                if t.get("fill_ts") is not None:
+                    errors.append(
+                        f"trades[{i}] unconfirmed 时 fill_ts 必须为 null")
+            elif fill_source in CONFIRMED_FILL_SOURCES:
+                if fill_px is None:
+                    errors.append(
+                        f"trades[{i}].fill_px 必须为正数（已确认成交）")
+                confirmed_sz = _as_pos_float(t.get("fill_sz"))
+                if confirmed_sz is None:
+                    errors.append(
+                        f"trades[{i}].fill_sz 必须为有限正数")
+                elif (
+                    actual_sz is not None
+                    and abs(actual_sz - confirmed_sz)
+                    > max(1e-9, 1e-9 * max(actual_sz, confirmed_sz))
+                ):
+                    errors.append(
+                        f"trades[{i}].sz 必须等于权威 fill_sz")
+                if strict_cst_ts(t.get("fill_ts")) is None:
+                    errors.append(
+                        f"trades[{i}].fill_ts 必须是有效 CST 时间")
+                if not str(t.get("ts_source") or "").strip():
+                    errors.append(f"trades[{i}].ts_source 必填")
+            else:
+                errors.append(
+                    f"trades[{i}].fill_source 不支持: {fill_source!r}")
+
+            approved_sz = _as_pos_float(t.get("approved_sz"))
+            if (
+                action in {"open", "add"}
+                and approved_sz is not None
+                and actual_sz is not None
+                and actual_sz > approved_sz + max(1e-9, 1e-9 * approved_sz)
+            ):
+                errors.append(f"trades[{i}].sz 超过 approved_sz")
     return errors
 
 
 # ---------------------------------------------------------------------------
-# equity 兜底：trader 回执留空 equity=None 时，下游 push 资金段无从取数。
-# 缺失时从 account.db 最新快照只读回填；快照过旧（>20min）
+# equity 兜底（2026-07-04）：trader 回执慢性留空 equity=None（07-04 当日 36/70 行），
+# 下游 push 资金段无从取数。缺失时从 account.db 最新快照只读回填；快照过旧（>20min）
 # 或任何读取失败一律保持 None——兜底绝不阻塞写库。
 # ---------------------------------------------------------------------------
 EQUITY_FALLBACK_MAX_AGE_SEC = 20 * 60
@@ -441,8 +748,106 @@ def _analysis_context_for_cycle(cycle_id: str) -> dict:
 # 写入
 # ---------------------------------------------------------------------------
 def write_trades(data: dict, db_path: Path) -> dict:
+    """Strict current receipt entry; callers cannot request maintenance modes."""
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "回执必须是 dict"}
+    payload = normalize_receipt(data)
+    profile = (
+        payload.get("_profile")
+        or payload.get("profile")
+        or payload.get("mode")
+    )
+    if profile not in DB_MAP:
+        return {"ok": False, "error": f"profile 不支持: {profile!r}"}
+    payload["_profile"] = profile
+    errors = validate(payload)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}
+    return _write_trades(
+        payload,
+        Path(db_path),
+        _capability=_CURRENT_WRITE_CAPABILITY,
+    )
+
+
+def maintenance_write_trades(
+    data: dict,
+    db_path: Path,
+    *,
+    trusted_timestamp: str,
+    preserve_equity_none: bool = True,
+) -> dict:
+    """Explicit history-repair entry.
+
+    The maintenance capability is created and consumed only inside this module;
+    receipt fields such as ``_maintenance_*`` or ``_trusted_*`` have no effect.
+    Callers must pass a separately verified historical timestamp explicitly.
+    """
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "回执必须是 dict"}
+    payload = normalize_receipt(data)
+    profile = (
+        payload.get("_profile")
+        or payload.get("profile")
+        or payload.get("mode")
+    )
+    if profile not in DB_MAP:
+        return {"ok": False, "error": f"profile 不支持: {profile!r}"}
+    payload["_profile"] = profile
+    errors = validate(payload, maintenance=True)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}
+    normalized_ts = strict_cst_ts(trusted_timestamp)
+    if normalized_ts is None:
+        return {
+            "ok": False,
+            "error": (
+                "trusted_timestamp 不是有效 CST 时间: "
+                f"{trusted_timestamp!r}"
+            ),
+        }
+    return _write_trades(
+        payload,
+        Path(db_path),
+        _capability=_MAINTENANCE_CAPABILITY,
+        trusted_timestamp=normalized_ts,
+        preserve_equity_none=bool(preserve_equity_none),
+    )
+
+
+def _write_trades(
+    data: dict,
+    db_path: Path,
+    *,
+    _capability: object,
+    trusted_timestamp: Optional[str] = None,
+    preserve_equity_none: bool = False,
+) -> dict:
+    """Write one receipt.
+
+    Normal callers cannot control business timestamps: ``trade_cycles.ts`` is
+    the first writer commit time and each new ``trades.ts`` prefers a strict
+    exchange ``fill_ts`` before falling back to this commit.  Historical tools
+    enter through ``maintenance_write_trades``; receipt data
+    cannot manufacture the private capability consumed here.
+    """
+    if _capability not in {
+        _CURRENT_WRITE_CAPABILITY,
+        _MAINTENANCE_CAPABILITY,
+    }:
+        raise PermissionError("missing internal writer capability")
+    is_maintenance = _capability is _MAINTENANCE_CAPABILITY
+    if is_maintenance != (trusted_timestamp is not None):
+        raise PermissionError("maintenance timestamp/capability mismatch")
     cycle_id = data["cycle_id"]
-    completed_at = normalize_ts(data.get("ts") or dt.now().strftime("%Y-%m-%d %H:%M:%S"))
+    writer_commit_at = now_cst()
+    if trusted_timestamp is not None:
+        completed_at = strict_cst_ts(trusted_timestamp)
+        if completed_at is None:
+            raise ValueError(
+                f"trusted_timestamp 不是有效 CST 时间: {trusted_timestamp!r}")
+    else:
+        completed_at = writer_commit_at
     mode = data.get("_profile", "full")  # 由 main() 注入 --profile 值（live|demo）
     incoming_trades = [t for t in (data.get("trades") or [])
                        if isinstance(t, dict) and t.get("action", "none") != "none"]
@@ -457,7 +862,9 @@ def write_trades(data: dict, db_path: Path) -> dict:
         n_orders = len(incoming_trades)
     equity = data.get("equity")
     equity_fallback_mark = None
-    if equity is None:
+    # 已备份的人工事实修复可通过维护专用入口保留历史 NULL，禁止用“修复执行时”
+    # 的最新 account snapshot 污染旧 cycle；普通 receipt 字段无法开启该能力。
+    if equity is None and not preserve_equity_none:
         fb = _equity_snapshot_fallback(mode)
         if fb is not None:
             equity = fb[0]
@@ -511,12 +918,27 @@ def write_trades(data: dict, db_path: Path) -> dict:
         note_parts.append(f"open_pnl={pnl_open}")
     note = " | ".join(p for p in note_parts if p)
     raw_obj = data.get("raw") or data
+    if not isinstance(raw_obj, dict):
+        raw_obj = {"payload_raw": raw_obj}
+    else:
+        raw_obj = dict(raw_obj)
+    if not is_maintenance:
+        reported_ts = data.get("ts")
+        if reported_ts is not None:
+            raw_obj["reported_ts"] = (
+                strict_cst_ts(reported_ts) or str(reported_ts))
+            raw_obj["cycle_ts_source"] = "writer_commit"
+    else:
+        raw_obj["cycle_ts_source"] = "trusted_internal_override"
     if isinstance(raw_obj, dict) and isinstance(data.get("decision_card"), dict):
         raw_obj = {
             **raw_obj,
             "decision_protocol": "decision_card_v1",
             "decision_card": data["decision_card"],
         }
+    if not is_maintenance:
+        raw_obj["status"] = data.get("status")
+        raw_obj["decision"] = decision
     if equity_fallback_mark and isinstance(raw_obj, dict):
         raw_obj = {**raw_obj, **equity_fallback_mark}
     if score_backfill_mark and isinstance(raw_obj, dict):
@@ -530,7 +952,7 @@ def write_trades(data: dict, db_path: Path) -> dict:
         # 拒绝时返回 ok:true+refused 标记
         # （账面状态良好，勿让 caller 当写失败重试/升级 P0）。
         old = con.execute(
-            "SELECT decision, n_orders FROM trade_cycles WHERE cycle_id=?",
+            "SELECT decision, n_orders, ts FROM trade_cycles WHERE cycle_id=?",
             (cycle_id,)).fetchone()
         if old and (old["n_orders"] or 0) > 0 and not incoming_trades:
             print(f"[trades_writer] REFUSE downgrade overwrite: cycle={cycle_id} "
@@ -599,11 +1021,16 @@ def write_trades(data: dict, db_path: Path) -> dict:
                     return {"ok": False, "cycle_id": cycle_id,
                             "n_orders": (old["n_orders"] if old else None),
                             "refused": "ambiguous_merge", "new_trades": []}
+        cycle_completed_at = (
+            str(old["ts"])
+            if old and old["ts"] and not is_maintenance
+            else completed_at
+        )
         con.execute(
             "INSERT OR REPLACE INTO trade_cycles"
             "(cycle_id, ts, mode, decision, n_orders, equity, note, raw)"
             "VALUES (?,?,?,?,?,?,?,?)",
-            (cycle_id, completed_at, mode, decision, n_orders, equity, note, raw),
+            (cycle_id, cycle_completed_at, mode, decision, n_orders, equity, note, raw),
         )
 
         # 删本 cycle 旧 trades（防止重跑覆盖；merge_keep 非空时旧行随后原样插回）
@@ -658,6 +1085,25 @@ def write_trades(data: dict, db_path: Path) -> dict:
                     }
                 except (json.JSONDecodeError, TypeError):
                     row_raw_obj = {"execution_raw": row_raw}
+            fill_ts = strict_cst_ts(t.get("fill_ts"))
+            if fill_ts is not None:
+                trade_ts = fill_ts
+                trade_ts_source = str(
+                    t.get("ts_source") or "trade.fill_ts")
+            else:
+                trade_ts = completed_at
+                trade_ts_source = (
+                    "trusted_internal_override"
+                    if is_maintenance
+                    else "writer_commit_fallback"
+                )
+            if isinstance(row_raw_obj, dict):
+                row_raw_obj = {
+                    **row_raw_obj,
+                    "ts_source": trade_ts_source,
+                }
+                if fill_ts is not None:
+                    row_raw_obj["fill_ts"] = fill_ts
             if card_mode and isinstance(effective_card, dict) and isinstance(row_raw_obj, dict):
                 row_raw_obj = {
                     **row_raw_obj,
@@ -715,7 +1161,7 @@ def write_trades(data: dict, db_path: Path) -> dict:
                 "VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?)",
                 (
                     cycle_id,
-                    completed_at,
+                    trade_ts,
                     symbol,
                     t.get("action", "none"),
                     t.get("side"),
@@ -744,8 +1190,13 @@ def write_trades(data: dict, db_path: Path) -> dict:
     if score_backfill_mark and not card_mode:
         data["total_score"] = total_score
         data["confidence"] = confidence
-    return {"ok": True, "cycle_id": cycle_id, "n_orders": orders_written,
-            "new_trades": new_trades}
+    return {
+        "ok": True,
+        "cycle_id": cycle_id,
+        "n_orders": orders_written,
+        "writer_commit_at": writer_commit_at,
+        "new_trades": new_trades,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -777,13 +1228,20 @@ def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
     非致命：trade DB 与 account.db 跨库无法同事务，交易记录已先落库；此处失败只记 stderr。
     表不存在（迁移前）→ 安全跳过。开仓插 open 行、平仓 UPDATE 匹配 open 行补 pnl。
     """
-    trades = [t for t in (data.get("trades") or [])
-              if isinstance(t, dict) and t.get("action", "none") != "none"]
+    trades = [
+        t for t in (data.get("trades") or [])
+        if (
+            isinstance(t, dict)
+            and t.get("action", "none") != "none"
+            and str(t.get("fill_source") or "").strip().lower()
+            != "unconfirmed"
+        )
+    ]
     if not trades:
         return {"exp": 0}
     # 与 write_trades 的 completed_at 缺省口径一致。JSON 回执可不带 ts；若把 None
     # 传给历史 close 的“ts<=平仓时刻”匹配，会错误落入 fallback 而不闭合真实 open。
-    now_ts = normalize_ts(now_ts or dt.now().strftime("%Y-%m-%d %H:%M:%S"))
+    now_ts = strict_cst_ts(now_ts) or now_cst()
     try:
         if _project_path('scripts') not in sys.path:
             sys.path.insert(0, _project_path('scripts'))
@@ -816,7 +1274,13 @@ def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
                     "playbook_ref": data.get("playbook_ref"),
                     "trades": [t],
                 }
-                _tew.insert_or_update_experiences(acc, payload, data.get("cycle_id"), now_ts)
+                experience_ts = strict_cst_ts(t.get("fill_ts")) or now_ts
+                _tew.insert_or_update_experiences(
+                    acc,
+                    payload,
+                    data.get("cycle_id"),
+                    experience_ts,
+                )
                 n += 1
             acc.commit()
             return {"exp": n}
@@ -865,24 +1329,114 @@ def _attribute_cycle(profile: str, rec_ts: str, ledger_db: Path) -> Optional[str
         return None
 
 
-def _journal_consumed(con, rec: dict) -> bool:
-    """journal 记录是否已入账：带 ordId 精确查（存于行 raw JSON，子串即中——19位唯一号
-    碰撞可忽略）；无 ordId 用 symbol/action/side/sz 近似。近似过匹配=不重放，方向保守安全。"""
+def _num_close(a, b, rel_tol: float = 1e-8, abs_tol: float = 1e-8) -> bool:
+    try:
+        af, bf = float(a), float(b)
+    except (TypeError, ValueError):
+        return a is None and b is None
+    return abs(af - bf) <= max(abs_tol, rel_tol * max(1.0, abs(af), abs(bf)))
+
+
+def _economic_trade_match(row, trade: dict) -> bool:
+    """同 cycle 成交经济指纹；ordId 不参与，用于识别身份冲突。"""
+    try:
+        same_text = all(
+            str(row[k] or "").strip().lower()
+            == str(trade.get(k) or "").strip().lower()
+            for k in ("symbol", "action", "side")
+        )
+        if not same_text:
+            return False
+        if not _num_close(row["sz"], trade.get("sz")):
+            return False
+        if not _num_close(row["fill_px"], trade.get("fill_px")):
+            return False
+        # pnl 只在双方均有值时收紧；open 行常为 NULL。
+        if row["pnl"] is not None and trade.get("pnl") is not None:
+            return _num_close(row["pnl"], trade.get("pnl"),
+                              rel_tol=1e-7, abs_tol=1e-7)
+        return True
+    except (KeyError, TypeError):
+        return False
+
+
+def _stored_trade_ordid(row) -> Optional[str]:
+    """读取账本成交行自身 ordId；兼容 raw=行 dict 与 raw=完整 receipt。"""
+    raw = row["raw"]
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    direct = _extract_ordid(raw)
+    if direct:
+        return direct
+    matches = [
+        _extract_ordid(t) for t in (raw.get("trades") or [])
+        if isinstance(t, dict) and _economic_trade_match(row, t)
+    ]
+    matches = [x for x in matches if x]
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def _journal_replay_status(con, rec: dict) -> dict:
+    """返回 pending / consumed / identity_conflict；冲突永不进入重放计划。"""
     t = rec.get("trade") or {}
     oid = _extract_ordid(t)
     if oid:
         n = con.execute("SELECT COUNT(*) FROM trades WHERE raw LIKE ?",
                         (f"%{oid}%",)).fetchone()[0]
-        return n > 0
+        if n > 0:
+            return {"status": "consumed", "match": "ordId", "ordId": oid}
+
+        cycle_id = str(rec.get("cycle_id") or "")
+        if cycle_id:
+            rows = con.execute(
+                "SELECT rowid AS ledger_rowid, cycle_id, symbol, action, side, "
+                "sz, fill_px, pnl, raw "
+                "FROM trades WHERE cycle_id=? AND symbol=? AND action=? AND side=?",
+                (cycle_id, t.get("symbol"), t.get("action"), t.get("side")),
+            ).fetchall()
+            for row in rows:
+                if not _economic_trade_match(row, t):
+                    continue
+                stored_oid = _stored_trade_ordid(row)
+                if stored_oid and stored_oid != oid:
+                    return {
+                        "status": "identity_conflict",
+                        "cycle": cycle_id,
+                        "symbol": t.get("symbol"),
+                        "action": t.get("action"),
+                        "side": t.get("side"),
+                        "sz": t.get("sz"),
+                        "journal_ordId": oid,
+                        "ledger_ordId": stored_oid,
+                        "ledger_rowid": row["ledger_rowid"],
+                        "ts": rec.get("ts"),
+                    }
+                # 旧账本行无 ordId，但经济指纹相同：保守视作已消费，禁止盲重放。
+                return {"status": "consumed", "match": "economic_fingerprint",
+                        "ordId": oid, "cycle": cycle_id}
+        return {"status": "pending", "ordId": oid}
+
     try:
         sz = float(t.get("sz"))
     except (TypeError, ValueError):
-        return True  # 无 ordId 又无 sz：无从匹配，视作已入账（禁盲目重放）
+        # 无 ordId 又无 sz：无从匹配，视作已入账（禁盲目重放）。
+        return {"status": "consumed", "match": "insufficient_identity"}
     n = con.execute(
         "SELECT COUNT(*) FROM trades WHERE symbol=? AND action=? AND side=? "
         "AND ABS(COALESCE(sz,0)-?) < 1e-6",
         (t.get("symbol"), t.get("action"), t.get("side"), sz)).fetchone()[0]
-    return n > 0
+    return {"status": "consumed" if n > 0 else "pending",
+            "match": "legacy_fingerprint" if n > 0 else None}
+
+
+def _journal_consumed(con, rec: dict) -> bool:
+    """兼容布尔调用方；identity_conflict 视作不可重放，而不是“待补账”。"""
+    return _journal_replay_status(con, rec)["status"] != "pending"
 
 
 def replay_from_journal(args) -> int:
@@ -928,10 +1482,13 @@ def replay_from_journal(args) -> int:
             recs.append(rec)
     con = connect(db_path)
     try:
-        pending = [r for r in recs if not _journal_consumed(con, r)]
+        classified = [(r, _journal_replay_status(con, r)) for r in recs]
     finally:
         con.close()
-    if not pending:
+    pending = [r for r, st in classified if st["status"] == "pending"]
+    identity_conflicts = [st for _, st in classified
+                          if st["status"] == "identity_conflict"]
+    if not pending and not identity_conflicts:
         print(json.dumps({"ok": True, "replayed": 0, "bad_lines": bad_lines,
                           "note": "journal 无未入账记录"}, ensure_ascii=False))
         return 0
@@ -950,13 +1507,26 @@ def replay_from_journal(args) -> int:
         plan = {cyc: [{"ordId": r["trade"].get("ordId") or None,
                        "symbol": r["trade"].get("symbol"),
                        "action": r["trade"].get("action"),
+                       "side": r["trade"].get("side"),
                        "sz": r["trade"].get("sz"), "ts": r.get("ts"),
                        "unwind": bool(r.get("unwind"))}
                       for r in rs] for cyc, rs in groups.items()}
         print(json.dumps({"ok": True, "dry_run": True,
                           "would_replay": sum(len(v) for v in groups.values()),
+                          "blocked_identity_conflicts": len(identity_conflicts),
+                          "identity_conflicts": identity_conflicts,
                           "bad_lines": bad_lines, "plan": plan}, ensure_ascii=False))
         return 0
+    if identity_conflicts:
+        print(json.dumps({
+            "ok": False,
+            "error": "identity_conflict: 经济字段相同但 journal/账本 ordId 不一致，"
+                     "已硬阻断整批重放，必须人工核交易所订单真值",
+            "blocked_identity_conflicts": len(identity_conflicts),
+            "identity_conflicts": identity_conflicts,
+            "replayed": 0,
+        }, ensure_ascii=False))
+        return 3
     results, all_ok = [], True
     for cyc, rs in sorted(groups.items()):
         data = {
@@ -997,12 +1567,17 @@ def replay_from_journal(args) -> int:
                 data["raw"] = {"source": "journal_replay",
                                "journal_ms": [r.get("ms") for r in rs],
                                "prev_raw_str": str(old_hdr["raw"])[:80000]}
-        errs = validate(data)
+        errs = validate(data, maintenance=True)
         if errs:
             results.append({"cycle_id": cyc, "ok": False, "error": "; ".join(errs)})
             all_ok = False
             continue
-        res = write_trades(data, db_path)
+        res = maintenance_write_trades(
+            data,
+            db_path,
+            trusted_timestamp=data.get("ts"),
+            preserve_equity_none=True,
+        )
         # 经验挂钩只喂真正新落的行；重放命中已有行时不重喂经验库。
         exp_trades = res.pop("new_trades", None)
         exp_data = data if exp_trades is None else {**data, "trades": exp_trades}
@@ -1021,17 +1596,70 @@ def replay_from_journal(args) -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def commit_receipt(data: dict, profile: str,
+                   db_path: Path | None = None,
+                   nudge: bool = True) -> dict:
+    """在当前确定性进程内完成回执校验、主账、经验库与 dispatcher nudge。
+
+    live 执行 helper 应在 order_executor 返回后直接调用本函数，避免把“交易所已成交”
+    和“模型下一工具调用再跑 writer”拆成两个易撕裂阶段。唯一写入逻辑仍由本模块持有。
+    """
+    if profile not in DB_MAP:
+        return {"ok": False, "error": f"profile 不支持: {profile}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "回执必须是 dict"}
+    target = Path(db_path or DB_MAP[profile])
+    if not target.exists():
+        return {"ok": False, "error": f"DB 不存在: {target}"}
+    payload = normalize_receipt(data)
+    claimed_profile = payload.get("profile") or payload.get("mode")
+    if claimed_profile and claimed_profile != profile:
+        return {
+            "ok": False,
+            "error": (
+                f"回执 profile/mode={claimed_profile!r} 与提交 profile="
+                f"{profile!r} 不一致"
+            ),
+        }
+    payload["_profile"] = profile
+    result = write_trades(payload, target)
+    if not result.get("ok") or result.get("refused"):
+        return result
+    exp_trades = result.pop("new_trades", None)
+    exp_data = (
+        payload
+        if exp_trades is None
+        else {**payload, "trades": exp_trades}
+    )
+    exp = write_experiences(
+        exp_data,
+        profile,
+        result.get("writer_commit_at"),
+    )
+    result["exp"] = exp.get("exp", 0)
+    if (nudge and result.get("ok") and not result.get("refused")
+            and _nudge_mod is not None):
+        try:
+            _nudge_mod.nudge(f"trades_writer:{profile}")
+        except Exception as exc:  # nudge 永不反向拖垮已提交的账本
+            sys.stderr.write(
+                f"[trades_writer][WARN] dispatcher nudge 跳过（非致命）: {exc}\n")
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="V2.0 trades writer")
     parser.add_argument("--stdin", action="store_true", help="从 stdin 读 JSON 回执")
     parser.add_argument("--json-file", type=str, help="从 UTF-8 文件读 JSON 回执（方案A：杜绝 echo 管道外层 shell GBK 编码坏码）")
     parser.add_argument("--cycle-id", type=str, help="cycle_id")
     parser.add_argument("--profile", type=str, choices=["live", "demo"], required=True)
-    parser.add_argument("--decision", type=str, help="decision: traded|hold|skip|degraded|error")
-    parser.add_argument("--n-orders", type=int, default=0, help="n_orders")
-    parser.add_argument("--equity", type=float, help="equity")
-    parser.add_argument("--note", type=str, help="note 字段")
-    parser.add_argument("--ts", type=str, help="完成时刻（缺省=now）")
+    # 旧 quick-write 参数只为让历史调用得到结构化拒绝原因而保留解析，
+    # 不再出现在 --help，也绝不据此拼装缺少 decision_card 的伪回执。
+    parser.add_argument("--decision", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--n-orders", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--equity", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--note", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--ts", type=str, help=argparse.SUPPRESS)
     parser.add_argument("--from-journal", type=str,
                         help="journal 重放：从 order_executor 执行 journal(JSONL) 补写未入账成交")
     parser.add_argument("--ordid", type=str, help="仅重放该订单号（--from-journal 模式）")
@@ -1077,25 +1705,13 @@ def main() -> int:
         if args.cycle_id:
             data["cycle_id"] = args.cycle_id
     else:
-        if not args.cycle_id:
-            print(json.dumps({"ok": False, "error": "需要 --cycle-id"}, ensure_ascii=False))
-            return 1
-        data = {
-            "cycle_id": args.cycle_id,
-            "ts": args.ts or dt.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mode": args.profile,
-            "decision": args.decision or "hold",
-            "n_orders": args.n_orders,
-            "equity": args.equity,
-            "note": args.note,
-            "trades": [],
-            "errors": [],
-            "status": "ok",
-        }
-
-    errors = validate(data)
-    if errors:
-        print(json.dumps({"ok": False, "error": "; ".join(errors)}, ensure_ascii=False))
+        print(json.dumps({
+            "ok": False,
+            "error": (
+                "当前写入必须提供 --json-file 或 --stdin 的完整回执；"
+                "legacy quick-write 已禁用"
+            ),
+        }, ensure_ascii=False))
         return 1
 
     db_path = DB_MAP.get(args.profile)
@@ -1103,22 +1719,9 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1
 
-    data["_profile"] = args.profile  # 注入 profile 给 write_trades 用作 mode
-    result = write_trades(data, db_path)
-    # V2.0 §8.5: 经验库挂钩（非致命，交易记录已落库）。只喂 write_trades
-    # 判定的真正新落行；重发、覆盖或拒写不再全量重喂。
-    exp_trades = result.pop("new_trades", None)  # 喂完即剥：stdout 回执契约不带整段 trade dict
-    exp_data = data if exp_trades is None else {**data, "trades": exp_trades}
-    exp = write_experiences(exp_data, args.profile, data.get("ts"))
-    result["exp"] = exp.get("exp", 0)
+    result = commit_receipt(data, args.profile, db_path)
     print(json.dumps(result, ensure_ascii=False))
-    # 真写入成功（result.ok 且非 refused）才 nudge。ambiguous_merge（ok:false）与
-    # downgrade_overwrite（ok:true+refused，库无新变化）都不拍；既有行已触发过 nudge，
-    # cron 同时保留兜底。
-    # 必须在 write_experiences 与 print 之后：经验行先落、stdout 契约不动。
-    if result.get("ok") and not result.get("refused") and _nudge_mod is not None:
-        _nudge_mod.nudge(f"trades_writer:{args.profile}")
-    return 0
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

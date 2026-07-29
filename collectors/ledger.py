@@ -24,8 +24,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -148,8 +150,31 @@ def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
                 PRIMARY KEY (cycle_id, stage)
             );
 
+            -- 开仓副作用幂等：同 profile/cycle/symbol/side 只允许一个逻辑意图。
+            -- completed 保存原回执供安全重跑；in-flight/uncertain 一律 fail-closed。
+            CREATE TABLE IF NOT EXISTS execution_intents (
+                profile             TEXT NOT NULL,
+                cycle_id            TEXT NOT NULL,
+                symbol              TEXT NOT NULL,
+                action              TEXT NOT NULL,
+                side                TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                request_json        TEXT NOT NULL,
+                state               TEXT NOT NULL,
+                reserved_at         TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                submitted_at        TEXT,
+                completed_at        TEXT,
+                ord_id              TEXT,
+                receipt_json        TEXT,
+                error               TEXT,
+                PRIMARY KEY (profile, cycle_id, symbol, action, side)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_cr_cycle ON collection_runs(cycle_id);
             CREATE INDEX IF NOT EXISTS idx_sd_cycle ON stage_dispatch(cycle_id);
+            CREATE INDEX IF NOT EXISTS idx_execution_intents_state
+                ON execution_intents(state, updated_at);
             """
         )
         con.commit()

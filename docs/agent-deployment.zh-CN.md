@@ -1,3 +1,10 @@
+<!--
+doc-version: V2.0-agent-deployment
+last-updated: 2026-07-29
+updated-by: Codex
+change-summary: Align public Agent deployment with the latest stage supervision and dry-run contracts.
+-->
+
 # Agent 与 OpenClaw 部署指南
 
 [简体中文](agent-deployment.zh-CN.md) · [English](agent-deployment.en.md)

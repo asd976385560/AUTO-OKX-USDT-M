@@ -7,7 +7,7 @@ trader 落库→push 派发 1.2min）。okx-dispatcher cron（*/2min）保持原
 四道守护闸（对抗核验 2026-07-16 钉死，缺一即转致命，禁删）：
   1. 暂停语义闸：okx-dispatcher cron enabled=1 才准 spawn（直读 openclaw.sqlite mode=ro，
      读失败/行缺失一律拒发 fail-closed）——保住「停 cron=停派发」不变量：P0 PAUSE 后已启动
-     agent 收尾落库不得绕过暂停派 trader 下真单；fulltest 停 cron 测试窗自动静默。
+     agent 收尾落库不得绕过暂停派 trader 下真单；停用 cron 的测试窗自动静默。
   2. DRYRUN 拒发：env 见 OKX_TRIGGER_DRYRUN（任何值，存在即拒）——dryrun dispatcher 对真库
      干跑仍写 stage_dispatch 闩锁，nudge 出去等于闩锁投毒。
   3. env 白名单：spawn 的 dispatcher 只继承系统基础键，OKX_* 全系 12 个消费键与 MX_APIKEY
@@ -31,8 +31,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -50,7 +52,7 @@ _DB_ROOT = _project_path('db')
 _LOG = Path(_project_path('logs', 'trigger', 'dispatch_nudge.log'))
 _STATE_DB = os.environ.get(
     "OKX_OPENCLAW_STATE_DB",
-    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"))
+    str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite')))
 _DISPATCHER_CRON_NAME = "okx-dispatcher"  # job_id 会随重建漂移，name 稳定（runbook 附录 A 对照表）
 
 _DETACHED_PROCESS = 0x00000008

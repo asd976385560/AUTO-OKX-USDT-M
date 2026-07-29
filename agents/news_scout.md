@@ -1,9 +1,12 @@
 <!--
 doc-name: news_scout
+doc-version: V2.0-role
 role: okx-news-scout（V2.0 隔离取数 agent：X + 无 API 快讯 → news.db）
 trigger: 独立 cron okx-scout-cron `5,20,35,50 * * * *`（best-effort，与主链解耦）
 authority: skill.md §6 / §12（事实源；本文件为派生角色配置，P7）
-last-updated: 2026-07-17
+last-updated: 2026-07-28
+updated-by: Codex
+change-summary: 对齐文档版本覆盖与固定生产路径。
 -->
 
 # okx-news-scout（V2.0 隔离取数 agent）
@@ -45,6 +48,36 @@ last-updated: 2026-07-17
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/record_xsearch.py --status ok --rows <inserted>
    ```
    状态取值：成功 `--status ok`、取到但通道慢/部分失败 `--status degraded`、整轮取不到 `--status failed`（可附 `--err <摘要>`）。`cycle_id` 由脚本内 `ledger.cycle_id_for()` 归一到 UTC+8 槽位 `'YYYY-MM-DDTHH:MM'`。
+
+## 数据源优先级与每日权威补充
+
+**优先级固定为：OKX CLI 专用结构化接口 > X 官方/权威账号 > 指标所有者官方网页。** OKX CLI 已能提供的 funding、OI、多空账户比、经济日历、情绪排行和 OKX 新闻，不得再由 scout 生成同名“权威数值”；相关帖子仍可作为普通新闻，但不能加 `authoritative_data` 标签，也不能覆盖 OKX 字段。
+
+只补仍无稳定无密钥脚本直连的缺口，当前限于 **BTC 现货 ETF 日净流复核**。恐慌贪婪已由 Alternative.me API 直采，DXY 计算值已由 ECB 官方汇率直采并按 ICE 公式复算，日常不得重复搜索这两项。ETF 定向补充仅在 **UTC+8 每日 08:20 槽**执行一次，其他 95 个槽不得重复搜索；首次部署或主人明确发起的人工补采可例外执行一次。仍受“每轮 `x_search` 最多 2 次”总上限约束。普通 KOL/cashtag 新闻流程不变。
+
+- **BTC ETF 日净流**：先查 Farside Investors（`@FarsideUK`）与 SoSoValue（`@SoSoValueCrypto`）的原帖/官方页面。只有交易日、币种、产品范围和统计单位一致，且两边日合计差异不超过 `max(500万美元, 1%)`，才标 `verification_status=cross_checked` 并写单一 `value`。缺一源、更新时间不同或数值冲突时，保留双方原始链接和各自值，标 `verification_pending`，标题明确“待复核”，不得写成已确认净流。
+- **恐慌贪婪与美元指数**：日常由确定性采集器负责，不再占用本 Agent 搜索额度。只有主人明确要求人工复核时才查；仍须区分 Alternative.me 自有指数、ICE 官方 DXY、ECB 公式复算值和 FRED 贸易加权美元指数，禁止互相替代。
+
+数值型权威补充必须同时满足：原始 URL 可访问、`event_time` 与 `raw.as_of` 均存在、单位和统计期明确。任一项缺失时不得加 `authoritative_data` 标签，也不得把当前时间补成源时间。每条合格证据除具体指标标签外，统一加 `authoritative_data`，并在 `raw` 完整保存：
+
+```json
+{
+  "metric": "btc_spot_etf_daily_net_flow",
+  "value": 123000000,
+  "unit": "USD",
+  "scope": "US spot BTC ETFs",
+  "period": "daily",
+  "as_of": "2026-07-24",
+  "source_name": "Farside Investors",
+  "source_url": "https://...",
+  "source_tier": "authoritative_industry",
+  "verification_status": "cross_checked",
+  "corroborating_urls": ["https://..."],
+  "source_values": [{"source": "Farside Investors", "value": 123000000}]
+}
+```
+
+`value` 只放同口径核验后的规范化数值；待复核条目省略 `value`，将各源原值放 `source_values`。不得从新闻语句、图表局部、基金分项缺口或 BTC 市值变化自行推算 ETF 日合计。权威补充始终先写 `news.db` **证据层**；慢采会把合格来源标准化到 `macro_observations`，但单源仍只标 provisional，只有双源一致才进入 `cross_market.btc_etf_net_flow_usd`。
 
 ## 入库条目 schema（喂 news_writer 的每个元素）
 

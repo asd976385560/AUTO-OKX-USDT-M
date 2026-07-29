@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
-"""schema 漂移只读对账：真库 PRAGMA vs db/schema.sql（权威 DDL）。
+"""schema 漂移只读对账：真库 sqlite_master vs db/schema.sql（权威 DDL）。
 
-用途：reviewer 每日复盘的系统健康段调用。
-只比【表存在性 + 列名集合】（类型/约束差异误报多，不比）；发现漂移只报告，
-**修复一律走 export_schema.py 重生成 + 人工确认，本脚本零写入**。
+比较范围：
+  - 表及显式索引存在性；
+  - 完整 CREATE TABLE 定义（列类型、默认值、NOT NULL、PK/UNIQUE/CHECK/FK、
+    generated column 等约束均包含在内）；
+  - 完整 CREATE INDEX 定义（索引列、顺序、表达式、唯一性及 WHERE 条件）。
+
+自动索引不单独比较，其对应的 PRIMARY KEY/UNIQUE 约束已由 CREATE TABLE 覆盖。
+发现漂移只报告，修复一律经人工确认后重新导出；本脚本零写入。
 
 用法：
   run_okx_python.ps1 scripts/schema_drift_check.py [--db-root <PROJECT_ROOT>/db] [--schema <PROJECT_ROOT>/db/schema.sql]
-退出码：0=一致；1=有漂移（明细见 stdout）；2=输入错误。
+退出码：0=一致；1=有漂移；2=输入或 schema 解析错误。
 """
 from __future__ import annotations
 
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -26,131 +33,249 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import TypeAlias
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-# 与 export_schema.py 的规范库清单一致
-DBS = [
-    "market.db", "news.db", "account.db", "lessons.db", "drill.db",
-    "regime.db", "analysis.db", "live_trades.db", "demo_trades.db", "ledger.db",
-]
+DBS = (
+    "market.db",
+    "news.db",
+    "account.db",
+    "lessons.db",
+    "drill.db",
+    "regime.db",
+    "analysis.db",
+    "live_trades.db",
+    "demo_trades.db",
+    "ledger.db",
+    "qq_push_dedupe.db",
+)
 EXCLUDE_TABLES = ("sqlite_sequence", "sqlite_stat1")
+OBJECT_TYPES = ("table", "index")
 
-_CREATE_RE = re.compile(
-    r"CREATE TABLE (?:IF NOT EXISTS )?[\"'`]?(\w+)[\"'`]?\s*\((.*?)\)\s*;",
-    re.IGNORECASE | re.DOTALL)
+ObjectMap: TypeAlias = dict[str, dict[str, str]]
+SchemaMap: TypeAlias = dict[str, ObjectMap | None]
 
 
-def parse_schema_sql(path: Path) -> dict[str, dict[str, set[str]]]:
-    """解析 schema.sql → {db_name: {table: {col, ...}}}。按 '-- xxx.db' 分节。"""
+def _strip_sql_comments(sql: str) -> str:
+    """移除 SQL 注释，同时保留引号内的 -- 与 /* */ 字面量。"""
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if quote is not None:
+            out.append(ch)
+            if quote == "]":
+                if ch == "]":
+                    quote = None
+            elif ch == quote:
+                if nxt == quote:
+                    out.append(nxt)
+                    i += 1
+                else:
+                    quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            quote = "]"
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "-" and nxt == "-":
+            i += 2
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+            out.append("\n")
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(sql) and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, len(sql))
+            out.append(" ")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _canonical_sql(sql: str) -> str:
+    """规范空白与非字面量大小写，保留字符串/引号标识符的精确内容。"""
+    source = _strip_sql_comments(sql).strip().rstrip(";")
+    out: list[str] = []
+    quote: str | None = None
+    pending_space = False
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if quote is not None:
+            out.append(ch)
+            if quote == "]":
+                if ch == "]":
+                    quote = None
+            elif ch == quote:
+                if nxt == quote:
+                    out.append(nxt)
+                    i += 1
+                else:
+                    quote = None
+            i += 1
+            continue
+        if ch.isspace():
+            pending_space = True
+            i += 1
+            continue
+        if pending_space and out and out[-1] not in "(," and ch not in "),":
+            out.append(" ")
+        pending_space = False
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+        elif ch == "[":
+            quote = "]"
+            out.append(ch)
+        else:
+            out.append(ch.casefold())
+        i += 1
+    return "".join(out).strip()
+
+
+def _catalog_from_connection(con: sqlite3.Connection) -> ObjectMap:
+    catalog: ObjectMap = {kind: {} for kind in OBJECT_TYPES}
+    rows = con.execute(
+        "SELECT type,name,sql FROM sqlite_master "
+        "WHERE type IN ('table','index') AND sql IS NOT NULL ORDER BY type,name"
+    ).fetchall()
+    for kind, name, sql in rows:
+        if kind == "table" and name in EXCLUDE_TABLES:
+            continue
+        if kind == "index" and name.startswith("sqlite_autoindex"):
+            continue
+        catalog[kind][name] = _canonical_sql(sql)
+    return catalog
+
+
+def parse_schema_sql(path: Path) -> SchemaMap:
+    """解析 schema.sql 各数据库段，并通过内存 SQLite 得到完整对象定义。"""
     text = path.read_text(encoding="utf-8", errors="replace")
-    out: dict[str, dict[str, set[str]]] = {}
-    # 切分各库段：export_schema.py 输出以 "-- 数据库: <db>.db" 行分节
-    marks = [(m.start(), m.group(1)) for m in
-             re.finditer(r"^--\s*数据库[:：]\s*(\w+\.db)\b", text, re.MULTILINE)]
+    out: SchemaMap = {}
+    marks = [
+        (m.start(), m.group(1))
+        for m in re.finditer(
+            r"^--\s*数据库[:：]\s*([A-Za-z0-9_.-]+\.db)\b", text, re.MULTILINE
+        )
+    ]
     if not marks:
         return out
-    marks.append((len(text), None))
+    marks.append((len(text), ""))
     for i in range(len(marks) - 1):
         db_name = marks[i][1]
-        if db_name is None:
-            continue
-        chunk = text[marks[i][0]:marks[i + 1][0]]
-        tables = out.setdefault(db_name, {})
-        for tm in _CREATE_RE.finditer(chunk):
-            tname, body = tm.group(1), tm.group(2)
-            if tname in EXCLUDE_TABLES:
-                continue
-            # 剥行内 -- 注释（注释里的逗号/词会污染列解析）
-            body = "\n".join(line.split("--", 1)[0] for line in body.splitlines())
-            cols: set[str] = set()
-            depth = 0
-            for raw_line in body.split(","):
-                token = raw_line.strip()
-                # 跳过括号内延续（如 CHECK(...) 内逗号）与表级约束
-                if depth > 0:
-                    depth += token.count("(") - token.count(")")
-                    continue
-                depth += token.count("(") - token.count(")")
-                if not token:
-                    continue
-                first = token.split()[0].strip("\"'`[]")
-                if first.upper() in ("PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT"):
-                    continue
-                cols.add(first)
-            tables[tname] = cols
-    return out
-
-
-def read_live_schema(db_root: Path) -> dict[str, dict[str, set[str]]]:
-    out: dict[str, dict[str, set[str]]] = {}
-    for db in DBS:
-        p = db_root / db
-        if not p.exists():
-            out[db] = {}
-            continue
-        con = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True, timeout=5)
-        tables = {}
+        chunk = text[marks[i][0] : marks[i + 1][0]]
+        con = sqlite3.connect(":memory:")
         try:
-            names = [r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")]
-            for t in names:
-                if t in EXCLUDE_TABLES:
-                    continue
-                # table_xinfo：含 GENERATED 列（hidden=2/3，table_info 不显示——
-                # regime.cross_market.btc_mcap_chg_24h_usd 实证）；hidden=1 真隐藏列不算
-                cols = {r[1] for r in con.execute(f"PRAGMA table_xinfo('{t}')")
-                        if r[6] in (0, 2, 3)}
-                tables[t] = cols
+            con.executescript(_strip_sql_comments(chunk))
+            out[db_name] = _catalog_from_connection(con)
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"{db_name} DDL 无法解析: {exc}") from exc
         finally:
             con.close()
-        out[db] = tables
     return out
 
 
-def main() -> int:
+def read_live_schema(db_root: Path) -> SchemaMap:
+    """以 mode=ro 读取真实库；缺库用 None 表示，绝不静默创建。"""
+    out: SchemaMap = {}
+    for db_name in DBS:
+        path = Path(db_root) / db_name
+        if not path.exists():
+            out[db_name] = None
+            continue
+        con = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            out[db_name] = _catalog_from_connection(con)
+        finally:
+            con.close()
+    return out
+
+
+def collect_drifts(declared: SchemaMap, live: SchemaMap) -> list[str]:
+    """返回不含 DDL 正文的安全漂移摘要。"""
+    drifts: list[str] = []
+    for db_name in DBS:
+        declared_objects = declared.get(db_name)
+        live_objects = live.get(db_name)
+        if declared_objects is None:
+            drifts.append(f"{db_name}: schema.sql 无该库段（声明缺失）")
+            continue
+        if live_objects is None:
+            drifts.append(f"{db_name}: 真库文件缺失")
+            continue
+        for kind in OBJECT_TYPES:
+            declared_kind = declared_objects.get(kind, {})
+            live_kind = live_objects.get(kind, {})
+            label = "表" if kind == "table" else "索引"
+            for name in sorted(set(declared_kind) | set(live_kind)):
+                declared_sql = declared_kind.get(name)
+                live_sql = live_kind.get(name)
+                if declared_sql is None:
+                    drifts.append(
+                        f"{db_name}.{name}: 真库有{label}、schema.sql 未声明"
+                    )
+                elif live_sql is None:
+                    drifts.append(
+                        f"{db_name}.{name}: schema.sql 声明{label}、真库缺失"
+                    )
+                elif declared_sql != live_sql:
+                    scope = (
+                        "完整表定义（类型/默认值/约束/generated）"
+                        if kind == "table"
+                        else "完整索引定义（唯一性/列序/表达式/WHERE）"
+                    )
+                    drifts.append(f"{db_name}.{name}: {scope} 漂移")
+    return drifts
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="schema drift check (read-only)")
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--schema", default=_project_path('db', 'schema.sql'))
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     schema_path = Path(args.schema)
     db_root = Path(args.db_root)
     if not schema_path.exists():
         print(f"[schema_drift][FAIL] schema.sql 不存在: {schema_path}", file=sys.stderr)
         return 2
-    declared = parse_schema_sql(schema_path)
-    live = read_live_schema(db_root)
-    drifts: list[str] = []
-    for db in DBS:
-        d_tables = declared.get(db, {})
-        l_tables = live.get(db, {})
-        if not d_tables:
-            drifts.append(f"{db}: schema.sql 无该库段（声明缺失）")
-            continue
-        for t in sorted(set(d_tables) | set(l_tables)):
-            dc, lc = d_tables.get(t), l_tables.get(t)
-            if dc is None:
-                drifts.append(f"{db}.{t}: 真库有表、schema.sql 未声明（疑新表未 export）")
-            elif lc is None:
-                drifts.append(f"{db}.{t}: schema.sql 声明、真库无表（疑被 DROP 未同步）")
-            else:
-                only_live = lc - dc
-                only_decl = dc - lc
-                if only_live:
-                    drifts.append(f"{db}.{t}: 真库多列 {sorted(only_live)}（疑加列未 export）")
-                if only_decl:
-                    drifts.append(f"{db}.{t}: 真库缺列 {sorted(only_decl)}")
+    try:
+        declared = parse_schema_sql(schema_path)
+        live = read_live_schema(db_root)
+    except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+        print(f"[schema_drift][FAIL] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    drifts = collect_drifts(declared, live)
     if drifts:
         print(f"[schema_drift] DRIFT x{len(drifts)}:")
-        for d in drifts:
-            print(f"  - {d}")
-        print("[schema_drift] 处置：人工确认后跑 export_schema.py 重生成 schema.sql；"
-              "本脚本只读不修。")
+        for drift in drifts:
+            print(f"  - {drift}")
+        print(
+            "[schema_drift] 处置：人工确认后跑 export_schema.py 重生成 schema.sql；"
+            "本脚本只读不修。"
+        )
         return 1
-    print("[schema_drift] OK — 10 库表/列与 schema.sql 一致")
+    print(f"[schema_drift] OK — {len(DBS)} 库完整表/约束/索引与 schema.sql 一致")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

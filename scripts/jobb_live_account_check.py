@@ -18,8 +18,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -33,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from _okxcli import okx_json
+import ledger_invariants as li
 
 CST = timezone(timedelta(hours=8))
 
@@ -503,6 +506,29 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
                 "INSERT OR REPLACE INTO system_state (key, value, updated_utc) VALUES (?, ?, ?)",
                 (key, value, ts),
             )
+        # 数量化经验账必须与本轮 OKX 实仓一致。命中只开/续
+        # repair_queue 元数据，不改经验或订单；恢复一致后自动闭单。
+        actual_positions = {
+            (str(item.get("instId")), position_side(item)):
+                abs(signed_size(item))
+            for item in open_positions
+        }
+        try:
+            experience_findings = li.experience_position_findings(
+                con, profile_label, actual_positions)
+            experience_queue = li.sync_repair_queue(
+                con,
+                family_prefix=(
+                    f"ledger_invariant:experience_position:{profile_label}:"),
+                findings=experience_findings,
+                ts=ts)
+            experience_audit = {
+                "findings": experience_findings,
+                "repair_queue": experience_queue,
+            }
+        except RuntimeError as exc:
+            # 迁移部署窗口内保持快采可用；迁移完成后下一轮自然启用。
+            experience_audit = {"skipped": str(exc)}
         con.commit()
     finally:
         con.close()
@@ -517,6 +543,7 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
         "positionCount": len(open_positions),
         # B13：非空即 WARN——agent 必须在本轮异常段上报并跑 fills 对账补 pnl
         "reconcile_vanished": vanished,
+        "experience_reconcile": experience_audit,
         "positions": [
             {
                 "instId": item.get("instId"),

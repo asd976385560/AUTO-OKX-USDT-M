@@ -44,7 +44,7 @@ VALUES (
     'scripts/apply_repair_queue_schema.py',
     '7.0e.5',
     ?,
-    '项目维护',
+    '维护者指令（自动化工具协助执行）',
     'v7.0e.5 治本：补 account.db.repair_queue 表（3 列 ts/check_name/issue/fix_action + status + cycle_id + 3 索引），幂等创建；写 doc_versions'
 );
 """

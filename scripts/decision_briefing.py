@@ -15,13 +15,16 @@ agent exec 环境是 cp936 pwsh——对本脚本输出接管道/捕获（`| tai
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
 
 import argparse
+import json
 import re
 import sqlite3
 import sys
@@ -236,8 +239,47 @@ def _render(root, top):
         def d1(v):
             return "None" if v is None else f"{v:+.4f}"
         print(f"  regime=**{r['regime']}** @ {fmt_age(r['ts'])} 前（事实标签，仅作决策参考）")
-        print(f"  DXY {r['dxy']}（d1 {d1(r['dxy_d1'])}） | VIX {r['vix']}（d1 {d1(r['vix_d1'])}） | SPX {r['spx']}（d1 {d1(r['spx_d1'])}）")
-        # DXY 分区统一使用 20 日 z-score；analyst/trader 禁自设绝对值阈值。
+        print(
+            f"  USD_BROAD(DTWEXBGS; legacy字段=dxy，非ICE DXY) "
+            f"{r['dxy']}（d1 {d1(r['dxy_d1'])}） | "
+            f"VIX {r['vix']}（d1 {d1(r['vix_d1'])}） | "
+            f"SPX {r['spx']}（d1 {d1(r['spx_d1'])}）"
+        )
+        public_snapshot = {}
+        try:
+            from public_macro import latest_snapshot as _latest_public_macro
+            public_snapshot = _latest_public_macro(reg)
+        except Exception:
+            pass
+        dxy_calc_row = public_snapshot.get("dxy_calc_ecb") or {}
+        dxy_calc_value = dxy_calc_row.get("value")
+        dxy_calc_d1 = public_snapshot.get("dxy_calc_ecb_d1")
+        if dxy_calc_value is None and "dxy_calc_ecb" in r.keys():
+            dxy_calc_value = r["dxy_calc_ecb"]
+            dxy_calc_d1 = r["dxy_calc_ecb_d1"]
+        fear_row = public_snapshot.get("fear_greed") or {}
+        fear_value = fear_row.get("value")
+        fear_label = fear_row.get("label")
+        if fear_value is None and "fear_greed" in r.keys():
+            fear_value = r["fear_greed"]
+            fear_label = r["fear_greed_label"]
+        print(
+            "  DXY_CALC_ECB "
+            + (
+                f"{dxy_calc_value:.3f}（d1 {d1(dxy_calc_d1)}；"
+                f"as_of={dxy_calc_row.get('observation_date') or '?'}；非ICE官方报价）"
+                if isinstance(dxy_calc_value, (int, float))
+                else "未采到（ECB六币种按ICE公式复算，非ICE官方报价）"
+            )
+            + " | Fear&Greed "
+            + (
+                f"{fear_value:.0f}/{fear_label or '?'} "
+                f"(as_of={fear_row.get('observation_date') or '?'}, Alternative.me)"
+                if isinstance(fear_value, (int, float))
+                else "未采到"
+            )
+        )
+        # 兼容键 dxy_zone 实际基于 USD_BROAD(DTWEXBGS) 20日 z-score。
         def _dxy_zone():
             if r["dxy"] is None:
                 return
@@ -248,7 +290,7 @@ def _render(root, top):
             ).fetchall()
             vals = [x["dxy"] for x in days]
             if len(vals) < 10:
-                print("  dxy_zone=UNKNOWN（20日样本不足）")
+                print("  dxy_zone=UNKNOWN（兼容键；USD_BROAD 20日样本不足）")
                 return
             mean = sum(vals) / len(vals)
             var = sum((v - mean) ** 2 for v in vals) / len(vals)
@@ -263,7 +305,8 @@ def _render(root, top):
                 else:
                     break
             frozen_s = f"{frozen}" if frozen < len(days) else f"≥{frozen}"
-            print(f"  dxy_zone=**{zone}**（20日 z={z:+.2f}，判据 z>1.5=EXTREME / z>0.75=ELEVATED；"
+            print(f"  dxy_zone=**{zone}**（兼容键，实际=USD_BROAD/DTWEXBGS；20日 z={z:+.2f}，"
+                  f"判据 z>1.5=EXTREME / z>0.75=ELEVATED；"
                   f"该值已连续 {frozen_s} 天=FRED weekday 源特性）")
             print("  ➤ zone 处置：EXTREME/ELEVATED 只作为方向或反对证据；不自动减仓、"
                   "不决定仓位、不禁开。Agent 可采纳、部分采纳或忽略并说明理由。")
@@ -272,9 +315,29 @@ def _render(root, top):
         etf_s = f"{mcap_chg/1e9:+.2f}B" if mcap_chg is not None else "None"
         dom = r["btc_dominance"]
         print(f"  BTC市值Δ24h(≠ETF净流) {etf_s} | BTC.D {f'{dom:.2f}' if dom is not None else '?'}% | TVL {r['defillama_tvl_total'] and round(r['defillama_tvl_total']/1e9,1)}B")
-        true_etf = r["btc_etf_net_flow_usd"] if "btc_etf_net_flow_usd" in r.keys() else None
-        print("  BTC ETF真实净流: "
-              + (f"${true_etf/1e6:+.1f}M" if true_etf is not None else "未接入（禁止用市值变化代理）"))
+        true_etf = (
+            r["btc_etf_net_flow_usd"]
+            if "btc_etf_net_flow_usd" in r.keys()
+            else None
+        )
+        confirmed_etf = public_snapshot.get("etf_confirmed") or {}
+        provisional_etf = public_snapshot.get("etf_provisional") or {}
+        if confirmed_etf.get("value") is not None:
+            true_etf = confirmed_etf["value"]
+            print(
+                f"  BTC ETF真实净流: ${true_etf/1e6:+.1f}M "
+                f"(as_of={confirmed_etf.get('observation_date')}; "
+                "Farside+SoSoValue cross_checked)"
+            )
+        elif provisional_etf.get("value") is not None:
+            print(
+                f"  BTC ETF净流 provisional: "
+                f"${provisional_etf['value']/1e6:+.1f}M "
+                f"(as_of={provisional_etf.get('observation_date')}; "
+                f"source={provisional_etf.get('source')}; 单源未进硬字段)"
+            )
+        else:
+            print("  BTC ETF真实净流: 未采到（禁止用市值变化代理）")
         if "carried_forward" in r.keys() and r["carried_forward"] not in (None, "", "[]"):
             print(f"  ⚠️ 本轮沿用旧宏观值: {r['carried_forward']}")
         if r["dxy_d1"] is None or r["spx_d1"] is None:
@@ -529,6 +592,37 @@ def _render(root, top):
         print(f"  @ {fmt_age(ts)} 前；逐笔流为最近最多500笔样本，样本跨度随成交活跃度变化")
     safe(s_micro)
 
+    # ── 3c. OKX CLI 多空账户比（影子软证据） ──────────
+    section("多空账户比（OKX CLI 1H，软证据）")
+
+    def s_positioning():
+        latest = mkt.execute(
+            "SELECT collected_ts FROM market_positioning "
+            "ORDER BY datetime(collected_ts) DESC LIMIT 1"
+        ).fetchone()
+        if not latest:
+            print("  暂无数据")
+            return
+        rows = mkt.execute(
+            "SELECT symbol,ts,long_ratio,short_ratio,long_short_ratio "
+            "FROM market_positioning WHERE collected_ts=? "
+            "ORDER BY CASE symbol WHEN 'BTC-USDT-SWAP' THEN 0 "
+            "WHEN 'ETH-USDT-SWAP' THEN 1 WHEN 'SOL-USDT-SWAP' THEN 2 ELSE 3 END "
+            "LIMIT 8",
+            (latest["collected_ts"],),
+        ).fetchall()
+        for r in rows:
+            print(
+                f"  {r['symbol'].split('-')[0]} long={r['long_ratio']:.0%} "
+                f"short={r['short_ratio']:.0%} L/S={r['long_short_ratio']:.2f} "
+                f"源时刻={r['ts']}"
+            )
+        print(
+            f"  @ {fmt_age(latest['collected_ts'])} 前；账户数量比≠仓位金额，"
+            "仅用于识别拥挤，不自动产生方向"
+        )
+    safe(s_positioning)
+
     # ── 4. 币种情绪（新闻+X 提及） ────────────────────
     section("情绪 Top（coin_sentiment）")
 
@@ -580,6 +674,61 @@ def _render(root, top):
             print(f"  [{r['severity']}] {sym_s}{str(r['title'])[:70]}{evt} @ {r['age_m']}m前")
         news.close()
     safe(s_critnews)
+
+    # ── 4c. OKX 无专用接口的数据：x_search 权威证据层 ──
+    section("权威补充数据（x_search 证据层）")
+
+    def s_authoritative_data():
+        news = connect(root, "news.db")
+        _tsn = (
+            "CASE WHEN COALESCE(ingested_at,ts) LIKE '%Z' "
+            "THEN datetime(COALESCE(ingested_at,ts)) "
+            "ELSE datetime(COALESCE(ingested_at,ts),'-8 hours') END"
+        )
+        rows = news.execute(
+            f"SELECT title,event_time,url,raw FROM news_items "
+            f"WHERE source='x_search' "
+            f"AND (tags LIKE '%authoritative_data%' OR tags LIKE '%\"fear_greed\"%') "
+            f"AND {_tsn} >= datetime('now','-72 hours') "
+            f"ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+        shown: set[str] = set()
+        for r in rows:
+            try:
+                raw = json.loads(r["raw"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            metric = str(raw.get("metric") or "unknown")
+            if metric in shown:
+                continue
+            shown.add(metric)
+            status = str(raw.get("verification_status") or "unknown")
+            as_of = raw.get("as_of") or r["event_time"] or "?"
+            source_name = raw.get("source_name") or "未标来源"
+            value = raw.get("value")
+            unit = str(raw.get("unit") or "")
+            if isinstance(value, (int, float)) and unit.upper() == "USD":
+                value_s = f"${value / 1_000_000:+.1f}M"
+            elif value is not None:
+                value_s = f"{value} {unit}".rstrip()
+            else:
+                value_s = "数值待复核"
+            print(
+                f"  [{status}] {metric}={value_s} as_of={as_of} "
+                f"src={source_name}｜{str(r['title'])[:60]}"
+            )
+            if len(shown) >= 5:
+                break
+        if not shown:
+            print("  近72h暂无合格权威补充证据")
+        print(
+            "  ETF单源证据仅进入macro_observations provisional；只有同日"
+            "Farside+SoSoValue一致才进入硬字段。其他pending/unknown不得当确认值"
+        )
+        news.close()
+    safe(s_authoritative_data)
 
     # ── 5. 持仓与账户 ────────────────────────────────
     section("持仓 / 账户")
@@ -779,14 +928,47 @@ def _render(root, top):
         matched, stats = select_playbook_matches(
             all_rows, current_regime, context, known, limit=9
         )
-        proven = [r for r in matched
-                  if int(r["win_count"] or 0) + int(r["loss_count"] or 0) >= 5][:6]
-        fresh = [r for r in matched
-                 if int(r["win_count"] or 0) + int(r["loss_count"] or 0) < 5][:3]
+        source_marker = (
+            Path(root).parent
+            / "reports"
+            / "quality"
+            / "playbook_current_source_v1.json"
+        )
+        stats_ready = False
+        if source_marker.exists():
+            try:
+                marker = json.loads(source_marker.read_text(encoding="utf-8"))
+                stats_ready = (
+                    marker.get("source")
+                    == "account.db.trade_experiences.closed.playbook_ref"
+                    and int(marker.get("attributed_experiences") or 0) > 0
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                stats_ready = False
+        if stats_ready:
+            proven = [
+                r for r in matched
+                if int(r["win_count"] or 0) + int(r["loss_count"] or 0) >= 5
+            ][:6]
+            fresh = [
+                r for r in matched
+                if int(r["win_count"] or 0) + int(r["loss_count"] or 0) < 5
+            ][:3]
+        else:
+            # Numeric fields pre-date the current trade_experiences source cutover
+            # and may include retired drill/trade_events facts.  Keep summaries as
+            # unverified context but never present those numbers as current proof.
+            proven = []
+            fresh = matched[:9]
         context_s = ",".join(sorted(context)[:18])
         if len(context) > 18:
             context_s += f",…(+{len(context)-18})"
         print(f"  匹配上下文: regime={current_regime or 'N/A'} | symbols={context_s or 'N/A'}")
+        if not stats_ready:
+            print(
+                "  ⚠️ 现役 playbook 统计尚未完成 current-source 初始化；"
+                "旧 drill/trade_events 数值已禁用，仅展示未验证条目。"
+            )
         for r in proven:
             n = int(r["win_count"] or 0) + int(r["loss_count"] or 0)
             wr = r["win_rate"] or 0

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""OKX 公共行情 HTTP 客户端。httpx，**无鉴权**（公共端点）。
 
-对齐消费者事实契约：
+对齐消费者公开调用契约：
     collect_data:  fetch_tickers_all_sync() / fetch_candles_batch_sync(syms, bar, limit=60)
                    / fetch_funding_rates_batch_sync(syms) / fetch_open_interest_all_sync()
     collect_market_features:
@@ -9,7 +9,8 @@ r"""OKX 公共行情 HTTP 客户端。httpx，**无鉴权**（公共端点）。
                    / fetch_recent_trades_batch_sync(syms, limit=500)
     collect_slow:  fetch_candles_batch_sync(...) / fetch_instruments_sync("SWAP")
 
-网络代理由 `OKX_PROXY_URL` 显式配置；本模块使用 `trust_env=False`，不隐式继承代理。
+部分网络环境需要代理访问 `www.okx.com`；本模块使用
+**trust_env=False + 显式 proxy=OKX_PROXY_URL**，避免意外继承系统代理。
 鉴权类（账户/下单）走 _okxcli（okx CLI 直连），不在本模块。
 
 返回形态（OKX `data` 数组原样，与旧消费者一致）：
@@ -77,13 +78,23 @@ def _client() -> httpx.Client:
 
 
 def _get_data(client: httpx.Client, path: str, params: Optional[dict] = None,
-              retries: int = 2) -> list:
+              retries: int = 2, deadline: float | None = None) -> list:
     """GET 公共端点 -> data 数组。code!=0 / HTTP 错误 / 429 退避重试。"""
     last: Optional[Exception] = None
     for i in range(retries + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"okx batch deadline exceeded: {path}")
         _throttle(path)
         try:
-            r = client.get(path, params=params)
+            timeout = None
+            if deadline is not None:
+                timeout = max(0.1, min(_TIMEOUT, deadline - time.monotonic()))
+                if timeout <= 0.1 and time.monotonic() >= deadline:
+                    raise TimeoutError(f"okx batch deadline exceeded: {path}")
+            request_kwargs = {"params": params}
+            if timeout is not None:
+                request_kwargs["timeout"] = timeout
+            r = client.get(path, **request_kwargs)
             r.raise_for_status()
             j = r.json()
             code = str(j.get("code", "0")) if isinstance(j, dict) else "0"
@@ -98,15 +109,26 @@ def _get_data(client: httpx.Client, path: str, params: Optional[dict] = None,
     raise RuntimeError(f"okx GET {path} {params or ''} failed: {last}")
 
 
-def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn) -> dict:
+def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn,
+           batch_timeout_s: float | None = None) -> dict:
     """共享 client + 线程池并发取每个 symbol；单 symbol 失败置默认（不拖垮整批）。"""
     out: dict[str, Any] = {}
     syms = [s for s in symbols if s]
     if not syms:
         return out
+    deadline = (
+        time.monotonic() + max(0.1, float(batch_timeout_s))
+        if batch_timeout_s is not None else None
+    )
     with _client() as c:
         with ThreadPoolExecutor(max_workers=_WORKERS) as ex:
-            futs = {ex.submit(_get_data, c, path_fn(s), params_fn(s)): s for s in syms}
+            futs = {
+                ex.submit(
+                    _get_data, c, path_fn(s), params_fn(s),
+                    deadline=deadline,
+                ): s
+                for s in syms
+            }
             for f in as_completed(futs):
                 s = futs[f]
                 try:
@@ -130,13 +152,15 @@ def fetch_instruments_sync(inst_type: str = "SWAP") -> list[dict]:
 
 
 def fetch_candles_batch_sync(symbols: Sequence[str], bar: str = "1H",
-                             limit: int = 60) -> dict:
+                             limit: int = 60,
+                             batch_timeout_s: float | None = None) -> dict:
     """{sym: [candle 数组]}（OKX data 原样，倒序新→旧）。"""
     return _batch(
         symbols,
         lambda s: "/api/v5/market/candles",
         lambda s: {"instId": s, "bar": bar, "limit": str(limit)},
         lambda data: data,
+        batch_timeout_s=batch_timeout_s,
     )
 
 

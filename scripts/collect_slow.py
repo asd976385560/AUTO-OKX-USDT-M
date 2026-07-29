@@ -4,8 +4,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -15,16 +17,20 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from _http import TokenBucket, get_json, load_coingecko_key, load_fred_key, make_client
 from _okxcli import okx_json
 from _okx_http import fetch_candles_batch_sync, fetch_instruments_sync
+from public_macro import import_xsearch_etf, latest_snapshot, reconcile_etf_consensus
 from regime_classifier import classify_regime
 
 DEFAULT_DB_ROOT = Path(_project_path('db'))
 FRED_SERIES = {
+    # 兼容字段名仍为 dxy，但实际序列是 FRED Nominal Broad U.S. Dollar Index，
+    # 不是 ICE DXY。展示层必须标 USD_BROAD(DTWEXBGS)，禁混称。
     "dxy": "DTWEXBGS",
     "vix": "VIXCLS",
     "spx": "SP500",
@@ -42,6 +48,10 @@ SLOW_TIMEFRAMES = {
     "1W":  "1W",
     "1M":  "1M",
 }
+SLOW_KLINE_BUDGET_S = float(os.environ.get("OKX_SLOW_KLINE_BUDGET_S", "200"))
+SLOW_KLINE_TF_TIMEOUT_S = float(
+    os.environ.get("OKX_SLOW_KLINE_TF_TIMEOUT_S", "50")
+)
 
 
 def utc_now_iso() -> str:
@@ -72,26 +82,21 @@ def _fetch_gold_etf_d1() -> float | None:
     try:
         import sys
         from pathlib import Path
-        candidates = []
-        if os.environ.get("MX_DATA_PATH"):
-            candidates.append(Path(os.environ["MX_DATA_PATH"]))
-        candidates.extend([
-            _PROJECT_ROOT.parent / "mx-data" / "mx_data.py",
+        candidates = [
+            Path(__file__).resolve().parents[2] / "mx-data" / "mx_data.py",
             Path.home() / ".openclaw" / "workspace" / "skills" / "mx-data" / "mx_data.py",
-        ])
+        ]
         mx_data_path = next((p for p in candidates if p.exists()), None)
         if mx_data_path is None:
             print("[WARN] mx_data.py not found, gold ETF skipped", flush=True)
             return None
         if not os.environ.get("MX_APIKEY"):
             try:
-                cfg = (_PROJECT_ROOT / "config.md").read_text(encoding="utf-8")
+                cfg = (Path(__file__).resolve().parents[1] / "config.md").read_text(encoding="utf-8")
                 import re
-                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|\s][^|]*?)\s*\|", cfg, re.S)
+                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
                 if m:
-                    value = m.group(1).strip().strip("`").strip()
-                    if not (value.startswith("<") and value.endswith(">")):
-                        os.environ["MX_APIKEY"] = value
+                    os.environ["MX_APIKEY"] = m.group(1).strip()
             except Exception:
                 pass
         sys.path.insert(0, str(mx_data_path.parent))
@@ -152,6 +157,7 @@ def open_db(db_root: Path, name: str) -> sqlite3.Connection:
     if not path.exists():
         raise RuntimeError(f"数据库不存在：{path}（请先运行 init_db.py）")
     connection = sqlite3.connect(str(path))
+    connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL;")
     return connection
 
@@ -317,8 +323,11 @@ def _collect_instruments_cache(
     return count
 
 
-def collect_slow_klines(market_con: sqlite3.Connection, symbols: list[str]) -> int:
-    """Fetch 1H/4H/1D/1W/1M/1Y K-lines + indicators for ALL symbols.
+def collect_slow_klines(
+    market_con: sqlite3.Connection,
+    symbols: list[str],
+) -> tuple[int, list[str]]:
+    """Fetch 1H/4H/1D/1W/1M K-lines + indicators for ALL symbols.
 
     Called by Job E (collect_slow.py). Writes to kline_cache table.
     Uses INSERT OR REPLACE so existing rows are updated with latest data.
@@ -326,8 +335,22 @@ def collect_slow_klines(market_con: sqlite3.Connection, symbols: list[str]) -> i
     """
     # Fetch slow K-lines per timeframe: HTTP concurrent (was 1460 CLI subprocess calls)
     rows_to_write: list[tuple] = []
+    incomplete: list[str] = []
+    deadline = time.monotonic() + SLOW_KLINE_BUDGET_S
     for tf, bar in SLOW_TIMEFRAMES.items():
-        batch = fetch_candles_batch_sync(symbols, bar, limit=60)
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            incomplete.append(f"{tf}:skipped_budget")
+            continue
+        batch = fetch_candles_batch_sync(
+            symbols,
+            bar,
+            limit=60,
+            batch_timeout_s=min(SLOW_KLINE_TF_TIMEOUT_S, remaining),
+        )
+        covered = sum(1 for raw in batch.values() if raw)
+        if covered < len(symbols):
+            incomplete.append(f"{tf}:{covered}/{len(symbols)}")
         for symbol, raw_candles in batch.items():
             candles = [
                 {
@@ -368,7 +391,7 @@ def collect_slow_klines(market_con: sqlite3.Connection, symbols: list[str]) -> i
         rows_to_write,
     )
     market_con.commit()
-    return len(rows_to_write)
+    return len(rows_to_write), incomplete
 
 
 # ── Macro / sentiment helpers ────────────────────────────────────────────────────
@@ -429,7 +452,7 @@ def synthetic_dxy_d1(client=None, bucket=None) -> float | None:
         from datetime import date, timedelta as _td
         end = date.today()
         start = end - _td(days=6)
-        with make_client() as _c:
+        with make_client(timeout=15.0) as _c:
             payload = get_json(
                 _c,
                 f"https://api.frankfurter.app/{start.isoformat()}..{end.isoformat()}",
@@ -641,8 +664,17 @@ def main() -> int:
     # ── K-lines (1H/4H/1D/1W/1M) ───────────────────────────────────────────
     # ALL symbols get slow K-lines (full coverage for accuracy)
     try:
-        kline_rows = collect_slow_klines(market_con, all_symbols)
+        kline_rows, kline_incomplete = collect_slow_klines(
+            market_con, all_symbols
+        )
         print(f"[collect_slow] Wrote {kline_rows} slow kline rows for {len(all_symbols)} symbols", flush=True)
+        if kline_incomplete:
+            degraded.append("klines")
+            print(
+                "[collect_slow][WARN] slow kline incomplete: "
+                + ", ".join(kline_incomplete),
+                flush=True,
+            )
     except Exception as e:
         print(f"[collect_slow] K-line collection failed: {e}", flush=True)
         kline_rows = 0
@@ -656,7 +688,7 @@ def main() -> int:
     gold_price = _fetch_gold_price_usd()
 
     try:
-        with make_client() as client:
+        with make_client(timeout=15.0) as client:
             fred_key = load_fred_key()
             dxy, dxy_d1, dxy_obs_date = fred_latest(client, bucket, FRED_SERIES["dxy"], fred_key)
             vix, vix_d1, _vix_date = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
@@ -682,6 +714,25 @@ def main() -> int:
 
         if cm_con is None:
             raise RuntimeError("regime.db 不可用，跳过 cross_market（记 degraded）")
+        # 公开宏观日频层：本轮不额外联网，只把 08:20 news-scout 已落库的
+        # Farside/SoSoValue 证据标准化，并读取 daily_maintenance 采到的
+        # Alternative.me / ECB 结果。表尚未迁移时保持兼容，不拖垮慢采。
+        public_macro_snapshot = {}
+        try:
+            imported = import_xsearch_etf(news_con, cm_con)
+            consensus = reconcile_etf_consensus(cm_con)
+            public_macro_snapshot = latest_snapshot(cm_con)
+            if imported or consensus.get("cross_checked") or consensus.get("conflicts"):
+                print(
+                    "[collect_slow] public_macro sync: "
+                    f"evidence={imported} consensus={consensus}",
+                    flush=True,
+                )
+        except sqlite3.OperationalError as _e:
+            if "macro_observations" not in str(_e):
+                print(f"[collect_slow][WARN] public_macro DB sync 跳过: {_e}", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[collect_slow][WARN] public_macro sync 跳过: {_e}", flush=True)
         # (2026-06-11 降级治本) 宏观值瞬时拉取失败时沿用上一行——失败写 NULL 会让
         # 决策面对空值，且 P1 复制链把 NULL 传播到之后每一轮（DTWEXBGS 官方发布
         # 延迟约 1 周属正常节奏，值"陈旧"仍可用；d1 不伪造，沿用时置 None）。
@@ -694,7 +745,7 @@ def main() -> int:
         if dxy is None and prev_vals[0] is not None:
             dxy, dxy_d1 = prev_vals[0], None
             carried_forward.append("dxy")
-            print(f"[collect_slow][WARN] FRED dxy 拉取失败，沿用上一行值 {dxy}", flush=True)
+            print(f"[collect_slow][WARN] FRED USD_BROAD(DTWEXBGS) 拉取失败，沿用上一行值 {dxy}", flush=True)
         # T7 (2026-06-12) + J1 (2026-06-13): regime 唯一驱动输入 dxy_d1 的新鲜度治理——
         # ① d1 缺失 → 合成替补（T7 原逻辑）；② FRED 有值但观测日滞后 >4 日历日（DTWEXBGS
         # 发布延迟 ~1 周是常态）→ 滞后 d1 不代表当下美元动能，同样用合成 d1 驱动（J1 扩展，
@@ -775,24 +826,72 @@ def main() -> int:
 
         # V2.0 (2026-06-26) Option A: cross_market 单写 cm_con（regime.db 优先，降级 market.db）。
         # 含真实列 btc_etf_flow（**禁**写生成列 btc_mcap_chg_24h_usd）。market.db 常规停写。
+        dxy_calc_row = public_macro_snapshot.get("dxy_calc_ecb") or {}
+        dxy_calc_ecb = to_float(dxy_calc_row.get("value"))
+        dxy_calc_ecb_d1 = to_float(
+            public_macro_snapshot.get("dxy_calc_ecb_d1")
+        )
+        fear_row = public_macro_snapshot.get("fear_greed") or {}
+        fear_greed = to_float(fear_row.get("value"))
+        fear_greed_label = fear_row.get("label")
+        etf_confirmed = public_macro_snapshot.get("etf_confirmed") or {}
+        etf_provisional = public_macro_snapshot.get("etf_provisional") or {}
+        btc_etf_net_flow_usd = to_float(etf_confirmed.get("value"))
+
+        if etf_confirmed:
+            etf_meta = {
+                "source": etf_confirmed.get("source"),
+                "status": etf_confirmed.get("status"),
+                "source_as_of": etf_confirmed.get("observation_date"),
+            }
+        elif etf_provisional:
+            etf_meta = {
+                "source": etf_provisional.get("source"),
+                "status": "provisional_single_source",
+                "source_as_of": etf_provisional.get("observation_date"),
+                "provisional_value_usd": etf_provisional.get("value"),
+            }
+        else:
+            etf_meta = {"source": None, "status": "not_collected"}
+
         cm_con.execute(
             "INSERT OR REPLACE INTO cross_market "
             "(ts, dxy, gold, gold_d1, vix, spx, spx_d1, btc_etf_flow, dxy_d1, vix_d1, "
             "defillama_tvl_total, regime, btc_dominance, total_mcap_usd, total_volume_24h_usd, "
-            "btc_etf_net_flow_usd, source_meta, carried_forward) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "btc_etf_net_flow_usd, dxy_calc_ecb, dxy_calc_ecb_d1, fear_greed, "
+            "fear_greed_label, source_meta, carried_forward) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, dxy, gold_price, gold_d1, vix, spx, spx_d1, btc_mcap_chg_24h_usd,
              dxy_d1, vix_d1, tvl_total, regime, cg["btc_d"], cg["total_mcap_usd"],
-             cg["total_volume_24h_usd"], None,
+             cg["total_volume_24h_usd"], btc_etf_net_flow_usd,
+             dxy_calc_ecb, dxy_calc_ecb_d1, fear_greed, fear_greed_label,
              json.dumps({
-                 "dxy": {"source": "fred", "source_as_of": dxy_obs_date},
+                  "dxy": {
+                      "source": "fred",
+                      "series": "DTWEXBGS",
+                      "metric": "nominal_broad_usd_index",
+                      "legacy_field": "dxy",
+                      "is_ice_dxy": False,
+                      "source_as_of": dxy_obs_date,
+                  },
                  "vix": {"source": "fred"},
                  "spx": {"source": "fred"},
                  "gold": {"source": "coingecko_tether_gold_proxy"},
                  "gold_d1": {"source": "mx_data_518880"},
                  "defillama_tvl_total": {"source": "defillama"},
                  "btc_mcap_chg_24h_usd": {"source": "coingecko"},
-                 "btc_etf_net_flow_usd": {"source": None, "status": "not_collected"},
+                 "btc_etf_net_flow_usd": etf_meta,
+                 "dxy_calc_ecb": {
+                     "source": "ecb_ice_formula" if dxy_calc_row else None,
+                     "status": dxy_calc_row.get("status"),
+                     "source_as_of": dxy_calc_row.get("observation_date"),
+                     "is_ice_official_quote": False,
+                 },
+                 "fear_greed": {
+                     "source": "alternative_me" if fear_row else None,
+                     "status": fear_row.get("status"),
+                     "source_as_of": fear_row.get("observation_date"),
+                 },
              }, ensure_ascii=False),
              json.dumps(carried_forward, ensure_ascii=False)),
         )

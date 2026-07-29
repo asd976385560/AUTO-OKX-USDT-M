@@ -22,8 +22,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -60,13 +62,20 @@ CREATE TABLE IF NOT EXISTS trade_experiences (
     pnl_pct            REAL,                 -- 平仓时填
     hold_hours         REAL,
     hit_1R             INTEGER,              -- 1=达 1R | 0=否 | NULL=未平
-    status             TEXT DEFAULT 'open',  -- open | closed
+    status             TEXT DEFAULT 'open',  -- open | closed | expired | superseded | orphaned
+    open_sz            REAL,
+    remaining_sz       REAL,
+    realized_pnl       REAL NOT NULL DEFAULT 0,
+    close_count        INTEGER NOT NULL DEFAULT 0,
+    closed_at          TEXT,
     raw                TEXT,                 -- 完整回执 JSON（事实正本）
     experience_summary TEXT                  -- L2 异步：LLM 1-2 行教训（maintainer 落）
 );
 CREATE INDEX IF NOT EXISTS idx_trade_exp_prs ON trade_experiences(profile, regime, side);
 CREATE INDEX IF NOT EXISTS idx_trade_exp_sym_ts ON trade_experiences(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_trade_exp_cycle ON trade_experiences(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_experience_open_qty
+    ON trade_experiences(profile,symbol,side,status,ts);
 """
 
 

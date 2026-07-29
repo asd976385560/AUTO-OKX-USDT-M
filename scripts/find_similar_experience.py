@@ -25,8 +25,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -34,9 +36,11 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -246,6 +250,72 @@ def find_similar_experience(
     }
 
 
+def compact_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the decision-useful subset without raw/vector payload bloat."""
+    keep_match = (
+        "sim", "pnl_pct", "hold_hours", "hit_1R", "age_days",
+        "playbook_ref", "cycle_id", "profile", "outcome", "lesson",
+    )
+    keep_missed = (
+        "ts", "symbol", "regime", "direction_hint", "actual_4h_pct",
+        "would_hit_1R", "notes",
+    )
+
+    def pick(item: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+        out = {key: item.get(key) for key in keys if key in item}
+        for key in ("lesson", "notes"):
+            if isinstance(out.get(key), str):
+                out[key] = out[key][:240]
+        return out
+
+    return {
+        "summary": result.get("summary") or {},
+        "matched_wins": [
+            pick(item, keep_match)
+            for item in (result.get("matched_wins") or [])
+            if isinstance(item, dict)
+        ],
+        "matched_losses": [
+            pick(item, keep_match)
+            for item in (result.get("matched_losses") or [])
+            if isinstance(item, dict)
+        ],
+        "missed_opportunities": [
+            pick(item, keep_missed)
+            for item in (result.get("missed_opportunities") or [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _atomic_write_json(path: Path, value: dict[str, Any], pretty: bool) -> int:
+    """Write UTF-8 JSON by same-directory replace so readers never see a tear."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(
+        value, ensure_ascii=False, indent=2 if pretty else None
+    ) + "\n"
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            tmp_path = Path(handle.name)
+        os.replace(tmp_path, path)
+        return len(content.encode("utf-8"))
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 交易经验检索")
     ap.add_argument("--symbol", required=True)
@@ -257,12 +327,34 @@ def main() -> int:
     ap.add_argument("--profile", default="all", choices=["live", "demo", "all"])
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--pretty", action="store_true")
+    ap.add_argument(
+        "--compact",
+        action="store_true",
+        help="仅输出决策所需摘要、正反样本与错失机会，省略向量和 raw_snippet",
+    )
+    ap.add_argument(
+        "--out-file",
+        help="把结果原子写为 UTF-8 JSON；stdout 只返回短回执，禁止再接管道/重定向",
+    )
     args = ap.parse_args()
     res = find_similar_experience(
         args.symbol, args.side, args.regime, args.action, top_k=args.top_k,
         min_sim=args.min_sim, profile_filter=args.profile,
         db_root=Path(args.db_root))
-    print(json.dumps(res, ensure_ascii=False, indent=2 if args.pretty else None))
+    output = compact_result(res) if args.compact else res
+    if args.out_file:
+        path = Path(args.out_file)
+        size = _atomic_write_json(path, output, args.pretty)
+        print(json.dumps({
+            "ok": True,
+            "out_file": str(path),
+            "bytes": size,
+            "compact": bool(args.compact),
+            "summary": output.get("summary") or {},
+        }, ensure_ascii=False))
+    else:
+        print(json.dumps(
+            output, ensure_ascii=False, indent=2 if args.pretty else None))
     return 0
 
 

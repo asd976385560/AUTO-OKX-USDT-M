@@ -5,6 +5,7 @@
   market.db:
     - market_microstructure：50档订单簿及深度/倾斜/滑点特征
     - market_trade_flow：最近逐笔成交样本的主动买卖流特征
+    - market_positioning：OKX CLI 每小时多空账户比（影子软证据）
   regime.db:
     - macro_events：经济日历
     - cross_market 补真实 ETF 净流、来源元数据和沿用标记
@@ -16,8 +17,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -25,7 +28,9 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
+import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, _project_path('collectors'))
@@ -92,6 +97,24 @@ CREATE INDEX IF NOT EXISTS idx_flow_symbol_ts
     ON market_trade_flow(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_flow_cycle
     ON market_trade_flow(cycle_id);
+
+CREATE TABLE IF NOT EXISTS market_positioning (
+    ts               TEXT NOT NULL,
+    collected_ts     TEXT NOT NULL,
+    cycle_id         TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    timeframe        TEXT NOT NULL DEFAULT '1H',
+    long_ratio       REAL,
+    short_ratio      REAL,
+    long_short_ratio REAL,
+    raw              TEXT,
+    source           TEXT NOT NULL DEFAULT 'okx_cli_top_long_short',
+    PRIMARY KEY (ts, symbol, timeframe)
+);
+CREATE INDEX IF NOT EXISTS idx_positioning_symbol_ts
+    ON market_positioning(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_positioning_cycle
+    ON market_positioning(cycle_id);
 """
 
 
@@ -117,12 +140,34 @@ CREATE INDEX IF NOT EXISTS idx_macro_events_ts
     ON macro_events(event_ts);
 CREATE INDEX IF NOT EXISTS idx_macro_events_importance_ts
     ON macro_events(importance, event_ts);
+
+CREATE TABLE IF NOT EXISTS macro_observations (
+    metric           TEXT NOT NULL,
+    observation_date TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    collected_at     TEXT NOT NULL,
+    value            REAL,
+    unit             TEXT,
+    label            TEXT,
+    status           TEXT NOT NULL,
+    source_url       TEXT,
+    raw              TEXT,
+    PRIMARY KEY (metric, observation_date, source)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_observations_metric_date
+    ON macro_observations(metric, observation_date DESC);
+CREATE INDEX IF NOT EXISTS idx_macro_observations_source_date
+    ON macro_observations(source, observation_date DESC);
 """
 
 REGIME_COLS = {
     "btc_etf_net_flow_usd": "REAL",
     "source_meta": "TEXT",
     "carried_forward": "TEXT",
+    "dxy_calc_ecb": "REAL",
+    "dxy_calc_ecb_d1": "REAL",
+    "fear_greed": "REAL",
+    "fear_greed_label": "TEXT",
 }
 
 ACCOUNT_DDL = """
@@ -153,13 +198,30 @@ CREATE INDEX IF NOT EXISTS idx_account_bills_ts
 CREATE INDEX IF NOT EXISTS idx_account_bills_inst_ts
     ON account_bills(profile, inst_id, ts);
 """
+CST = timezone(timedelta(hours=8))
+
+
+def online_backup(source: Path, target: Path) -> None:
+    """SQLite 在线备份，兼容 WAL 并在落盘后做完整性检查。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=20)
+    dst = sqlite3.connect(target, timeout=20)
+    try:
+        src.backup(dst)
+        integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"{target.name} integrity_check={integrity}")
+    finally:
+        dst.close()
+        src.close()
 
 
 def columns(con, table: str) -> set[str]:
     return {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
 
 
-def migrate(root: Path, dry_run: bool = False) -> dict:
+def migrate(root: Path, dry_run: bool = False,
+            backup_dir: Path | None = None) -> dict:
     result = {"ok": True, "dry_run": dry_run, "market": {}, "regime": {}}
     market_path = root / "market.db"
     regime_path = root / "regime.db"
@@ -174,7 +236,8 @@ def migrate(root: Path, dry_run: bool = False) -> dict:
             result["market"]["tables"] = [
                 r["name"] for r in mcon.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name IN ('market_microstructure','market_trade_flow')")
+                    "AND name IN "
+                    "('market_microstructure','market_trade_flow','market_positioning')")
             ]
             have = columns(rcon, "cross_market")
             result["regime"]["columns_to_add"] = sorted(set(REGIME_COLS) - have)
@@ -183,11 +246,22 @@ def migrate(root: Path, dry_run: bool = False) -> dict:
             rcon.close()
         return result
 
+    if backup_dir is not None:
+        stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
+        backups = []
+        for source in (market_path, regime_path, account_path):
+            target = backup_dir / f"{source.stem}-pre-data-enrichment-{stamp}.db"
+            online_backup(source, target)
+            backups.append(str(target))
+        result["backups"] = backups
+
     mcon = ledger.connect(market_path)
     try:
         mcon.executescript(MARKET_DDL)
         mcon.commit()
-        result["market"]["tables"] = ["market_microstructure", "market_trade_flow"]
+        result["market"]["tables"] = [
+            "market_microstructure", "market_trade_flow", "market_positioning"
+        ]
     finally:
         mcon.close()
 
@@ -201,7 +275,10 @@ def migrate(root: Path, dry_run: bool = False) -> dict:
                 rcon.execute(f"ALTER TABLE cross_market ADD COLUMN {name} {typ}")
                 added.append(name)
         rcon.commit()
-        result["regime"] = {"table": "macro_events", "columns_added": added}
+        result["regime"] = {
+            "tables": ["macro_events", "macro_observations"],
+            "columns_added": added,
+        }
     finally:
         rcon.close()
 
@@ -230,10 +307,13 @@ def verify(root: Path) -> dict:
         }
         missing_cols = sorted(set(REGIME_COLS) - columns(rcon, "cross_market"))
         missing_tables = sorted(
-            {"market_microstructure", "market_trade_flow"} - mtables
+            {"market_microstructure", "market_trade_flow", "market_positioning"}
+            - mtables
         )
         if "macro_events" not in rtables:
             missing_tables.append("macro_events")
+        if "macro_observations" not in rtables:
+            missing_tables.append("macro_observations")
         atables = {
             r["name"] for r in acon.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")
@@ -256,9 +336,16 @@ def main() -> int:
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument(
+        "--backup-dir",
+        help="真迁移前对 market/regime/account 做 SQLite 在线备份",
+    )
     args = ap.parse_args()
     root = Path(args.db_root)
-    res = migrate(root, args.dry_run)
+    res = migrate(
+        root, args.dry_run,
+        backup_dir=Path(args.backup_dir) if args.backup_dir else None,
+    )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if not res.get("ok"):
         return 1

@@ -19,8 +19,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -441,8 +443,8 @@ def _ts_age_minutes(ts: Any) -> float | None:
 def authoritative_equity(profile: str) -> float | None:
     """资金权威（2026-07-04）：account_snapshots 按 profile 最新行（rowid DESC，禁 MAX(ts)）。
 
-    ts 距今 ≤SNAPSHOT_FRESH_MIN 分钟才覆盖 agent 传值，防止跨 profile 的权益值误用。
-    stale/不可用 → None（回退 agent 值），
+    ts 距今 ≤SNAPSHOT_FRESH_MIN 分钟才覆盖 agent 传值（#588 事故：agent 把 demo totalEq
+    73275.01 填进实盘 current_equity 直接上屏）。stale/不可用 → None（回退 agent 值），
     渲染不因回读失败。
     """
     try:
@@ -636,6 +638,10 @@ def validate_input(payload: dict[str, Any]) -> None:
                           ("leverage", ["lev", "leverage", "max_leverage"]),
                           ("side_pct", ["side_pct", "same_side_pct", "same_side_exposure_pct"])):
         if value_at(risk, _keys, default="") in ("", "-"):
+            if (_label == "margin_pct"
+                    and risk.get("margin_pct_scope") == "max_current_cycle_open_trade"):
+                # 本轮没有 OPEN/ADD 时空值是正确语义，渲染层会明确显示“本轮无开/加仓”。
+                continue
             print(f"[render_push_report][WARN] 风控字段 {_label} 缺失（不拦截，渲染为 -）", file=sys.stderr)
 
 
@@ -724,13 +730,20 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         demo_positions = str(_demo_n)
 
     margin_pct = pct(value_at(risk, ["margin_pct", "imr_pct", "single_margin_pct"], "-"))
+    max_position_margin_pct = pct(risk.get("max_position_margin_pct"))
+    if margin_pct == "-":
+        margin_display = "本轮无开/加仓"
+        if max_position_margin_pct != "-":
+            margin_display += f" | 当前最大持仓 {with_pct(max_position_margin_pct)}(观察)"
+    else:
+        margin_display = f"{with_pct(margin_pct)} / 20%"
     leverage = first_nonempty(risk.get("lev"), risk.get("leverage"), risk.get("max_leverage"), default="-")
     side_pct = pct(value_at(risk, ["side_pct", "same_side_pct", "same_side_exposure_pct"], "-"))
     position_count = num_only(first_nonempty(risk.get("position_count"), risk.get("pos_count"), default=live_positions), default="-")
     risk_status = first_nonempty(risk.get("status"), risk.get("hard_limit_status"), default="PASS")
 
     # 资金/持仓数/累计收益权威回读（2026-07-04）：cycle_count 权威覆盖的同模式推广——
-    # 库权威值覆盖 agent 传值，避免跨 profile equity / 假 0 仓 / 手写累计收益污染；
+    # 库权威值覆盖 agent 传值（#588 双盘 equity 填错 / 假 0 仓 / 累计收益手写污染即此因）；
     # 每项独立回退：DB stale/不可用 → 保留 agent 值，渲染永不因回读失败。
     for _profile in ("live", "demo"):
         _eq = authoritative_equity(_profile)
@@ -852,17 +865,17 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
          else f"兼容格式置信度 {confidence} | {action_summary}"),
         "",
         "📊 资产",
-        f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益 {live_pnl} USDT | {live_positions}仓",
-        f"🟡 模拟盘：资金 ${demo_equity} | 可用USDT ${demo_available} | 累计收益 {demo_pnl} USDT | {demo_positions}仓",
+        f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益(交易PnL·未扣费) {live_pnl} USDT | {live_positions}仓",
+        f"🟡 模拟盘：资金 ${demo_equity} | 可用USDT ${demo_available} | 累计收益(交易PnL·未扣费) {demo_pnl} USDT | {demo_positions}仓",
         "",
         "💼 持仓详情",
         format_positions(positions),
         "",
         "🛡 风控",
-        f"单笔保证金 {with_pct(margin_pct)} / 20% | 杠杆 {leverage}x / 10x | 同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / demo {demo_positions}(数量仅观察) | {risk_status}",
+        f"单笔保证金 {margin_display} | 杠杆 {leverage}x / 10x | 同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / demo {demo_positions}(数量仅观察) | {risk_status}",
         "",
         "🌍 行情",
-        f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | regime={regime} | DXY {dxy}",
+        f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | regime={regime} | USD_BROAD {dxy}",
         "",
         "🎯 Agent裁决",
         decision_reason,
@@ -901,7 +914,8 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         clip(format_exceptions(exceptions), EXCEPTIONS_MAX, tail="…（更多异常见归档）"),
     ]
 
-    if bool(payload.get("is_hh01")) or bool(macro.get("enabled")):
+    include_macro = bool(payload.get("is_hh01")) or bool(macro.get("enabled"))
+    if include_macro:
         degraded_sources = first_nonempty(macro.get("degraded_sources"), market.get("degraded_sources"), default="无")
         top_gainers = first_nonempty(market.get("top_gainers"), default="-")
         top_losers = first_nonempty(market.get("top_losers"), default="-")
@@ -909,8 +923,10 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         content_parts.extend([
             "",
             "🌐 宏观 HH:01",
-            f"DXY {first_nonempty(macro.get('dxy'), dxy)} ({with_pct(macro.get('dxy_d1'))}) | VIX {first_nonempty(macro.get('vix'), default='-')} | SPX {first_nonempty(macro.get('spx'), default='-')} ({with_pct(macro.get('spx_d1'))})",
-            f"BTC ETF proxy {first_nonempty(macro.get('btc_mcap_chg_24h_usd'), macro.get('btc_etf_proxy'), default='-')} | TVL {first_nonempty(macro.get('tvl'), default='-')} | BTC.D {with_pct(macro.get('btc_dominance'))}",
+            f"USD_BROAD(DTWEXBGS) {first_nonempty(macro.get('dxy'), dxy)} ({with_pct(macro.get('dxy_d1'))}) | VIX {first_nonempty(macro.get('vix'), default='-')} | SPX {first_nonempty(macro.get('spx'), default='-')} ({with_pct(macro.get('spx_d1'))})",
+            f"DXY_CALC_ECB {first_nonempty(macro.get('dxy_calc_ecb'), default='-')} ({with_pct(macro.get('dxy_calc_ecb_d1'))}, 非ICE官方报价) | Fear&Greed {first_nonempty(macro.get('fear_greed'), default='-')}/{first_nonempty(macro.get('fear_greed_label'), default='-')}",
+            f"BTC市值Δ24h(≠ETF净流) {first_nonempty(macro.get('btc_mcap_chg_24h_usd'), macro.get('btc_etf_proxy'), default='-')} | TVL {first_nonempty(macro.get('tvl'), default='-')} | BTC.D {with_pct(macro.get('btc_dominance'))}",
+            f"BTC ETF净流 {first_nonempty(macro.get('btc_etf_net_flow_usd'), default='-')} | 状态 {first_nonempty(macro.get('btc_etf_flow_status'), default='missing')} | as_of {first_nonempty(macro.get('btc_etf_flow_as_of'), default='-')}",
             f"降级源: {degraded_sources}",
             "",
             "📊 全市场 HH:01",
@@ -921,11 +937,132 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
 
     content_body = "\n".join(content_parts).strip()
     content = qq_markdown_hardbreak(content_body)
-    # 单条上限闸：极端情形（多仓+各段满）仍超 MAX 时，整体裁剪兜底（保证 1 条发出）。
+    # 单条上限闸：禁止再整体从尾部裁剪。时间线/决策卡等必填段位于后半部，
+    # 旧逻辑会把它们一起裁掉，导致 validator 在发送前拦截整轮推送。
+    # 超长时改用结构化压缩版：缩正文，不删除任何必填段标题。
     if len(content) > MAX_CONTENT_CHARS:
-        content = qq_markdown_hardbreak(
-            clip(content_body, MAX_CONTENT_CHARS - 120,
-                 tail="\n…（报告超长已截断，全文见归档）"))
+        compact_card = (
+            f"方向：{card_text(decision_card.get('direction_evidence'), 80)}\n"
+            f"反对：{card_text(decision_card.get('opposing_evidence'), 80)}\n"
+            f"执行：{card_text(decision_card.get('execution_conditions'), 80)}\n"
+            f"失效：{card_text(decision_card.get('invalidation_point'), 80)}\n"
+            f"风险收益：{card_text(decision_card.get('risk_reward'), 80)}\n"
+            f"组合：{card_text(decision_card.get('portfolio_impact'), 80)}"
+            if decision_card else "旧轮次无 decision_card_v1"
+        )
+        compact_history = (
+            f"盈利样本 {len(historical.get('matched_wins') or [])} | "
+            f"亏损样本 {len(historical.get('matched_losses') or [])} | "
+            f"错失机会 {len(historical.get('missed_opportunities') or [])} | "
+            f"取舍={historical.get('usage') or 'none'}："
+            f"{card_text(historical.get('reason'), 100)}"
+            if historical else
+            f"兼容格式 play_id={play_id} \"{clip(play_title, 50)}\" | "
+            f"hit_rate={with_pct(hit_rate)} / avg_return={with_pct(avg_return)} "
+            f"| 不确定性={uncertainty}"
+        )
+        compact_parts = [
+            f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
+            (f"Agent自主裁决 | {clip(action_summary, 140)}" if decision_card
+             else f"兼容格式置信度 {confidence} | {clip(action_summary, 140)}"),
+            "",
+            "📊 资产",
+            f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益 {live_pnl} USDT | {live_positions}仓",
+            f"🟡 模拟盘：资金 ${demo_equity} | 可用USDT ${demo_available} | 累计收益 {demo_pnl} USDT | {demo_positions}仓",
+            "",
+            "💼 持仓详情",
+            clip(format_positions(positions), 520, tail="\n…（其余持仓见账本）"),
+            "",
+            "🛡 风控",
+            clip(
+                f"单笔保证金 {margin_display} | 杠杆 {leverage}x / 10x | "
+                f"同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / "
+                f"demo {demo_positions}(数量仅观察) | {risk_status}",
+                210,
+            ),
+            "",
+            "🌍 行情",
+            f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | "
+            f"regime={regime} | USD_BROAD {dxy}",
+            "",
+            "🎯 Agent裁决",
+            clip(decision_reason, 180),
+            "",
+            "🧭 六项决策卡",
+            compact_card,
+            "",
+            "📚 历史经验",
+            compact_history,
+            "",
+            "⚙️ 执行",
+            clip(f"{execution_result}\n{exec_meta}", 180),
+            "",
+            "⏰ 时间线",
+            f"下次HH:01: {next_hh01}min | 下次复盘: {next_review}",
+            "",
+            "⚠️ 异常",
+            clip(format_exceptions(exceptions), 120, tail="…（更多异常见账本）"),
+        ]
+        if include_macro:
+            compact_parts.extend([
+                "",
+                "🌐 宏观 HH:01",
+                clip(
+                    f"USD_BROAD {first_nonempty(macro.get('dxy'), dxy)} "
+                    f"({with_pct(macro.get('dxy_d1'))}) | "
+                    f"DXY_CALC_ECB {first_nonempty(macro.get('dxy_calc_ecb'), default='-')} "
+                    f"({with_pct(macro.get('dxy_calc_ecb_d1'))}, 非ICE官方报价) | "
+                    f"Fear&Greed {first_nonempty(macro.get('fear_greed'), default='-')}/"
+                    f"{first_nonempty(macro.get('fear_greed_label'), default='-')}",
+                    260,
+                ),
+                f"BTC ETF净流 {first_nonempty(macro.get('btc_etf_net_flow_usd'), default='-')} | "
+                f"状态 {first_nonempty(macro.get('btc_etf_flow_status'), default='missing')} | "
+                f"as_of {first_nonempty(macro.get('btc_etf_flow_as_of'), default='-')}",
+            ])
+        compact_parts.extend(["", "…（推送过长已结构化压缩，完整事实以账本和分析归档为准）"])
+        content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
+        # 极端兜底仍按“逐段再压缩”而非裁尾，保证所有必填段存在。
+        if len(content) > MAX_CONTENT_CHARS:
+            compact_parts[8] = clip(format_positions(positions), 260, tail="\n…（其余持仓见账本）")
+            compact_parts[17] = clip(decision_reason, 100)
+            compact_parts[20] = clip(compact_card, 360)
+            compact_parts[23] = clip(compact_history, 90)
+            compact_parts[26] = clip(f"{execution_result}\n{exec_meta}", 100)
+            compact_parts[32] = clip(format_exceptions(exceptions), 60)
+            content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
+        if len(content) > MAX_CONTENT_CHARS:
+            minimal_card = (
+                f"方向：{card_text(decision_card.get('direction_evidence'), 30)}\n"
+                f"反对：{card_text(decision_card.get('opposing_evidence'), 30)}\n"
+                f"执行：{card_text(decision_card.get('execution_conditions'), 30)}\n"
+                f"失效：{card_text(decision_card.get('invalidation_point'), 30)}\n"
+                f"风险收益：{card_text(decision_card.get('risk_reward'), 30)}\n"
+                f"组合：{card_text(decision_card.get('portfolio_impact'), 30)}"
+                if decision_card else "旧轮次无 decision_card_v1"
+            )
+            minimal_parts = [
+                f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
+                f"Agent自主裁决 | {clip(action_summary, 80)}",
+                "", "📊 资产",
+                f"🟢 实盘：资金 ${live_equity} | 可用 ${live_available} | {live_positions}仓",
+                f"🟡 模拟盘：资金 ${demo_equity} | 可用 ${demo_available} | {demo_positions}仓",
+                "", "💼 持仓详情",
+                clip(format_positions(positions), 120, tail="\n…（其余见账本）"),
+                "", "🛡 风控",
+                clip(f"保证金 {margin_display} | 杠杆 {leverage}x | 同侧 {with_pct(side_pct)} | {risk_status}", 100),
+                "", "🌍 行情",
+                f"BTC ${btc} | ETH ${eth} | regime={regime} | USD_BROAD {dxy}",
+                "", "🎯 Agent裁决", clip(decision_reason, 70),
+                "", "🧭 六项决策卡", minimal_card,
+                "", "📚 历史经验", clip(compact_history, 60),
+                "", "⚙️ 执行", clip(f"{execution_result}\n{exec_meta}", 70),
+                "", "⏰ 时间线",
+                f"下次HH:01: {next_hh01}min | 下次复盘: {next_review}",
+                "", "⚠️ 异常", clip(format_exceptions(exceptions), 40),
+                "", "…（推送过长已最小化，完整事实以账本和分析归档为准）",
+            ]
+            content = qq_markdown_hardbreak("\n".join(minimal_parts).strip())
     title = first_nonempty(payload.get("title"), default=f"【{hhmm}】{action} {symbol}")
     return {
         "ok": True,

@@ -23,8 +23,10 @@ from __future__ import annotations
 import os as _project_os
 from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(_project_os.environ.get("OKX_ROOT") or _ProjectPath(__file__).resolve().parents[1]).resolve()
-
+_PROJECT_ROOT = _ProjectPath(
+    _project_os.environ.get("OKX_ROOT")
+    or _ProjectPath(__file__).resolve().parents[1]
+).resolve()
 
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
@@ -59,8 +61,33 @@ CREATE TABLE IF NOT EXISTS cross_market (
     total_volume_24h_usd REAL,
     gold_d1       REAL,
     spx_d1        REAL,
-    btc_mcap_chg_24h_usd REAL GENERATED ALWAYS AS (btc_etf_flow) VIRTUAL
+    btc_mcap_chg_24h_usd REAL GENERATED ALWAYS AS (btc_etf_flow) VIRTUAL,
+    btc_etf_net_flow_usd REAL,
+    source_meta TEXT,
+    carried_forward TEXT,
+    dxy_calc_ecb REAL,
+    dxy_calc_ecb_d1 REAL,
+    fear_greed REAL,
+    fear_greed_label TEXT
 );
+
+CREATE TABLE IF NOT EXISTS macro_observations (
+    metric           TEXT NOT NULL,
+    observation_date TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    collected_at     TEXT NOT NULL,
+    value            REAL,
+    unit             TEXT,
+    label            TEXT,
+    status           TEXT NOT NULL,
+    source_url       TEXT,
+    raw              TEXT,
+    PRIMARY KEY (metric, observation_date, source)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_observations_metric_date
+    ON macro_observations(metric, observation_date DESC);
+CREATE INDEX IF NOT EXISTS idx_macro_observations_source_date
+    ON macro_observations(source, observation_date DESC);
 """
 
 # analysis.db：统一 live agent 产出的结构化市场报告与自主决策卡。
