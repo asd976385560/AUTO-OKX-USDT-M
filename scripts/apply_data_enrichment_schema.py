@@ -11,6 +11,9 @@
     - cross_market 补真实 ETF 净流、来源元数据和沿用标记
   account.db:
     - account_bills：手续费、资金费、已实现盈亏等交易所账单
+
+默认只读 dry-run；真迁移必须同时提供 ``--apply --backup-dir``，三个目标库
+会在任何写连接前完成 SQLite 在线备份和完整性检查。
 """
 from __future__ import annotations
 
@@ -28,13 +31,17 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
-import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, _project_path('scripts'))
 sys.path.insert(0, _project_path('collectors'))
 import ledger  # noqa: E402
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 
 MARKET_DDL = """
@@ -198,29 +205,11 @@ CREATE INDEX IF NOT EXISTS idx_account_bills_ts
 CREATE INDEX IF NOT EXISTS idx_account_bills_inst_ts
     ON account_bills(profile, inst_id, ts);
 """
-CST = timezone(timedelta(hours=8))
-
-
-def online_backup(source: Path, target: Path) -> None:
-    """SQLite 在线备份，兼容 WAL 并在落盘后做完整性检查。"""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=20)
-    dst = sqlite3.connect(target, timeout=20)
-    try:
-        src.backup(dst)
-        integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"{target.name} integrity_check={integrity}")
-    finally:
-        dst.close()
-        src.close()
-
-
 def columns(con, table: str) -> set[str]:
     return {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
 
 
-def migrate(root: Path, dry_run: bool = False,
+def migrate(root: Path, dry_run: bool = True,
             backup_dir: Path | None = None) -> dict:
     result = {"ok": True, "dry_run": dry_run, "market": {}, "regime": {}}
     market_path = root / "market.db"
@@ -246,14 +235,14 @@ def migrate(root: Path, dry_run: bool = False,
             rcon.close()
         return result
 
-    if backup_dir is not None:
-        stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
-        backups = []
-        for source in (market_path, regime_path, account_path):
-            target = backup_dir / f"{source.stem}-pre-data-enrichment-{stamp}.db"
-            online_backup(source, target)
-            backups.append(str(target))
-        result["backups"] = backups
+    if backup_dir is None:
+        raise ValueError("backup_dir is required when dry_run=False")
+    backups = backup_databases(
+        [market_path, regime_path, account_path],
+        backup_dir,
+        "data-enrichment-schema",
+    )
+    result["backups"] = [str(path) for path in backups.values()]
 
     mcon = ledger.connect(market_path)
     try:
@@ -334,22 +323,19 @@ def verify(root: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="数据增强 schema 迁移")
     ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
-    ap.add_argument(
-        "--backup-dir",
-        help="真迁移前对 market/regime/account 做 SQLite 在线备份",
-    )
+    add_migration_arguments(ap)
     args = ap.parse_args()
+    apply_changes = resolve_apply(ap, args)
     root = Path(args.db_root)
     res = migrate(
-        root, args.dry_run,
+        root, not apply_changes,
         backup_dir=Path(args.backup_dir) if args.backup_dir else None,
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if not res.get("ok"):
         return 1
-    if args.verify and not args.dry_run:
+    if args.verify and apply_changes:
         checked = verify(root)
         print(json.dumps({"verify": checked}, ensure_ascii=False, indent=2))
         return 0 if checked["ok"] else 1

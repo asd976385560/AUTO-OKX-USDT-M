@@ -836,6 +836,7 @@ def main() -> int:
         fear_greed_label = fear_row.get("label")
         etf_confirmed = public_macro_snapshot.get("etf_confirmed") or {}
         etf_provisional = public_macro_snapshot.get("etf_provisional") or {}
+        etf_conflict = public_macro_snapshot.get("etf_conflict") or {}
         btc_etf_net_flow_usd = to_float(etf_confirmed.get("value"))
 
         if etf_confirmed:
@@ -843,6 +844,12 @@ def main() -> int:
                 "source": etf_confirmed.get("source"),
                 "status": etf_confirmed.get("status"),
                 "source_as_of": etf_confirmed.get("observation_date"),
+            }
+        elif etf_conflict:
+            etf_meta = {
+                "source": etf_conflict.get("source"),
+                "status": "conflict",
+                "source_as_of": etf_conflict.get("observation_date"),
             }
         elif etf_provisional:
             etf_meta = {

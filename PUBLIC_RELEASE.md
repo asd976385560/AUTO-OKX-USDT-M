@@ -15,6 +15,8 @@ This file records the intended V2.0 public synchronization boundary.
 - Agent role sources and report templates;
 - `db/schema.sql` without runtime databases;
 - the public-only `scripts/lifecycle.json` and its read-only validator;
+- audited current schema migrations that default to read-only dry-run and require
+  explicit `--apply --backup-dir` with verified SQLite online backups before writes;
 - isolated regression tests that do not connect to production databases, place orders, start Agents or send messages;
 - `config.example.md`, `.gitignore`, dependency metadata and bilingual public documentation;
 - privacy-preserving aggregate star history data, SVG, generator and scheduled workflow.
@@ -24,7 +26,7 @@ This file records the intended V2.0 public synchronization boundary.
 - `docs/archive/` and `scripts/archive/`;
 - internal host runbooks, execution records and OpenClaw baselines;
 - full-environment orchestration and host sampling scripts;
-- Drill, Phase 5 and one-off migration/backfill compatibility tools;
+- Drill, Phase 5 and legacy/compatibility one-off backfill tools;
 - the local ANT/Clash bridge tool tree, which has its own host and network security boundary;
 - all credentials, databases, logs, reports, memory, temporary data, local dependencies and caches.
 

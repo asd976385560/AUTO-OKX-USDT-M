@@ -5,6 +5,8 @@ regime.db:
   - macro_observations 标准化日频事实表；
   - cross_market 增加 dxy_calc_ecb / dxy_calc_ecb_d1 / fear_greed /
     fear_greed_label。ETF 复用既有 btc_etf_net_flow_usd。
+
+默认只读 dry-run；真迁移必须同时提供 ``--apply --backup-dir``。
 """
 from __future__ import annotations
 
@@ -22,21 +24,22 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
-import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, _project_path('collectors'))
 sys.path.insert(0, _project_path('scripts'))
 
 import ledger  # noqa: E402
-from public_macro import TABLE_DDL  # noqa: E402
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-CST = timezone(timedelta(hours=8))
 NEW_COLUMNS = {
     "dxy_calc_ecb": "REAL",
     "dxy_calc_ecb_d1": "REAL",
@@ -45,31 +48,19 @@ NEW_COLUMNS = {
 }
 
 
-def columns(con: sqlite3.Connection, table: str) -> set[str]:
+def columns(con, table: str) -> set[str]:
     return {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
 
 
-def online_backup(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
-    dst = sqlite3.connect(target)
-    try:
-        src.backup(dst)
-        integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"backup integrity_check={integrity}")
-    finally:
-        dst.close()
-        src.close()
-
-
 def migrate(
-    db_root: Path, *, dry_run: bool = False, backup_dir: Path | None = None
+    db_root: Path, *, dry_run: bool = True, backup_dir: Path | None = None
 ) -> dict:
     path = db_root / "regime.db"
     if not path.exists():
         return {"ok": False, "error": f"regime.db not found: {path}"}
-    con = ledger.connect(path, readonly=dry_run)
+    # Preflight is always read-only. In apply mode the verified backup below
+    # must exist before the first writable connection is opened.
+    con = ledger.connect(path, readonly=True)
     try:
         have = columns(con, "cross_market")
         missing = {name: typ for name, typ in NEW_COLUMNS.items() if name not in have}
@@ -87,11 +78,13 @@ def migrate(
     finally:
         con.close()
 
-    backup = None
-    if backup_dir is not None:
-        stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
-        backup = backup_dir / f"regime-pre-public-macro-{stamp}.db"
-        online_backup(path, backup)
+    if backup_dir is None:
+        raise ValueError("backup_dir is required when dry_run=False")
+    backups = backup_databases([path], backup_dir, "public-macro-schema")
+
+    # The collector module imports its HTTP client.  Keep that dependency out
+    # of --help and dry-run; writes are already guarded and backed up here.
+    from public_macro import TABLE_DDL  # noqa: PLC0415
 
     con = ledger.connect(path)
     try:
@@ -109,9 +102,8 @@ def migrate(
         "ok": True,
         "table": "macro_observations",
         "columns_added": added,
+        "backups": [str(item) for item in backups.values()],
     }
-    if backup is not None:
-        result["backup"] = str(backup)
     return result
 
 
@@ -143,20 +135,20 @@ def verify(db_root: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="公开宏观数据 schema 迁移")
     parser.add_argument("--db-root", default=_project_path('db'))
-    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--backup-dir")
+    add_migration_arguments(parser)
     args = parser.parse_args()
+    apply_changes = resolve_apply(parser, args)
     root = Path(args.db_root)
     result = migrate(
         root,
-        dry_run=args.dry_run,
+        dry_run=not apply_changes,
         backup_dir=Path(args.backup_dir) if args.backup_dir else None,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result.get("ok"):
         return 1
-    if args.verify and not args.dry_run:
+    if args.verify and apply_changes:
         checked = verify(root)
         print(json.dumps({"verify": checked}, ensure_ascii=False, indent=2))
         return 0 if checked["ok"] else 1

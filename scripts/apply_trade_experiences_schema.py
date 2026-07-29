@@ -15,7 +15,9 @@ schema（§8.5）：
 索引：(profile,regime,side)、(symbol,ts)。
 
 用法：
-  python apply_trade_experiences_schema.py --db-root <PROJECT_ROOT>\\db [--dry-run] [--verify]
+  python apply_trade_experiences_schema.py --db-root <PROJECT_ROOT>\\db [--dry-run]
+  python apply_trade_experiences_schema.py --db-root <PROJECT_ROOT>\\db \
+      --apply --backup-dir <BACKUP_DIR> [--verify]
 """
 from __future__ import annotations
 
@@ -37,7 +39,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, _project_path('scripts'))
 import ledger  # noqa: E402
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -84,18 +92,34 @@ def existing_tables(con) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def migrate(db_root: Path, dry_run: bool = False) -> dict:
+def migrate(
+    db_root: Path,
+    dry_run: bool = True,
+    backup_dir: Path | None = None,
+) -> dict:
     account = db_root / "account.db"
     if not account.exists():
         return {"ok": False, "error": f"account.db 不存在: {account}"}
-    con = ledger.connect(account)
+    if not dry_run and backup_dir is None:
+        raise ValueError("backup_dir is required when dry_run=False")
+    backups = (
+        backup_databases([account], backup_dir, "trade-experiences-schema")
+        if not dry_run
+        else {}
+    )
+    con = ledger.connect(account, readonly=dry_run)
     try:
         had = "trade_experiences" in existing_tables(con)
         if dry_run:
             return {"ok": True, "dry_run": True, "already_exists": had}
         con.executescript(DDL)
         con.commit()
-        return {"ok": True, "already_existed": had, "created": not had}
+        return {
+            "ok": True,
+            "already_existed": had,
+            "created": not had,
+            "backups": [str(path) for path in backups.values()],
+        }
     finally:
         con.close()
 
@@ -118,16 +142,21 @@ def verify(db_root: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 trade_experiences 建表迁移")
     ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    add_migration_arguments(ap)
     args = ap.parse_args()
+    apply_changes = resolve_apply(ap, args)
     root = Path(args.db_root)
 
-    res = migrate(root, dry_run=args.dry_run)
+    res = migrate(
+        root,
+        dry_run=not apply_changes,
+        backup_dir=Path(args.backup_dir) if args.backup_dir else None,
+    )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if not res.get("ok"):
         return 1
-    if args.verify and not args.dry_run:
+    if args.verify and apply_changes:
         v = verify(root)
         print("-- verify --")
         print(json.dumps(v, ensure_ascii=False, indent=2))

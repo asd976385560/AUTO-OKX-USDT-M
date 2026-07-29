@@ -22,7 +22,8 @@ news_events_index PK(symbol,ts,news_id)）：目标 CST 值已存在同键行时
 用法（默认 dry-run，只读打开、逐表计数不写）：
     pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
         <PROJECT_ROOT>\\scripts\\apply_ts_cst_migration.py --db-root <PROJECT_ROOT>\\db
-    加 --apply 才真写（生产执行须主人/主循环拍板；跑前备份 db）。
+    加 --apply --backup-dir <BACKUP_DIR> 才真写；两个目标库会在任何写连接前
+    完成 SQLite 在线备份和 integrity_check。
 
 退出码：0=成功（dry-run 或 apply 完成）；1=库不可达/执行错误。
 """
@@ -47,6 +48,13 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+sys.path.insert(0, _project_path('scripts'))
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -116,18 +124,30 @@ def main() -> int:
         description="ts UTC-Z → CST 幂等迁移（news_items/news_events_index/"
                     "account_snapshots/position_snapshots/trade_events）")
     ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--apply", action="store_true",
-                    help="真写（默认 dry-run 只读计数）")
+    add_migration_arguments(ap)
     args = ap.parse_args()
+    apply_changes = resolve_apply(ap, args)
 
     db_root = Path(args.db_root)
-    mode = "APPLY" if args.apply else "DRY-RUN"
+    mode = "APPLY" if apply_changes else "DRY-RUN"
     report = {"mode": mode, "db_root": str(db_root), "tables": {}, "ok": True}
 
     # 按 db 分组打开一次连接
     by_db: dict[str, list[tuple[str, str]]] = {}
     for db_name, table, col in TARGETS:
         by_db.setdefault(db_name, []).append((table, col))
+
+    if apply_changes:
+        target_paths = [db_root / db_name for db_name in by_db]
+        missing = [str(path) for path in target_paths if not path.is_file()]
+        if missing:
+            report["ok"] = False
+            report["error"] = "db 不存在: " + ", ".join(missing)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 1
+        backups = backup_databases(
+            target_paths, Path(args.backup_dir), "ts-cst-migration")
+        report["backups"] = [str(path) for path in backups.values()]
 
     for db_name, tables in by_db.items():
         db_path = db_root / db_name
@@ -136,7 +156,7 @@ def main() -> int:
             report["ok"] = False
             continue
         try:
-            if args.apply:
+            if apply_changes:
                 con = sqlite3.connect(str(db_path), timeout=15)
                 con.execute("PRAGMA busy_timeout=15000")
             else:
@@ -153,7 +173,8 @@ def main() -> int:
                     report["tables"][key] = {"skipped": "表不存在"}
                     continue
                 scan = scan_table(con, table, col)
-                res = migrate_table(con, table, col, scan["matched"], args.apply)
+                res = migrate_table(
+                    con, table, col, scan["matched"], apply_changes)
                 report["tables"][key] = {
                     "total_rows": scan["total"],
                     "z_matched": len(scan["matched"]),

@@ -107,6 +107,11 @@ class PublicMacroTests(unittest.TestCase):
         self.assertEqual(result["cross_checked"], 1)
         self.assertEqual(snap["etf_confirmed"]["value"], -240100000)
         self.assertEqual(snap["etf_confirmed"]["status"], "cross_checked")
+        self.assertIsNone(snap["etf_provisional"])
+        self.assertIsNone(snap["etf_conflict"])
+        self.assertEqual(
+            pm.source_dates(self.con)["macro_etf_flow"], "2026-07-24"
+        )
 
     def test_conflicting_etf_sources_do_not_enter_hard_value(self):
         rows = [
@@ -131,6 +136,153 @@ class PublicMacroTests(unittest.TestCase):
         self.assertEqual(result["conflicts"], 1)
         self.assertIsNone(snap["etf_confirmed"])
         self.assertEqual(snap["etf_conflict"]["status"], "conflict")
+        self.assertIsNone(snap["etf_provisional"])
+
+    def test_newer_conflict_supersedes_older_confirmed_value(self):
+        pm.upsert_observations(
+            self.con,
+            [
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-24",
+                    "source": pm.SOURCE_ETF_CONSENSUS,
+                    "status": "cross_checked",
+                    "value": 10_000_000,
+                },
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-25",
+                    "source": pm.SOURCE_FARSIDE,
+                    "status": "source_reported",
+                    "value": 20_000_000,
+                },
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-25",
+                    "source": pm.SOURCE_SOSOVALUE,
+                    "status": "source_reported",
+                    "value": 40_000_000,
+                },
+            ],
+        )
+        pm.reconcile_etf_consensus(self.con)
+
+        snap = pm.latest_snapshot(self.con)
+        self.assertIsNone(snap["etf_confirmed"])
+        self.assertIsNone(snap["etf_provisional"])
+        self.assertEqual(
+            snap["etf_conflict"]["observation_date"], "2026-07-25"
+        )
+        self.assertEqual(
+            pm.source_dates(self.con)["macro_etf_flow"], "2026-07-25"
+        )
+
+    def test_newer_single_source_supersedes_older_confirmed_value(self):
+        pm.upsert_observations(
+            self.con,
+            [
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-24",
+                    "source": pm.SOURCE_ETF_CONSENSUS,
+                    "status": "cross_checked",
+                    "value": 10_000_000,
+                },
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-25",
+                    "source": pm.SOURCE_FARSIDE,
+                    "status": "source_reported",
+                    "value": 20_000_000,
+                },
+            ],
+        )
+
+        snap = pm.latest_snapshot(self.con)
+        self.assertIsNone(snap["etf_confirmed"])
+        self.assertIsNone(snap["etf_conflict"])
+        self.assertEqual(
+            snap["etf_provisional"]["observation_date"], "2026-07-25"
+        )
+        self.assertEqual(
+            pm.source_dates(self.con)["macro_etf_flow"], "2026-07-25"
+        )
+
+    def test_corrected_same_day_sources_replace_conflict_with_confirmation(self):
+        rows = [
+            {
+                "metric": pm.METRIC_BTC_ETF,
+                "observation_date": "2026-07-25",
+                "source": pm.SOURCE_FARSIDE,
+                "status": "source_reported",
+                "value": 20_000_000,
+            },
+            {
+                "metric": pm.METRIC_BTC_ETF,
+                "observation_date": "2026-07-25",
+                "source": pm.SOURCE_SOSOVALUE,
+                "status": "source_reported",
+                "value": 40_000_000,
+            },
+        ]
+        pm.upsert_observations(self.con, rows)
+        pm.reconcile_etf_consensus(self.con)
+        self.assertIsNotNone(pm.latest_snapshot(self.con)["etf_conflict"])
+
+        rows[1]["value"] = 20_100_000
+        pm.upsert_observations(self.con, [rows[1]])
+        pm.reconcile_etf_consensus(self.con)
+
+        snap = pm.latest_snapshot(self.con)
+        self.assertEqual(snap["etf_confirmed"]["value"], 20_000_000)
+        self.assertIsNone(snap["etf_conflict"])
+        self.assertIsNone(snap["etf_provisional"])
+
+    def test_newer_observation_date_beats_later_collection_timestamp(self):
+        pm.upsert_observations(
+            self.con,
+            [
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-24",
+                    "source": pm.SOURCE_ETF_CONSENSUS,
+                    "collected_at": "2026-07-27T00:00:00Z",
+                    "status": "cross_checked",
+                    "value": 10_000_000,
+                },
+                {
+                    "metric": pm.METRIC_BTC_ETF,
+                    "observation_date": "2026-07-25",
+                    "source": pm.SOURCE_FARSIDE,
+                    "collected_at": "2026-07-26T00:00:00Z",
+                    "status": "source_reported",
+                    "value": 20_000_000,
+                },
+            ],
+        )
+
+        snap = pm.latest_snapshot(self.con)
+        self.assertIsNone(snap["etf_confirmed"])
+        self.assertEqual(
+            snap["etf_provisional"]["observation_date"], "2026-07-25"
+        )
+
+    def test_no_etf_rows_return_empty_mutually_exclusive_state(self):
+        state = pm.latest_etf_state(self.con)
+        self.assertEqual(
+            state,
+            {
+                "observation_date": None,
+                "etf_confirmed": None,
+                "etf_provisional": None,
+                "etf_conflict": None,
+            },
+        )
+        snap = pm.latest_snapshot(self.con)
+        self.assertIsNone(snap["etf_confirmed"])
+        self.assertIsNone(snap["etf_provisional"])
+        self.assertIsNone(snap["etf_conflict"])
+        self.assertIsNone(pm.source_dates(self.con)["macro_etf_flow"])
 
 
 if __name__ == "__main__":

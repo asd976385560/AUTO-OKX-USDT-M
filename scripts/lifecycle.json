@@ -19,6 +19,7 @@
         "_regime_read.py",
         "_simutil.py",
         "_tsnorm.py",
+        "migration_guard.py",
         "public_macro.py",
         "regime_classifier.py"
       ]
@@ -126,11 +127,11 @@
       ]
     },
     {
-      "name": "schema and one-time data migrations pending lifecycle review",
-      "status": "migration-pending",
-      "invocation": "owner-authorized one-time wrapper invocation",
-      "write_scope": "the named schema or historical backfill target only",
-      "default_mode": "dry-run/inspection first; explicit apply plus backup",
+      "name": "audited current schema migrations",
+      "status": "manual-maintenance",
+      "invocation": "owner-authorized wrapper invocation with explicit --apply and --backup-dir",
+      "write_scope": "only the named schema or timestamp-normalization target after verified SQLite online backups of every target database",
+      "default_mode": "read-only dry-run; --apply and --dry-run are mutually exclusive",
       "replacement": null,
       "last_verified": "2026-07-29",
       "paths": [
