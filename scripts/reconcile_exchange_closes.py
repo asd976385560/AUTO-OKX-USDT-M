@@ -119,7 +119,7 @@ def ledger_rows(con):
     """全量 trades 行 → {(symbol, side): [row, ...]}（rowid 序）。"""
     by_key = defaultdict(list)
     for r in con.execute(
-            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl "
+            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl, raw "
             "FROM trades ORDER BY rowid"):
         by_key[(r["symbol"], norm_side(r["side"]))].append(r)
     return by_key
@@ -260,8 +260,27 @@ CLOSE_ACTIONS = ("close", "stop_loss", "reduce")
 OPEN_ACTIONS = ("open", "add")
 
 
+def _recorded_ord_ids(row) -> set[str]:
+    """Extract authoritative exchange order identities from one ledger row."""
+    try:
+        raw_value = row["raw"]
+    except (KeyError, IndexError, TypeError):
+        return set()
+    try:
+        raw = json.loads(raw_value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    raw_ord_ids = raw.get("ord_ids") or []
+    if not isinstance(raw_ord_ids, (list, tuple, set)):
+        raw_ord_ids = [raw_ord_ids]
+    values = [raw.get("ordId"), *raw_ord_ids]
+    return {str(value) for value in values if value not in (None, "")}
+
+
 def consume_recorded(groups, rows, t0_dt, actions=CLOSE_ACTIONS):
-    """账本已有成交行 → 销账对应 fills 组（sz 相等 + 时间窗内）。
+    """账本已有成交行 → 优先按 ordId、否则按唯一 sz+时间候选销账。
 
     `actions` 默认平仓腿（幽灵仓补 close 用）；P2 补 open 时传 `OPEN_ACTIONS`
     销账已记录的开仓行，逻辑完全对称。
@@ -278,20 +297,48 @@ def consume_recorded(groups, rows, t0_dt, actions=CLOSE_ACTIONS):
         if r_dt is None or (t0_dt is not None and r_dt < t0_dt):
             continue
         r_sz = f(r["sz"], 0.0) or 0.0
-        best, best_gap = None, None
-        for g in remaining:
-            if abs(g["sz"] - r_sz) > SZ_TOL:
+        ord_ids = _recorded_ord_ids(r)
+        if ord_ids:
+            identified = [g for g in remaining if str(g.get("ordId")) in ord_ids]
+            identified_sz = sum(g["sz"] for g in identified)
+            if identified and abs(identified_sz - r_sz) <= SZ_TOL:
+                for group in identified:
+                    remaining.remove(group)
+                notes.append(
+                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
+                    f"ordId={','.join(sorted(ord_ids))} 已按身份销账"
+                )
+            else:
+                notes.append(
+                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 的 "
+                    f"ordId 身份与 fills 数量不一致，拒绝弱匹配"
+                )
+            continue
+
+        candidates = []
+        for group in remaining:
+            if abs(group["sz"] - r_sz) > SZ_TOL:
                 continue
-            gap = abs((fill_dt(g["t_last_ms"]) - r_dt).total_seconds())
-            if gap <= CONSUME_WINDOW_MIN * 60 and (best_gap is None or gap < best_gap):
-                best, best_gap = g, gap
-        if best is not None:
-            remaining.remove(best)
-            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
-                         f"ordId={best['ordId']} 已销账")
+            gap = abs((fill_dt(group["t_last_ms"]) - r_dt).total_seconds())
+            if gap <= CONSUME_WINDOW_MIN * 60:
+                candidates.append((gap, group))
+        if len(candidates) == 1:
+            group = candidates[0][1]
+            remaining.remove(group)
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
+                f"ordId={group['ordId']} 已按唯一数量/时间候选销账"
+            )
+        elif len(candidates) > 1:
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 有 "
+                f"{len(candidates)} 个等量时间候选，拒绝弱匹配并转人工"
+            )
         else:
-            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
-                         f"（可能超 API 窗口，靠合计硬门兜底）")
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
+                f"（可能超 API 窗口，靠合计硬门兜底）"
+            )
     return remaining, notes
 
 

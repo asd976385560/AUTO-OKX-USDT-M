@@ -58,14 +58,14 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 
 ## 版本线说明
 
-公开发行采用语义化版本，唯一版本源是 [`VERSION`](VERSION)，当前准备版本为
-[`1.0.0`](CHANGELOG.md)，对应 Git tag 和 GitHub Release 名称
-`v1.0.0`。每次发布的变更记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+公开发行采用语义化版本，唯一版本源是 [`VERSION`](VERSION)；对应 Git tag 和
+GitHub Release 名称统一为 `v<VERSION>`。每次发布的非空说明及版本链接记录在
+[`CHANGELOG.md`](CHANGELOG.md)，发布工作流直接使用匹配版本段作为 Release 正文。
 
 `V2.0` 继续表示系统架构、业务契约、文档和 schema 代际，不是公开发行版本，
-也不会被 `1.0.0` 替换。只有版本变更 PR 合并到 `main` 后，维护者创建并推送
+也不会被公开发行版本替换。只有版本变更 PR 合并到 `main` 后，维护者创建并推送
 匹配的 annotated tag，且发布工作流的版本、主分支可达性、完整 CI 全部通过，
-才会创建 GitHub Release；当前 PR 本身不会创建 tag 或 Release。
+才会创建 GitHub Release。
 
 ## 本次同步
 
@@ -109,7 +109,7 @@ OpenClaw cron
 
 - `skill.md` 是 V2.0 业务事实源，本文是公开系统地图；
 - `ledger.db.stage_dispatch(cycle_id, stage)` 是阶段派发幂等真值；
-- `ledger.db.execution_intents` 在任何交易所 I/O 前阻断每个 profile 的未决或含糊意图；
+- `ledger.db.execution_intents` 在任何交易所 I/O 前阻断每个 profile 的未决或含糊意图；精确补账转为 `reconciled` 后只阻断原逻辑单重下，不再冻结整个 profile；
 - 每张表或明确键域只有一个权威 writer，读者使用 SQLite `mode=ro`；
 - live 开仓只经 `core/order_executor.py`，内部强制调用 `core/risk_validator.py`；
 - 下单前必须使 OKX 全量现仓与该 profile 的已确认交易账本一致；

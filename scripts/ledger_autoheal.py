@@ -74,8 +74,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, _project_path('scripts'))
 sys.path.insert(0, _project_path('collectors'))
 
+sys.path.insert(0, _project_path('core'))
 sys.path.insert(0, _project_path('core', 'lib'))
 
+import execution_intent as ei  # noqa: E402
 import reconcile_exchange_closes as rec  # noqa: E402
 import repair_queue_tool  # noqa: E402
 from live_reconcile_monitor import active_runner  # noqa: E402
@@ -86,7 +88,7 @@ DEFAULT_MAX_HEALS = 3
 # UNRECORDED 无 intent 时的 fills 回看窗（天）——只用于定位开仓腿，不放宽判定
 UNRECORDED_LOOKBACK_DAYS = 7
 # execution_intents 终态；非终态 + 有 ord_id = 「单已提交、落库没跟上」的归属证据
-INTENT_TERMINAL = ("completed", "failed_clean")
+INTENT_TERMINAL = ("completed", "failed_clean", "reconciled")
 
 
 def _live_write_policy(requested_apply: bool,
@@ -117,8 +119,8 @@ def _intent_for(db_root: Path, profile: str, sym: str, side: str) -> dict | None
     """找该 sym/side 的开仓意图归属证据（T1 判据）。
 
     非终态 + 有 ord_id ⇒ 单确实提交到交易所了、只是账没落上。
-    全历史 95 条实测是干净二元分布（completed 全有单号 / failed_clean 全无），
-    所以非终态带单号本身就是异常信号，正是我们要抓的那种。
+    历史样本在补账前是干净二元分布（completed 全有单号 / failed_clean 全无）；
+    精确补账成功后会转为 reconciled。除此之外，非终态带单号本身就是异常信号。
     """
     led = db_root / "ledger.db"
     if not led.exists():
@@ -130,8 +132,8 @@ def _intent_for(db_root: Path, profile: str, sym: str, side: str) -> dict | None
         return None
     try:
         row = con.execute(
-            "SELECT cycle_id, symbol, action, side, state, reserved_at, "
-            "       submitted_at, ord_id, error "
+            "SELECT cycle_id, symbol, action, side, request_fingerprint, "
+            "       state, reserved_at, submitted_at, ord_id, error "
             "FROM execution_intents "
             "WHERE profile=? AND symbol=? AND side=? AND action IN ('open','add') "
             f"  AND state NOT IN ({','.join('?' * len(INTENT_TERMINAL))}) "
@@ -144,6 +146,58 @@ def _intent_for(db_root: Path, profile: str, sym: str, side: str) -> dict | None
         return None
     finally:
         con.close()
+
+
+def _mark_intent_reconciled(
+    db_root: Path,
+    profile: str,
+    intent: dict,
+    result: dict,
+) -> dict:
+    """Terminalize the exact intent after its missing OPEN row is recovered.
+
+    ``reconciled`` is intentionally distinct from ``completed``: the latter
+    carries the executor's original replayable receipt, while this path only has
+    exchange-fill and ledger-recovery evidence.  Both are profile-terminal, but
+    retrying this exact logical order remains blocked to prevent a duplicate.
+    """
+    fingerprint = str(intent.get("request_fingerprint") or "").strip()
+    ord_id = str(intent.get("ord_id") or "").strip()
+    result_ord_ids = {str(value) for value in (result.get("ord_ids") or [])}
+    if not fingerprint:
+        raise RuntimeError("execution intent missing request_fingerprint")
+    if not ord_id or ord_id not in result_ord_ids:
+        raise RuntimeError("reconciled OPEN ordId does not match execution intent")
+
+    evidence = {
+        "ok": True,
+        "intent_state": "reconciled",
+        "reconciled_by": "ledger_autoheal",
+        "profile": profile,
+        "cycle_id": intent.get("cycle_id"),
+        "symbol": intent.get("symbol"),
+        "side": intent.get("side"),
+        "ord_id": ord_id,
+        "ledger_recovery": {
+            "open_ts": result.get("open_ts"),
+            "sz": result.get("sz"),
+            "fill_px": result.get("wavg_px"),
+            "ord_ids": sorted(result_ord_ids),
+        },
+    }
+    ei.mark_reconciled(
+        db_root / "ledger.db",
+        profile=profile,
+        cycle_id=str(intent.get("cycle_id") or ""),
+        symbol=str(intent.get("symbol") or ""),
+        side=str(intent.get("side") or ""),
+        fingerprint=fingerprint,
+        now_ts=_now(),
+        ord_id=ord_id,
+        receipt=evidence,
+        error=None,
+    )
+    return evidence
 
 
 def _card_for(db_root: Path, cycle_id: str, sym: str) -> dict | None:
@@ -566,6 +620,26 @@ def autoheal(profile: str, db_root: Path, apply: bool,
             item.update({"applied": True, "fill_px": res["wavg_px"],
                          "cycle_id": res["cycle_id"], "open_ts": res["open_ts"],
                          "degradation": res["degradation"]})
+            try:
+                _mark_intent_reconciled(
+                    db_root, profile, plan["intent"], res
+                )
+            except Exception as e:  # noqa: BLE001
+                item["intent_transition_error"] = str(e)
+                out["needs_human"].append({
+                    "kind": "INTENT-RECONCILE-ERROR",
+                    "sev": "P1",
+                    "symbol": sym,
+                    "side": side,
+                    "ord_ids": plan["ord_ids"],
+                    "reason": str(e),
+                })
+                out["rc"] = 2
+                out["healed"].append(item)
+                # The ledger write succeeded, but the profile remains blocked.
+                # Keep repair_queue open so this split-brain state stays visible.
+                continue
+            item["intent_state"] = "reconciled"
             out["healed"].append(item)
             qids = _pending_queue_ids(account_db, profile, sym, side)
             _close_pending_queue(

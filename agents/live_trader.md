@@ -197,7 +197,7 @@ open_position(
 ```
 
 内部流程（确定性，LLM 越不过）：回执/决策卡 preflight → 在任何 OKX 读取/下单前检查同 profile 全部
-`execution_intents`，任一非 `completed/failed_clean` 状态即全局阻断并记录 blocker → 无阻塞才持久化本轮 `execution_intent` 占位 → 取 OKX API 全仓并与本 profile 交易主账只读轧差做 `{symbol,side,sz}` 全集合比较，差异/坏行/不可读即 `pretrade_ledger_position_mismatch|ledger_unavailable` 阻断 → 一致才装配现场并**强制 `risk_validator.validate`**（reject 即止、不下单）→ 市价开仓（`--ordType market --posSide --tdMode`；SWAP 不支持 `--tgtCcy`——永续 sz 恒为合约张数）→ **必挂 algo 止损**，回读时严格核 symbol、posSide、平仓 side、reduceOnly、数量、触发价与 live 状态，独立 algo 必须命中本次返回的精确 algoId，旧同价单不得冒充 → **成交双源确认**求真 `fill_px/fillPnl/fill_sz/fill_ts`（回执 `fill_source`、`ts_source` 标来源；SL 失败/双源确认失败的处置见 §8 表）→ **成交即留痕**（executor 自动落执行 journal）→ 保存完整回执。相同 cycle/symbol/side 的同参数重跑只返回原回执并标 `idempotent_replay=true`；未决/冲突意图直接 `execution_intent_profile_blocked` 或 `execution_intent_blocked`，**禁止改参数或再次下单**，只做 intent/journal/OKX/主账对账。
+`execution_intents`，任一非 `completed/failed_clean/reconciled` 状态即全局阻断并记录 blocker → 无阻塞才持久化本轮 `execution_intent` 占位 → 取 OKX API 全仓并与本 profile 交易主账只读轧差做 `{symbol,side,sz}` 全集合比较，差异/坏行/不可读即 `pretrade_ledger_position_mismatch|ledger_unavailable` 阻断 → 一致才装配现场并**强制 `risk_validator.validate`**（reject 即止、不下单）→ 市价开仓（`--ordType market --posSide --tdMode`；SWAP 不支持 `--tgtCcy`——永续 sz 恒为合约张数）→ **必挂 algo 止损**，回读时严格核 symbol、posSide、平仓 side、reduceOnly、数量、触发价与 live 状态，独立 algo 必须命中本次返回的精确 algoId，旧同价单不得冒充 → **成交双源确认**求真 `fill_px/fillPnl/fill_sz/fill_ts`（回执 `fill_source`、`ts_source` 标来源；SL 失败/双源确认失败的处置见 §8 表）→ **成交即留痕**（executor 自动落执行 journal）→ 保存完整回执。相同 cycle/symbol/side 的同参数重跑只返回原回执并标 `idempotent_replay=true`；`reconciled` 表示成交已由精确 ordId 补账，不冻结其它 symbol，但原逻辑单仍禁止重下；其余未决/冲突意图直接 `execution_intent_profile_blocked` 或 `execution_intent_blocked`，**禁止改参数或再次下单**，只做 intent/journal/OKX/主账对账。
 
 ### 平仓
 

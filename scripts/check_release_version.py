@@ -32,6 +32,10 @@ SEMVER_RE = re.compile(rf"^{SEMVER_PATTERN}$")
 CHANGELOG_HEADING_RE = re.compile(
     r"^## \[([^\]]+)\](?: - ([^\r\n]+))?\s*$", re.MULTILINE
 )
+CHANGELOG_LINK_RE = re.compile(
+    r"^\[([^\]]+)\]:\s+(\S+)\s*$", re.MULTILINE
+)
+RELEASE_BULLET_RE = re.compile(r"^\s*[-*]\s+\S", re.MULTILINE)
 
 ParsedVersion = tuple[int, int, int, tuple[str, ...]]
 
@@ -110,21 +114,29 @@ def _validate_changelog(
     path: Path,
     version: Optional[str],
     errors: list[str],
-) -> None:
+) -> Optional[str]:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         errors.append(f"CHANGELOG.md unreadable: {exc}")
-        return
+        return None
 
-    headings = CHANGELOG_HEADING_RE.findall(text)
+    matches = list(CHANGELOG_HEADING_RE.finditer(text))
+    headings = [(match.group(1), match.group(2) or "") for match in matches]
     unreleased = [index for index, item in enumerate(headings) if item[0] == "Unreleased"]
     if len(unreleased) != 1:
         errors.append("CHANGELOG.md must contain exactly one [Unreleased] heading")
     elif unreleased[0] != 0 or headings[0][1]:
         errors.append("[Unreleased] must be the first version heading and have no date")
 
-    formal: list[tuple[str, ParsedVersion]] = []
+    sections: dict[str, list[str]] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end():end]
+        body = CHANGELOG_LINK_RE.sub("", body).strip()
+        sections.setdefault(match.group(1), []).append(body)
+
+    formal: list[tuple[str, ParsedVersion, Optional[date]]] = []
     for label, released_on in headings:
         if label == "Unreleased":
             continue
@@ -132,6 +144,7 @@ def _validate_changelog(
         if parsed is None:
             errors.append(f"CHANGELOG.md has a non-SemVer version heading: {label}")
             continue
+        parsed_date = None
         try:
             parsed_date = date.fromisoformat(released_on)
         except ValueError:
@@ -143,7 +156,15 @@ def _validate_changelog(
                 errors.append(
                     f"CHANGELOG.md version {label} date is not canonical YYYY-MM-DD"
                 )
-        formal.append((label, parsed))
+        formal.append((label, parsed, parsed_date))
+
+        release_sections = sections.get(label, [])
+        if len(release_sections) != 1 or not RELEASE_BULLET_RE.search(
+            release_sections[0]
+        ):
+            errors.append(
+                f"CHANGELOG.md version {label} must contain non-empty release notes"
+            )
 
     if version is not None:
         occurrences = [item for item in formal if item[0] == version]
@@ -157,11 +178,43 @@ def _validate_changelog(
             )
 
     for newer, older in zip(formal, formal[1:]):
-        if compare_semver(newer[1], older[1]) <= 0:
+        newer_date, older_date = newer[2], older[2]
+        if newer_date is not None and older_date is not None and newer_date < older_date:
             errors.append(
-                "CHANGELOG.md formal versions must be strictly newest-to-oldest: "
-                f"{newer[0]} before {older[0]}"
+                "CHANGELOG.md release dates must be newest-to-oldest: "
+                f"{newer[0]} ({newer_date}) before {older[0]} ({older_date})"
             )
+
+    links: dict[str, list[str]] = {}
+    for label, url in CHANGELOG_LINK_RE.findall(text):
+        links.setdefault(label, []).append(url)
+    required_links = ["Unreleased", *(item[0] for item in formal)]
+    for label in required_links:
+        if len(links.get(label, [])) != 1:
+            errors.append(
+                f"CHANGELOG.md must contain exactly one [{label}] link reference"
+            )
+
+    if version is not None:
+        unreleased_urls = links.get("Unreleased", [])
+        version_urls = links.get(version, [])
+        if len(unreleased_urls) == 1 and not (
+            unreleased_urls[0].startswith("https://github.com/")
+            and unreleased_urls[0].endswith(f"/compare/v{version}...HEAD")
+        ):
+            errors.append(
+                f"CHANGELOG.md [Unreleased] link must compare v{version}...HEAD"
+            )
+        if len(version_urls) == 1 and not (
+            version_urls[0].startswith("https://github.com/")
+            and version_urls[0].endswith(f"/releases/tag/v{version}")
+        ):
+            errors.append(
+                f"CHANGELOG.md [{version}] link must target releases/tag/v{version}"
+            )
+
+    release_notes = sections.get(version or "", [])
+    return release_notes[0] if len(release_notes) == 1 else None
 
 
 def validate_release_contract(
@@ -171,7 +224,7 @@ def validate_release_contract(
     root = Path(root).resolve()
     errors: list[str] = []
     version, parsed = _read_version(root / "VERSION", errors)
-    _validate_changelog(root / "CHANGELOG.md", version, errors)
+    release_notes = _validate_changelog(root / "CHANGELOG.md", version, errors)
 
     if tag is not None:
         if not tag.startswith("v") or parse_semver(tag[1:]) is None:
@@ -184,6 +237,7 @@ def validate_release_contract(
         "version": version,
         "tag": tag,
         "prerelease": bool(parsed and parsed[3]),
+        "release_notes": release_notes,
         "version_file": str(root / "VERSION"),
         "changelog_file": str(root / "CHANGELOG.md"),
         "errors": errors,
@@ -196,10 +250,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--tag")
+    parser.add_argument(
+        "--notes-out", type=Path,
+        help="write the validated current CHANGELOG section for gh --notes-file",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     result = validate_release_contract(args.root, args.tag)
+    if result["ok"] and args.notes_out is not None:
+        notes = str(result.get("release_notes") or "").strip()
+        args.notes_out.write_text(notes + "\n", encoding="utf-8")
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

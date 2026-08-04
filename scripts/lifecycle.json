@@ -156,6 +156,7 @@
       "replacement": null,
       "last_verified": "2026-08-04",
       "paths": [
+        "check_public_boundary.py",
         "check_release_version.py",
         "migration_guard.py",
         "update_star_stats.py"

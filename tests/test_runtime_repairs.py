@@ -285,7 +285,7 @@ class DailyInspectionRegressionTests(unittest.TestCase):
 
             results = []
             with mock.patch.dict(
-                os.environ, {"OPENCLAW_STATE_DB": str(openclaw_db)}, clear=False
+                os.environ, {"OKX_OPENCLAW_STATE_DB": str(openclaw_db)}, clear=False
             ):
                 query_state.check_collection_failures(
                     str(root), stale_min=15, hh01_only=False, results=results
@@ -295,6 +295,23 @@ class DailyInspectionRegressionTests(unittest.TestCase):
         self.assertEqual(len(results[0]["collection_errors"]), 1)
         self.assertEqual(len(results[0]["cron_errors"]), 1)
         self.assertEqual(len(results[0]["active_cron_errors"]), 1)
+
+    def test_prefixed_openclaw_state_db_wins_over_legacy_alias(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OKX_OPENCLAW_STATE_DB": "preferred.sqlite",
+                "OPENCLAW_STATE_DB": "legacy.sqlite",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                query_state._openclaw_state_db(), "preferred.sqlite")
+
+        with mock.patch.dict(
+            os.environ, {"OPENCLAW_STATE_DB": "legacy.sqlite"}, clear=True
+        ):
+            self.assertEqual(query_state._openclaw_state_db(), "legacy.sqlite")
 
     def test_regime_check_prefers_authoritative_public_macro_observations(self):
         with tempfile.TemporaryDirectory() as tmp:

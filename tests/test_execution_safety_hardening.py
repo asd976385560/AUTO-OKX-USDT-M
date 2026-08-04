@@ -110,6 +110,10 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 path, receipt={"ok": True, "cycle_id": cycle}, **kwargs)
         elif state == "failed_clean":
             oe.ei.mark_failed_clean(path, error="confirmed_no_fill", **kwargs)
+        elif state == "reconciled":
+            oe.ei.mark_reconciled(
+                path, ord_id="RECONCILED-ORDER",
+                receipt={"reconciled_by": "isolated-test"}, **kwargs)
         else:
             raise AssertionError(state)
 
@@ -170,7 +174,7 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 [("CYCLE-PENDING", "BTC-USDT-SWAP", "reserved")],
             )
 
-    def test_completed_and_failed_clean_do_not_block_profile(self):
+    def test_terminal_states_do_not_block_profile(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ledger.db"
             clean = self._reserve(path, "CLEAN", "BTC-USDT-SWAP")
@@ -181,6 +185,17 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
             self.assertEqual(done["status"], "reserved")
             self._transition(
                 path, done, "DONE", "ETH-USDT-SWAP", "completed")
+
+            recovered = self._reserve(path, "RECOVERED", "XRP-USDT-SWAP")
+            self.assertEqual(recovered["status"], "reserved")
+            self._transition(
+                path, recovered, "RECOVERED", "XRP-USDT-SWAP", "reconciled")
+
+            same_recovered = self._reserve(
+                path, "RECOVERED", "XRP-USDT-SWAP")
+            self.assertEqual(same_recovered["status"], "blocked")
+            self.assertEqual(same_recovered["reason"], "intent_reconciled")
+            self.assertEqual(same_recovered["pending_count"], 0)
 
             next_intent = self._reserve(path, "NEXT", "SOL-USDT-SWAP")
             self.assertEqual(next_intent["status"], "reserved")
@@ -421,7 +436,8 @@ class LiveAccountImrGateTests(unittest.TestCase):
         }
 
     def _run_live(self, capacity: dict, *, caller_account_imr=0.0,
-                  use_real_validator: bool = False):
+                  use_real_validator: bool = False,
+                  validator_exception: Exception | None = None):
         get_balance = mock.Mock(return_value={"ok": True, "data": [{}]})
         extract_capacity = mock.Mock(return_value=capacity)
         fetch_positions = mock.Mock(return_value=[])
@@ -445,6 +461,8 @@ class LiveAccountImrGateTests(unittest.TestCase):
         place_algo_sl = mock.Mock()
         validate_mock = mock.Mock(
             return_value=self._rejected_risk())
+        if validator_exception is not None:
+            validate_mock.side_effect = validator_exception
 
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(
@@ -454,7 +472,8 @@ class LiveAccountImrGateTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe.ei, "reserve",
                 return_value={"status": "reserved", "fingerprint": "FP"}))
-            stack.enter_context(mock.patch.object(oe.ei, "mark_failed_clean"))
+            mark_failed_clean = stack.enter_context(
+                mock.patch.object(oe.ei, "mark_failed_clean"))
             stack.enter_context(mock.patch.object(
                 oe.ox, "get_balance", get_balance))
             stack.enter_context(mock.patch.object(
@@ -495,10 +514,27 @@ class LiveAccountImrGateTests(unittest.TestCase):
             "get_mark": get_mark,
             "fetch_specs": fetch_specs,
             "validate": validate_mock,
+            "mark_failed_clean": mark_failed_clean,
             "set_leverage": set_leverage,
             "place_market_open": place_market_open,
             "place_algo_sl": place_algo_sl,
         }
+
+    def test_unexpected_validator_exception_cleans_reserved_intent(self):
+        state = self._run_live({
+            "ok": True,
+            "total_equity": 100.0,
+            "available_margin": 90.0,
+            "settlement_ccy": "USDT",
+            "account_imr": 10.0,
+        }, validator_exception=ValueError("synthetic validator failure"))
+
+        self.assertFalse(state["result"]["ok"])
+        self.assertEqual(
+            state["result"]["reject_reason"], "risk_validation_exception")
+        state["mark_failed_clean"].assert_called_once()
+        state["set_leverage"].assert_not_called()
+        state["place_market_open"].assert_not_called()
 
     def test_non_dryrun_live_uses_api_account_imr_and_ignores_caller(self):
         state = self._run_live({
@@ -606,6 +642,42 @@ class StopLossDirectionTests(unittest.TestCase):
                 self.assertFalse(result["approved"])
                 self.assertEqual(result["reject_reason"], "sl_direction_invalid")
 
+
+class NonFiniteRiskInputTests(unittest.TestCase):
+    def test_non_finite_money_path_inputs_are_rejected_without_math_errors(self):
+        base = {
+            "symbol": "BTC-USDT-SWAP",
+            "side": "long",
+            "intended_sz": 1.0,
+            "lev": 5.0,
+            "mark_px": 100.0,
+            "ct_val": 1.0,
+            "lot_sz": 1.0,
+            "equity": 1000.0,
+            "available_margin": 900.0,
+            "account_imr": 10.0,
+            "open_positions": [],
+            "sl_trigger_px": 95.0,
+        }
+        expected = {
+            "mark_px": "bad_mark_px",
+            "ct_val": "instrument_unknown",
+            "lot_sz": "instrument_unknown",
+            "intended_sz": "bad_sz",
+            "equity": "bad_equity",
+        }
+        for field, reason in expected.items():
+            with self.subTest(field=field):
+                payload = dict(base)
+                payload[field] = float("nan")
+                result = rv.validate(**payload)
+                self.assertFalse(result["approved"])
+                self.assertEqual(result["reject_reason"], reason)
+
+    def test_numeric_adapter_drops_nan_and_infinity(self):
+        for value in ("NaN", "Infinity", "-Infinity", float("nan")):
+            with self.subTest(value=value):
+                self.assertIsNone(oe._to_float(value))
 
 class StopLossReadbackTests(unittest.TestCase):
     @staticmethod

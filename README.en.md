@@ -59,17 +59,16 @@ Copy `config.example.md` to a local `config.md` before filling it in. Environmen
 ## Version lineage
 
 Public releases follow Semantic Versioning. [`VERSION`](VERSION) is the single
-release-version source; the currently prepared version is
-[`1.0.0`](CHANGELOG.md), with `v1.0.0` as its Git tag and
-GitHub Release name. Every published change is recorded in
-[`CHANGELOG.md`](CHANGELOG.md).
+release-version source, and `v<VERSION>` is the corresponding Git tag and
+GitHub Release name. [`CHANGELOG.md`](CHANGELOG.md) must contain non-empty notes
+and links for every release; the workflow publishes that matching section as
+the Release body.
 
 `V2.0` remains the generation identifier for the system architecture, business
 contracts, documentation, and schema. It is not the public release version and
-is not replaced by `1.0.0`. A GitHub Release is created only after the version
+is not replaced by a public release number. A GitHub Release is created only after the version
 PR is merged into `main`, a maintainer pushes the matching annotated tag, and
-the release workflow passes version, main-ancestry, and full CI checks. This PR
-does not itself create a tag or Release.
+the release workflow passes version, current-main ancestry, and full CI checks.
 
 ## Latest synchronization
 
@@ -113,7 +112,7 @@ Core invariants:
 
 - `skill.md` is the V2.0 business fact source; this README is the public system map;
 - `ledger.db.stage_dispatch(cycle_id, stage)` is the idempotent stage-dispatch truth;
-- `ledger.db.execution_intents` blocks unresolved or ambiguous intents for an entire profile before any exchange I/O;
+- `ledger.db.execution_intents` blocks unresolved or ambiguous intents for an entire profile before any exchange I/O; exact recovery moves an intent to `reconciled`, which blocks replay of that logical order without freezing the profile;
 - every table or explicit key domain has one authoritative writer, while readers use SQLite `mode=ro`;
 - live opens only pass through `core/order_executor.py`, which always calls `core/risk_validator.py`;
 - the complete OKX position set must match the confirmed local trade ledger before ordering;

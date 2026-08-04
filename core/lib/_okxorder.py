@@ -38,6 +38,7 @@ def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
 
 
+import math
 import os
 import sys
 from typing import Any, Optional
@@ -153,8 +154,9 @@ def get_mark_price(inst_id: str, profile: str) -> Optional[float]:
     for row in r.get("data", []):
         if isinstance(row, dict) and row.get("markPx"):
             try:
-                return float(row["markPx"])
-            except (TypeError, ValueError):
+                value = float(row["markPx"])
+                return value if math.isfinite(value) else None
+            except (TypeError, ValueError, OverflowError):
                 return None
     return None
 

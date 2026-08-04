@@ -78,8 +78,10 @@ class TemplateContractTests(unittest.TestCase):
         self.assertIn("17 项", template)
         self.assertIn("10 个 emoji 锚点", template)
         self.assertLess(template.index("-> `push_archive`"), template.index("-> `qq_push`"))
-        for stale_target in ("729624934", "731765529"):
-            self.assertNotIn(stale_target, template)
+        self.assertNotRegex(
+            template,
+            r"(?i)(?:target|group|c2c)[^\r\n]{0,80}\b[0-9]{8,20}\b",
+        )
 
 
 class CrossDocumentFactTests(unittest.TestCase):

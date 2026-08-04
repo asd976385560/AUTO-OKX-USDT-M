@@ -118,9 +118,12 @@ def load_public_macro_snapshot(db_root):
 
 def _openclaw_state_db() -> str:
     """允许巡检/隔离测试覆盖；默认只读当前用户 OpenClaw 状态库。"""
-    return os.environ.get(
-        "OPENCLAW_STATE_DB",
-        os.path.join(os.path.expanduser("~"), ".openclaw", "state", "openclaw.sqlite"),
+    return (
+        os.environ.get("OKX_OPENCLAW_STATE_DB")
+        or os.environ.get("OPENCLAW_STATE_DB")  # backward-compatible alias
+        or os.path.join(
+            os.path.expanduser("~"), ".openclaw", "state", "openclaw.sqlite"
+        )
     )
 
 

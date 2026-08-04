@@ -5,11 +5,10 @@ reconcile_exchange_closes.py 本体不动（比对/分类/--apply 全复用）�
 （主人 2026-07-16 拍板）：
   demo → dry 检；rc=1（GHOST-EXACT 可修）→ --apply 自动补账 → dry 复检验证归零；
          rc=3（FUZZY/含糊）→ P1 人工。
-  live → **本脚本永远只 dry**；rc∈{1,3} → P1 告警附人工命令，本脚本绝不自动 --apply。
-         （2026-08-04 口径变更：live 的 GHOST-EXACT 幽灵仓已由 scripts/ledger_autoheal.py
-          在交易环节自动补账——起棒前 + pretrade 拒单前各一次。所以日维护跑到这里时
-          GHOST-EXACT 通常已归零；本脚本的 live 人工告警实际只覆盖
-          FUZZY / OVER_CLOSED / UNRECORDED 三类。本脚本自身行为未变。）
+  live → **所有路径永久只 dry**；rc∈{1,3} → P1 告警附人工命令，本脚本和
+         scripts/ledger_autoheal.py 均绝不自动 --apply。GHOST-EXACT 也只能按唯一 ordId、
+         已验证备份和逐笔写后复核流程人工修复；FUZZY / OVER_CLOSED / UNRECORDED 同样
+         保持只读分类并转人工。
   rc=2（API/账本错误）→ 两盘均 P1。
 推送经 scripts/qq_push.py，--dedupe-key reconcile:{YYYYMMDD}（显式身份键契约；
 当日重跑同键去重、送达失败可重试）。

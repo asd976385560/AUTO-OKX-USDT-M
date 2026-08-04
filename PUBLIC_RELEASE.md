@@ -78,9 +78,8 @@ The workflow uses the repository-scoped `GITHUB_TOKEN` only at runtime. No perso
 ## Public release versioning
 
 Public releases follow Semantic Versioning. `VERSION` is the single release-version
-source and contains `1.0.0` for the initial prepared release. `CHANGELOG.md` contains
-the matching dated entry. Git tags and GitHub Releases add the `v` prefix, so this
-version is published as `v1.0.0`.
+source and `CHANGELOG.md` contains the matching dated, non-empty release entry and
+link references. Git tags and GitHub Releases add the `v` prefix.
 
 The internal V2.0 identifier remains the authority for architecture, business
 contracts, document headers and schema lineage. It is deliberately independent from
@@ -96,10 +95,10 @@ Every release must follow this sequence:
 5. let `.github/workflows/release.yml` verify the tag object, version/changelog match,
    `main` ancestry and reusable CI before it creates the GitHub Release.
 
-The release workflow never creates a tag. It uses `--verify-tag`, generates release
-notes only after all gates pass, and marks SemVer prerelease identifiers such as
-`1.1.0-beta.1` as GitHub prereleases. This PR prepares `1.0.0`; it does not merge the
-PR, create `v1.0.0`, or publish a GitHub Release.
+The release workflow never creates a tag. It uses `--verify-tag`, rechecks the tag
+commit against the current `main` immediately before publication, publishes the
+validated matching `CHANGELOG.md` section as release notes, and marks SemVer
+prerelease identifiers such as `1.1.0-beta.1` as GitHub prereleases.
 
 Before the first tag is pushed, the repository owner should protect `main`, restrict
 creation of release tags to maintainers, block updates and deletions for `v*`, and

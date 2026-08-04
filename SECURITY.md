@@ -22,8 +22,14 @@ including direct API/CLI calls; Live repair remains a unique-ordId, verified-bac
 one-record-at-a-time manual workflow with fresh post-write reconciliation and invariant checks.
 The close/open opt-ins authorize Demo only. Demo UNRECORDED bookkeeping requires matching
 intent/ordId evidence and a confirmed active reduce-only stop covering the same position;
-missing or unknown protection remains report-only. These
-settings do not authorize order placement or replay.
+missing or unknown protection remains report-only. These settings do not
+authorize order placement or replay.
+
+CI runs `scripts/check_public_boundary.py` across every tracked path and UTF-8
+source file. It blocks runtime database/log/report artifacts, concrete delivery
+routes, private IP addresses, user-home paths, and production-root paths while
+redacting matched values from its output. This complements the independent
+credential scan; neither check replaces credential rotation after a real leak.
 
 ## Reporting a leak
 

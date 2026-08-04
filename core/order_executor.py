@@ -91,9 +91,10 @@ def _to_float(v: Any) -> Optional[float]:
     if v is None or v == "":
         return None
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        value = float(v)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return value if math.isfinite(value) else None
 
 
 def _exchange_fill_time(
@@ -1391,13 +1392,24 @@ def open_position(
     if is_demo:
         # 第一阶段只校公共安全与交易所规格。必须先于 set_leverage，防止一个本应
         # 被拒绝的请求也修改 Demo 账户杠杆配置。
-        preflight = rv.validate(
-            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-            profile="demo", available_margin=None,
-            min_order_size=min_sz, preflight_only=True,
-        )
+        try:
+            preflight = rv.validate(
+                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+                profile="demo", available_margin=None,
+                min_order_size=min_sz, preflight_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="risk_validation_exception",
+                reject_detail=(
+                    "Demo 风控预检异常，订单尚未提交并已清理执行意图: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                p0=True,
+            ), f"risk_validation_exception:{type(exc).__name__}")
         if not preflight["approved"]:
             return _finish_clean(receipt(
                 False, action_taken="REJECT",
@@ -1455,23 +1467,45 @@ def open_position(
             ), "demo_max_size_fetch_failed")
 
         # 第二阶段只按交易所 minSz/lotSz 与本次方向 max-size 定仓。
-        v = rv.validate(
-            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-            profile="demo", available_margin=None,
-            exchange_max_size=exchange_max_size,
-            min_order_size=min_sz,
-        )
+        try:
+            v = rv.validate(
+                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+                profile="demo", available_margin=None,
+                exchange_max_size=exchange_max_size,
+                min_order_size=min_sz,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="risk_validation_exception",
+                reject_detail=(
+                    "Demo 容量风控异常，订单尚未提交并已清理执行意图: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                p0=True,
+            ), f"risk_validation_exception:{type(exc).__name__}")
     else:
         # Live 保持 1% 名义下限、可用保证金×98% 与组合 IMR 66.6% 整单拒绝规则。
-        v = rv.validate(
-            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-            profile="live", available_margin=available_margin,
-            account_imr=account_imr,
-        )
+        try:
+            v = rv.validate(
+                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+                profile="live", available_margin=available_margin,
+                account_imr=account_imr,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="risk_validation_exception",
+                reject_detail=(
+                    "Live 风控异常，订单尚未提交并已清理执行意图: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                p0=True,
+            ), f"risk_validation_exception:{type(exc).__name__}")
 
     if not v["approved"]:
         return _finish_clean(receipt(

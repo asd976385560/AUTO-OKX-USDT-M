@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-TERMINAL_STATES = frozenset({"completed", "failed_clean"})
+TERMINAL_STATES = frozenset({"completed", "failed_clean", "reconciled"})
 
 
 SCHEMA = """
@@ -81,7 +81,7 @@ def _pending_profile_intents(
     return con.execute(
         "SELECT profile,cycle_id,symbol,action,side,state,updated_at,ord_id,error "
         "FROM execution_intents WHERE profile=? "
-        "AND state NOT IN ('completed','failed_clean') "
+        "AND state NOT IN ('completed','failed_clean','reconciled') "
         "ORDER BY updated_at,cycle_id,symbol,action,side",
         (profile,),
     ).fetchall()
@@ -179,6 +179,24 @@ def reserve(
             return {"status": "reserved", "fingerprint": fingerprint,
                     "reused_failed_clean": True}
 
+        if state == "reconciled":
+            # The exchange fill and ledger row were recovered after the original
+            # executor lost its receipt.  This key must never place another order,
+            # but it is terminal and therefore must not freeze the whole profile.
+            pending = _pending_profile_intents(con, profile)
+            if pending:
+                con.commit()
+                return _blocking_result(pending)
+            con.commit()
+            return {
+                "status": "blocked",
+                "state": state,
+                "reason": "intent_reconciled",
+                "ord_id": row["ord_id"],
+                "same_fingerprint": same,
+                "pending_count": 0,
+            }
+
         con.commit()
         return {
             "status": "blocked",
@@ -225,7 +243,7 @@ def _transition(
         receipt_json = json.dumps(
             receipt, ensure_ascii=False, sort_keys=True, allow_nan=False)
     submitted_at = now_ts if state in ("submitted", "uncertain") else None
-    completed_at = now_ts if state == "completed" else None
+    completed_at = now_ts if state in ("completed", "reconciled") else None
     con = _connect(path)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -266,6 +284,11 @@ def mark_completed(path: Path, **kwargs: Any) -> None:
 
 def mark_failed_clean(path: Path, **kwargs: Any) -> None:
     _transition(path, state="failed_clean", **kwargs)
+
+
+def mark_reconciled(path: Path, **kwargs: Any) -> None:
+    """Close an intent whose exchange fill and ledger row were reconciled later."""
+    _transition(path, state="reconciled", **kwargs)
 
 
 def mark_uncertain(path: Path, **kwargs: Any) -> None:

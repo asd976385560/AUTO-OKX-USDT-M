@@ -29,6 +29,10 @@ Copy-Item config.example.md config.md
 | `OKX_PROXY_URL` | `<OPTIONAL_PROXY_URL>` |
 | `MX_DATA_PATH` | `<OPTIONAL_PATH_TO_MX_DATA_PY>` |
 
+`OKX_OPENCLAW_STATE_DB` is the public deployment name. The legacy
+`OPENCLAW_STATE_DB` alias remains readable for compatibility, but the prefixed
+name takes precedence when both are set.
+
 ## 2. OKX 凭证
 
 OKX API Key、Secret 和 Passphrase 由仓库外的 OKX CLI profile 或部署环境管理。本仓库不解析本节中的真实值，也不提供默认凭证。

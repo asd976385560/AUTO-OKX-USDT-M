@@ -24,18 +24,19 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for sub in ("scripts", "collectors"):
+for sub in ("scripts", "collectors", "core"):
     p = str(ROOT / sub)
     if p not in sys.path:
         sys.path.insert(0, p)
 
 import ledger_autoheal  # noqa: E402
+import execution_intent  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 
@@ -127,6 +128,46 @@ class LedgerAutohealGateTests(unittest.TestCase):
             self.assertEqual(again["exact_count"], 0)
             self.assertEqual(again["healed"], [])
             self.assertEqual(len(_rows(db, "close")), 1)
+
+    def test_recorded_ordid_wins_over_a_closer_equal_size_fill(self):
+        groups = ledger_autoheal.rec.group_by_ord([
+            {"ordId": "ORDER-A", "fillSz": "1", "fillPx": "100",
+             "fillPnl": "1", "fillTime": str(CLOSE_MS - 60_000)},
+            {"ordId": "ORDER-B", "fillSz": "1", "fillPx": "101",
+             "fillPnl": "2", "fillTime": str(CLOSE_MS)},
+        ])
+        rows = [{
+            "id": 1, "action": "close", "sz": 1.0,
+            "ts": datetime.fromtimestamp(CLOSE_MS / 1000, CST).strftime(
+                "%Y-%m-%d %H:%M:%S"),
+            "raw": json.dumps({"ord_ids": ["ORDER-A"]}),
+        }]
+
+        remaining, notes = ledger_autoheal.rec.consume_recorded(
+            groups, rows, None)
+
+        self.assertEqual([group["ordId"] for group in remaining], ["ORDER-B"])
+        self.assertTrue(any("按身份销账" in note for note in notes))
+
+    def test_equal_size_fills_without_ordid_are_ambiguous(self):
+        groups = ledger_autoheal.rec.group_by_ord([
+            {"ordId": "ORDER-A", "fillSz": "1", "fillPx": "100",
+             "fillPnl": "1", "fillTime": str(CLOSE_MS - 60_000)},
+            {"ordId": "ORDER-B", "fillSz": "1", "fillPx": "101",
+             "fillPnl": "2", "fillTime": str(CLOSE_MS)},
+        ])
+        rows = [{
+            "id": 1, "action": "close", "sz": 1.0,
+            "ts": datetime.fromtimestamp(CLOSE_MS / 1000, CST).strftime(
+                "%Y-%m-%d %H:%M:%S"),
+            "raw": None,
+        }]
+
+        remaining, notes = ledger_autoheal.rec.consume_recorded(
+            groups, rows, None)
+
+        self.assertEqual(len(remaining), 2)
+        self.assertTrue(any("拒绝弱匹配" in note for note in notes))
 
     # --- 闸 1：FUZZY 绝不写库 ---
     def test_fuzzy_ghost_is_never_written(self):
@@ -421,19 +462,25 @@ class UnrecordedAutohealTests(unittest.TestCase):
     """Demo：账本 < OKX（交易所有仓账本无）→ 受控补 open。"""
 
     def _run(self, root, *, venue, open_fills, intent=None, card=None,
-             sl=None, apply=True, enabled=True, max_heals=3):
+             sl=None, apply=True, enabled=True, max_heals=3,
+             real_intent=False):
         with mock.patch.object(ledger_autoheal.rec, "venue_positions",
                                return_value=venue), \
              mock.patch.object(ledger_autoheal.rec, "fetch_reduce_fills",
                                return_value=[]), \
              mock.patch.object(ledger_autoheal.rec, "fetch_open_fills",
                                side_effect=lambda *a, **k: open_fills), \
-             mock.patch.object(ledger_autoheal, "_intent_for",
-                               return_value=intent), \
              mock.patch.object(ledger_autoheal, "_card_for", return_value=card), \
              mock.patch.object(ledger_autoheal, "_probe_sl",
                                return_value=sl or {"has_sl": True, "n_pending": 1}), \
-             mock.patch.object(ledger_autoheal, "active_runner", return_value=None):
+             mock.patch.object(ledger_autoheal, "active_runner", return_value=None), \
+             ExitStack() as stack:
+            if not real_intent:
+                stack.enter_context(mock.patch.object(
+                    ledger_autoheal, "_intent_for", return_value=intent))
+                stack.enter_context(mock.patch.object(
+                    ledger_autoheal, "_mark_intent_reconciled",
+                    return_value={"intent_state": "reconciled"}))
             return ledger_autoheal.autoheal("demo", root, apply, max_heals,
                                             None, enable_unrecorded=enabled)
 
@@ -463,6 +510,52 @@ class UnrecordedAutohealTests(unittest.TestCase):
             self.assertEqual(healed[0]["cycle_id"], "2026-08-04T09:30")
             self.assertEqual(len(_rows(db, "open")), 1)
             self.assertEqual(len(_rows(db, "close")), 0)
+
+    def test_t1_recovery_terminalizes_real_intent_and_unblocks_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._empty_db(root)
+            ledger_path = root / "ledger.db"
+            request = {
+                "profile": "demo", "cycle_id": "2026-08-04T09:30",
+                "symbol": SYM, "action": "open", "side": "long",
+                "intended_sz": 2.0, "lev": 5.0,
+                "sl_trigger_px": 95.0, "mgn_mode": "cross",
+            }
+            reserved = execution_intent.reserve(
+                ledger_path, profile="demo", cycle_id=request["cycle_id"],
+                symbol=SYM, side="long", request=request,
+                now_ts="2026-08-04 09:29:00")
+            execution_intent.mark_submitted(
+                ledger_path, profile="demo", cycle_id=request["cycle_id"],
+                symbol=SYM, side="long",
+                fingerprint=reserved["fingerprint"],
+                now_ts="2026-08-04 09:30:00", ord_id="ORDER-RECOVERED")
+
+            result = self._run(
+                root, venue={(SYM, "long"): 2.0},
+                open_fills=_open_fill("ORDER-RECOVERED", 2.0),
+                card=_valid_card(), real_intent=True)
+
+            self.assertEqual(result["rc"], 0, result)
+            self.assertEqual(result["healed"][0]["intent_state"], "reconciled")
+            self.assertEqual(len(_rows(db, "open")), 1)
+            con = sqlite3.connect(ledger_path)
+            try:
+                state = con.execute(
+                    "SELECT state FROM execution_intents WHERE profile='demo'"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            self.assertEqual(state, "reconciled")
+
+            next_request = dict(request, cycle_id="2026-08-04T09:45",
+                                symbol="NEXT-USDT-SWAP")
+            next_intent = execution_intent.reserve(
+                ledger_path, profile="demo", cycle_id=next_request["cycle_id"],
+                symbol=next_request["symbol"], side="long",
+                request=next_request, now_ts="2026-08-04 09:45:00")
+            self.assertEqual(next_intent["status"], "reserved")
 
     def test_t2_without_intent_is_reported_and_never_applied(self):
         with tempfile.TemporaryDirectory() as tmp:

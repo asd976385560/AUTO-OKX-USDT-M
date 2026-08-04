@@ -127,6 +127,16 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out the validated release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
       - name: Recheck immutable inputs and create GitHub Release
         shell: pwsh
         env:
@@ -139,6 +149,14 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
+
+          python scripts/check_release_version.py `
+            --tag $env:RELEASE_TAG `
+            --notes-out .release-notes.md `
+            --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release contract changed after validation."
+          }
 
           $remoteTagRef = @(
             gh api "repos/$env:GH_REPO/git/ref/tags/$env:RELEASE_TAG" `
@@ -166,12 +184,32 @@ jobs:
             throw "The release tag moved after validation."
           }
 
+          $mainCommitOutput = @(
+            gh api "repos/$env:GH_REPO/commits/main" --jq ".sha"
+          )
+          if ($LASTEXITCODE -ne 0 -or $mainCommitOutput.Count -ne 1) {
+            throw "Could not resolve current main immediately before publication."
+          }
+          $mainCommit = $mainCommitOutput[0].Trim()
+          $compareStatusOutput = @(
+            gh api `
+              "repos/$env:GH_REPO/compare/$($env:EXPECTED_COMMIT)...$mainCommit" `
+              --jq ".status"
+          )
+          if ($LASTEXITCODE -ne 0 -or $compareStatusOutput.Count -ne 1) {
+            throw "Could not recheck release commit ancestry against current main."
+          }
+          $compareStatus = $compareStatusOutput[0].Trim()
+          if ($compareStatus -notin @("ahead", "identical")) {
+            throw "Release commit is no longer reachable from current main."
+          }
+
           $releaseArgs = @(
             "release", "create", $env:RELEASE_TAG,
             "--repo", $env:GH_REPO,
             "--verify-tag",
             "--title", $env:RELEASE_TAG,
-            "--generate-notes",
+            "--notes-file", ".release-notes.md",
             "--fail-on-no-commits"
           )
           if ($env:IS_PRERELEASE -ceq "true") {

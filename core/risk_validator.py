@@ -43,6 +43,13 @@ AVAILABLE_MARGIN_USE_PCT = 0.98
 _EPS = 1e-9
 
 
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # lot_sz 步进取整
 # ---------------------------------------------------------------------------
@@ -234,18 +241,32 @@ def validate(
     }
 
     # ── 数据完备性（instrument 未知/缺 = 下架或不存在；demo 也拒，因物理无法定仓）──
-    if mark_px is None or mark_px <= 0:
+    if not _is_finite_number(mark_px) or float(mark_px) <= 0:
         return _reject("bad_mark_px", f"mark_px 非法: {mark_px}")
-    if not is_demo and (equity is None or equity <= 0):
+    mark_px = float(mark_px)
+    if not is_demo and (not _is_finite_number(equity) or float(equity) <= 0):
         return _reject("bad_equity", f"equity 非法: {equity}")
-    if ct_val is None or ct_val <= 0 or lot_sz is None or lot_sz <= 0:
+    if (not _is_finite_number(ct_val) or float(ct_val) <= 0
+            or not _is_finite_number(lot_sz) or float(lot_sz) <= 0):
         return _reject("instrument_unknown",
                        f"{symbol} ctVal/lotSz 缺失（下架/不存在/未缓存）: "
                        f"ctVal={ct_val} lotSz={lot_sz}")
+    ct_val = float(ct_val)
+    lot_sz = float(lot_sz)
+    if not is_demo:
+        equity = float(equity)
     if side not in ("long", "short"):
         return _reject("bad_side", f"side 非法: {side!r}")
-    if intended_sz is None or intended_sz <= 0:
+    if not _is_finite_number(intended_sz) or float(intended_sz) <= 0:
         return _reject("bad_sz", f"intended_sz 非法: {intended_sz}")
+    intended_sz = float(intended_sz)
+    math_box.update({
+        "intended_sz": intended_sz,
+        "mark_px": mark_px,
+        "ct_val": ct_val,
+        "lot_sz": lot_sz,
+        "equity": equity,
+    })
     try:
         lev = float(lev)
     except (TypeError, ValueError):
@@ -598,6 +619,17 @@ def position_budget(mark_px: float, ct_val: float, lot_sz: float,
     本次方向 ``exchange_max_size``，仅按 lotSz/minSz 归一。最终以 :func:`validate`
     为准。
     """
+    try:
+        mark_px = float(mark_px)
+        ct_val = float(ct_val)
+        lot_sz = float(lot_sz)
+        lev = float(lev)
+    except (TypeError, ValueError, OverflowError):
+        return {"ok": False}
+    if (not all(math.isfinite(value) for value in (mark_px, ct_val, lot_sz, lev))
+            or min(mark_px, ct_val, lot_sz, lev) <= 0):
+        return {"ok": False}
+
     is_demo = (
         str(profile).lower() == "demo" or "demo" in str(profile).lower())
     common = [mark_px, ct_val, lot_sz, lev]

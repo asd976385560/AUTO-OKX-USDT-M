@@ -98,7 +98,8 @@ SELECT ts,profile,totalEq,availBal,upl FROM account_snapshots WHERE profile='dem
 `validate_receipt_context(receipt_context, cycle_id=..., required=True)`；有错误立即停止。
 禁把 JSON 的 `true/false/null` 直接粘进 Python dict，也禁成交后再拼卡。executor
 会在任何 OKX 读取/下单前先检查同 profile 全部执行意图：任一非
-`completed/failed_clean` 状态即全局阻断并记录 blocker；无阻塞才持久化本轮意图。
+`completed/failed_clean/reconciled` 状态即全局阻断并记录 blocker；其中
+`reconciled` 只阻断原逻辑单重下，不冻结其它 symbol；无阻塞才持久化本轮意图。
 相同 cycle/symbol/side 重跑返回原回执 `idempotent_replay=true`；未决/冲突返回
 `execution_intent_profile_blocked` 或 `execution_intent_blocked`，禁止再次下单。
 
