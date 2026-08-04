@@ -6,9 +6,9 @@ type: rollback agent
 trigger: 仅主人明确要求的人工回滚；正常新轮由 dispatcher 直接起 unified live
 session: 每 cycle 独立 session（stage=analyst + cycle_id 槽位），跨轮不保留
 config-source: skill.md §3/§6/§7/§8.5/§12（事实源；本文件为派生角色配置）
-last-updated: 2026-07-29
-updated-by: Codex
-change-summary: 对齐writer提交时间、动作方向强校验与Windows UTF-8文件契约。
+last-updated: 2026-07-31
+updated-by: Maintainer
+change-summary: wait 的 side 恢复为可选方向（hold 仍恒 null）：wait 方向是错失机会对照组的唯一输入，2026-07-29 误收紧为 null 致 missed_opportunities 静默断供两天。
 -->
 
 # analyst — OKX 人工回滚分析师 agent（V2.0）
@@ -27,8 +27,8 @@ change-summary: 对齐writer提交时间、动作方向强校验与Windows UTF-8
 |---|---|---|
 | **本 agent（analyst）** | gate 校验 → 读 market/regime/news → 写 analysis.db | **不**下单、**不**写 *_trades.db、**不**推 QQ、**不**改采集脚本/registry、**不**起下一棒 |
 | unified live-trader | 正常新轮完成 gate→分析→实盘；人工回滚轮读取本角色写出的 analysis 后走 full live | 下单必经风控闸；不推送 |
-| demo-trader | 同上（与 live 同闸同硬上限），写 demo_trades.db | 同上 |
-| push（纯脚本管道，非 agent） | 整合分析+双盘 → 模板 → 统一 QQ target | 不采集、不分析、不下单 |
+| demo-trader | 同上（与 live 共享账仓/幂等/SL/成交确认安全路径；仓位只按 OKX Demo 实时 max-size，不套 Live 组合 IMR 闸或人工百分比公式），写 demo_trades.db | 同上 |
+| push（纯脚本管道，非 agent） | 整合分析+双盘业务报告 → 模板 → 不带 `--alert` 的 `qq_push.py`（`OKX_QQ_TARGET`） | 不采集、不分析、不下单 |
 | news-scout | 经 LLM 取 X+无 API 新闻 → news_writer 落 news.db | **不判断**、不阻断主链（正常轮情绪/影响判断归 unified live；回滚轮才归本 analyst） |
 
 - 起 trader / push 一律由 `core/dispatcher.py` 按业务产物就绪条件确定性派发（`ledger.db.stage_dispatch` 仅作闩锁幂等）——**本 agent 写完 analysis.db 即 complete，绝不自己 exec trigger_agent 起 trader/push**（避免与 dispatcher 双起致重复下单），不自起下一棒。
@@ -72,7 +72,7 @@ gate 结果处置：
 
 - **采集任务正常性**：**直接用 gate 命令输出的 `per_source`**（每源 status/age 已在里面）——出现 `error`/`timeout`/`degraded` 或超龄 → 标 `missing_sources` / `market_summary.risk_warnings`（不 abort）。**禁再写 `_precheck_*.py` 去查 collection_runs**（gate 输出=同一数据源，07-16 实测自写预检最坏一轮 12K 字符+4 读 schema.sql 全是列名瞎猜返工）。
 - **账户状态**（只读 `account.db.system_state`，**禁裸键 GROUP BY**；现仓口径以 OKX API 为准，本 agent 不据 `position_snapshots` 算仓）：live/demo 权益+持仓数+健康+快照时间，任一缺/快照 >15min 陈旧/健康异常 → 标 `risk_warnings` + `missing_sources`（**不 abort**——账户陈旧不阻断市场分析）。
-- 查最新行用 `rowid DESC` / `datetime(ts)`，**禁 `MAX(ts)`**（TEXT 词典序坑：`"JobB-…"` 以 J > 2 误判最新）。
+- 查最新行默认用 **ts 词典序**（`MAX(ts)` / `ORDER BY ts DESC`），前提是该列纯时间戳且格式统一（`ts_audit` 守 MIXED=0；历史 bug 是混进 `"JobB-…"` 这类非时间戳串，`J > 2` 误判最新）。**`rowid DESC` 仅限纯 append 表**——本项目主要表均 `INSERT OR REPLACE`，补写旧槽会改 rowid（红线 #12）。
 
 ## 3. 输入（一律 `file:xxx.db?mode=ro` 只读打开）
 
@@ -95,7 +95,9 @@ pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/s
 ```
 
 `decision_briefing.py` 五库汇总简报，已含历史盈利、亏损和错失机会预览。拟执行标的另调
-`find_similar_experience.py` 取得 `matched_wins/matched_losses/missed_opportunities`。
+`find_similar_experience.py` 的 `matched_wins/matched_losses/summary` 只代表同标的直接经验；
+`cross_symbol_wins/cross_symbol_losses/cross_summary` 是跨标的类比，必须标为 analogue，
+禁止把跨标的胜率冒充本标的胜率；另取 `missed_opportunities`。
 
 - **wrapper 中文输出禁接管道/捕获**（exec 是 cp936 pwsh：`| tail` / `| head` / `| Select-Object` / `2>&1 |` 会把中文 GBK 坏码成 `鍐崇瓥…`）。简报才 ~3KB 无需截断；需复读/截断 → 加 `--out-file <PROJECT_ROOT>/tmp/briefing_analyst.md` 后 `read` 该文件（仅此三参：`--db-root`/`--top`/`--out-file`）。
 - `find_similar_experience.py` 一律使用 `--compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`，再用 `read` 读取该 UTF-8 JSON；禁止接 `head`/`tail`/`Select-Object`、shell 重定向或临时内联解析器。stdout 只会返回短写入回执。
@@ -127,11 +129,13 @@ pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/s
 - 一闻多币从 `news_events_index` 取，写进 `symbols[]`。
 - analyst 读原文 + X 帖 + `coin_sentiment` 统计**自己判** severity/impact（采集器只确定性喂结构化输入，不替 LLM 判断）。
 
-**`analysis_signals`**（每轮 0..n 行，PK=`cycle_id+symbol`）：`action`（open_long|open_short|hold|close|wait）/ `side` / `entry_hint` / `stop_hint` / `tp_hint` / `reasoning` / `decision_card` / `raw`。`dim1..5/total/confidence` 为只读兼容列，新记录全部填 null。
+**`analysis_signals`**（每轮 0..n 行，PK=`cycle_id+symbol`）：`action`（open_long|open_short|hold|close|wait）/ `side` / `entry_hint` / `stop_hint` / `tp_hint` / `reasoning` / `decision_card` / `raw`。`dim1..5/total/confidence` 为只读兼容列，新记录全部填 null。三个价格 hint 只允许正有限 JSON 数值或 `null`，叙述文字放 `reasoning`；`hold|wait` 时三者必须全为 `null`。hint 是候选分析值，不是现仓 algo 保护事实，禁止凭记忆写“当前 SL”。
 
 > `decision_card` 必含方向证据、反对证据、执行条件、失效点、风险收益、组合影响六项，并附 `historical_experience`、`agent_judgement`、`reference_overrides`。
 > `action=open_long|open_short|hold|close|wait` 是**结构化标签**（有证据就标 open_*，禁因「不做交易判断」红线而回避 open）；trader 自主决定是否执行，analyst 不替其下单。
-> action/side 是强契约：`open_long→long`、`open_short→short`、`hold|wait→null`、`close→long|short`；未知动作或组合不一致由 writer 拒写，禁止让下游猜测。
+> action/side 是强契约：`open_long→long`、`open_short→short`、`hold→null`、`close→long|short`；未知动作或组合不一致由 writer 拒写，禁止让下游猜测。
+> **`wait` 的 side 是可选方向**：能判出「本可做多/做空但本轮不入场」就填 `long|short`，纯观望无方向才留 `null`。`hold` 是持有既有仓位、无方向可言，恒为 `null`。
+> ⚠️ `wait` 的方向是**错失机会对照组的唯一输入**（`scripts/missed_opps_writer.py` 只取带方向的 wait，回填 4h 后验走幅到 `lessons.db.missed_opportunities`，再经 decision_briefing / find_similar_experience 回到决策卡）。不填 = 压制策略失去机会成本对照、只能自证。2026-07-29 该字段被误收紧为 null，对照组静默断供两天。
 > `signals=[]` 仅用于 gate 失败或确无可评价标的；正常轮列出的每行必须有完整决策卡。`symbol` 一律 `<BASE>-USDT-SWAP` 全称。
 
 > 🔴 **Agent 自主裁决**：
@@ -195,14 +199,14 @@ pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/c
 | 缺一个宏观指标（USD_BROAD/VIX/SPX/DXY_CALC_ECB/Fear&Greed/ETF 之一；真ICE官方报价默认缺） | `missing_sources` 标，用其余市场事实补充；由 Agent 自主评估影响。ETF provisional只作待核证据，不能冒充cross_checked硬值 |
 | 新闻管道枯竭（news 0 items） | 标 `missing_sources` + `risk_warnings`，照常出报告（OKX news 死不阻断；新闻边缘多源 + scout 兜底） |
 | 账户快照陈旧 / 健康异常 | 标 `risk_warnings` + `missing_sources`，不 abort |
-| analyst_writer 失败（exit≠0） | 重写一次；仍败 → 写 `status=error` + failureAlert 经统一 QQ target 告警（P0） |
-| LLM 限流 / transport 异常 | card 自然失败，failureAlert 经统一 QQ target 告警，**不**降级（宁可丢轮不瞎分析） |
+| analyst_writer 失败（exit≠0） | 重写一次；仍败 → 写 `status=error` + failureAlert 经 `qq_push.py --alert` 告警（P0，目标仅取 `OKX_QQ_ALERT_TARGET`） |
+| LLM 限流 / transport 异常 | card 自然失败，failureAlert 经 `qq_push.py --alert` 告警（目标仅取 `OKX_QQ_ALERT_TARGET`），**不**降级（宁可丢轮不瞎分析） |
 
 ## 7. 红线（本文件及子 prompt 全检，自身不得违反）
 
 | 红线 | 处置 |
 |---|---|
-| **零模型名** | 文档/prompt 禁出现任何具体模型名、厂商名或路由标签；模型分配只在 `openclaw config agents.list.*.model` |
+| **零模型名** | 文档/prompt 禁出现任何具体模型或厂商名；模型分配只在 `openclaw config agents.list.*.model` |
 | **时间全 UTC+8 字符串** | cycle_id='YYYY-MM-DDTHH:MM'，ts='YYYY-MM-DD HH:MM:SS'；禁混入裸 UTC-Z |
 | **UTF-8 无 BOM** | 中文禁走 `sqlite3` CLI / `python -c`（GBK 坏码）——一律脚本 + wrapper |
 | **禁 pwsh 内联多行 Python/SQL** | 禁在 PowerShell 直接敲多行 Python / 裸列名 / SQL 片段 / `key=value`（pwsh 把裸 token 当 cmdlet → "term not recognized"，本 agent 历史最大噪声源）：Python 一律写 `<PROJECT_ROOT>/tmp/*.py` 经 `run_okx_python.ps1` 跑；SQL 作**带引号单参数**传脚本 |

@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-07-29
+last-updated: 2026-08-04
 updated-by: Codex
-change-summary: Sync the latest sanitized execution, reconciliation, macro, report, lifecycle and regression contracts.
+change-summary: Sync portfolio risk, Demo sizing, profile leases, ledger autoheal, alert routing and point-in-time reporting contracts.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Sync the latest sanitized execution, reconciliation, macro, repo
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用同一套硬风控、执行意图幂等、账仓一致性和止损要求，只切换执行环境。
+V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用执行意图幂等、账仓一致性、成交确认和止损安全路径，但容量按 profile 分治：Live 使用组合 IMR，Demo 使用实时方向性 max-size。
 
 > [!WARNING]
 > 本项目包含真实交易执行能力。首次部署必须保持 `OKX_EXECUTOR_DRYRUN=1` 和 `OKX_TRIGGER_DRYRUN=1`，并在隔离数据库中完成验证。本项目不构成投资建议，也不保证盈利。
@@ -62,15 +62,14 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 
 ## 本次同步
 
-2026-07-29 的公开同步带出以下生产语义，同时保留公开版的动态路径和空凭证默认值：
+2026-08-04 的公开同步在 7 月 29 日基线上继续带出以下生产语义，同时保留动态路径、空凭证和显式写入授权：
 
-- `execution_intents` 全局未决意图闸，以及已完成同参请求的幂等重放；
-- 下单前 OKX 全量现仓与本 profile 交易账本的全集合一致性校验；
-- 只接受权威端点的成交数量、均价、成交时间和来源，禁止用仓位变化伪造成交；
-- `stage_runner.py` 在子进程退出后核验真实业务产物，避免把 `rc=0` 误当业务完成；
-- Alternative.me、ECB 复算 DXY 和 ETF 双源确认的公开宏观管道；
-- daily maintenance ready 清单、reviewer 哈希校验、有效 fill 与风控拒绝分栏统计；
-- 公开脚本生命周期清单和分层隔离回归。
+- Live OPEN/ADD 预计成交后组合 `account.imr/totalEq` 不得超过 66.6%，超限整笔拒绝；Demo 按目标杠杆后的方向性 `account max-size` 定仓；
+- `stage_profile_leases` 防止同一 profile 跨 cycle 重叠，runner 还会核验真实 trade 终态；
+- DXY observation-date 去重与 stale 语义、交易时点 regime、固定 08:00 报告窗口和推送持仓投影；
+- GHOST-EXACT / UNRECORDED 精确证据链检查；Live autoheal 永久只读，Demo close/open 写入分别使用两级显式 opt-in；Demo UNRECORDED 还必须确认 intent、ordId 与现有交易所止损，且永不下单或重放订单；
+- 业务推送与告警目标分离，分别只从 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 读取；
+- 扩展后的隔离回归、生命周期清单及带备份门禁的 profile-lease 迁移。
 
 ## 架构
 
@@ -83,7 +82,7 @@ OpenClaw cron
                                       v
                               core/dispatcher.py
                                       │
-                    stage_dispatch 阶段幂等闩锁
+              stage_dispatch 闩锁 + profile lease
                                       │
                  ┌────────────────────┴───────────────────┐
                  v                                        v
@@ -223,8 +222,24 @@ openclaw cron create '*/2 * * * *' `
 | `MX_APIKEY` | 妙想数据源凭证 |
 | `OKX_PROXY_URL` | 可选代理 URL |
 | `OKX_QQ_TARGET` | QQ 目标；无默认值 |
+| `OKX_QQ_ALERT_TARGET` | 告警 QQ 目标；无默认值 |
 | `OKX_EXECUTOR_DRYRUN` | `1` 时阻止交易变更命令 |
 | `OKX_TRIGGER_DRYRUN` | `1` 时阻止 Agent/push 起棒 |
+| `OKX_LEDGER_AUTOHEAL_APPLY` | 仅 Demo：`1` 时允许精确 GHOST close 补账；Live 永久只读 |
+| `OKX_LEDGER_AUTOHEAL_UNRECORDED` | 仅 Demo：与上一开关同时为 `1`，且 execution_intent、ordId 与同侧足量保护止损均确认时才允许精确 UNRECORDED open 补账；任一证据缺失永远只报告 |
+
+`OKX_DB_ROOT` 可用于确定性脚本、writer、push 与隔离 dry-run。真实 Agent turn
+在 OpenClaw Gateway 服务端执行，本地子进程环境不能证明会传入远端工具进程；因此公开版对
+非默认 DB root 的真实 Agent 起棒会 fail-closed，只允许在 `OKX_TRIGGER_DRYRUN=1` 下验证。
+完成隔离验收后，真实 Agent 部署须使用规范 `<PROJECT_ROOT>/db`，或由维护者另行实现并验证
+Gateway 级 DB-root 注入后再改此硬闸。
+
+升级已有 `ledger.db` 时，dispatcher 不会隐式创建新增租约表。先对隔离副本 dry-run，确认后再显式指定备份目录：
+
+```powershell
+python scripts/apply_stage_profile_lease_schema.py --db-root <ISOLATED_DB_ROOT>
+python scripts/apply_stage_profile_lease_schema.py --db-root <AUTHORIZED_DB_ROOT> --apply --backup-dir <VERIFIED_BACKUP_DIR>
+```
 
 不访问交易所、不推送、不写运行数据库的基础检查：
 
@@ -238,19 +253,20 @@ python scripts/check_doc_versions.py --static-only
 python scripts/update_star_stats.py --self-test
 ```
 
-涉及数据库的工具必须传入隔离目录。涉及 Agent、QQ、OpenClaw 或 OKX 的入口只允许 dry-run，或在缺少外部环境时明确跳过。
+涉及数据库的工具必须传入隔离目录。涉及 Agent、QQ、OpenClaw 或 OKX 的入口只允许 dry-run，或在缺少外部环境时明确跳过；不要把隔离 DB root 的 dry-run 直接改成真实 Agent 起棒。
 
 ## 测试边界
 
 `tests/` 是最小、分层、无生产副作用的回归集，覆盖执行意图、账仓一致性、
-成交和止损契约、writer/dispatcher、报告、公开宏观和运行修复。它不连接生产数据库，
+成交和止损契约、writer/dispatcher/profile lease、报告、公开宏观和受控账本修复。它不连接生产数据库，
 不发送消息，也不代表完整 money-path、真实交易所或 OpenClaw 端到端验收已恢复。
 
 ## 风控摘要
 
 权威值以 `core/risk_validator.py` 为准：
 
-- 单笔保证金最多为权益的 20%（`MAX_MARGIN_PCT`）；
+- Live OPEN/ADD 预计成交后组合 IMR 比例不超过 66.6%（`MAX_PORTFOLIO_IMR_RATIO`），超限整笔拒绝；
+- Demo OPEN 只按交易所实时方向性 `account max-size` 和合约 `minSz/lotSz` 定仓，不回退 Live 余额公式；
 - 最多使用当前可用 USDT 保证金的 98%（`AVAILABLE_MARGIN_USE_PCT`）；
 - 杠杆不超过 10x（`MAX_LEVERAGE`）；
 - 单笔名义价值不低于权益的 1%（`MIN_NOTIONAL_PCT`）；
@@ -259,6 +275,12 @@ python scripts/update_star_stats.py --self-test
 - OKX 现仓与本地交易账本不一致时，在读取 mark 或下单前 fail-closed；
 - 独立止损必须回读本次 `algoId`，confirmed fill 必须来自权威端点；
 - 合约规格、余额、可用保证金或成交确认缺失时 fail-safe 拒绝。
+
+Live 账本 autoheal 永久只读；即使直接向 API/CLI 传 `--apply` 或设置环境开关，也只会
+完成只读分类并以非零结构化结果指向受控人工流程。Live 修复必须唯一命中一个 `ordId`，
+写前创建并验证 SQLite 备份，逐笔 apply，随后重拉交易所现仓并复跑 reconciliation 与
+ledger invariants。两个环境开关仅授权 Demo；Demo UNRECORDED open 仍需精确 fills、订单
+归属、同侧足量保护止损、单轮上限和 runner 互斥检查。所有路径只修账，不会下单。
 
 这些限制没有因公开发布、文档国际化或 Stars 统计而修改。
 

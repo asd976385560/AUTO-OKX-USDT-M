@@ -126,6 +126,40 @@ class ReportRevisionTests(unittest.TestCase):
 
 
 class DailyArtifactTests(unittest.TestCase):
+    def test_account_bill_window_is_half_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "account.db"
+            con = sqlite3.connect(db)
+            try:
+                con.execute(
+                    "CREATE TABLE account_bills("
+                    "profile TEXT,type TEXT,ts TEXT,"
+                    "bal_change REAL,fee REAL,pnl REAL)")
+                con.executemany(
+                    "INSERT INTO account_bills VALUES(?,?,?,?,?,?)",
+                    [
+                        ("live", "2", "2026-07-30 08:04:59", 100, 0, 0),
+                        ("live", "2", "2026-07-30 08:05:00", 1, 0, 1),
+                        ("live", "8", "2026-07-31 08:04:59", 2, 0, 2),
+                        ("live", "2", "2026-07-31 08:05:00", 100, 0, 0),
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            result = daily_report_writer._account_bill_net_for_window(
+                db,
+                "live",
+                "2026-07-30 08:05:00",
+                "2026-07-31 08:05:00",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["rows"], 2)
+        self.assertEqual(result["net"], 3.0)
+        self.assertTrue(result["period_end_exclusive"])
+
     def test_daily_markdown_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -172,6 +206,13 @@ class DailyArtifactTests(unittest.TestCase):
                 "report_revision: 1",
                 path.read_text(encoding="utf-8"),
             )
+            content = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "统计窗口: [2026-07-27 08:00:00, "
+                "2026-07-28 08:00:00)",
+                content,
+            )
+            self.assertIn("本复盘周期成交开仓", content)
             self.assertEqual(list(out_dir.glob("*.tmp")), [])
 
     def test_commit_precedes_markdown_and_file_failure_keeps_db_fact(self):
@@ -303,6 +344,14 @@ class WeeklyArtifactTests(unittest.TestCase):
                 (out_dir / "weekly-2026-07-27.md").exists())
 
 
+class WeeklyMigrationBoundaryTests(unittest.TestCase):
+    def test_one_off_weekly_migration_is_not_published(self):
+        script = ROOT / "scripts" / "migrate_weekly_win_rate_pct.py"
+        self.assertFalse(script.exists())
+        gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("/scripts/migrate_weekly_win_rate_pct.py", gitignore)
+
+
 class DailyValidatorTests(unittest.TestCase):
     def test_validator_checks_report_time_facts_and_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,6 +431,7 @@ class DailyValidatorTests(unittest.TestCase):
             report.write_text(
                 """# 📊 小灵日报 2026-07-28
 > ts: 2026-07-28 08:05:00
+> 统计窗口: [2026-07-27 08:00:00, 2026-07-28 08:00:00)，UTC+8（固定24小时）
 > **报告状态：最终报告｜live 对账已清零**
 > report_revision: 1 | revision_kind: initial | resend_review_required: false | auto_resend: false
 ## 💰 资产
@@ -392,13 +442,13 @@ class DailyValidatorTests(unittest.TestCase):
 ### 🟡 模拟盘
 ## 🎯 交易
 ### 🟢 实盘
-- 今日成交开仓: 1 笔
-- 今日成交平仓: 1 笔
+- 本复盘周期成交开仓: 1 笔
+- 本复盘周期成交平仓: 1 笔
 - 开仓尝试被风控拒绝: 0 笔
 - 净 PnL: $1.00
 ### 🟡 模拟盘
-- 今日成交开仓: 0 笔
-- 今日成交平仓: 0 笔
+- 本复盘周期成交开仓: 0 笔
+- 本复盘周期成交平仓: 0 笔
 - 开仓尝试被风控拒绝: 1 笔
 - 净 PnL: $0.00
 ## ⚠️ 异常 / 🛠 自修
@@ -417,6 +467,7 @@ ok
             self.assertTrue(result["ok"], result["errors"])
             self.assertIn("risk_reject", result["checks"])
             self.assertIn("revision", result["checks"])
+            self.assertIn("daily_window_24h", result["checks"])
 
 
 class PushMacroSummaryTests(unittest.TestCase):
@@ -427,6 +478,21 @@ class PushMacroSummaryTests(unittest.TestCase):
         })
         self.assertEqual(value, "USD_BROAD 120.71 ELEVATED")
         self.assertNotIn(" -", value)
+
+    def test_analysis_dxy_broad_aliases_are_supported(self):
+        value = build_push_payload._usd_broad_summary({
+            "dxy_broad_value": 120.71,
+            "dxy_broad_zone": "ELEVATED",
+            "dxy_broad_d1": -0.08,
+        })
+        self.assertEqual(value, "USD_BROAD 120.71 ELEVATED")
+
+    def test_error_decision_is_never_rendered_as_hold(self):
+        self.assertEqual(build_push_payload._map_decision("error"), "ERROR")
+        self.assertEqual(
+            build_push_payload._map_decision("degraded"), "DEGRADED")
+        self.assertEqual(
+            build_push_payload._map_decision("unexpected"), "UNKNOWN")
 
 
 if __name__ == "__main__":

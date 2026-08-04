@@ -36,6 +36,12 @@ from typing import Any
 
 CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
+# 日报事实窗锚点（CST）。cron 08:05 触发，窗口闭合在 08:00，留 5min 让数据落定。
+# 固定锚点而非跟随报告 ts：报告 ts 由 agent 写入且历史上会漂，跟随会造成
+# 相邻日报缺口/重叠。改锚点需同步 validate_daily_report._expected_daily_window
+# （该处刻意保持独立实现，勿改为共享此常量）。
+DAILY_ANCHOR_HOUR = 8
+DAILY_ANCHOR_MINUTE = 0
 PROFILE_DB = {
     "live": Path(_project_path('db', 'live_trades.db')),
     "demo": Path(_project_path('db', 'demo_trades.db')),
@@ -80,9 +86,43 @@ def fmt_ts(value: str | datetime) -> str:
 
 
 def daily_window(as_of_ts: str | datetime) -> tuple[str, str]:
-    end = parse_cst(as_of_ts)
-    start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    """Return the fixed 24h reviewer window ``[前一日 08:00, 当日 08:00)``.
+
+    The reviewer runs at 08:05 CST.  Anchoring the start at same-day midnight
+    left every day's 08:05-24:00 trades outside all daily reports.  Anchoring
+    on ``as_of_ts`` itself fixed the coverage hole but re-introduced drift:
+    the report ts is agent-written and historically wandered (08:00 / 08:06 /
+    08:12 / 08:36 ...), so one minute of jitter shifted the window and made
+    consecutive reports gap or overlap.  Pinning both edges to 08:00 keeps the
+    window deterministic and exactly tiling regardless of trigger jitter, and
+    closes it 5 minutes before the run so the data has settled.
+    """
+    ref = parse_cst(as_of_ts)
+    end = ref.replace(
+        hour=DAILY_ANCHOR_HOUR, minute=DAILY_ANCHOR_MINUTE,
+        second=0, microsecond=0)
+    if ref < end:
+        # Triggered before the anchor (manual re-run / early fire): report the
+        # last complete window rather than a future-ending one.
+        end -= timedelta(days=1)
+    start = end - timedelta(days=1)
     return start.strftime(TS_FMT), end.strftime(TS_FMT)
+
+
+def weekly_window(week_start_ts: str | datetime) -> tuple[str, str]:
+    """Return ``[上周一 08:00, 本周一 08:00)`` for the given 本周一 report key.
+
+    Anchored on the same 08:00 boundary as :func:`daily_window` so the seven
+    daily windows of a week tile this interval exactly — a calendar-midnight
+    weekly window would sit 8h out of phase and make the dailies unable to
+    reconcile against the weekly.  ``week_start_ts`` stays the 本周一 00:00:00
+    report key; only the fact window is anchored.
+    """
+    anchor = parse_cst(week_start_ts).replace(
+        hour=DAILY_ANCHOR_HOUR, minute=DAILY_ANCHOR_MINUTE,
+        second=0, microsecond=0)
+    start = anchor - timedelta(days=7)
+    return start.strftime(TS_FMT), anchor.strftime(TS_FMT)
 
 
 def rolling_window(
@@ -407,13 +447,16 @@ def _cli() -> int:
             parser.error("--window explicit requires --start-ts")
         start, end = fmt_ts(args.start_ts), as_of
 
+    # Daily reviewer windows are adjacent half-open intervals.  The end must be
+    # exclusive so an exact 08:05:00 fill cannot be counted in two reports.
+    end_exclusive = bool(args.end_exclusive or args.window == "daily")
     root = Path(args.db_root)
     profiles = ("live", "demo") if args.profile == "both" else (args.profile,)
     payload = {
         "as_of_ts": as_of,
         "period_start_ts": start,
         "period_end_ts": end,
-        "period_end_exclusive": bool(args.end_exclusive),
+        "period_end_exclusive": end_exclusive,
         "profiles": {},
     }
     for profile in profiles:
@@ -423,7 +466,7 @@ def _cli() -> int:
             root / "ledger.db",
             start,
             end,
-            end_exclusive=args.end_exclusive,
+            end_exclusive=end_exclusive,
             include_avg_hold=args.include_avg_hold,
         )
         if not args.include_rows:

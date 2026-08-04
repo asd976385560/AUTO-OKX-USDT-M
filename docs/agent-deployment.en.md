@@ -139,6 +139,12 @@ python scripts/check_trader_docs_sync.py
 
 Confirm that `$env:OKX_DB_ROOT` does not point to production before continuing.
 
+The isolated root below is for dry-run validation only. OpenClaw Agent turns execute in the
+Gateway service, and local cron environment inheritance does not prove that remote tool
+processes received the same root. The public trigger rejects a non-default root combined with
+a real Agent launch. After validation, use canonical `<PROJECT_ROOT>/db` for real Agents unless
+Gateway-level root injection has been implemented and verified separately.
+
 ## 8. Create dry-run command cron jobs
 
 Replace every placeholder one at a time. `--no-dispatch` is retained by the source only as a no-op compatibility option, so these examples do not depend on it. Isolation comes from `--dry-collect`, `OKX_TRIGGER_DRYRUN=1`, and a separate database root.

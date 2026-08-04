@@ -42,6 +42,25 @@ from datetime import datetime, timezone, timedelta
 from _db_ro import connect_ro
 
 CST = timezone(timedelta(hours=8))
+
+# 复盘事实窗注入点。reviewer 传 --as-of 时置为 (start_ts, end_ts) CST 字符串，
+# lost_cycles / collection_failures 改用该固定窗，与日报成交窗同相位、可复现重跑；
+# 不传则保持“从此刻回看 24h”的即时巡检语义（手工排障用）。
+# 各 check 的签名是固定的四参数，故用模块级注入而非逐个改签名。
+REVIEW_WINDOW: tuple[str, str] | None = None
+
+
+def _review_window_or_none() -> tuple[str, str] | None:
+    return REVIEW_WINDOW
+
+
+def _window_label() -> str:
+    """报文里的窗口标注，避免固定写死“近24h”而与实际取数窗不符。"""
+    if REVIEW_WINDOW:
+        return f"窗[{REVIEW_WINDOW[0]}, {REVIEW_WINDOW[1]})"
+    return "近24h"
+
+
 _REGISTRY_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "collectors", "sources"
 )
@@ -300,14 +319,17 @@ def check_analysis_macro(db_root, stale_min, hh01_only, results):
             macro = {}
         dxy = _macro_pick(
             macro,
+            "dxy_broad_value", "dxy_broad_usd_trade_weighted",
             "usd_broad_dtwexbgs", "usd_broad", "dxy_broad_dtwbxgs",
             "dxy", "dxy_value", "live_dxy",
         )
         dxy_zone = _macro_pick(
             macro,
-            "dxy_zone", "usd_broad_zone", "usd_broad_zone_label",
+            "dxy_broad_zone", "dxy_zone",
+            "usd_broad_zone", "usd_broad_zone_label",
         )
-        dxy_d1 = _macro_pick(macro, "usd_broad_d1", "dxy_d1")
+        dxy_d1 = _macro_pick(
+            macro, "dxy_broad_d1", "usd_broad_d1", "dxy_d1")
         if not regime or str(regime).strip() in ("", "null", "None"):
             regime = _macro_pick(macro, "regime", "regime_label")
         age = fmt_age_minutes(parse_utc_iso(ts_raw))
@@ -691,7 +713,7 @@ def check_degraded(db_root, stale_min, hh01_only, results):
 def check_cycle_fresh(db_root, stale_min, hh01_only, results):
     """P3-8: V2.0 交易账本新鲜度——读 live_trades.db.trade_cycles 最新槽位 ts。
     （account.db.cycle_runs.cycle_count 不再推进——V2.0 trader
-    只写 trade_cycles，不旁路调用其他 writer；权威账本＝trade_cycles 槽位 cycle_id。
+    只写 trade_cycles 不调 phase5_writer；权威账本＝trade_cycles 槽位 cycle_id。
     历史补账会 INSERT OR REPLACE 旧槽位并改变 rowid，故不能按 rowid 判断最新周期。）"""
     ltdb = os.path.join(db_root, "live_trades.db")
     con = safe_connect(ltdb)
@@ -764,7 +786,7 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
     2026-07-23 起 unified live）；
     form②：fast 采集已完成、槽位已过 30 分钟但 stage_dispatch 从未出现 analyst/live。
     两者都会令该 cycle 分析+交易+推送全丢。本检测供 reviewer/巡检
-    FAIL 告警（推统一 QQ target）；**不自动 release/refire**（禁 watchdog 红线；V2.0 无任何
+    FAIL 告警（经 `qq_push.py --alert` 推送至 `OKX_QQ_ALERT_TARGET`）；**不自动 release/refire**（禁 watchdog 红线；V2.0 无任何
     自动兜底派发，过窗槽 dispatcher 仅打 "collection window expired" alert-only WARN，
     永不补派）。dispatched_at 是 UTC+8 空格格式；datetime('now','+8 hours')=CST now。
     回看窗 2026-07-06 由 6h 放宽到 24h：13:30 型静默丢槽在晚间巡检时已出 6h 窗而漏检；
@@ -777,24 +799,48 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
         results.append({"name": "lost_cycles", "status": "WARN", "msg": f"ledger.db 不可读: {con}"})
         return
     LOST_MIN = 12  # 首段 analysis 正常数分钟产出；派发 >12min 仍无产出 = 丢轮
+    window = _review_window_or_none()
     try:
-        rows = con.execute(
-            "SELECT cycle_id, MIN(dispatched_at) dispatched_at FROM stage_dispatch "
-            "WHERE stage IN ('analyst','live') "
-            "AND datetime(dispatched_at) <= datetime('now','+8 hours',?) "
-            "AND datetime(dispatched_at) >= datetime('now','+8 hours','-24 hours') "
-            "AND cycle_id NOT LIKE 'TEST-%' "
-            "GROUP BY cycle_id ORDER BY cycle_id",
-            (f"-{LOST_MIN} minutes",)).fetchall()
-        never = con.execute(
-            "SELECT c.cycle_id,c.ts FROM collection_runs c "
-            "WHERE c.source='fast' AND lower(c.status) NOT IN ('error','timeout','fail','failed') "
-            "AND c.cycle_id NOT LIKE 'TEST-%' "
-            "AND datetime(replace(c.cycle_id,'T',' ')) <= datetime('now','+8 hours','-30 minutes') "
-            "AND datetime(replace(c.cycle_id,'T',' ')) >= datetime('now','+8 hours','-24 hours') "
-            "AND NOT EXISTS (SELECT 1 FROM stage_dispatch s "
-            "                WHERE s.cycle_id=c.cycle_id AND s.stage IN ('analyst','live')) "
-            "ORDER BY c.cycle_id").fetchall()
+        if window:
+            # 固定复盘窗：与日报成交窗同相位，重跑历史日报可复现。
+            # 仍保留 “>LOST_MIN 分钟前派发” 条件，避免把在飞周期误报为丢轮。
+            rows = con.execute(
+                "SELECT cycle_id, MIN(dispatched_at) dispatched_at FROM stage_dispatch "
+                "WHERE stage IN ('analyst','live') "
+                "AND datetime(dispatched_at) >= datetime(?) "
+                "AND datetime(dispatched_at) < datetime(?) "
+                "AND datetime(dispatched_at) <= datetime('now','+8 hours',?) "
+                "AND cycle_id NOT LIKE 'TEST-%' "
+                "GROUP BY cycle_id ORDER BY cycle_id",
+                (window[0], window[1], f"-{LOST_MIN} minutes")).fetchall()
+            never = con.execute(
+                "SELECT c.cycle_id,c.ts FROM collection_runs c "
+                "WHERE c.source='fast' AND lower(c.status) NOT IN ('error','timeout','fail','failed') "
+                "AND c.cycle_id NOT LIKE 'TEST-%' "
+                "AND datetime(replace(c.cycle_id,'T',' ')) >= datetime(?) "
+                "AND datetime(replace(c.cycle_id,'T',' ')) < datetime(?) "
+                "AND datetime(replace(c.cycle_id,'T',' ')) <= datetime('now','+8 hours','-30 minutes') "
+                "AND NOT EXISTS (SELECT 1 FROM stage_dispatch s "
+                "                WHERE s.cycle_id=c.cycle_id AND s.stage IN ('analyst','live')) "
+                "ORDER BY c.cycle_id", (window[0], window[1])).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT cycle_id, MIN(dispatched_at) dispatched_at FROM stage_dispatch "
+                "WHERE stage IN ('analyst','live') "
+                "AND datetime(dispatched_at) <= datetime('now','+8 hours',?) "
+                "AND datetime(dispatched_at) >= datetime('now','+8 hours','-24 hours') "
+                "AND cycle_id NOT LIKE 'TEST-%' "
+                "GROUP BY cycle_id ORDER BY cycle_id",
+                (f"-{LOST_MIN} minutes",)).fetchall()
+            never = con.execute(
+                "SELECT c.cycle_id,c.ts FROM collection_runs c "
+                "WHERE c.source='fast' AND lower(c.status) NOT IN ('error','timeout','fail','failed') "
+                "AND c.cycle_id NOT LIKE 'TEST-%' "
+                "AND datetime(replace(c.cycle_id,'T',' ')) <= datetime('now','+8 hours','-30 minutes') "
+                "AND datetime(replace(c.cycle_id,'T',' ')) >= datetime('now','+8 hours','-24 hours') "
+                "AND NOT EXISTS (SELECT 1 FROM stage_dispatch s "
+                "                WHERE s.cycle_id=c.cycle_id AND s.stage IN ('analyst','live')) "
+                "ORDER BY c.cycle_id").fetchall()
     finally:
         con.close()
     acon = safe_connect(analysis_db)
@@ -813,7 +859,7 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
     all_cycles = [c for c, _ in lost] + [c for c, _ in never_cycles]
     if not all_cycles:
         results.append({"name": "lost_cycles", "status": "PASS",
-                        "msg": f"近24h 无派单丢轮（已派无产出=0，从未派发=0）"})
+                        "msg": f"{_window_label()} 无派单丢轮（已派无产出=0，从未派发=0）"})
     else:
         fired_detail = ", ".join(f"{c}(派于{d})" for c, d in lost[:5]) or "无"
         never_detail = ", ".join(f"{c}(采集于{t})" for c, t in never_cycles[:5]) or "无"
@@ -826,7 +872,7 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
                         "decision_fired_no_analysis": [c for c, _ in lost],
                         "analyst_fired_no_analysis": [c for c, _ in lost],
                         "never_dispatched": [c for c, _ in never_cycles],
-                        "msg": f"近24h {len(all_cycles)} 轮丢失：已派无产出={len(lost)} "
+                        "msg": f"{_window_label()} {len(all_cycles)} 轮丢失：已派无产出={len(lost)} "
                                f"[{fired_detail}]；采集成功但从未派分析/实盘首棒={len(never_cycles)} "
                                f"[{never_detail}]。只告警、不自动补派。"})
 
@@ -850,17 +896,29 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
             "msg": f"ledger.db 不可读，无法核对采集失败: {con}",
         })
         return
+    window = _review_window_or_none()
     try:
         placeholders = ",".join("?" for _ in failure_states)
-        collection_errors = con.execute(
-            "SELECT cycle_id,source,status,ts,COALESCE(err,'') "
-            "FROM collection_runs "
-            f"WHERE lower(status) IN ({placeholders}) "
-            "AND cycle_id NOT LIKE 'TEST-%' "
-            "AND datetime(ts) >= datetime('now','+8 hours','-24 hours') "
-            "ORDER BY datetime(ts)",
-            failure_states,
-        ).fetchall()
+        if window:
+            collection_errors = con.execute(
+                "SELECT cycle_id,source,status,ts,COALESCE(err,'') "
+                "FROM collection_runs "
+                f"WHERE lower(status) IN ({placeholders}) "
+                "AND cycle_id NOT LIKE 'TEST-%' "
+                "AND datetime(ts) >= datetime(?) AND datetime(ts) < datetime(?) "
+                "ORDER BY datetime(ts)",
+                (*failure_states, window[0], window[1]),
+            ).fetchall()
+        else:
+            collection_errors = con.execute(
+                "SELECT cycle_id,source,status,ts,COALESCE(err,'') "
+                "FROM collection_runs "
+                f"WHERE lower(status) IN ({placeholders}) "
+                "AND cycle_id NOT LIKE 'TEST-%' "
+                "AND datetime(ts) >= datetime('now','+8 hours','-24 hours') "
+                "ORDER BY datetime(ts)",
+                failure_states,
+            ).fetchall()
     finally:
         con.close()
 
@@ -874,15 +932,23 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
     else:
         try:
             placeholders = ",".join("?" for _ in failure_states)
-            since_ms = int((datetime.now(timezone.utc).timestamp() - 86400) * 1000)
+            def _cst_ms(text: str) -> int:
+                return int(datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+                           .replace(tzinfo=CST).timestamp() * 1000)
+
+            if window:
+                since_ms, until_ms = _cst_ms(window[0]), _cst_ms(window[1])
+            else:
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                since_ms, until_ms = now_ms - 86400 * 1000, now_ms
             cron_errors = ocon.execute(
                 "SELECT j.name,l.status,COALESCE(l.error,''),l.run_at_ms,l.duration_ms "
                 "FROM cron_run_logs l JOIN cron_jobs j "
                 "ON j.store_key=l.store_key AND j.job_id=l.job_id "
                 "WHERE j.name LIKE 'okx-%' "
                 f"AND lower(COALESCE(l.status,'')) IN ({placeholders}) "
-                "AND l.ts>=? ORDER BY l.ts",
-                (*failure_states, since_ms),
+                "AND l.ts>=? AND l.ts<? ORDER BY l.ts",
+                (*failure_states, since_ms, until_ms),
             ).fetchall()
             active_errors = ocon.execute(
                 "SELECT name,last_run_status,COALESCE(last_error,''),"
@@ -902,7 +968,7 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
         results.append({
             "name": "collection_failures",
             "status": "PASS",
-            "msg": "近24h 无采集失败、OpenClaw cron 错误或当前连续错误",
+            "msg": f"{_window_label()} 无采集失败、OpenClaw cron 错误或当前连续错误",
             "collection_errors": [],
             "cron_errors": [],
             "active_cron_errors": [],
@@ -939,7 +1005,7 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
         for row in active_errors
     ]
     msg = (
-        f"近24h 采集失败={len(collection_errors)}，"
+        f"{_window_label()} 采集失败={len(collection_errors)}，"
         f"OpenClaw cron 错误={len(cron_errors)}，"
         f"当前连续错误={len(active_errors)}。只告警、不自动补采。"
     )
@@ -985,7 +1051,17 @@ def main():
     p.add_argument("--stale-min", type=int, default=15, help="新鲜度阈值（分钟）")
     p.add_argument("--hh01-only", action="store_true", help="regime/kline 在 HH:01 必检；其他时间放宽")
     p.add_argument("--json", action="store_true", help="输出 JSON（默认 text）")
+    p.add_argument("--as-of", dest="as_of",
+                   help="日报 ts（CST）；令 lost_cycles/collection_failures 改用固定复盘窗 "
+                        "[前一日 08:00, 当日 08:00)，与日报成交窗同相位且可复现。"
+                        "不传 = 从此刻回看 24h（即时巡检）")
     args = p.parse_args()
+
+    if args.as_of:
+        global REVIEW_WINDOW
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import trade_report_stats  # noqa: PLC0415  仅 --as-of 路径需要
+        REVIEW_WINDOW = trade_report_stats.daily_window(args.as_of)
 
     if args.check == "all":
         targets = list(CHECK_FUNCS.keys())

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V2.0 §7 契约 B —— 确定性下单/止损/平仓/回读（live + demo 同代码路径 + 同硬上限）。
+"""V2.0 §7 契约 B —— 确定性下单/止损/平仓/回读（live + Demo 分 profile 定仓）。
 
 live 下单**唯一路径**：order_executor.open_position()，其内部**强制调** risk_validator.validate()
 （LLM 物理越不过闸）。本模块把 live_trader.md §4/§8 现为「LLM 手拼 okx 命令 + 手挂止损」的
@@ -13,12 +13,13 @@ live 下单**唯一路径**：order_executor.open_position()，其内部**强制
     （拿 ordId 即时确认；绝不翻反向仓）主路径 → 被拒转 swap close 兜底 → 51087 下架/
     51001 不存在明确拒因 → fills→订单状态双源确认求真 pnl，两端点均无 →
     unconfirmed(pnl=NULL)+repair_queue。
-  - demo：与 live 使用同一套 risk_validator 硬上限；只差 OKX profile / 执行环境。
+  - Demo：不使用 live 的 1%/20%/98% 仓位比例；公共安全预检后，新开先确认目标
+    杠杆，再按 symbol/side/tdMode 实时读取 OKX Demo max-size。查询失败不下单。
 
 现仓/equity 权威一律 OKX API（禁 position_snapshots GROUP BY，红线 #6）。
 ctVal/lotSz：live=market.db.instruments_cache → 缺/stale 现拉 → 仍缺 reject（不拿默认 1.0 蒙）；
-demo=带 x-simulated-trading 头现拉 demo 环境规格（F1 2026-07-06，缓存只存 live 口径、
-demo 同名合约可 100x 不同）→ 失败回退 live 口径带 spec_source 留痕。
+Demo=带 x-simulated-trading 头现拉 Demo 环境 ctVal/lotSz/minSz（缓存只存 live 口径）；
+失败即拒绝，禁止回退 live 规格。
 零模型名（红线 #1）。
 """
 from __future__ import annotations
@@ -283,7 +284,7 @@ def _fetch_demo_instrument(symbol: str) -> Optional[dict[str, Any]]:
 
     CLI `market instruments` 的 demo profile 不保证带 x-simulated-trading 头；demo 环境
     同名合约规格可能与 live 不同，因此必须带头直连 public 端点（无需凭证）。
-    任何失败返 None（caller 回退 live 缓存并带标，禁静默错尺度）。"""
+    任何失败返 None；Demo 调用方必须 fail-closed，禁止回退 live 规格。"""
     try:
         import httpx  # vendored <PROJECT_ROOT>\Lib\site-packages（wrapper 注入 PYTHONPATH）
         r = httpx.get(_OKX_PUBLIC_INSTRUMENTS,
@@ -300,13 +301,12 @@ def _fetch_demo_instrument(symbol: str) -> Optional[dict[str, Any]]:
 
 def fetch_instrument_specs(symbol: str, profile: str,
                            db_root: Path = DEFAULT_DB_ROOT) -> dict[str, Any]:
-    """ctVal/lotSz。live：instruments_cache（market.db）优先 → 缺则现拉 → 仍缺返回 None。
+    """ctVal/lotSz/minSz。live：instruments_cache（market.db）优先 → 缺则现拉。
 
     demo：instruments_cache 只存 live 口径，demo 同名合约规格可能不同；跳过缓存主路径，
-    带 x-simulated-trading 头现拉 demo
-    环境规格（进程内 memo）；现拉失败才回退 live 缓存/现拉，返回带
-    spec_source='live_cache_fallback'/'live_fetch_fallback' 留痕（不再静默错尺度）。"""
-    ct_val = lot_sz = None
+    带 x-simulated-trading 头现拉 Demo 环境规格（进程内 memo）；现拉失败直接返回空规格，
+    由开仓闸拒绝，禁止用 live 元数据替代。"""
+    ct_val = lot_sz = min_sz = None
     src = None
     db_root = Path(db_root)  # 调用方（trader agent）常传 str 路径——强制 Path，避免 str/str TypeError
     is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
@@ -318,15 +318,23 @@ def fetch_instrument_specs(symbol: str, profile: str,
         if inst:
             ct_val = _to_float(inst.get("ctVal"))
             lot_sz = _to_float(inst.get("lotSz"))
-        if ct_val is not None and lot_sz is not None and ct_val > 0 and lot_sz > 0:
-            out = {"ct_val": ct_val, "lot_sz": lot_sz,
+            min_sz = _to_float(inst.get("minSz"))
+        if (ct_val is not None and lot_sz is not None and min_sz is not None
+                and ct_val > 0 and lot_sz > 0 and min_sz > 0):
+            out = {"ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz,
                    "source": "demo_fetch", "spec_source": "demo_fetch"}
             _DEMO_SPEC_MEMO[symbol] = dict(out)
             return out
-        # demo 现拉失败 → 回退 live 口径（规格可能与 demo 环境不同，带标留痕，禁静默错尺度）
-        print(f"[order_executor] WARN demo instrument fetch failed for {symbol}, "
-              "falling back to live specs (may be wrong-scaled)", file=sys.stderr)
-        ct_val = lot_sz = None
+        print(
+            f"[order_executor] WARN demo instrument fetch/spec invalid for {symbol}; "
+            "fail-closed without live fallback",
+            file=sys.stderr,
+        )
+        return {
+            "ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz,
+            "source": "demo_fetch_failed",
+            "spec_source": "demo_fetch_failed",
+        }
     market_db = db_root / "market.db"
     if market_db.exists():
         try:
@@ -340,6 +348,8 @@ def fetch_instrument_specs(symbol: str, profile: str,
             if row and row["ctVal"] is not None and row["lotSz"] is not None:
                 ct_val = _to_float(row["ctVal"])
                 lot_sz = _to_float(row["lotSz"])
+                # 旧缓存没有 minSz；live 风控保持原行为，以 lotSz 作为物理最小单位。
+                min_sz = lot_sz
                 src = "cache"
         except Exception:
             pass
@@ -348,12 +358,12 @@ def fetch_instrument_specs(symbol: str, profile: str,
         if inst:
             ct_val = _to_float(inst.get("ctVal"))
             lot_sz = _to_float(inst.get("lotSz"))
+            min_sz = _to_float(inst.get("minSz")) or lot_sz
             src = "live_fetch"
-    if is_demo and src:
-        # demo 落到 live 口径（缓存/CLI 现拉均为 live 元数据）——尺度可能失真，回执留痕
-        src = {"cache": "live_cache_fallback",
-               "live_fetch": "live_fetch_fallback"}.get(src, src)
-    return {"ct_val": ct_val, "lot_sz": lot_sz, "source": src, "spec_source": src}
+    return {
+        "ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz,
+        "source": src, "spec_source": src,
+    }
 
 
 def _avg_fill(fills: list[dict[str, Any]]) -> dict[str, Any]:
@@ -669,6 +679,63 @@ def _verify_open_settled(symbol: str, side: str, profile: str, pre_sz: float,
     return None
 
 
+_SCRIPTS_DIR = os.environ.get("OKX_SCRIPTS_DIR", _project_path('scripts'))
+_AUTOHEAL_TIMEOUT_SEC = 180
+
+
+def _try_autoheal_ledger(profile: str, db_root, cycle_id: Optional[str]) -> bool:
+    """插入点 B：pretrade 账仓不一致时，拒单前给一次确定性自愈机会（2026-08-04）。
+
+    Live 永久只读；即使设置 `OKX_LEDGER_AUTOHEAL_APPLY=1` 或
+    `OKX_LEDGER_AUTOHEAL_UNRECORDED=1`，本层也不会向 Live 子进程传写参数。
+    两个开关只允许 Demo 账本自愈。EXACT 判定、单轮上限、方向限制和幂等等
+    闸门都在 `scripts/ledger_autoheal.py` 内，本层不复制规则。
+
+    **fail-closed 语义不变**：本函数只可能让「账本修好后本就该通过」的校验重新通过，
+    绝不会让校验不通过的单放行——调用方在自愈后必须重跑
+    `_verify_pretrade_ledger_positions`，仍不 ok 照旧拒单。
+
+    子进程隔离 + 全异常吞掉：自愈崩溃/超时一律返回 False，退回原有拒单路径。
+    `--self-cycle` 让本轮自己的 running runner 不被误判为互斥冲突。
+    环境变量 `OKX_DISABLE_LEDGER_AUTOHEAL=1` 可一键关掉本层。
+    """
+    if os.environ.get("OKX_DISABLE_LEDGER_AUTOHEAL") == "1":
+        return False
+    try:
+        import subprocess  # 局部 import：仅此罕见分支需要，不拖累安全层常态路径
+
+        heal_py = os.path.join(_SCRIPTS_DIR, "ledger_autoheal.py")
+        if not os.path.exists(heal_py):
+            return False
+        apply_enabled = (
+            str(profile) == "demo"
+            and os.environ.get("OKX_LEDGER_AUTOHEAL_APPLY") == "1"
+        )
+        unrecorded_enabled = (
+            apply_enabled
+            and os.environ.get("OKX_LEDGER_AUTOHEAL_UNRECORDED") == "1"
+        )
+        cmd = [sys.executable, heal_py, "--profile", str(profile),
+               "--db-root", str(db_root)]
+        if apply_enabled:
+            cmd.append("--apply")
+        if unrecorded_enabled:
+            cmd.append("--enable-unrecorded")
+        if cycle_id:
+            cmd += ["--self-cycle", str(cycle_id)]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=_AUTOHEAL_TIMEOUT_SEC)
+        data = json.loads(proc.stdout or "{}")
+        # Live classification can never repair the ledger in public code. Keep
+        # the caller fail-closed even if stale subprocess output claims a write.
+        if str(profile) == "live":
+            return False
+        return any(h.get("applied") for h in data.get("healed", []))
+    except Exception:  # noqa: BLE001  自愈失败绝不影响拒单主路径
+        return False
+
+
 def _verify_sl_placed(
     symbol: str,
     pos_side: str,
@@ -862,6 +929,7 @@ def open_position(
     cycle_id: Optional[str] = None,
     available_margin: Optional[float] = None,
     receipt_context: Optional[dict[str, Any]] = None,
+    account_imr: Optional[float] = None,
 ) -> dict[str, Any]:
     is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
     profile_label = "demo" if is_demo else "live"
@@ -1052,48 +1120,104 @@ def open_position(
     # 现仓 API 失败 = 敞口未知 → 拒单，不当零仓。
     input_divergence: list[str] = []
     if not ox.is_dryrun():
-        # 余额只拉一次：totalEq 是全账户折 USD 权益，不等于 USDT-SWAP
-        # 可用结算币保证金。必须同时从 details.USDT 取 availBal/availEq；
-        # 缺失禁回退 caller/totalEq，否则会对交易所提出必然资金不足的大单。
         caller_equity = equity
         caller_available_margin = available_margin
-        try:
-            balance_payload = ox.get_balance(profile)
-        except Exception as exc:
-            balance_payload = {"ok": False, "error": str(exc)}
-        capacity = ac.extract_settlement_capacity(balance_payload, "USDT")
-        api_equity = _to_float(capacity.get("total_equity"))
-        api_available_margin = _to_float(capacity.get("available_margin"))
-        capacity_audit = {
-            "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
-            "source": capacity.get("source"),
-            "available_margin": api_available_margin,
-            "frozen_balance": capacity.get("frozen_balance"),
-            "error": capacity.get("error"),
-        }
-        if (not capacity.get("ok") or api_available_margin is None
-                or not math.isfinite(api_available_margin)
-                or api_available_margin < 0):
-            return _finish_clean(receipt(False, action_taken="REJECT",
-                           reject_reason="available_margin_fetch_failed",
-                           reject_detail="USDT 可用保证金不可用，拒开（禁回退 totalEq/caller）: "
-                                         f"{capacity.get('error')}", p0=True),
-                                 "available_margin_fetch_failed")
-        if api_equity is None or not math.isfinite(api_equity) or api_equity <= 0:
-            return _finish_clean(receipt(False, action_taken="REJECT",
-                           reject_reason="equity_fetch_failed",
-                           reject_detail="totalEq 非法，拒开（禁回退 caller）", p0=True),
-                                 "equity_fetch_failed")
-        if (caller_equity is not None
-                and abs((_to_float(caller_equity) or 0.0) - api_equity) > 1.0):
-            input_divergence.append(f"equity caller={caller_equity} → API={api_equity}")
-        if (caller_available_margin is not None
-                and abs((_to_float(caller_available_margin) or 0.0)
-                        - api_available_margin) > 1.0):
-            input_divergence.append(
-                f"available_margin caller={caller_available_margin} → API={api_available_margin}")
-        equity = api_equity
-        available_margin = api_available_margin
+        caller_account_imr = account_imr
+        if is_demo:
+            # Demo 容量不读取 balance/totalEq/availBal；这些字段与 live 的抵押品、
+            # 账户模式口径不同。真正容量在公共安全预检及（必要时）set_leverage 后，
+            # 按 symbol/side/tdMode 从 account max-size 实时取得。
+            equity = None
+            available_margin = None
+            account_imr = None
+            if caller_equity is not None:
+                input_divergence.append(
+                    f"demo equity caller={caller_equity} ignored_for_sizing")
+            if caller_available_margin is not None:
+                input_divergence.append(
+                    "demo available_margin "
+                    f"caller={caller_available_margin} ignored_for_sizing")
+            if caller_account_imr is not None:
+                input_divergence.append(
+                    "demo account_imr "
+                    f"caller={caller_account_imr} ignored_for_sizing")
+        else:
+            # live 余额只拉一次：totalEq 是全账户折 USD 权益，不等于
+            # USDT-SWAP 可用结算币保证金；必须从 details.USDT 取
+            # availBal/availEq；账户组合 IMR 同样只认这次 balance 的顶层 imr。
+            # 任一缺失都禁回退 caller/totalEq。
+            try:
+                balance_payload = ox.get_balance(profile)
+            except Exception as exc:
+                balance_payload = {"ok": False, "error": str(exc)}
+            capacity = ac.extract_settlement_capacity(balance_payload, "USDT")
+            api_equity = _to_float(capacity.get("total_equity"))
+            api_available_margin = _to_float(capacity.get("available_margin"))
+            api_account_imr = _to_float(capacity.get("account_imr"))
+            capacity_audit = {
+                "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
+                "source": capacity.get("source"),
+                "available_margin": api_available_margin,
+                "account_imr": api_account_imr,
+                "account_imr_source": capacity.get("account_imr_source"),
+                "account_imr_error": capacity.get("account_imr_error"),
+                "account_mgn_ratio_observation_only": capacity.get(
+                    "account_mgn_ratio_observation_only"
+                ),
+                "frozen_balance": capacity.get("frozen_balance"),
+                "error": capacity.get("error"),
+            }
+            if (api_account_imr is None
+                    or not math.isfinite(api_account_imr)
+                    or api_account_imr < 0):
+                return _finish_clean(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="account_imr_fetch_failed",
+                    reject_detail=(
+                        "账户初始保证金 imr 不可用，拒开"
+                        "（禁回退 caller/持仓本地估算）: "
+                        f"{capacity.get('account_imr_error') or capacity.get('error')}"),
+                    p0=True,
+                ), "account_imr_fetch_failed")
+            if (not capacity.get("ok") or api_available_margin is None
+                    or not math.isfinite(api_available_margin)
+                    or api_available_margin < 0):
+                return _finish_clean(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="available_margin_fetch_failed",
+                    reject_detail=(
+                        "USDT 可用保证金不可用，拒开（禁回退 totalEq/caller）: "
+                        f"{capacity.get('error')}"),
+                    p0=True,
+                ), "available_margin_fetch_failed")
+            if (api_equity is None or not math.isfinite(api_equity)
+                    or api_equity <= 0):
+                return _finish_clean(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="equity_fetch_failed",
+                    reject_detail="totalEq 非法，拒开（禁回退 caller）",
+                    p0=True,
+                ), "equity_fetch_failed")
+            if (caller_equity is not None
+                    and abs((_to_float(caller_equity) or 0.0)
+                            - api_equity) > 1.0):
+                input_divergence.append(
+                    f"equity caller={caller_equity} → API={api_equity}")
+            if (caller_available_margin is not None
+                    and abs((_to_float(caller_available_margin) or 0.0)
+                            - api_available_margin) > 1.0):
+                input_divergence.append(
+                    "available_margin "
+                    f"caller={caller_available_margin} → API={api_available_margin}")
+            if (caller_account_imr is not None
+                    and abs((_to_float(caller_account_imr) or 0.0)
+                            - api_account_imr) > 1.0):
+                input_divergence.append(
+                    f"account_imr caller={caller_account_imr} "
+                    f"→ API={api_account_imr}")
+            equity = api_equity
+            available_margin = api_available_margin
+            account_imr = api_account_imr
         try:
             api_positions = fetch_open_positions(profile)
         except PositionsUnavailable as exc:
@@ -1146,6 +1270,16 @@ def open_position(
                 "pretrade_api_positions_invalid",
             )
         position_reconciliation_audit = position_check
+        if not position_check["ok"] and _try_autoheal_ledger(
+                profile_label, db_root, cycle_id):
+            # 自愈写了 close 行 → 用同一份 api_positions 重新校验（不重复打 API）。
+            # 仍不 ok 就落回下面原有的 fail-closed 拒单路径，语义不变。
+            try:
+                position_check = _verify_pretrade_ledger_positions(
+                    profile_label, db_root, api_positions)
+                position_reconciliation_audit = position_check
+            except (TradeLedgerUnavailable, PositionsUnavailable):
+                pass
         if not position_check["ok"]:
             diffs = position_check["diffs"]
             compact = ";".join(
@@ -1187,29 +1321,57 @@ def open_position(
         if input_divergence:  # 注入尝试可观测（不阻断，已用真值）
             print(f"[order_executor] WARN input_divergence: {input_divergence}", file=sys.stderr)
     else:
-        # dryrun/单测：允许显式注入；缺值时尝试用同一 balance 回包补齐。
-        # helper 不可用时保留 None 交给 validator 做 controlled reject，不伪造余额。
-        if equity is None or available_margin is None:
+        # dryrun/单测：live 允许显式注入 equity/available_margin/account_imr，
+        # 缺项时由同一次 balance 补齐；Demo 即使 dryrun 也不得把 balance 或
+        # account_imr 当成容量，后续仍走 account max-size 只读查询。
+        if is_demo:
+            available_margin = None
+            account_imr = None
+        elif (equity is None or available_margin is None
+              or account_imr is None):
             try:
-                capacity = ac.extract_settlement_capacity(ox.get_balance(profile), "USDT")
+                capacity = ac.extract_settlement_capacity(
+                    ox.get_balance(profile), "USDT")
             except Exception:
                 capacity = {"ok": False, "error": "balance_unavailable"}
             if equity is None:
                 equity = _to_float(capacity.get("total_equity"))
             if available_margin is None and capacity.get("ok"):
                 available_margin = _to_float(capacity.get("available_margin"))
-            if capacity.get("ok"):
-                capacity_audit = {
-                    "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
-                    "source": capacity.get("source"),
-                    "available_margin": available_margin,
-                    "frozen_balance": capacity.get("frozen_balance"),
-                }
-        elif available_margin is not None:
+            if account_imr is None:
+                account_imr = _to_float(capacity.get("account_imr"))
+            capacity_audit = {
+                "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
+                "source": capacity.get("source"),
+                "available_margin": available_margin,
+                "account_imr": account_imr,
+                "account_imr_source": capacity.get("account_imr_source"),
+                "account_imr_error": capacity.get("account_imr_error"),
+                "account_mgn_ratio_observation_only": capacity.get(
+                    "account_mgn_ratio_observation_only"
+                ),
+                "frozen_balance": capacity.get("frozen_balance"),
+                "error": capacity.get("error"),
+            }
+        elif available_margin is not None and account_imr is not None:
             capacity_audit = {
                 "settlement_ccy": "USDT", "source": "caller_dryrun",
-                "available_margin": available_margin, "frozen_balance": None,
+                "available_margin": available_margin,
+                "account_imr": _to_float(account_imr),
+                "frozen_balance": None,
             }
+        if not is_demo:
+            account_imr = _to_float(account_imr)
+            if (account_imr is None or not math.isfinite(account_imr)
+                    or account_imr < 0):
+                return _finish_clean(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="account_imr_fetch_failed",
+                    reject_detail=(
+                        "账户初始保证金 imr 不可用，拒开"
+                        "（dryrun/单测须显式注入或由 balance 提供）"),
+                    p0=True,
+                ), "account_imr_fetch_failed")
         if open_positions is None:
             try:
                 open_positions = fetch_open_positions(profile)
@@ -1218,42 +1380,120 @@ def open_position(
         if mark_px is None:
             mark_px = ox.get_mark_price(symbol, profile)
     specs = fetch_instrument_specs(symbol, profile, db_root)
-    ct_val, lot_sz = specs["ct_val"], specs["lot_sz"]
-
-    # ── 强制风控闸 ──
-    v = rv.validate(
-        symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-        mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-        open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-        profile="demo" if is_demo else "live",
-        available_margin=available_margin,
-    )
-    if not v["approved"]:
-        return _finish_clean(receipt(False, action_taken="REJECT",
-                       reject_reason=v["reject_reason"],
-                       reject_detail=v["reject_detail"], risk=v),
-                             f"risk_reject:{v['reject_reason']}")
-    approved_sz = v["approved_sz"]
-    # 加仓时 OKX 不允许在有仓状态随意改杠杆；validator 已用现仓实际杠杆
-    # 重算本笔预算。成交回执必须沿用同一口径，禁用 caller lev 低估 margin。
-    effective_lev = (_to_float((v.get("math") or {}).get("effective_lev"))
-                     or lev)
-
-    # ── 设杠杆（仅新开；加仓不动杠杆，OKX 拒改有仓杠杆）──
+    ct_val = specs.get("ct_val")
+    lot_sz = specs.get("lot_sz")
+    min_sz = specs.get("min_sz")
     new_open = not any(
         (p.get("symbol") == symbol and str(p.get("side", "")).lower() == side)
         for p in open_positions)
     lev_warn = None
-    if new_open:
+
+    if is_demo:
+        # 第一阶段只校公共安全与交易所规格。必须先于 set_leverage，防止一个本应
+        # 被拒绝的请求也修改 Demo 账户杠杆配置。
+        preflight = rv.validate(
+            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+            profile="demo", available_margin=None,
+            min_order_size=min_sz, preflight_only=True,
+        )
+        if not preflight["approved"]:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason=preflight["reject_reason"],
+                reject_detail=preflight["reject_detail"],
+                risk=preflight,
+            ), f"risk_reject:{preflight['reject_reason']}")
+
+        # OKX CLI 当前 max-size 不透传 leverage，接口会使用账户当前杠杆。
+        # 新开必须先成功设置目标杠杆；加仓则不改，沿用 API 现仓杠杆。
+        if new_open:
+            lr = ox.set_leverage(
+                symbol, lev, mgn_mode, profile,
+                pos_side=side if mgn_mode == "isolated" else None,
+            )
+            if not lr.get("ok"):
+                return _finish_clean(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="set_leverage_failed",
+                    reject_detail=str(lr.get("sMsg") or lr.get("error")),
+                    risk=preflight,
+                ), "set_leverage_failed")
+
+        try:
+            max_size_payload = ox.get_max_size(symbol, mgn_mode, profile)
+        except Exception as exc:
+            max_size_payload = {"ok": False, "error": str(exc)}
+        directional_capacity = ac.extract_directional_max_size(
+            max_size_payload, symbol, side)
+        exchange_max_size = _to_float(
+            directional_capacity.get("max_size"))
+        capacity_audit = {
+            "source": directional_capacity.get("source"),
+            "inst_id": symbol,
+            "side": side,
+            "td_mode": mgn_mode,
+            "direction_field": directional_capacity.get("direction_field"),
+            "direction_value": directional_capacity.get("direction_value"),
+            "max_size": exchange_max_size,
+            "queried_after_target_leverage": bool(new_open),
+            "error": directional_capacity.get("error"),
+        }
+        if (not directional_capacity.get("ok")
+                or exchange_max_size is None
+                or not math.isfinite(exchange_max_size)
+                or exchange_max_size < 0):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="demo_max_size_fetch_failed",
+                reject_detail=(
+                    "OKX Demo 实时最大可开张数不可用，拒开；"
+                    "禁止回退 balance/totalEq/max-avail-size/live 公式: "
+                    f"{directional_capacity.get('error')}"),
+                risk=preflight, p0=True,
+            ), "demo_max_size_fetch_failed")
+
+        # 第二阶段只按交易所 minSz/lotSz 与本次方向 max-size 定仓。
+        v = rv.validate(
+            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+            profile="demo", available_margin=None,
+            exchange_max_size=exchange_max_size,
+            min_order_size=min_sz,
+        )
+    else:
+        # Live 保持 1% 名义下限、可用保证金×98% 与组合 IMR 66.6% 整单拒绝规则。
+        v = rv.validate(
+            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+            profile="live", available_margin=available_margin,
+            account_imr=account_imr,
+        )
+
+    if not v["approved"]:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason=v["reject_reason"],
+            reject_detail=v["reject_detail"], risk=v,
+        ), f"risk_reject:{v['reject_reason']}")
+    approved_sz = v["approved_sz"]
+    # 加仓时不改杠杆；validator 已用现仓实际杠杆记录成交保证金口径。
+    effective_lev = (_to_float((v.get("math") or {}).get("effective_lev"))
+                     or lev)
+
+    # live 仍在完整预算闸通过后设杠杆；Demo 已在 max-size 查询前完成。
+    if not is_demo and new_open:
         lr = ox.set_leverage(symbol, lev, mgn_mode, profile)
         if not lr.get("ok"):
-            # live：杠杆设失败 → 不在未知杠杆下开仓
-            if not is_demo:
-                return _finish_clean(receipt(False, action_taken="REJECT",
-                               reject_reason="set_leverage_failed",
-                               reject_detail=str(lr.get("sMsg") or lr.get("error")),
-                               risk=v), "set_leverage_failed")
-            lev_warn = f"demo set_leverage failed: {lr.get('sMsg') or lr.get('error')}"
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="set_leverage_failed",
+                reject_detail=str(lr.get("sMsg") or lr.get("error")),
+                risk=v,
+            ), "set_leverage_failed")
 
     # ── 市价开仓（附挂 SL，原子）──
     pre_sz = _position_size(open_positions, symbol, side)
@@ -1404,6 +1644,7 @@ def open_position(
         return {
             "symbol": symbol, "action": "open", "side": side,
             "sz": accounting["sz"],
+            "fill_sz": accounting["sz"],
             "approved_sz": accounting["approved_sz"],
             "partial_fill": accounting["partial_fill"],
             "fill_ratio": accounting["fill_ratio"],
@@ -1896,8 +2137,7 @@ def _enqueue_repair(profile: str, symbol: str, ord_id: Optional[str],
     try:
         ts = ledger.now_cst()
         issue = f"[{profile}] {symbol} ord={ord_id}: {reason}"
-        fills_file = _project_path(
-            "tmp", f"repair_{profile}_{symbol}_fills.json")
+        fills_file = _project_path('tmp', f'repair_{profile}_{symbol}_fills.json')
         wrapper = "'" + _project_path(
             "scripts", "run_okx_python.ps1").replace("'", "''") + "'"
         cli = "'" + _project_path(

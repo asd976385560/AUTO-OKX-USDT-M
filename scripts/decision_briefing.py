@@ -37,6 +37,9 @@ CST = timezone(timedelta(hours=8))
 MIN_QUOTE_VOL_USD = 5_000_000  # 流动性下限：过滤微盘噪音
 MIN_OI_USD = 5_000_000         # 可交易候选 OI 下限：过滤成交额虚高但盘口承载不足
 TRADEABLE_CANDIDATE_COUNT = 8
+DXY_OBSERVATION_WINDOW = 20    # DTWEXBGS 是周频；按 source_as_of 取真实观测，不取 carry-forward 日历行
+DXY_MIN_OBSERVATIONS = 3       # 仅保证可描述离散度；样本量会原样展示给 Agent 自主权衡
+DXY_CARRY_STALE_DAYS = 3       # 本地连续 carry-forward 达该天数后不再输出 zone 档位
 PLAYBOOK_HYPOTHESIS_TTL_DAYS = 14
 PLAYBOOK_OTHER_TTL_DAYS = 30
 REGIME_TOKENS = ("trend_up", "trend_down", "range")
@@ -83,6 +86,54 @@ def _row_get(row, key, default=None):
     except (KeyError, IndexError, TypeError):
         value = default
     return default if value is None else value
+
+
+def _dxy_observation_rows(reg, limit: int = DXY_OBSERVATION_WINDOW):
+    """返回按 FRED observation date 去重的 DTWEXBGS 真实观测。
+
+    ``cross_market`` 是小时级快照，周频 DTWEXBGS 会被 carry-forward 成数百行。
+    ``source_meta.dxy.source_as_of`` 才是 FRED 观测日期；没有该字段的旧行不能
+    冒充真实观测进入 z-score。
+    """
+    source_date = "json_extract(source_meta,'$.dxy.source_as_of')"
+    return reg.execute(
+        f"SELECT {source_date} AS observation_date, dxy, MAX(ts) AS last_ts "
+        "FROM cross_market WHERE dxy IS NOT NULL "
+        f"AND {source_date} IS NOT NULL "
+        "GROUP BY observation_date ORDER BY observation_date DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def _dxy_zone_state(current, observations, frozen_days: int) -> dict:
+    """基于真实周观测给出软标签；carry-forward 过久时 fail-open 为 STALE。"""
+    rows = [row for row in observations if _row_get(row, "dxy") is not None]
+    state = {
+        "status": "UNKNOWN",
+        "z": None,
+        "raw_std": None,
+        "n": len(rows),
+        "reason": "observation_sample_insufficient",
+    }
+    if frozen_days >= DXY_CARRY_STALE_DAYS:
+        state.update(status="STALE", reason="carry_forward_stale")
+        return state
+    if len(rows) < DXY_MIN_OBSERVATIONS:
+        return state
+    values = [float(_row_get(row, "dxy")) for row in rows]
+    if abs(values[0] - float(current)) > 1e-9:
+        state["reason"] = "latest_observation_mismatch"
+        return state
+    mean = sum(values) / len(values)
+    raw_std = (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+    state["raw_std"] = raw_std
+    if raw_std <= 0:
+        state["reason"] = "zero_observation_variance"
+        return state
+    z = (float(current) - mean) / raw_std
+    zone = "EXTREME" if z > 1.5 else ("ELEVATED" if z > 0.75 else "NORMAL")
+    state.update(status=zone, z=z, reason="true_observation_zscore")
+    return state
 
 
 def _parse_playbook_time(row) -> datetime | None:
@@ -169,7 +220,8 @@ def _playbook_context(mkt: sqlite3.Connection, acc: sqlite3.Connection,
 
     for profile in ("live", "demo"):
         latest = acc.execute(
-            "SELECT ts FROM position_snapshots WHERE profile=? ORDER BY rowid DESC LIMIT 1",
+            "SELECT ts FROM position_snapshots WHERE profile=? "
+            "ORDER BY ts DESC,rowid DESC LIMIT 1",
             (profile,),
         ).fetchone()
         if latest:
@@ -279,36 +331,53 @@ def _render(root, top):
                 else "未采到"
             )
         )
-        # 兼容键 dxy_zone 实际基于 USD_BROAD(DTWEXBGS) 20日 z-score。
+        # 兼容键 dxy_zone 实际基于 USD_BROAD(DTWEXBGS) 的真实 FRED 周观测。
         def _dxy_zone():
             if r["dxy"] is None:
                 return
-            # MAX(ts) 聚合使裸列 dxy 确定性取自当日最后一行（SQLite bare-column 语义）。
+            observations = _dxy_observation_rows(reg)
+            # 日历行只用于判断本地 carry-forward 了几天，绝不进入 z-score。
             days = reg.execute(
                 "SELECT substr(ts,1,10) AS d, dxy, MAX(ts) AS _mt FROM cross_market "
                 "WHERE dxy IS NOT NULL GROUP BY d ORDER BY d DESC LIMIT 20"
             ).fetchall()
-            vals = [x["dxy"] for x in days]
-            if len(vals) < 10:
-                print("  dxy_zone=UNKNOWN（兼容键；USD_BROAD 20日样本不足）")
-                return
-            mean = sum(vals) / len(vals)
-            var = sum((v - mean) ** 2 for v in vals) / len(vals)
-            std = max(var ** 0.5, 0.15)  # std 地板：FRED 周更源多日冻值，防除小数爆 z
-            z = (r["dxy"] - mean) / std
-            zone = "EXTREME" if z > 1.5 else ("ELEVATED" if z > 0.75 else "NORMAL")
-            # 连续同值段长度以最新日为终点，窗口 20 日。
+            cur = r["dxy"]
             frozen = 0
             for x in days:
-                if x["dxy"] == r["dxy"]:
+                if x["dxy"] == cur:
                     frozen += 1
                 else:
                     break
             frozen_s = f"{frozen}" if frozen < len(days) else f"≥{frozen}"
-            print(f"  dxy_zone=**{zone}**（兼容键，实际=USD_BROAD/DTWEXBGS；20日 z={z:+.2f}，"
-                  f"判据 z>1.5=EXTREME / z>0.75=ELEVATED；"
-                  f"该值已连续 {frozen_s} 天=FRED weekday 源特性）")
-            print("  ➤ zone 处置：EXTREME/ELEVATED 只作为方向或反对证据；不自动减仓、"
+            prev = observations[1] if len(observations) > 1 else None
+            if prev is None:
+                delta_s = "真实观测中无第二个取值"
+            else:
+                delta = cur - prev["dxy"]
+                delta_s = (f"前值 {prev['dxy']}（as_of={prev['observation_date']}）→ 现值 {cur}，"
+                           f"{delta:+.4f} = {delta / prev['dxy'] * 100:+.3f}%")
+            state = _dxy_zone_state(cur, observations, frozen)
+            newest_as_of = (_row_get(observations[0], "observation_date", "?")
+                            if observations else "?")
+            if state["status"] == "STALE":
+                print(f"  dxy_zone=**STALE**（兼容键，实际=USD_BROAD/DTWEXBGS；"
+                      f"FRED 周频值在本地已连续 carry-forward {frozen_s} 天，"
+                      "不出 zone 档位）")
+                print(f"    {delta_s}；真实观测 n={state['n']}，最新 as_of={newest_as_of}；"
+                      "carry-forward 日历行不进入 z-score")
+            elif state["status"] == "UNKNOWN":
+                print(f"  dxy_zone=UNKNOWN（兼容键，实际=USD_BROAD/DTWEXBGS；"
+                      f"真实观测 n={state['n']}，reason={state['reason']}，不出 zone 档位）")
+                print(f"    {delta_s}；最新 as_of={newest_as_of}；"
+                      "缺 source_as_of 的旧 carry-forward 行不冒充观测")
+            else:
+                print(f"  dxy_zone=**{state['status']}**（兼容键，实际=USD_BROAD/DTWEXBGS；"
+                      f"真实周观测 n={state['n']}，z={state['z']:+.2f}，"
+                      f"判据 z>1.5=EXTREME / z>0.75=ELEVATED；"
+                      f"最新 as_of={newest_as_of}）")
+                print(f"    {delta_s}；真实观测 std={state['raw_std']:.4f}；"
+                      "carry-forward 日历行不进入 z-score")
+            print("  ➤ zone 处置：EXTREME/ELEVATED/STALE 均只作为方向或反对证据；不自动减仓、"
                   "不决定仓位、不禁开。Agent 可采纳、部分采纳或忽略并说明理由。")
         _dxy_zone()
         mcap_chg = r["btc_mcap_chg_24h_usd"]
@@ -435,7 +504,8 @@ def _render(root, top):
         # 已有 live 仓由持仓管理段覆盖；这里专门给空余资金提供新的、可执行的标的池。
         held = set()
         pts = acc.execute(
-            "SELECT ts FROM position_snapshots WHERE profile='live' ORDER BY rowid DESC LIMIT 1"
+            "SELECT ts FROM position_snapshots WHERE profile='live' "
+            "ORDER BY ts DESC,rowid DESC LIMIT 1"
         ).fetchone()
         if pts:
             held = {
@@ -767,8 +837,6 @@ def _render(root, top):
             warns = []
             if eq and gross / eq >= 3.0:
                 warns.append("gross≥3x")
-            if eq and margin / eq >= 0.40:
-                warns.append("保证金≥40%")
             if len(rows) >= 2 and same >= 0.80:
                 warns.append("同向≥80%")
             if len(rows) >= 2 and largest >= 0.60:
@@ -776,9 +844,15 @@ def _render(root, top):
             warn_s = f" | ⚠️ {','.join(warns)}" if warns else ""
             print(
                 f"    {tag} 组合观察: {len(rows)}仓 | gross=${gross:.2f}/{gross_x} | "
-                f"保证金≈${margin:.2f}/{margin_pct} | net={net_x} | "
+                f"逐仓保证金求和≈${margin:.2f}/{margin_pct} | net={net_x} | "
                 f"同向={same:.0%} | 最大仓={largest:.0%}gross{warn_s}"
             )
+            if tag == "live":
+                print(
+                    "      Live OPEN/ADD硬闸以执行时同次OKX "
+                    "account.balance.imr/totalEq加本单增量计算预计值，须≤66.6%；"
+                    "本段逐仓估算、mgnRatio、gross、net均不得替代。"
+                )
 
         def _fmt_pos(tag, r, eq):
             # 2026-07-15 主人要求：持仓行补「多/空 + 保证金 USD + 占净值%」（原只有张数难判风险）。
@@ -798,7 +872,8 @@ def _render(root, top):
                   f"{r['lev']:g}x{m} upl={(r['upl'] or 0):+.2f}")
 
         a = acc.execute(
-            "SELECT totalEq,availBal,upl,daily_pnl,ts FROM account_snapshots WHERE profile='live' ORDER BY rowid DESC LIMIT 1"
+            "SELECT totalEq,availBal,upl,daily_pnl,ts FROM account_snapshots "
+            "WHERE profile='live' ORDER BY ts DESC,rowid DESC LIMIT 1"
         ).fetchone()
         if a:
             avail = f"${a['availBal']:.2f}" if a["availBal"] is not None else "N/A"
@@ -806,7 +881,8 @@ def _render(root, top):
                   f"upl {a['upl'] or 0:+.2f} | 日内 {a['daily_pnl'] or 0:+.2f} "
                   f"@ {fmt_age(a['ts'])} 前")
         pts_row = acc.execute(
-            "SELECT ts FROM position_snapshots WHERE profile='live' ORDER BY rowid DESC LIMIT 1"
+            "SELECT ts FROM position_snapshots WHERE profile='live' "
+            "ORDER BY ts DESC,rowid DESC LIMIT 1"
         ).fetchone()
         pts = pts_row["ts"] if pts_row else None
         # F7（2026-07-06）：symbol='__FLAT__' 是空仓哨兵行（jobb 写方标记"该 ts 确认空仓"，
@@ -827,13 +903,15 @@ def _render(root, top):
             a["totalEq"] if a else None,
         )
         d_eq = acc.execute(
-            "SELECT totalEq, availBal, upl, ts FROM account_snapshots WHERE profile='demo' ORDER BY rowid DESC LIMIT 1"
+            "SELECT totalEq, availBal, upl, ts FROM account_snapshots "
+            "WHERE profile='demo' ORDER BY ts DESC,rowid DESC LIMIT 1"
         ).fetchone()
         # 2026-07-12：demo 持仓改读 position_snapshots（与 live 同源、同 __FLAT__ 哨兵语义）。
         # 旧源 drill.db.drill_trades 06-19 停更且 V2.0 不再写——open 恒 0 行，demo 真开仓时
         # 本段仍显示 0 仓（主动误导），对抗核查 2026-07-12 定性后换源。
         d_pts_row = acc.execute(
-            "SELECT ts FROM position_snapshots WHERE profile='demo' ORDER BY rowid DESC LIMIT 1"
+            "SELECT ts FROM position_snapshots WHERE profile='demo' "
+            "ORDER BY ts DESC,rowid DESC LIMIT 1"
         ).fetchone()
         d_pts = d_pts_row["ts"] if d_pts_row else None
         op = acc.execute(
@@ -842,9 +920,13 @@ def _render(root, top):
         ).fetchall() if d_pts else []
         if d_eq:
             d_avail = f"${d_eq['availBal']:.2f}" if d_eq["availBal"] is not None else "N/A"
-            print(f"  🟡 demo 资金 ${d_eq['totalEq']:.2f}（唯一口径=虚拟盘 totalEq）| "
-                  f"可用USDT {d_avail} | snapshot 落库 @ {fmt_age(d_eq['ts'])} 前 | "
+            print(f"  🟡 demo 资产/绩效展示 ${d_eq['totalEq']:.2f} | "
+                  f"snapshot availBal {d_avail}（仅展示，非开仓容量）| "
+                  f"snapshot 落库 @ {fmt_age(d_eq['ts'])} 前 | "
                   f"upl {d_eq['upl'] or 0:+.2f} | {len(op)} 仓:")
+            print("    Demo OPEN 容量只认 order_executor 按目标 "
+                  "symbol/side/tdMode/有效杠杆实时查询的 OKX Demo max-size；"
+                  "禁用 totalEq/availBal、Live 组合 IMR 闸或人工百分比公式推导。")
         else:
             print(f"  🟡 demo {len(op)} 仓（⚠️ 无 demo 权益快照——先跑 demo_account_check）:")
         # N1 (2026-06-14): 连续无成交计数——防变相 IDLE/僵持持有。
@@ -889,7 +971,8 @@ def _render(root, top):
             tail = " ".join(f"{r['symbol'].split('-')[0]}×{r['c']}" for r in nullpnl)
             print(f"  ⚠️ 待回填 pnl 的 demo 行(30d): {tail}（demo_account_check 已代查 fills；"
                   f"仍 NULL 者可 swap fills/--archive 复核，确认无记录则属可接受终态）")
-        # L4 (2026-06-14): demo 同向集中度——极端同向=单边敞口风险（demo 与 live 同闸）
+        # L4 (2026-06-14): demo 同向集中度——极端同向=单边敞口观察；
+        # Demo 仓位容量按交易所实时 max-size，不套 Live 组合 IMR 或人工百分比仓位闸。
         if len(op) >= 2:
             long_n = sum(1 for r in op if str(r["side"]).lower() in ("buy", "long"))
             dom = max(long_n, len(op) - long_n)

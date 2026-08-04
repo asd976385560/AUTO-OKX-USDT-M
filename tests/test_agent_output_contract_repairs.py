@@ -16,9 +16,11 @@ def _project_path(*parts: str) -> str:
 
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -37,6 +39,68 @@ import trigger_agent  # noqa: E402
 
 
 class SimilarExperienceOutputTests(unittest.TestCase):
+    def test_same_symbol_statistics_are_separate_from_cross_symbol_analogues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            con = sqlite3.connect(root / "account.db")
+            try:
+                con.execute(
+                    "CREATE TABLE trade_experiences("
+                    "cycle_id TEXT,ts TEXT,profile TEXT,symbol TEXT,side TEXT,"
+                    "action TEXT,regime TEXT,regime_stale INTEGER,"
+                    "score_total REAL,confidence REAL,playbook_ref TEXT,"
+                    "experience_vector TEXT,pnl_pct REAL,hold_hours REAL,"
+                    "hit_1R INTEGER,raw TEXT,experience_summary TEXT,"
+                    "status TEXT)"
+                )
+                query_vec = find_similar_experience._simutil.experience_vector({
+                    "symbol": "GOOGL-USDT-SWAP",
+                    "side": "long",
+                    "regime": "range",
+                    "action": "open",
+                    "score_total": None,
+                })
+                for index, symbol in enumerate(
+                        ["GOOGL-USDT-SWAP"] * 3 + ["ETH-USDT-SWAP"] * 3):
+                    con.execute(
+                        "INSERT INTO trade_experiences VALUES("
+                        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            f"c{index}", "2026-07-30 12:00:00", "demo",
+                            symbol, "long", "open", "range", 0, None, None,
+                            None, json.dumps(query_vec),
+                            1.0 if index % 2 == 0 else -1.0,
+                            1.0, 0, "{}", "lesson", "closed",
+                        ),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+            result = find_similar_experience.find_similar_experience(
+                "GOOGL-USDT-SWAP",
+                "long",
+                "range",
+                "open",
+                db_root=root,
+                now=datetime(2026, 7, 31, 12, 0,
+                             tzinfo=find_similar_experience.CST),
+            )
+
+        self.assertEqual(result["summary"]["n"], 3)
+        self.assertEqual(result["cross_summary"]["n"], 3)
+        self.assertTrue(all(
+            item["symbol"] == "GOOGL-USDT-SWAP"
+            for item in result["matched_wins"] + result["matched_losses"]
+        ))
+        self.assertTrue(all(
+            item["symbol"] == "ETH-USDT-SWAP"
+            for item in (
+                result["cross_symbol_wins"]
+                + result["cross_symbol_losses"]
+            )
+        ))
+
     def test_compact_output_keeps_decision_evidence_without_raw_payloads(self):
         result = find_similar_experience.compact_result({
             "summary": {"n": 4, "credibility": 0.25},
@@ -47,11 +111,24 @@ class SimilarExperienceOutputTests(unittest.TestCase):
                 "pnl_pct": 1.2,
                 "cycle_id": "c1",
                 "profile": "live",
+                "symbol": "BTC-USDT-SWAP",
                 "outcome": "win",
                 "lesson": "x" * 300,
                 "raw_snippet": "must be omitted",
             }],
             "matched_losses": [],
+            "cross_summary": {"n": 2, "sufficient": False},
+            "cross_symbol_wins": [{
+                "sim": 0.8,
+                "pnl_pct": 0.5,
+                "cycle_id": "c2",
+                "profile": "demo",
+                "symbol": "ETH-USDT-SWAP",
+                "outcome": "win",
+                "lesson": "analogue",
+            }],
+            "cross_symbol_losses": [],
+            "query_symbol": "BTC-USDT-SWAP",
             "missed_opportunities": [{
                 "ts": "2026-07-28 00:00:00",
                 "symbol": "BTC-USDT-SWAP",
@@ -65,6 +142,11 @@ class SimilarExperienceOutputTests(unittest.TestCase):
         self.assertNotIn(
             "raw_snippet", result["matched_wins"][0])
         self.assertEqual(len(result["matched_wins"][0]["lesson"]), 240)
+        self.assertEqual(
+            result["matched_wins"][0]["symbol"], "BTC-USDT-SWAP")
+        self.assertEqual(
+            result["cross_symbol_wins"][0]["symbol"], "ETH-USDT-SWAP")
+        self.assertEqual(result["cross_summary"]["n"], 2)
         self.assertEqual(
             len(result["missed_opportunities"][0]["notes"]), 240)
 

@@ -20,6 +20,7 @@ def _project_path(*parts: str) -> str:
 
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,11 +34,22 @@ from pathlib import Path
 
 CST = timezone(timedelta(hours=8))
 ROOT = Path(_project_path())
+COLLECTORS = ROOT / "collectors"
+if str(COLLECTORS) not in sys.path:
+    sys.path.insert(0, str(COLLECTORS))
+from cycle_contract import (  # noqa: E402
+    cycle_session_token,
+    cycle_status_token,
+    validate_cycle_id,
+)
+import ledger  # noqa: E402
+
 STATUS_DIR = Path(os.environ.get("OKX_STAGE_STATUS_DIR")
                   or _project_path('logs', 'stage-status'))
 QQ_PUSH = ROOT / "scripts" / "qq_push.py"
 LIVE_RECON_MONITOR = ROOT / "scripts" / "live_reconcile_monitor.py"
 DB_ROOT = Path(os.environ.get("OKX_DB_ROOT") or _project_path('db'))
+CANONICAL_DB_ROOT = (ROOT / "db").resolve()
 OPENCLAW_STATE_ROOT = Path(
     os.environ.get("OKX_OPENCLAW_STATE_ROOT")
     or (Path.home() / ".openclaw")
@@ -60,9 +72,21 @@ def _safe(value: str) -> str:
     return _SAFE_RE.sub("-", str(value)).strip("-")[:100] or "unknown"
 
 
-def _stage_session_key(stage: str, cycle: str) -> str:
-    safe_cycle = str(cycle).replace("-", "").replace(":", "").replace("T", "-")
-    return f"{stage}-{safe_cycle}"
+def _root_namespace(db_root: Path | str | None = None) -> str:
+    resolved = Path(db_root or DB_ROOT).resolve()
+    if resolved == CANONICAL_DB_ROOT:
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
+
+
+def _stage_session_key(stage: str, cycle: str,
+                       db_root: Path | str | None = None) -> str:
+    safe_cycle = cycle_session_token(cycle)
+    suffix = _root_namespace(db_root)
+    tail = f"-{suffix}" if suffix else ""
+    return f"{stage}-{safe_cycle}{tail}"
 
 
 def _walk_dicts(value):
@@ -81,8 +105,10 @@ def detect_agent_terminal_failure(
     stage: str,
     cycle: str,
     state_root: Path | None = None,
+    db_root: Path | str | None = None,
 ) -> dict | None:
     """Read only the matching terminal reason; never persist model-chain data."""
+    cycle = validate_cycle_id(cycle)
     agent = _STAGE_AGENTS.get(stage)
     if not agent:
         return None
@@ -91,7 +117,7 @@ def detect_agent_terminal_failure(
     index_path = session_dir / "sessions.json"
     try:
         index = json.loads(index_path.read_text(encoding="utf-8"))
-        lookup_key = f"agent:{agent}:{_stage_session_key(stage, cycle)}"
+        lookup_key = f"agent:{agent}:{_stage_session_key(stage, cycle, db_root)}"
         entry = index.get(lookup_key)
         if not isinstance(entry, dict) or not entry.get("sessionId"):
             return None
@@ -133,8 +159,12 @@ def detect_agent_terminal_failure(
         return None
 
 
-def _status_path(stage: str, cycle: str) -> Path:
-    return STATUS_DIR / f"{_safe(stage)}-{_safe(cycle)}.json"
+def _status_path(stage: str, cycle: str,
+                 db_root: Path | str | None = None) -> Path:
+    safe_cycle = cycle_status_token(cycle)
+    suffix = _root_namespace(db_root)
+    tail = f"-{suffix}" if suffix else ""
+    return STATUS_DIR / f"{_safe(stage)}-{safe_cycle}{tail}.json"
 
 
 def _write_status(path: Path, payload: dict) -> None:
@@ -147,10 +177,11 @@ def _write_status(path: Path, payload: dict) -> None:
 
 def _send_failure_alert(stage: str, cycle: str, rc: int,
                         status_path: Path,
-                        failure_detail: dict | None = None) -> dict:
+                        failure_detail: dict | None = None,
+                        db_root: Path | str | None = None) -> dict:
     if os.environ.get("OKX_STAGE_RUNNER_NO_ALERT") == "1":
         return {"skipped": "OKX_STAGE_RUNNER_NO_ALERT=1"}
-    alert_file = STATUS_DIR / f"alert-{_safe(stage)}-{_safe(cycle)}.txt"
+    alert_file = status_path.with_name(f"alert-{status_path.stem}.txt")
     detail_line = ""
     if failure_detail:
         detail_line = (
@@ -169,7 +200,9 @@ def _send_failure_alert(stage: str, cycle: str, rc: int,
     try:
         p = subprocess.run(
             [sys.executable, str(QQ_PUSH), "--content-file", str(alert_file),
-             "--dedupe-key", f"stage-failed:{stage}:{cycle}"],
+              "--alert",  # 告警走 C2C 私聊，不混进业务播报群（2026-08-04）
+              "--dedupe-key", f"stage-failed:{status_path.stem}",
+              "--db-root", str(Path(db_root or DB_ROOT).resolve())],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60,
             creationflags=_CREATE_NO_WINDOW,
@@ -214,6 +247,7 @@ def verify_business_output(stage: str, cycle: str, mode: str,
     本校验绝不释放 stage_dispatch、补派或重试；异常按 fail-closed 返回。
     unified gate 主动写 skipped/stale 时按合法无交易终态处理。
     """
+    cycle = validate_cycle_id(cycle)
     root = Path(db_root or DB_ROOT)
     checks: list[dict] = []
 
@@ -225,10 +259,36 @@ def verify_business_output(stage: str, cycle: str, mode: str,
             raise LookupError(f"{filename}.{table}[{cycle}] 缺失")
         return row
 
+    def require_analysis_terminal() -> dict:
+        row = require("analysis.db", "analysis_runs", "status,ts,mode") or {}
+        status = str(row.get("status") or "").strip().lower()
+        if status not in {"ok", "skipped", "stale"}:
+            raise RuntimeError(
+                f"analysis status={status or 'missing'} 非成功终态")
+        return row
+
+    def require_trade_terminal(filename: str) -> dict:
+        row = require(
+            filename, "trade_cycles", "decision,n_orders,ts") or {}
+        decision = str(row.get("decision") or "").strip().lower()
+        try:
+            n_orders = int(row.get("n_orders"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{filename} n_orders={row.get('n_orders')!r} 非整数") from exc
+        valid = (
+            (decision == "traded" and n_orders > 0)
+            or (decision in {"hold", "skip"} and n_orders == 0)
+        )
+        if not valid:
+            raise RuntimeError(
+                f"{filename} decision={decision or 'missing'},"
+                f"n_orders={n_orders} 非成功终态")
+        return row
+
     try:
         if stage == "live" and mode == "unified":
-            analysis = require(
-                "analysis.db", "analysis_runs", "status,ts,mode")
+            analysis = require_analysis_terminal()
             analysis_status = str((analysis or {}).get("status") or "").lower()
             if analysis_status in ("skipped", "stale"):
                 return {
@@ -239,16 +299,13 @@ def verify_business_output(stage: str, cycle: str, mode: str,
             if analysis_status != "ok":
                 raise RuntimeError(
                     f"analysis status={analysis_status or 'missing'} 非可交易终态")
-            require("live_trades.db", "trade_cycles",
-                    "decision,n_orders,ts")
+            require_trade_terminal("live_trades.db")
         elif stage == "live":
-            require("live_trades.db", "trade_cycles",
-                    "decision,n_orders,ts")
+            require_trade_terminal("live_trades.db")
         elif stage == "demo":
-            require("demo_trades.db", "trade_cycles",
-                    "decision,n_orders,ts")
+            require_trade_terminal("demo_trades.db")
         elif stage == "analyst":
-            require("analysis.db", "analysis_runs", "status,ts,mode")
+            require_analysis_terminal()
         else:
             return {"ok": True, "skipped": f"stage={stage} 无额外业务后置条件"}
         return {"ok": True, "checks": checks}
@@ -268,16 +325,20 @@ def verify_business_output(stage: str, cycle: str, mode: str,
         }
 
 
-def _run_post_push_monitor(cycle: str) -> dict:
-    """push 后运行 live-only dry reconciliation；告警由 monitor 自己去重。
+def _run_post_push_monitor(cycle: str, profile: str,
+                           db_root: Path | None = None) -> dict:
+    """push 后运行指定 profile dry reconciliation；告警由 monitor 自己去重。
 
     该检查永远不改变 push stage 的成功/失败，也不 apply/replay。
     """
+    cycle = validate_cycle_id(cycle)
     if os.environ.get("OKX_POST_PUSH_RECONCILE", "1") == "0":
         return {"skipped": "OKX_POST_PUSH_RECONCILE=0"}
     try:
         proc = subprocess.run(
-            [sys.executable, str(LIVE_RECON_MONITOR), "--cycle", cycle],
+            [sys.executable, str(LIVE_RECON_MONITOR),
+             "--cycle", cycle, "--profile", profile,
+             "--db-root", str(Path(db_root or DB_ROOT))],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=240, creationflags=_CREATE_NO_WINDOW)
         return {
@@ -291,10 +352,12 @@ def _run_post_push_monitor(cycle: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="OKX detached stage lifecycle runner")
     ap.add_argument("--stage", required=True)
-    ap.add_argument("--cycle", required=True)
+    ap.add_argument("--cycle", required=True, type=validate_cycle_id)
     ap.add_argument("--mode", default="full")
+    ap.add_argument("--db-root", default=str(DB_ROOT))
     ap.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args()
+    runtime_db_root = Path(args.db_root).resolve()
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
@@ -302,7 +365,7 @@ def main() -> int:
         ap.error("缺少 -- 后的实际命令")
 
     started_mono = time.monotonic()
-    path = _status_path(args.stage, args.cycle)
+    path = _status_path(args.stage, args.cycle, runtime_db_root)
     status = {
         "stage": args.stage,
         "cycle_id": args.cycle,
@@ -316,8 +379,11 @@ def main() -> int:
         # runner 自身由 DETACHED_PROCESS 拉起；其内部再次启动 console 程序时，
         # Windows 仍可能新建控制台。内层只用 CREATE_NO_WINDOW（不再叠 DETACHED），
         # 保持可等待/取退出码，同时彻底阻止 openclaw-agent 定时弹窗。
+        child_env = os.environ.copy()
+        child_env["OKX_DB_ROOT"] = str(runtime_db_root)
         proc = subprocess.run(
-            command, cwd=str(ROOT), creationflags=_CREATE_NO_WINDOW)
+            command, cwd=str(ROOT), creationflags=_CREATE_NO_WINDOW,
+            env=child_env)
         child_rc = int(proc.returncode)
         error = None
     except Exception as exc:
@@ -330,14 +396,14 @@ def main() -> int:
     terminal_evidence = None
     if child_rc == 0:
         business_check = verify_business_output(
-            args.stage, args.cycle, args.mode)
+            args.stage, args.cycle, args.mode, db_root=runtime_db_root)
         if not business_check.get("ok"):
             rc = _BUSINESS_FAILURE_RC
             failure_kind = business_check.get(
                 "failure_kind", "business_verification_error")
     if rc != 0:
         terminal_evidence = detect_agent_terminal_failure(
-            args.stage, args.cycle)
+            args.stage, args.cycle, db_root=runtime_db_root)
         if terminal_evidence:
             failure_kind = terminal_evidence["failure_kind"]
             if business_check is not None:
@@ -363,11 +429,23 @@ def main() -> int:
     if terminal_evidence:
         status["agent_terminal_evidence"] = terminal_evidence
     if rc == 0 and args.stage == "push":
-        status["post_live_reconcile"] = _run_post_push_monitor(args.cycle)
+        status["post_live_reconcile"] = _run_post_push_monitor(
+            args.cycle, "live", runtime_db_root)
+        status["post_demo_reconcile"] = _run_post_push_monitor(
+            args.cycle, "demo", runtime_db_root)
     _write_status(path, status)
     if rc != 0:
         status["alert"] = _send_failure_alert(
-            args.stage, args.cycle, rc, path, business_check)
+            args.stage, args.cycle, rc, path, business_check,
+            db_root=runtime_db_root)
+        _write_status(path, status)
+    if args.stage in {"live", "demo"}:
+        try:
+            status["profile_lease_released"] = ledger.release_profile_lease(
+                runtime_db_root / "ledger.db", args.stage, args.cycle)
+        except Exception as exc:
+            status["profile_lease_release_error"] = (
+                f"{type(exc).__name__}: {exc}")
         _write_status(path, status)
     return rc if 0 <= rc <= 255 else 1
 

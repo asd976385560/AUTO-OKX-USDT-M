@@ -3,7 +3,7 @@ doc: trade_template
 doc-version: V2.0-template
 last-updated: 2026-07-29
 updated-by: Codex
-change-summary: 对齐交易前全账户未决意图闸、止损身份、部分成交、权威成交时间与writer提交时间契约。
+change-summary: Live改为预计成交后组合IMR不超过66.6%的整单拒绝闸；Demo仍仅用实时max-size。
 role: 交易回执模板（live/demo trader -> live_trades.db / demo_trades.db）
 权威: skill.md（交易执行契约节）+ core/order_executor.py + core/risk_validator.py + collectors/trades_writer.py
 落点: <PROJECT_ROOT>\db\live_trades.db / demo_trades.db（trade_cycles + trades）
@@ -16,11 +16,13 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 
 > live 下单**唯一路径** = `core/order_executor.open_position()` / `close_position()`，其内部**强制调** `core/risk_validator.validate()`（LLM 物理越不过闸，红线 #7）。
 > 执行器产出已携完整 cycle/决策卡的**回执 dict**。任何确认成交轮都必须在调用 executor 的同一确定性 Python 进程内立即调用 `collectors.trades_writer.commit_receipt(receipt, profile)`；禁止先退出、再由模型下一次工具调用补落账。HOLD/ADJUST 等无成交回执才可走 `--json-file`。
-> 红线：写库必走 writer，禁手写 INSERT；现仓以 OKX API 为准（禁 position_snapshots GROUP BY）；勿用 ctVal 直接比硬上限（先算每张保证金）。零模型名。
+> 红线：写库必走 writer，禁手写 INSERT；现仓以 OKX API 为准（禁 position_snapshots GROUP BY）；Live 组合 IMR 只认同次 OKX `account.balance.imr/totalEq` 与本单增量，禁用 `mgnRatio`、gross、net 替代。零模型名。
 
 ## 1. order_executor 回执 dict（每笔执行产物）
 
 `open_position(symbol, side, intended_sz, lev, sl_trigger_px, profile, mgn_mode='cross', mark_px, equity, open_positions, reasoning, db_root, cycle_id, available_margin=None, receipt_context=None)`
+
+> `available_margin` 仅参与 Live 的实时可用保证金边界；Live OPEN/ADD 还必须用同次 `account.imr/totalEq` 计算预计成交后组合 IMR。Demo OPEN 不信任 caller 或账户快照容量；executor 会按本次 `symbol/side/tdMode/effective_lev` 实时查询 OKX Demo `account max-size`。
 `close_position(symbol, profile, pos_side, mgn_mode='cross', reasoning, db_root, cycle_id, receipt_context=None)`
 
 > 非 dry-run 的 `cycle_id` 与 `receipt_context` 必传。`receipt_context` 必须是有效 JSON dict，含 `status=ok`、同一 `cycle_id`、`decision_protocol=decision_card_v1` 和完整 `decision_card`；执行器在任何 OKX I/O 前校验，失败直接 reject。
@@ -56,11 +58,12 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 | `ord_id` / `algo_id` | OKX 订单号 / 独立 algo SL 单号（在 trade 内） |
 | `clamped`/`adjustments` | clamp 标记 / 调整说明（透传自 risk） |
 | `unwind` | UNWIND 时附平裸仓子回执 |
-| `reject_reason`/`reject_detail` | REJECT/UNWIND 时拒因（机读码 + 人读）。码含 `no_sl`/`bad_sl`/`bad_lev`/`bad_mark_px`/`bad_equity`/`available_margin_missing`/`insufficient_available_margin`/`instrument_unknown`/`set_leverage_failed`/`place_failed`/`sl_failed_unwound`/`fills_missing` 等 |
+| `reject_reason`/`reject_detail` | REJECT/UNWIND 时拒因（机读码 + 人读）。码含 `no_sl`/`bad_sl`/`bad_lev`/`bad_mark_px`/`bad_equity`/Live `available_margin_missing|insufficient_available_margin`/Demo `demo_max_size_fetch_failed|exchange_max_size_missing|bad_exchange_max_size|exchange_capacity_below_minimum|exchange_min_size`/`instrument_unknown`/`set_leverage_failed`/`place_failed`/`sl_failed_unwound`/`fills_missing` 等 |
+| `capacity` | profile 对应的执行容量证据。Live 为同次账户余额的 `account.imr/totalEq` 与实时 USDT 可用额；Demo 必含 `source=account.max-size`、`inst_id/side/td_mode/direction_field/direction_value/max_size` |
 | `reduce_only_fallback`/`fills_ok` | CLOSE 专属：是否经 reduceOnly 市价单完成平仓（2026-07-03 起为主路径，正常情况即 True；False=降级走 swap close CLI 兜底）/ fills 是否回读成功 |
 | `note` | 如 `no_open_position`（已平，幂等成功） |
 
-> **OPEN 不变量**：装配现场 -> 强制 risk_validator -> 市价开仓即附挂 SL -> 按 symbol、posSide、平仓 side、reduceOnly、数量、触发价和 live 状态回读，独立 algo 必须命中本次精确 algoId -> 附挂失败独立 algo SL（重试1）-> 仍失败立即市价平掉裸仓 unwind(p0) -> 从 fills/订单状态/订单历史端点求真实际成交（均失败 -> repair_queue + reject + p0）。
+> **OPEN 不变量**：装配现场 -> Live 同次取 `account.imr/totalEq` 与实时 USDT 可用额并计算预计组合 IMR、Demo 按目标合约实时取 `account max-size`（失败即止）-> 强制 profile-aware risk_validator -> 市价开仓即附挂 SL -> 按 symbol、posSide、平仓 side、reduceOnly、数量、触发价和 live 状态回读，独立 algo 必须命中本次精确 algoId -> 附挂失败独立 algo SL（重试1）-> 仍失败立即市价平掉裸仓 unwind(p0) -> 从 fills/订单状态/订单历史端点求真实际成交（均失败 -> repair_queue + reject + p0）。
 > **CLOSE 不变量**（2026-07-03 主路径反转）：OKX API 现仓确认 posSide -> reduceOnly 反向市价单（主路径，拿 ordId 即时确认，绝不翻反向仓）-> 被拒（51023/51169 等）转 swap close CLI 兜底 -> 51087 下架/51001 不存在明确拒因 -> 权威端点回读真实 pnl、实际 `fill_sz` 和 `fill_ts`。
 > **live/demo 开仓必须传 `sl_trigger_px`**；缺失或非有限、long 不低于 mark、short 不高于 mark、偏离超过 30% 均 reject（双盘一致）。
 
@@ -120,19 +123,27 @@ CLOSE 产出：`action="close"`、`pnl`=回读 fills 真实 pnl（拉不到为 n
 
 ## 3. risk/clamp 留痕（risk_validator.validate 返回）
 
-执行器回执 `risk` 字段即 `validate()` 完整返回，**全程留痕**（push「风控」段 + 复盘消费）：
+执行器回执 `risk` 字段即 `validate()` 完整返回，**全程留痕**（push「风控」段 + 复盘消费）。下例是 **Live** 回执：
 
 ```json
 {
   "approved": true,
   "approved_sz": 1,
-  "clamped": true,
-  "adjustments": ["intended 3 张超单笔保证金 20% 上限，clamp 至 1 张"],
+  "clamped": false,
+  "adjustments": [],
   "reject_reason": null,
   "reject_detail": null,
   "math": {
     "symbol": "BTC-USDT-SWAP", "side": "long", "profile": "live",
-    "intended_sz": 3, "requested_lev": 5, "effective_lev": 5,
+    "intended_sz": 1, "requested_lev": 5, "effective_lev": 5,
+    "account_imr": 180.0,
+    "incremental_order_imr": 20.0,
+    "projected_account_imr": 200.0,
+    "current_portfolio_imr_ratio": 0.60,
+    "projected_portfolio_imr_ratio": 0.666,
+    "max_portfolio_imr_ratio": 0.666,
+    "portfolio_imr_ratio_unit": "fraction",
+    "portfolio_imr_source": "account.balance.imr",
     "mark_px": 62500.0, "ct_val": 0.01, "lot_sz": 1,
     "equity": 1000.0, "available_margin_raw": 180.0,
     "equity_margin_budget": 200.0, "available_margin_budget": 176.4,
@@ -141,11 +152,11 @@ CLOSE 产出：`action="close"`、`pnl`=回读 fills 真实 pnl（拉不到为 n
 }
 ```
 
-模块级**硬上限常量**（`core/risk_validator.py`，live/demo 同一套硬上限判定，均越不过）：
+模块级 **Live 硬上限常量**（`core/risk_validator.py`；仅 `profile=live`）：
 
 | 常量 | 值 | 含义 |
 |---|---|---|
-| `MAX_MARGIN_PCT` | `0.20` | 单笔保证金占 equity 上限 20% |
+| `MAX_PORTFOLIO_IMR_RATIO` | `0.666` | 预计成交后组合 `(account.imr+incremental_order_imr)/totalEq` 上限 66.6%；超限整笔 reject，不 clamp |
 | `AVAILABLE_MARGIN_USE_PCT` | `0.98` | 本笔最多使用当前 USDT 可用保证金的 98% |
 | `MAX_LEVERAGE` | `10.0` | 杠杆上限 10x |
 | `MIN_NOTIONAL_PCT` | `0.01` | 名义下限 1%（太小拒） |
@@ -153,9 +164,28 @@ CLOSE 产出：`action="close"`、`pnl`=回读 fills 真实 pnl（拉不到为 n
 
 > （MAX_SAME_SIDE_PCT 同侧 60% 闸已于 2026-07-15 主人拍板取消——除硬上限+强制 SL 外不加条件；同侧暴露仅算入 `math_box["same_side_existing_notional"]` 观察留痕，无闸。）
 
-> **20% 仅是本次 OPEN/ADD 单笔上限，不是组合总保证金上限。** HOLD/ADJUST 的组合估算比例放 `risk.portfolio_observation.estimated_margin_pct_equity`，不得冒充 `risk.margin_pct`；有成交时直接保留执行器返回的 risk，禁 trader 重算。真实开仓有效预算=`min(20%×totalEq,98%×details.USDT可用保证金)`。
+> **Live 组合 IMR 闸**：当前值=`account.imr/totalEq`，预计值=`(account.imr+incremental_order_imr)/totalEq`；预计超过 66.6% 时整笔拒绝 OPEN/ADD，禁止 clamp 或自动缩量重试，CLOSE/REDUCE 不受影响。有开仓时直接保留执行器返回的 risk，禁 trader 重算。
+>
+> `mgnRatio` 是 OKX 风险健康度，gross/net 是名义敞口，逐仓 `notional/lev` 求和也只可作推送观察；它们均不得冒充或替代执行时同次 `account.balance.imr/totalEq`。
 
-> `position_budget(mark_px, ct_val, lot_sz, equity, lev)` 供 `decision_briefing` 预算（先算每张保证金 `per_contract_margin = mark_px*ct_val/lev`，再得 `max_sz_margin`/`min_notional_sz`）——红线 #8：**勿用 ctVal 直接比硬上限**。
+> `position_budget(mark_px, ct_val, lot_sz, equity, lev, available_margin, account_imr, profile="live")` 只展示名义下限、可用资金张数与组合 IMR 剩余空间，不能预批订单；Live 放行仍须 executor 使用同次账户余额和本单增量。
+
+Demo OPEN 的 `risk.math` 必须使用以下语义，不得重填 Live 字段：
+
+```json
+{
+  "sizing_policy": "okx_demo_max_size_only",
+  "exchange_min_size": 0.01,
+  "exchange_max_size_raw": 25.0,
+  "max_sz_exchange": 25.0,
+  "margin_budget_binding": "exchange_max_size",
+  "notional_floor": null,
+  "equity_margin_budget": null,
+  "available_margin_budget": null
+}
+```
+
+> Demo 不应用 Live 的名义百分比下限、可用额折扣或组合 IMR 闸。只按交易所 `minSz/lotSz` 与本次 OKX Demo `maxBuy|maxSell` 定仓；低于 `minSz` 时拒绝而不自动向上放大，容量查询失败或不足最小下单单位时 fail-safe。`account_snapshots.totalEq/availBal` 只作资产/绩效展示。
 
 ## 4. cycle 级回执（trader -> trades_writer.write_trades）
 
@@ -247,7 +277,8 @@ if not result.get("ok") or result.get("refused"):
 
 | 校验项 | 由谁 | 失败行为 |
 |---|---|---|
-| 风控硬闸（live 越不过） | `core/risk_validator.validate`（执行器内部强制调） | reject -> 执行器回执 `ok=false action_taken=REJECT`，**不下单** |
+| Live 组合 IMR 硬闸 | `core/risk_validator.validate`（执行器内部强制调） | 预计成交后 `account.imr/totalEq>66.6%` 时整笔 reject OPEN/ADD，不 clamp；CLOSE/REDUCE 不受影响 |
+| Demo 实时容量闸 | `core/lib/_okxorder.get_max_size` + profile-aware `risk_validator.validate` | 每笔按 `symbol/side/tdMode/effective_lev` 实时查询；失败或容量不可行即 reject，禁回退 Live 公式 |
 | SL 保障（live/demo 必带、方向正确且必须挂上） | `core/risk_validator.validate` + `core/order_executor.open_position` | 无效/反向 SL reject；严格身份回读失败后重试独立 SL；挂单全败 -> 市价平裸仓 UNWIND + p0 |
 | 现仓真伪 | OKX API（`fetch_open_positions`） | 禁 position_snapshots GROUP BY（红线 #6） |
 | 成交真伪 | fills → order status / orders-history 双源确认 | OPEN 均确认不了 -> repair_queue + reject + p0；禁止 mark/聚合估算兜底。CLOSE 未确认只留 null 待对账，不计确认成交 |

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -112,6 +114,54 @@ def _create_trade_db(path: Path) -> None:
 
 
 class AnalystWriterHardeningTests(unittest.TestCase):
+    def test_price_hints_are_numeric_and_hold_cannot_claim_stop_price(self):
+        base = {
+            "cycle_id": "2026-07-29T12:00",
+            "ts": "2026-07-29 12:01:00",
+            "mode": "full",
+            "status": "ok",
+            "decision_protocol": "decision_card_v1",
+            "market_summary": {
+                name: {} for name in analyst_writer.MARKET_SUMMARY_SECTIONS
+            },
+        }
+        string_price = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "open_long",
+                "side": "long",
+                "entry_hint": "60000附近",
+                "stop_hint": 59000.0,
+                "tp_hint": 62000.0,
+                "decision_card": _valid_card(),
+            }],
+        }
+        errors = analyst_writer.validate_receipt(string_price)
+        self.assertTrue(
+            any("entry_hint" in item and "正有限数值" in item
+                for item in errors),
+            errors,
+        )
+
+        hold_with_claimed_stop = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "hold",
+                "side": None,
+                "entry_hint": None,
+                "stop_hint": 59000.0,
+                "tp_hint": None,
+                "decision_card": _valid_card(),
+            }],
+        }
+        errors = analyst_writer.validate_receipt(hold_with_claimed_stop)
+        self.assertTrue(
+            any("价格提示必须全为 null" in item for item in errors),
+            errors,
+        )
+
     def test_action_side_contract_is_fail_closed(self) -> None:
         base = {
             "cycle_id": "2026-07-29T12:00",
@@ -146,6 +196,47 @@ class AnalystWriterHardeningTests(unittest.TestCase):
         }
         errors = analyst_writer.validate_receipt(unknown)
         self.assertTrue(any("action 不支持" in item for item in errors), errors)
+
+        # hold = 持有既有仓位，恒无方向。
+        hold_with_side = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "hold",
+                "side": "long",
+                "decision_card": _valid_card(),
+            }],
+        }
+        errors = analyst_writer.validate_receipt(hold_with_side)
+        self.assertTrue(any("不一致" in item for item in errors), errors)
+
+        # wait = 可选方向；三种取值都必须放行，否则错失机会对照组断供。
+        for wait_side in (None, "long", "short"):
+            with self.subTest(wait_side=wait_side):
+                wait_signal = {
+                    **base,
+                    "signals": [{
+                        "symbol": "BTC-USDT-SWAP",
+                        "action": "wait",
+                        "side": wait_side,
+                        "decision_card": _valid_card(),
+                    }],
+                }
+                self.assertEqual(
+                    analyst_writer.validate_receipt(wait_signal), [])
+
+        # wait 的方向仍受域约束，垃圾值（历史上出现过 '-'/'n/a'）必须拒。
+        wait_garbage = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "wait",
+                "side": "n/a",
+                "decision_card": _valid_card(),
+            }],
+        }
+        errors = analyst_writer.validate_receipt(wait_garbage)
+        self.assertTrue(any("不一致" in item for item in errors), errors)
 
         missing_status = dict(base)
         missing_status.pop("status")
@@ -508,6 +599,96 @@ class TradesWriterHardeningTests(unittest.TestCase):
 
 
 class DispatcherHardeningTests(unittest.TestCase):
+    def test_public_runner_uses_current_python_and_propagates_db_root(self):
+        trigger_source = Path(dispatcher.trigger_agent.__file__).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("pythoncore-", trigger_source)
+        self.assertIn(
+            'os.environ.get("OKX_PYTHON_BIN", sys.executable)',
+            trigger_source,
+        )
+
+        custom_root = Path("isolated") / "db"
+        with mock.patch.object(dispatcher.trigger_agent, "_PYTHON_EXE",
+                               sys.executable):
+            command = dispatcher.trigger_agent._supervised_cmd(
+                "live", "2026-07-29T12:00", "full", ["child"],
+                db_root=custom_root,
+            )
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("--db-root", command)
+        self.assertEqual(
+            command[command.index("--db-root") + 1],
+            os.fspath(custom_root.resolve()),
+        )
+
+    def test_fire_passes_canonical_db_root_into_build_and_runner(self):
+        selected_root = dispatcher.trigger_agent._CANONICAL_DB_ROOT
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(dispatcher.trigger_agent, "LOG_DIR", Path(tmp)), \
+             mock.patch.object(dispatcher.trigger_agent, "build_cmd",
+                               return_value=["child"]) as build, \
+             mock.patch.object(dispatcher.trigger_agent, "_supervised_cmd",
+                               return_value=["runner"]) as supervised, \
+             mock.patch.object(dispatcher.trigger_agent.subprocess, "Popen",
+                               return_value=mock.Mock()), \
+             mock.patch.object(dispatcher.trigger_agent, "_probe_launch"):
+            dispatcher.trigger_agent.fire(
+                "live", "2026-07-29T12:00", "full", db_root=selected_root
+            )
+
+        build.assert_called_once_with(
+            "live", "2026-07-29T12:00", "full", db_root=selected_root
+        )
+        supervised.assert_called_once_with(
+            "live", "2026-07-29T12:00", "full", ["child"],
+            db_root=selected_root,
+        )
+
+    def test_profile_lease_serializes_cycles_and_owner_only_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.db"
+            dispatcher.ledger.init_ledger(path)
+            at = datetime(2026, 7, 29, 12, 0, tzinfo=CST)
+            self.assertTrue(dispatcher.ledger.try_profile_lease(
+                path, "live", "2026-07-29T12:00", now=at))
+            self.assertFalse(dispatcher.ledger.try_profile_lease(
+                path, "live", "2026-07-29T12:00", now=at))
+            self.assertFalse(dispatcher.ledger.try_profile_lease(
+                path, "live", "2026-07-29T12:15", now=at))
+            self.assertFalse(dispatcher.ledger.release_profile_lease(
+                path, "live", "2026-07-29T12:15"))
+            self.assertTrue(dispatcher.ledger.release_profile_lease(
+                path, "live", "2026-07-29T12:00"))
+            self.assertTrue(dispatcher.ledger.try_profile_lease(
+                path, "live", "2026-07-29T12:15", now=at))
+
+    def test_trade_written_rejects_error_and_fake_traded_terminal(self):
+        cycle = "2026-07-29T12:00"
+        for decision, n_orders, expected in (
+            ("error", 0, False),
+            ("traded", 0, False),
+            ("hold", 0, True),
+            ("traded", 1, True),
+        ):
+            with self.subTest(decision=decision, n_orders=n_orders):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _create_trade_db(root / "live_trades.db")
+                    with closing(sqlite3.connect(
+                            root / "live_trades.db")) as con:
+                        con.execute(
+                            "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                            (cycle, "2026-07-29 12:01:00", "live",
+                             decision, n_orders, None, "", "{}"),
+                        )
+                        con.commit()
+                    self.assertEqual(
+                        dispatcher.trade_written(root, "live", cycle),
+                        expected,
+                    )
+
     def test_unknown_analysis_status_never_dispatches_downstream(self) -> None:
         fired: list[tuple] = []
         now = datetime(2026, 7, 29, 12, 5, tzinfo=CST)

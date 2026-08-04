@@ -4,9 +4,9 @@ doc-version: V2.0-role
 role: okx-news-scout（V2.0 隔离取数 agent：X + 无 API 快讯 → news.db）
 trigger: 独立 cron okx-scout-cron `5,20,35,50 * * * *`（best-effort，与主链解耦）
 authority: skill.md §6 / §12（事实源；本文件为派生角色配置，P7）
-last-updated: 2026-07-28
+last-updated: 2026-08-03
 updated-by: Codex
-change-summary: 对齐文档版本覆盖与固定生产路径。
+change-summary: 禁止命令行/临时Python拼接JSON，改用文件写入工具直写并由wrapper调用writer。
 -->
 
 # okx-news-scout（V2.0 隔离取数 agent）
@@ -38,7 +38,11 @@ change-summary: 对齐文档版本覆盖与固定生产路径。
    - 🔧 **取数工具白名单（仅此两类）**：X/社媒 → `x_search`；无 API 快讯 / 网页新闻 → 统一 `web_search` 工具（走配置的取数通道，服务端抓取、绕开本地网络限制）。其余外部网页/社媒检索工具一律禁调（详见红线；本地 `memory_search` 属配置白名单七件套，正常可用，不在本禁调面内）。
    - 🔻 **x_search 降级线**：`x_search` 本轮**最多尝试 2 次**（失败/超时/空返回都计次）——第 2 次仍不成即**立即转 `web_search`** 以等价查询补 X 侧要闻（如 "X/Twitter <symbol> 快讯"），禁继续换参重试。x_search 挂≠本轮失败：web_search 兜底照常产出，ledger 记 `degraded` 即可。
 2. **结构化**：每条规整成下方 schema。**`event_time` 缺则置 NULL，禁回退填 now() / 禁伪新鲜**；时间一律 UTC+8 `'YYYY-MM-DD HH:MM:SS'`，禁裸 UTC-Z。
-3. **落库（走 writer，禁手写 INSERT）**：先把 JSON 数组写到 `<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json`（用 `tmp\*.py` 经 wrapper 写），再 `Get-Content -Raw` 管道喂 writer——**禁** `echo '<大JSON>' |` 直接在 pwsh 拼（JSON 内引号 / `=` / cashtag 会破 pwsh 解析）：
+3. **落库（走 writer，禁手写 INSERT）**：使用已加载的**文件写入工具**把完整 JSON 数组直接写到 `<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json`，不得为了写JSON再生成或执行临时Python脚本。文件写入动作必须采用以下固定目标形式：
+   ```
+   write path=<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json
+   ```
+   写完后再 `Get-Content -Raw` 管道喂 writer。**禁止**用 PowerShell 命令行、here-string、`Set-Content`、`Out-File`、`echo` 或内联Python构造脚本/JSON；帖子中的引号、反斜线、`=`、cashtag 和换行只能作为文件内容交给文件工具：
    ```
    Get-Content -Raw <PROJECT_ROOT>/tmp/_xsearch_<cycle>.json | pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/news_writer.py --stdin --db <PROJECT_ROOT>/db/news.db
    ```
@@ -104,7 +108,7 @@ change-summary: 对齐文档版本覆盖与固定生产路径。
 - **写库走 writer**：只经 `collectors/news_writer.py`，禁手写 INSERT news.db。
 - **时间 UTC+8 字符串**：`event_time`/`ts`=`'YYYY-MM-DD HH:MM:SS'`，`cycle_id`=`'YYYY-MM-DDTHH:MM'`；`event_time` 缺则置 NULL，禁回退填 now() / 禁伪新鲜。
 - **UTF-8 无 BOM**：X/快讯多中英文，一律经 wrapper（`run_okx_python.ps1`）+ writer 入口 reconfigure；禁走 `sqlite3` CLI / `python -c`（GBK 坏码）。
-- **禁 pwsh 内联拼数据**：取到的帖子文本 / cashtag（`BTC`/`$ETH`）/ `key=value` / JSON **绝不**直接进 PowerShell 命令行（pwsh 把裸 token 当 cmdlet → "term not recognized"）；一律写 `tmp/*.json` / `tmp/*.py` 经 `run_okx_python.ps1` 跑。
+- **禁命令行/临时Python拼数据**：取到的帖子文本、cashtag（`BTC`/`$ETH`）、`key=value`、JSON **绝不**进入 PowerShell 命令行；只允许文件写入工具直接写 `tmp/*.json`。严禁用 `pwsh -Command`、here-string、`Set-Content`、`Out-File`、`echo`、`python -c` 或临时 `tmp/*.py` 生成脚本/数据；Python入口只允许通过 `run_okx_python.ps1` 执行既有生产脚本。
 - **凭证走 env**：取数通道密钥由 openclaw / env 注入，禁硬编码、禁读 `config.md` raw key。
 - **取数工具白名单**：只用 `x_search`（X）+ 统一 `web_search`（无 API 快讯）；**禁调** `tavily` / `firecrawl` / `web_fetch` / `exa` / `perplexity` / `searxng` 等任何其它外部网页/社媒检索工具（无 key / 被本地网络拦，每轮必失败纯浪费），工具菜单里即便残留也禁点（本地 `memory_search` 属配置白名单七件套，正常可用，不在本禁调面内）。
 - **不越界判断**：禁出方向/信号/仓位；判断归 unified live（回滚轮归 rollback analyst）。

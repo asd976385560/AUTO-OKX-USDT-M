@@ -132,6 +132,21 @@ def get_balance(profile: str) -> dict[str, Any]:
     return _call("account", "balance", profile=profile)
 
 
+def get_max_size(inst_id: str, td_mode: str, profile: str) -> dict[str, Any]:
+    """查询交易所按当前账户状态计算的最大可下单张数。
+
+    ``account max-size`` 是只读接口；对于 SWAP，回包 ``maxBuy/maxSell`` 与
+    下单参数 ``sz`` 同为合约张数。接口默认按账户当前杠杆计算，因此调用方若要
+    使用目标杠杆，必须先确认/设置该杠杆，再调用本函数，不能用余额公式回推。
+    """
+    return _call(
+        "account", "max-size",
+        "--instId", inst_id,
+        "--tdMode", td_mode,
+        profile=profile,
+    )
+
+
 def get_mark_price(inst_id: str, profile: str) -> Optional[float]:
     r = _call("market", "mark-price", "--instType", "SWAP", "--instId", inst_id,
               profile=profile)

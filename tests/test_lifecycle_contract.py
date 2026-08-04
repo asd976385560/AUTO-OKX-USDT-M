@@ -49,6 +49,33 @@ class ScriptLifecycleContractTests(unittest.TestCase):
         self.assertTrue(any("不得继续留在" in item for item in errors))
         self.assertTrue(any("未登记脚本" in item for item in errors))
 
+    def test_retired_cross_market_powershell_query_stays_absent(self):
+        stale_query = ROOT / "scripts" / "query_cross_market.ps1"
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        registered = {
+            path
+            for group in manifest["groups"]
+            for path in group["paths"]
+        }
+        self.assertFalse(stale_query.exists())
+        self.assertNotIn(stale_query.name, registered)
+
+    def test_completed_gateway_rss_probe_is_not_published(self):
+        active_probe = ROOT / "scripts" / "gateway_rss_sample.ps1"
+        archived_probe = (
+            ROOT / "scripts" / "archive" / "diagnostics"
+            / "gateway_rss_sample.ps1"
+        )
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        registered = {
+            path
+            for group in manifest["groups"]
+            for path in group["paths"]
+        }
+        self.assertFalse(active_probe.exists())
+        self.assertFalse(archived_probe.exists())
+        self.assertNotIn(active_probe.name, registered)
+
 
 if __name__ == "__main__":
     unittest.main()

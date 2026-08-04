@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """周度判断质量报告（T11，2026-06-12）——P7 weekly 固定段落数据源。
 
-输出 markdown 到 stdout，由周报 agent 原样嵌入推送（统一 QQ target）。四段:
+输出 markdown 到 stdout，由周报 agent 原样嵌入业务报告，并经不带
+`--alert` 的 `qq_push.py` 推送至 `OKX_QQ_TARGET`。四段:
   1. 六项决策卡完整率与历史经验取舍结果
   2. regime 判定 vs BTC 实际走势（近 7 天逐日复盘）
   3. 轮次可靠性（cron 运行成功率 / 丢轮 / provider 分布，读 openclaw.sqlite 只读）

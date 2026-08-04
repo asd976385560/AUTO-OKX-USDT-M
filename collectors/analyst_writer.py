@@ -82,6 +82,7 @@ def _project_path(*parts: str) -> str:
 
 
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone, timedelta
@@ -149,11 +150,21 @@ try:
 except Exception:  # noqa: BLE001
     _nudge_mod = None
 
-DB_PATH = Path(_project_path('db', 'analysis.db'))
+_PRODUCTION_DB_ROOT = Path(_project_path('db')).resolve()
 
 
-def connect(write: bool = False) -> sqlite3.Connection:
-    uri = f"file:{DB_PATH}" + ("?mode=ro" if not write else "")
+def _runtime_db_root(explicit: str | Path | None = None) -> Path:
+    """Resolve the runtime DB root without silently falling back to production."""
+    value = explicit if explicit is not None else _project_os.environ.get("OKX_DB_ROOT")
+    return Path(value or _PRODUCTION_DB_ROOT).expanduser().resolve()
+
+
+DB_PATH = _runtime_db_root() / "analysis.db"
+
+
+def connect(write: bool = False, db_path: Path | None = None) -> sqlite3.Connection:
+    target = Path(db_path or DB_PATH)
+    uri = f"file:{target}" + ("?mode=ro" if not write else "")
     con = sqlite3.connect(uri, uri=True, timeout=10)
     con.row_factory = sqlite3.Row
     if write:
@@ -296,11 +307,17 @@ def validate_receipt(data: dict) -> list[str]:
                     if raw_side is None or not str(raw_side).strip()
                     else str(raw_side).strip().lower()
                 )
+                # hold = 持有既有仓位，本身无方向可言 → 必须 null。
+                # wait = 看到方向但本轮不入场，方向正是可检验的信息：
+                #   scripts/missed_opps_writer.py 靠它回填「不开仓」的机会成本对照组。
+                #   2026-07-29 该字段被一并收紧为 null 后，对照组静默停写两天
+                #   （missed_opportunities 最后一条 = 最后一条带方向的 wait/hold）。
+                #   故 wait 恢复为「可选方向」：能判方向就填，纯观望留 null。
                 expected_sides = {
                     "open_long": {"long"},
                     "open_short": {"short"},
                     "hold": {None},
-                    "wait": {None},
+                    "wait": {None, "long", "short"},
                     "close": {"long", "short"},
                 }.get(action)
                 if expected_sides is not None and side not in expected_sides:
@@ -342,13 +359,32 @@ def validate_receipt(data: dict) -> list[str]:
                 if v is not None and (not _num(v) or not (0.0 <= v <= 1.0)):
                     errors.append(
                         f"signals[{i}]({sig.get('symbol')}) confidence={v!r} 越域（须为 0.0-1.0 数值）")
+                for c in ("entry_hint", "stop_hint", "tp_hint"):
+                    v = sig.get(c)
+                    if v is not None and (
+                        not _num(v)
+                        or not math.isfinite(float(v))
+                        or float(v) <= 0
+                    ):
+                        errors.append(
+                            f"signals[{i}]({sig.get('symbol')}) {c}={v!r} "
+                            "须为正有限数值或 null")
+                if action in {"hold", "wait"}:
+                    non_null_hints = [
+                        c for c in ("entry_hint", "stop_hint", "tp_hint")
+                        if sig.get(c) is not None
+                    ]
+                    if non_null_hints:
+                        errors.append(
+                            f"signals[{i}].action={action} 时价格提示必须全为 null，"
+                            f"got: {','.join(non_null_hints)}")
     return errors
 
 
 # ---------------------------------------------------------------------------
 # 写入
 # ---------------------------------------------------------------------------
-def write_analysis(data: dict) -> dict:
+def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     """写 analysis_runs + analysis_signals；成功返回 ok，失败返回错误 dict。
 
     闩锁规则（防 race condition）：
@@ -389,7 +425,7 @@ def write_analysis(data: dict) -> dict:
     missing_json = json.dumps(missing_sources, ensure_ascii=False) if missing_sources is not None else None
     raw_json = json.dumps(raw, ensure_ascii=False) if raw is not None else None
 
-    con = connect(write=True)
+    con = connect(write=True, db_path=db_path)
     try:
         # 闩锁：查是否已有 status='ok' 的行 → 有则拒绝（race condition 防护）
         existing = con.execute(
@@ -484,6 +520,15 @@ def main() -> int:
         _i = sys.argv.index("--input-file")
         if _i + 1 < len(sys.argv):
             input_file = sys.argv[_i + 1]
+    db_root = None
+    if "--db-root" in sys.argv:
+        _i = sys.argv.index("--db-root")
+        if _i + 1 >= len(sys.argv) or sys.argv[_i + 1].startswith("--"):
+            print(json.dumps({"ok": False, "error": "--db-root 缺少目录参数"},
+                             ensure_ascii=False))
+            return 1
+        db_root = sys.argv[_i + 1]
+    db_path = _runtime_db_root(db_root) / "analysis.db"
     try:
         if input_file:
             with open(input_file, "rb") as _f:
@@ -543,7 +588,7 @@ def main() -> int:
     if "ts" in data and data["ts"]:
         data["ts"] = normalize_ts(data["ts"])
 
-    result = write_analysis(data)
+    result = write_analysis(data, db_path=db_path)
     print(json.dumps(result, ensure_ascii=False))
     # already_exists 是闩锁拒绝（race condition 防护），不是真失败
     # 返回 exit 0 让 agent 不 panic，但 result.ok=false 让 agent 知道没写进去
@@ -551,7 +596,7 @@ def main() -> int:
         # HANDOFF-4A：真写入成功才 nudge（already_exists 不拍——先前那次成功写已拍过，cron 兜底）。
         # 放 print 之后：stdout JSON 契约不受任何影响；nudge 内部全 try/except 非致命。
         if _nudge_mod is not None:
-            _nudge_mod.nudge("analyst_writer")
+            _nudge_mod.nudge("analyst_writer", db_root=db_path.parent)
         return 0
     # already_exists: exit 0（幂等成功——数据已在库里，只是不是本次写的）
     if result.get("error") == "already_exists":

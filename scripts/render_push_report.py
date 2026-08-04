@@ -9,7 +9,8 @@
 
 权威回读覆盖（2026-07-02/04）：以下字段由库权威覆盖 agent 传值，agent 传值仅作回退——
   - 轮次 cycle_count ← ledger.stage_dispatch push 计数（传 9999 也被纠正）；
-  - 资金 ← account_snapshots 按 profile 最新行（≤30min 新鲜才覆盖）；
+  - 资产/绩效资金展示 ← account_snapshots 按 profile 最新行（≤30min 新鲜才覆盖）；
+    Demo availBal 仅作展示，开仓容量只读该笔回执的 OKX Demo max-size；
   - 累计收益 ← cum_pnl.py 口径（冻结基线 + reset_ts 后 trades.pnl 增量）；
   - 持仓数 ← position_snapshots 最新批次行数。
 每项独立回退：DB stale/不可用 → 保留 agent 值，渲染永不因回读失败中断。
@@ -114,6 +115,18 @@ def pct(value: Any, default: str = "-") -> str:
         return f"{float(value):.4f}"
     except Exception:
         return str(value) if value not in (None, "") else default
+
+
+def portfolio_ratio_pct(value: Any, unit: Any = "fraction",
+                        default: str = "-") -> str:
+    """组合 IMR 比率转展示百分数；新契约单位为 fraction。"""
+    try:
+        number = float(value)
+        if str(unit or "fraction").lower() not in ("percent", "pct", "%"):
+            number *= 100.0
+        return f"{number:.1f}"
+    except (TypeError, ValueError):
+        return default
 
 
 def num_only(value: Any, default: str = "0") -> str:
@@ -441,7 +454,7 @@ def _ts_age_minutes(ts: Any) -> float | None:
 
 
 def authoritative_equity(profile: str) -> float | None:
-    """资金权威（2026-07-04）：account_snapshots 按 profile 最新行（rowid DESC，禁 MAX(ts)）。
+    """资金权威：account_snapshots 按 profile 的真实 ts 最新行。
 
     ts 距今 ≤SNAPSHOT_FRESH_MIN 分钟才覆盖 agent 传值（#588 事故：agent 把 demo totalEq
     73275.01 填进实盘 current_equity 直接上屏）。stale/不可用 → None（回退 agent 值），
@@ -452,7 +465,8 @@ def authoritative_equity(profile: str) -> float | None:
         try:
             row = con.execute(
                 "SELECT ts, totalEq FROM account_snapshots "
-                "WHERE profile=? ORDER BY rowid DESC LIMIT 1", (profile,)).fetchone()
+                "WHERE profile=? ORDER BY ts DESC,rowid DESC LIMIT 1",
+                (profile,)).fetchone()
         finally:
             con.close()
         if not row or row[1] is None:
@@ -466,7 +480,7 @@ def authoritative_equity(profile: str) -> float | None:
 
 
 def authoritative_position_count(profile: str) -> int | None:
-    """持仓数权威：position_snapshots 按 profile 最新批次（同 ts 行数）。
+    """持仓数权威：position_snapshots 按 profile 真实 ts 最新批次。
 
     最新批次 ts ≤SNAPSHOT_FRESH_MIN 分钟才覆盖。
     flat 哨兵适配：空仓时写侧写一行 symbol='__FLAT__' 哨兵，
@@ -478,7 +492,8 @@ def authoritative_position_count(profile: str) -> int | None:
         try:
             row = con.execute(
                 "SELECT ts FROM position_snapshots "
-                "WHERE profile=? ORDER BY rowid DESC LIMIT 1", (profile,)).fetchone()
+                "WHERE profile=? ORDER BY ts DESC,rowid DESC LIMIT 1",
+                (profile,)).fetchone()
             if not row:
                 return None
             age = _ts_age_minutes(row[0])
@@ -634,14 +649,24 @@ def validate_input(payload: dict[str, Any]) -> None:
     if decision_protocol != "decision_card_v1" and confidence in ("", "-"):
         print("[render_push_report][WARN] confidence 缺失（不拦截，渲染为 -）", file=sys.stderr)
     risk = section(payload, "risk")
-    for _label, _keys in (("margin_pct", ["margin_pct", "imr_pct", "single_margin_pct"]),
-                          ("leverage", ["lev", "leverage", "max_leverage"]),
+    _has_new_imr = any(
+        risk.get(key) not in (None, "")
+        for key in (
+            "current_portfolio_imr_ratio",
+            "projected_portfolio_imr_ratio",
+        )
+    )
+    _has_legacy_margin = value_at(
+        risk,
+        ["live_margin_pct", "margin_pct", "imr_pct", "single_margin_pct"],
+        default="",
+    ) not in ("", "-")
+    if not _has_new_imr and not _has_legacy_margin:
+        print("[render_push_report][WARN] 风控字段 portfolio_imr_ratio 缺失"
+              "（不拦截，渲染为 -）", file=sys.stderr)
+    for _label, _keys in (("leverage", ["lev", "leverage", "max_leverage"]),
                           ("side_pct", ["side_pct", "same_side_pct", "same_side_exposure_pct"])):
         if value_at(risk, _keys, default="") in ("", "-"):
-            if (_label == "margin_pct"
-                    and risk.get("margin_pct_scope") == "max_current_cycle_open_trade"):
-                # 本轮没有 OPEN/ADD 时空值是正确语义，渲染层会明确显示“本轮无开/加仓”。
-                continue
             print(f"[render_push_report][WARN] 风控字段 {_label} 缺失（不拦截，渲染为 -）", file=sys.stderr)
 
 
@@ -729,14 +754,81 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         live_positions = str(_live_n)
         demo_positions = str(_demo_n)
 
-    margin_pct = pct(value_at(risk, ["margin_pct", "imr_pct", "single_margin_pct"], "-"))
-    max_position_margin_pct = pct(risk.get("max_position_margin_pct"))
-    if margin_pct == "-":
-        margin_display = "本轮无开/加仓"
-        if max_position_margin_pct != "-":
-            margin_display += f" | 当前最大持仓 {with_pct(max_position_margin_pct)}(观察)"
+    imr_unit = risk.get("portfolio_imr_ratio_unit") or "fraction"
+    current_imr_pct = portfolio_ratio_pct(
+        risk.get("current_portfolio_imr_ratio"), imr_unit)
+    projected_imr_pct = portfolio_ratio_pct(
+        risk.get("projected_portfolio_imr_ratio"), imr_unit)
+    max_imr_pct = portfolio_ratio_pct(
+        first_nonempty(risk.get("max_portfolio_imr_ratio"), 0.666),
+        imr_unit,
+    )
+    if current_imr_pct != "-":
+        margin_display = f"当前 {with_pct(current_imr_pct)}"
+        if projected_imr_pct != "-":
+            margin_display += (
+                f" | 预计 {with_pct(projected_imr_pct)} / "
+                f"{with_pct(max_imr_pct)}"
+            )
+        else:
+            margin_display += f" / {with_pct(max_imr_pct)}"
     else:
-        margin_display = f"{with_pct(margin_pct)} / 20%"
+        # 历史 payload 只读兼容：旧单笔字段不得冒充当前组合 IMR。
+        legacy_margin_pct = pct(value_at(
+            risk,
+            ["live_margin_pct", "margin_pct", "imr_pct", "single_margin_pct"],
+            "-",
+        ))
+        margin_display = f"当前 - / {with_pct(max_imr_pct)}"
+        if legacy_margin_pct != "-":
+            margin_display += (
+                f" | 旧payload单笔字段 {with_pct(legacy_margin_pct)}"
+                "（历史只读）"
+            )
+    demo_capacity = section(risk, "demo_capacity")
+    demo_capacity_entries = demo_capacity.get("entries")
+    if not isinstance(demo_capacity_entries, list):
+        demo_capacity_entries = []
+    demo_capacity_first = (
+        demo_capacity_entries[0]
+        if demo_capacity_entries and isinstance(demo_capacity_entries[0], dict)
+        else demo_capacity
+    )
+    demo_actual_sz = num_only(
+        demo_capacity_first.get("actual_open_sz"), default="-")
+    demo_max_sz = num_only(
+        first_nonempty(
+            demo_capacity_first.get("max_size"),
+            demo_capacity_first.get("exchange_max_sz"),
+            demo_capacity_first.get("exchange_max_size"),
+            demo_capacity_first.get("max_sz_exchange"),
+            demo_capacity_first.get("direction_value"),
+            default="-",
+        ),
+        default="-",
+    )
+    demo_cap_symbol = _short_symbol(
+        demo_capacity_first.get("inst_id") or "")
+    demo_cap_lev = num_only(
+        demo_capacity_first.get("effective_lev"), default="-")
+    demo_cap_context = " ".join(
+        part for part in (
+            demo_cap_symbol,
+            f"@{demo_cap_lev}x" if demo_cap_lev != "-" else "",
+        ) if part
+    )
+    if demo_actual_sz != "-":
+        demo_capacity_display = (
+            f"{demo_actual_sz}张 / 实时容量 {demo_max_sz}张"
+            if demo_max_sz != "-"
+            else f"{demo_actual_sz}张 / 实时容量未回读"
+        )
+    elif demo_max_sz != "-":
+        demo_capacity_display = f"未成交 / 实时容量 {demo_max_sz}张"
+    else:
+        demo_capacity_display = "本轮无开/加仓"
+    if demo_cap_context and demo_capacity_display != "本轮无开/加仓":
+        demo_capacity_display += f"({demo_cap_context})"
     leverage = first_nonempty(risk.get("lev"), risk.get("leverage"), risk.get("max_leverage"), default="-")
     side_pct = pct(value_at(risk, ["side_pct", "same_side_pct", "same_side_exposure_pct"], "-"))
     position_count = num_only(first_nonempty(risk.get("position_count"), risk.get("pos_count"), default=live_positions), default="-")
@@ -866,13 +958,13 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         "",
         "📊 资产",
         f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益(交易PnL·未扣费) {live_pnl} USDT | {live_positions}仓",
-        f"🟡 模拟盘：资金 ${demo_equity} | 可用USDT ${demo_available} | 累计收益(交易PnL·未扣费) {demo_pnl} USDT | {demo_positions}仓",
+        f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示·非开仓容量) | 累计收益(交易PnL·未扣费) {demo_pnl} USDT | {demo_positions}仓",
         "",
         "💼 持仓详情",
         format_positions(positions),
         "",
         "🛡 风控",
-        f"单笔保证金 {margin_display} | 杠杆 {leverage}x / 10x | 同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / demo {demo_positions}(数量仅观察) | {risk_status}",
+        f"Live组合保证金 {margin_display} | Demo开仓 {demo_capacity_display} | 杠杆 {leverage}x / 10x | 同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / demo {demo_positions}(数量仅观察) | {risk_status}",
         "",
         "🌍 行情",
         f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | regime={regime} | USD_BROAD {dxy}",
@@ -968,14 +1060,14 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             "",
             "📊 资产",
             f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益 {live_pnl} USDT | {live_positions}仓",
-            f"🟡 模拟盘：资金 ${demo_equity} | 可用USDT ${demo_available} | 累计收益 {demo_pnl} USDT | {demo_positions}仓",
+            f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示·非容量) | 累计收益 {demo_pnl} USDT | {demo_positions}仓",
             "",
             "💼 持仓详情",
             clip(format_positions(positions), 520, tail="\n…（其余持仓见账本）"),
             "",
             "🛡 风控",
             clip(
-                f"单笔保证金 {margin_display} | 杠杆 {leverage}x / 10x | "
+                f"Live组合保证金 {margin_display} | Demo开仓 {demo_capacity_display} | 杠杆 {leverage}x / 10x | "
                 f"同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / "
                 f"demo {demo_positions}(数量仅观察) | {risk_status}",
                 210,
@@ -1046,11 +1138,11 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
                 f"Agent自主裁决 | {clip(action_summary, 80)}",
                 "", "📊 资产",
                 f"🟢 实盘：资金 ${live_equity} | 可用 ${live_available} | {live_positions}仓",
-                f"🟡 模拟盘：资金 ${demo_equity} | 可用 ${demo_available} | {demo_positions}仓",
+                f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示) | {demo_positions}仓",
                 "", "💼 持仓详情",
                 clip(format_positions(positions), 120, tail="\n…（其余见账本）"),
                 "", "🛡 风控",
-                clip(f"保证金 {margin_display} | 杠杆 {leverage}x | 同侧 {with_pct(side_pct)} | {risk_status}", 100),
+                clip(f"Live组合保证金 {margin_display} | Demo {demo_capacity_display} | 杠杆 {leverage}x | {risk_status}", 120),
                 "", "🌍 行情",
                 f"BTC ${btc} | ETH ${eth} | regime={regime} | USD_BROAD {dxy}",
                 "", "🎯 Agent裁决", clip(decision_reason, 70),

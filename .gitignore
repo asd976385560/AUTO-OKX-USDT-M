@@ -2,18 +2,43 @@
 config.md
 .env
 .env.*
+*.env
 *.key
 *.pem
 *.p12
 *.pfx
+*.ppk
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+.npmrc
+.pypirc
+*credentials*.json
+*secrets*.json
+*service-account*.json
+*auth*.json
+*token*.json
 
 # Runtime databases and SQLite sidecars
+/db/**
+!/db/
+!/db/schema.sql
 *.db
 *.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 *.wal
 *.shm
+*.jsonl
 
 # Runtime output
 logs/
@@ -31,6 +56,20 @@ tmp/
 # Backups and editor/OS artifacts
 *.bak
 *.bak*
+*.old
+*.orig
+*.save
+*.dump
+*.dmp
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
 *.tmp
 *.swp
 .tmp/

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-07-29",
+  "last_updated": "2026-08-04",
   "authority": "public README + PUBLIC_RELEASE.md + tracked source",
   "groups": [
     {
@@ -10,7 +10,7 @@
       "write_scope": "none unless the caller explicitly supplies a writer callback",
       "default_mode": "not a standalone entrypoint",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
         "_db_ro.py",
         "_http.py",
@@ -19,7 +19,6 @@
         "_regime_read.py",
         "_simutil.py",
         "_tsnorm.py",
-        "migration_guard.py",
         "public_macro.py",
         "regime_classifier.py"
       ]
@@ -31,7 +30,7 @@
       "write_scope": "only the database/report targets declared in README and the module contract",
       "default_mode": "production contract; explicit --apply remains required where implemented",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
         "audit_snapshot.py",
         "bookkeeping_health.py",
@@ -53,6 +52,7 @@
         "hypotheses_writer.py",
         "jobb_live_account_check.py",
         "judgment_quality_report.py",
+        "ledger_autoheal.py",
         "ledger_invariants.py",
         "live_reconcile_monitor.py",
         "log_rotate.py",
@@ -86,7 +86,7 @@
       "write_scope": "read-only or dry-run by default; any apply scope is documented per script",
       "default_mode": "read-only/dry-run where supported",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
         "backup_reconcile_state.py",
         "check_doc_versions.py",
@@ -117,7 +117,7 @@
       "write_scope": "isolated fixtures, temporary outputs, or explicitly supplied non-production targets",
       "default_mode": "no production mutation",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
         "backtest_engine.py",
         "backtest_regime_classifier.py",
@@ -127,13 +127,13 @@
       ]
     },
     {
-      "name": "audited current schema migrations",
-      "status": "manual-maintenance",
-      "invocation": "owner-authorized wrapper invocation with explicit --apply and --backup-dir",
-      "write_scope": "only the named schema or timestamp-normalization target after verified SQLite online backups of every target database",
-      "default_mode": "read-only dry-run; --apply and --dry-run are mutually exclusive",
+      "name": "schema and one-time data migrations pending lifecycle review",
+      "status": "migration-pending",
+      "invocation": "owner-authorized one-time wrapper invocation",
+      "write_scope": "the named schema or historical backfill target only",
+      "default_mode": "dry-run/inspection first; explicit apply plus backup",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
         "apply_analysis_status_col.py",
         "apply_data_enrichment_schema.py",
@@ -142,6 +142,7 @@
         "apply_public_macro_schema.py",
         "apply_regime_split.py",
         "apply_repair_queue_schema.py",
+        "apply_stage_profile_lease_schema.py",
         "apply_trade_experiences_schema.py",
         "apply_ts_cst_migration.py"
       ]
@@ -153,8 +154,9 @@
       "write_scope": "public repository metadata only",
       "default_mode": "no production trading mutation",
       "replacement": null,
-      "last_verified": "2026-07-29",
+      "last_verified": "2026-08-04",
       "paths": [
+        "migration_guard.py",
         "update_star_stats.py"
       ]
     }

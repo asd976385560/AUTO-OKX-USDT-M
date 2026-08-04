@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Post-cycle live reconciliation monitor (read-only, alert-only).
+"""Post-cycle live/demo reconciliation monitor (read-only, alert-only).
 
 Invoked after a successful push stage.  It shortens detection latency for
 exchange-side algo closes without restoring the stateful collection monitor or
@@ -23,12 +23,18 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(_project_path())
+COLLECTORS = str(ROOT / "collectors")
+if COLLECTORS not in sys.path:
+    sys.path.insert(0, COLLECTORS)
+from cycle_contract import validate_cycle_id  # noqa: E402
+
 RECON = ROOT / "scripts" / "reconcile_exchange_closes.py"
 QQ_PUSH = ROOT / "scripts" / "qq_push.py"
 LOG_DIR = ROOT / "logs" / "reconcile"
@@ -40,10 +46,20 @@ _MARKERS = (
     "[GHOST-EXACT]", "[GHOST-FUZZY]", "[OVER_CLOSED]",
     "[UNRECORDED]", "[LEFTOVER]",
 )
+_ROOT_SUFFIX_RE = re.compile(r"-r[0-9a-f]{10}$")
 
 
 def now_cst() -> datetime:
     return datetime.now(CST)
+
+
+def _root_namespace(db_root: Path) -> str:
+    resolved = Path(db_root).resolve()
+    if resolved == (ROOT / "db").resolve():
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
 
 
 def _findings(out: str, cap: int = 10) -> str:
@@ -97,11 +113,18 @@ def evaluate(rc: int, out: str) -> dict:
     }
 
 
-def active_live_runner() -> dict | None:
+def active_runner(profile: str, db_root: Path | None = None) -> dict | None:
     cutoff = now_cst() - timedelta(minutes=45)
+    namespace = _root_namespace(Path(db_root or (ROOT / "db")))
     try:
         paths = sorted(
-            STAGE_STATUS_DIR.glob("live-*.json"),
+            (
+                path for path in STAGE_STATUS_DIR.glob(f"{profile}-*.json")
+                if (
+                    path.stem.endswith(f"-{namespace}")
+                    if namespace else not _ROOT_SUFFIX_RE.search(path.stem)
+                )
+            ),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )[:8]
@@ -125,10 +148,17 @@ def active_live_runner() -> dict | None:
     return None
 
 
-def run_reconcile() -> tuple[int, str]:
+def active_live_runner() -> dict | None:
+    """Backward-compatible live probe used by existing diagnostics/tests."""
+    return active_runner("live")
+
+
+def run_reconcile(profile: str = "live",
+                  db_root: Path | None = None) -> tuple[int, str]:
     try:
         proc = subprocess.run(
-            [sys.executable, str(RECON), "--profile", "live"],
+            [sys.executable, str(RECON), "--profile", profile,
+             "--db-root", str(Path(db_root or (ROOT / "db")))],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=180, creationflags=_CREATE_NO_WINDOW)
         return int(proc.returncode), (proc.stdout or "") + (proc.stderr or "")
@@ -138,26 +168,30 @@ def run_reconcile() -> tuple[int, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cycle", default="")
+    ap.add_argument("--cycle", default=None, type=validate_cycle_id)
+    ap.add_argument("--profile", choices=("live", "demo"), default="live")
+    ap.add_argument("--db-root", default=str(ROOT / "db"))
     ap.add_argument("--dry-run", action="store_true",
                     help="只检测和打印，不写告警文件、不推 QQ")
     args = ap.parse_args()
 
-    active = active_live_runner()
+    runtime_db_root = Path(args.db_root).resolve()
+    active = active_runner(args.profile, runtime_db_root)
     if active:
         print(json.dumps({
             "ok": True,
             "issue": False,
-            "skipped": "live_runner_active",
+            "skipped": f"{args.profile}_runner_active",
             "active": active,
             "cycle_id": args.cycle or None,
         }, ensure_ascii=False, indent=1))
         return 0
 
-    rc, out = run_reconcile()
+    rc, out = run_reconcile(args.profile, runtime_db_root)
     report = {
         "ts": now_cst().strftime("%Y-%m-%d %H:%M:%S"),
         "cycle_id": args.cycle or None,
+        "profile": args.profile,
         **evaluate(rc, out),
     }
     if not report["issue"]:
@@ -165,7 +199,8 @@ def main() -> int:
         return 0
 
     text = (
-        f"⚠️ Live 日内账实对账告警 [P1] [{now_cst():%Y-%m-%d %H:%M}]"
+        f"⚠️ {args.profile.upper()} 日内账实对账告警 [P1] "
+        f"[{now_cst():%Y-%m-%d %H:%M}]"
         f" (统一QQ告警)\n"
         f"· cycle={args.cycle or 'post-cycle'} rc={rc} "
         f"{report.get('classification', '')}\n"
@@ -182,18 +217,29 @@ def main() -> int:
         (str(report.get("classification")) + "|" + str(report.get("findings")))
         .encode("utf-8")
     ).hexdigest()[:20]
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    alert_file = LOG_DIR / f"live_monitor_{now_cst():%Y%m%d_%H%M%S}.txt"
+    namespace = _root_namespace(runtime_db_root)
+    alert_dir = LOG_DIR / namespace if namespace else LOG_DIR
+    alert_dir.mkdir(parents=True, exist_ok=True)
+    alert_file = (
+        alert_dir / f"{args.profile}_monitor_{now_cst():%Y%m%d_%H%M%S}.txt")
     alert_file.write_text(text, encoding="utf-8")
     try:
         proc = subprocess.run(
             [sys.executable, str(QQ_PUSH), "--content-file", str(alert_file),
-             "--dedupe-key", f"live-reconcile-monitor:{digest}"],
+             "--alert",  # 告警走 C2C 私聊，不混进业务播报群（2026-08-04）
+             "--dedupe-key", (
+                 f"{args.profile}-reconcile-monitor:{namespace}:{digest}"
+                 if namespace else f"{args.profile}-reconcile-monitor:{digest}"
+             ),
+             "--db-root", str(runtime_db_root)],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60, creationflags=_CREATE_NO_WINDOW)
         report["alert"] = {
             "rc": int(proc.returncode),
-            "dedupe_key": f"live-reconcile-monitor:{digest}",
+            "dedupe_key": (
+                f"{args.profile}-reconcile-monitor:{namespace}:{digest}"
+                if namespace else f"{args.profile}-reconcile-monitor:{digest}"
+            ),
         }
     except Exception as exc:
         report["alert"] = {"error": f"{type(exc).__name__}: {exc}"}

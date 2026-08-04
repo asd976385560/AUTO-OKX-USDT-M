@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 r"""check_trader_docs_sync.py — live/demo trader 手册同步块防漂移校验。
 
 背景：两手册 44% 机械重复，规则改动要双改（07-15 同侧闸取消实测要改 4 份文档，漏一份
@@ -6,11 +7,12 @@ r"""check_trader_docs_sync.py — live/demo trader 手册同步块防漂移校�
 标注（HTML 注释，agent 渲染无感），本脚本校验两文档同名块在 profile 词归一
 （live/demo → §P§）后**逐字节一致**；并守住 money-path 回执文件契约（普通 HOLD
 使用 write 工具；live 成交脚本允许同进程 Path.write_text→commit_receipt；
-文件名一律 HH-MM、组合保证金不冒充单笔字段）。不一致 → exit 1 + 打差异。
+文件名一律 HH-MM、Live 组合 IMR 新字段完整且 Demo 仍为 max-size）。不一致 → exit 1 + 打差异。
 
 选择"同步校验"而非"base+overlay 生成管线"（读图原案）的原因：手册是高频直编的
 money-path 文档，生成管线引入"编辑生成物被下次 compose 覆盖"的新事故面；校验器
-零改编辑习惯、零内容风险，同样根治漂移（单点强制而非单点编辑）。
+零改编辑习惯、零内容风险，同样根治漂移（单点强制而非单点编辑）。另独立守住
+Live 组合 IMR 新契约与 Demo max-size 契约，防旧单笔百分比字段回流。
 
 用法：check_trader_docs_sync.py [--live <path>] [--demo <path>]   # exit 0=同步
 """
@@ -24,10 +26,8 @@ _PROJECT_ROOT = _ProjectPath(
     or _ProjectPath(__file__).resolve().parents[1]
 ).resolve()
 
-
 def _project_path(*parts: str) -> str:
     return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import re
@@ -90,21 +90,40 @@ def compare(live_text: str, demo_text: str) -> list[str]:
 def receipt_contract_problems(label: str, text: str) -> list[str]:
     """防止再次引入 shell JSON 转义失败或 raw cycle 冒号/NTFS ADS。"""
     problems: list[str] = []
-    required = {
-        "安全文件名": "YYYY-MM-DDTHH-MM.json",
-        "单笔字段为空": "risk.single_trade_margin_pct=null",
-        "组合观察字段": "risk.portfolio_observation.estimated_margin_pct_equity",
-    }
+    required = {"安全文件名": "YYYY-MM-DDTHH-MM.json"}
+    if label == "live":
+        required.update({
+            "当前组合IMR金额": "risk.math.account_imr",
+            "预计组合IMR比例": "projected_portfolio_imr_ratio",
+            "组合IMR来源": "portfolio_imr_source=account.balance.imr",
+            "超限整单拒绝": "整笔 reject OPEN/ADD，不 clamp",
+            "禁错误比率替代": "mgnRatio",
+            "平减仓不受开仓闸": "CLOSE/REDUCE",
+        })
+    else:
+        required.update({
+            "Demo实时容量来源": "capacity.source=account.max-size",
+            "Demo容量策略": "risk.math.sizing_policy=okx_demo_max_size_only",
+        })
     file_write_tokens = [f"write path=<PROJECT_ROOT>/tmp/_receipt_{label}_"]
     if label == "live":
-        file_write_tokens.append(
-            'Path("<PROJECT_ROOT>/tmp/_receipt_live_YYYY-MM-DDTHH-MM.json").write_text')
+        file_write_tokens.extend([
+            "Path(_project_path('tmp', '_receipt_live_YYYY-MM-DDTHH-MM.json')).write_text",
+            'Path("<PROJECT_ROOT>/tmp/_receipt_live_YYYY-MM-DDTHH-MM.json").write_text',
+        ])
     if not any(token in text for token in file_write_tokens):
         problems.append(
             f"{label} 回执契约缺安全文件写入路径: {file_write_tokens}")
     for name, token in required.items():
         if token not in text:
             problems.append(f"{label} 回执契约缺 {name}: {token}")
+    for obsolete in (
+        "MAX_" + "MARGIN_PCT=" + "0." + str(20),
+        "risk.single_trade_" + "margin_pct",
+        "单笔保证金 ≤" + str(20) + "%",
+    ):
+        if obsolete in text:
+            problems.append(f"{label} 仍含已废弃Live单笔百分比契约: {obsolete}")
     if re.search(r"(?mi)^\s*Set-Content\b", text):
         problems.append(f"{label} 仍含可执行 Set-Content 示例（会受 JSON/PowerShell 转义影响）")
     if re.search(r"(?mi)^\s*pwsh\b.*\s-Command\b", text):

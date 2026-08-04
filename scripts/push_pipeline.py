@@ -6,10 +6,11 @@
     → push_archive hard-check → qq_push（--no-send 跳过）→ system_state_writer → 环节报告
 
 幂等：dispatcher 的 ledger.stage_dispatch(cycle,'push') 闩锁保每 cycle 单发；
-qq_push 层用显式 --dedupe-key push:{cycle}。
+qq_push 层用显式 --dedupe-key push:{cycle}；非默认 DB root 还包含 root namespace。
 故本脚本可安全重跑。
 
-每环节出详细报告：reports/push/pipeline-<cycle>.json + 追加 logs/push/pipeline_runs.jsonl，
+每环节出详细报告：默认 root 使用 reports/push/pipeline-<cycle>.json；非默认 root
+使用 root-hashed 子目录与 runlog，
 含 build/render/validate/send/archive/state 各步 rc 与关键指标。
 
 用法（阶段一开发，安全）:
@@ -32,6 +33,7 @@ def _project_path(*parts: str) -> str:
 
 
 import argparse
+import hashlib
 import importlib.util as ilu
 import json
 import os
@@ -39,6 +41,11 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+COLLECTORS = _project_path('collectors')
+if COLLECTORS not in sys.path:
+    sys.path.insert(0, COLLECTORS)
+from cycle_contract import cycle_artifact_token, validate_cycle_id  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -57,6 +64,16 @@ WORK = Path(_project_path('tmp', 'push_pipeline'))
 REPORT_DIR = Path(_project_path('reports', 'push'))
 RUNLOG = Path(_project_path('logs', 'push', 'pipeline_runs.jsonl'))
 _CREATE_NO_WINDOW = 0x08000000
+CANONICAL_DB_ROOT = Path(_project_path('db')).resolve()
+
+
+def _root_namespace(db_root: str | Path) -> str:
+    resolved = Path(db_root).resolve()
+    if resolved == CANONICAL_DB_ROOT:
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
 
 
 def now_ts() -> str:
@@ -107,14 +124,24 @@ def _archive_hard_check(
 
 
 def run(cycle: str, db_root: str, no_send: bool) -> dict:
-    WORK.mkdir(parents=True, exist_ok=True)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    RUNLOG.parent.mkdir(parents=True, exist_ok=True)
-    safe = cycle.replace(":", "").replace("T", "-")
-    payload_f = str(WORK / f"payload-{safe}.json")
-    content_f = str(WORK / f"content-{safe}.txt")
+    cycle = validate_cycle_id(cycle)
+    db_root = str(Path(db_root).resolve())
+    namespace = _root_namespace(db_root)
+    work_dir = WORK / namespace if namespace else WORK
+    report_dir = REPORT_DIR / namespace if namespace else REPORT_DIR
+    runlog = (
+        RUNLOG.with_name(f"{RUNLOG.stem}-{namespace}{RUNLOG.suffix}")
+        if namespace else RUNLOG
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    runlog.parent.mkdir(parents=True, exist_ok=True)
+    safe = cycle_artifact_token(cycle)
+    payload_f = str(work_dir / f"payload-{safe}.json")
+    content_f = str(work_dir / f"content-{safe}.txt")
 
-    rep: dict = {"cycle": cycle, "ts": now_ts(), "steps": {}, "ok": False}
+    rep: dict = {"cycle": cycle, "ts": now_ts(), "steps": {}, "ok": False,
+                 "root_namespace": namespace or "default"}
 
     # 1. build（进程内直调，确定性组装）
     try:
@@ -129,7 +156,7 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
     except Exception as e:
         rep["steps"]["build"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         rep["fatal"] = "build_failed"
-        return _finish(rep)
+        return _finish(rep, report_dir, runlog)
 
     # 2. render：透传 db_root，确保库权威覆盖读取同一根目录。
     rc, out, err = _run(_project_path('scripts', 'render_push_report.py'),
@@ -144,10 +171,13 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
                               "title": receipt.get("title"), "err": err[:200] if rc else None}
     if rc != 0 or not Path(content_f).exists():
         rep["fatal"] = "render_failed"
-        return _finish(rep)
+        return _finish(rep, report_dir, runlog)
 
     # 3. validate（必须 rc=0 才外发）
-    rc, out, err = _run(_project_path('scripts', 'validate_push_format.py'), ["--file", content_f])
+    rc, out, err = _run(
+        _project_path('scripts', 'validate_push_format.py'),
+        ["--file", content_f, "--db-root", db_root],
+    )
     vres = {}
     try:
         vres = json.loads(out) if out else {}
@@ -158,7 +188,7 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
                                 "char_count": vres.get("char_count")}
     if rc != 0:
         rep["fatal"] = "validate_failed"       # 不外发残缺内容（阶段二在此写 repair_queue + 告警）
-        return _finish(rep)
+        return _finish(rep, report_dir, runlog)
 
     # 4. 归档前置硬闸：归档返回成功且文件内容核验完成，才允许进入 send。
     # --no-send 下归到 dev 目录，不覆写生产 latest.md。
@@ -167,7 +197,9 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
                          ensure_ascii=False)
     arch_args = ["--stdin"]
     if no_send:
-        arch_args = ["--reports-dir", str(WORK / "reports"), "--stdin"]
+        arch_args = ["--reports-dir", str(work_dir / "reports"), "--stdin"]
+    elif namespace:
+        arch_args = ["--reports-dir", str(report_dir / "archive"), "--stdin"]
     rc, out, err = _run(_project_path('scripts', 'push_archive.py'), arch_args, stdin_text=arch_in)
     ares = {}
     try:
@@ -183,17 +215,21 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
     if not archive_ok:
         rep["steps"]["send"] = {"skipped": True, "reason": "archive_hard_check_failed"}
         rep["fatal"] = "archive_hard_check_failed"
-        return _finish(rep)
+        return _finish(rep, report_dir, runlog)
 
     # 5. 外发（--no-send 跳过）。发送失败时，前置时间戳归档已经完整保留。
     if no_send:
         rep["steps"]["send"] = {"skipped": True, "reason": "--no-send"}
     else:
-        # 显式身份键 push:{cycle}：同 cycle 任何 content 同键，重跑幂等。
+        # 身份键含非默认 root namespace：同一 root/cycle 幂等，不同 root 不互吞。
         try:
+            dedupe_key = (
+                f"push:{namespace}:{cycle}" if namespace else f"push:{cycle}"
+            )
             rc, out, err = _run(
                 _project_path('scripts', 'qq_push.py'),
-                ["--content-file", content_f, "--dedupe-key", f"push:{cycle}"],
+                ["--content-file", content_f, "--dedupe-key", dedupe_key,
+                 "--db-root", db_root],
             )
             rep["steps"]["send"] = {
                 "rc": rc,
@@ -227,29 +263,33 @@ def run(cycle: str, db_root: str, no_send: bool) -> dict:
                                         "would_write": {"push_last_cycle": cycle,
                                                         "push_last_status": status}}
     else:
-        state_json = str(WORK / f"state-{safe}.json")
+        state_json = str(work_dir / f"state-{safe}.json")
         with open(state_json, "w", encoding="utf-8") as f:
             json.dump({"updates": {"push_last_cycle": cycle, "push_last_status": status},
                        "ts": now_ts()}, f, ensure_ascii=False)
-        rc, out, err = _run(_project_path('scripts', 'system_state_writer.py'), ["--json-file", state_json])
+        rc, out, err = _run(
+            _project_path('scripts', 'system_state_writer.py'),
+            ["--json-file", state_json, "--db-root", db_root],
+        )
         rep["steps"]["system_state"] = {"rc": rc}
 
     rep["send_status"] = status
     rep["ok"] = no_send or status in {"sent", "duplicate_skip"}
     if not rep["ok"]:
         rep["fatal"] = "send_failed"
-    return _finish(rep)
+    return _finish(rep, report_dir, runlog)
 
 
-def _finish(rep: dict) -> dict:
+def _finish(rep: dict, report_dir: Path = REPORT_DIR,
+            runlog: Path = RUNLOG) -> dict:
     """落环节报告 + 追加 run-log。"""
+    safe = cycle_artifact_token(rep.get("cycle"))
     try:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        safe = rep["cycle"].replace(":", "").replace("T", "-")
-        with open(REPORT_DIR / f"pipeline-{safe}.json", "w", encoding="utf-8") as f:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        with open(report_dir / f"pipeline-{safe}.json", "w", encoding="utf-8") as f:
             json.dump(rep, f, ensure_ascii=False, indent=1)
-        RUNLOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(RUNLOG, "a", encoding="utf-8") as f:
+        runlog.parent.mkdir(parents=True, exist_ok=True)
+        with open(runlog, "a", encoding="utf-8") as f:
             f.write(json.dumps(rep, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[push_pipeline] WARN 报告落盘失败: {e}", file=sys.stderr)
@@ -258,7 +298,7 @@ def _finish(rep: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="纯脚本推送编排器")
-    ap.add_argument("--cycle", required=True)
+    ap.add_argument("--cycle", required=True, type=validate_cycle_id)
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--no-send", action="store_true", help="跳过 QQ 外发（阶段一开发用）")
     args = ap.parse_args()
