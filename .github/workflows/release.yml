@@ -1,0 +1,183 @@
+name: Release version
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      commit: ${{ steps.validate.outputs.commit }}
+      tag_object: ${{ steps.validate.outputs.tag_object }}
+      prerelease: ${{ steps.validate.outputs.prerelease }}
+
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag, version, changelog, and main ancestry
+        id: validate
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          if ($env:GITHUB_REF_TYPE -cne "tag") {
+            throw "Release must be triggered by a tag."
+          }
+
+          python scripts/check_release_version.py --tag $env:RELEASE_TAG --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "VERSION, CHANGELOG.md, or release tag validation failed."
+          }
+
+          $tagType = @(git cat-file -t $env:RELEASE_REF)
+          if ($LASTEXITCODE -ne 0 -or $tagType.Count -ne 1) {
+            throw "Could not resolve the release tag object."
+          }
+          if ($tagType[0].Trim() -cne "tag") {
+            throw "Release tags must be annotated tags."
+          }
+          $tagObjectOutput = @(git rev-parse --verify $env:RELEASE_REF)
+          if ($LASTEXITCODE -ne 0 -or $tagObjectOutput.Count -ne 1) {
+            throw "Could not resolve the annotated tag object."
+          }
+          $tagObject = $tagObjectOutput[0].Trim()
+          if ($tagObject -cnotmatch '^[0-9a-f]{40,64}$') {
+            throw "Resolved annotated tag object is invalid."
+          }
+
+          git fetch --force --no-tags origin `
+            'refs/heads/main:refs/remotes/origin/main'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch origin/main."
+          }
+
+          $commitSpec = "$($env:RELEASE_REF)^{commit}"
+          $commitOutput = @(git rev-parse --verify $commitSpec)
+          if ($LASTEXITCODE -ne 0 -or $commitOutput.Count -ne 1) {
+            throw "Could not resolve the release tag to one commit."
+          }
+          $tagCommit = $commitOutput[0].Trim()
+          if ($tagCommit -cnotmatch '^[0-9a-f]{40,64}$') {
+            throw "Resolved release commit is invalid."
+          }
+
+          git merge-base --is-ancestor $tagCommit refs/remotes/origin/main
+          $ancestorExit = $LASTEXITCODE
+          if ($ancestorExit -eq 1) {
+            throw "Release tag commit is not reachable from origin/main."
+          }
+          if ($ancestorExit -ne 0) {
+            throw "Could not verify release tag ancestry."
+          }
+
+          $isPrerelease = if ($env:RELEASE_TAG.Contains("-")) { "true" } else { "false" }
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $output = (
+            "tag=$($env:RELEASE_TAG)`n" +
+            "commit=$tagCommit`n" +
+            "tag_object=$tagObject`n" +
+            "prerelease=$isPrerelease`n"
+          )
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_OUTPUT,
+            $output,
+            $utf8NoBom
+          )
+
+  regression:
+    needs: validate-release
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish-release:
+    needs:
+      - validate-release
+      - regression
+    runs-on: windows-latest
+    timeout-minutes: 5
+    environment:
+      name: github-release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Recheck immutable inputs and create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.validate-release.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate-release.outputs.tag_object }}
+          IS_PRERELEASE: ${{ needs.validate-release.outputs.prerelease }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $remoteTagRef = @(
+            gh api "repos/$env:GH_REPO/git/ref/tags/$env:RELEASE_TAG" `
+              --jq '[.object.type, .object.sha] | @tsv'
+          )
+          if ($LASTEXITCODE -ne 0 -or $remoteTagRef.Count -ne 1) {
+            throw "Could not resolve the remote annotated tag object."
+          }
+          $tagParts = @($remoteTagRef[0].Trim() -split "`t")
+          if ($tagParts.Count -ne 2 -or $tagParts[0] -cne "tag") {
+            throw "The remote release ref is no longer an annotated tag."
+          }
+          if ($tagParts[1] -cne $env:EXPECTED_TAG_OBJECT) {
+            throw "The annotated tag object moved after validation."
+          }
+
+          $remoteCommitOutput = @(
+            gh api "repos/$env:GH_REPO/commits/$env:RELEASE_TAG" --jq ".sha"
+          )
+          if ($LASTEXITCODE -ne 0 -or $remoteCommitOutput.Count -ne 1) {
+            throw "Could not resolve the remote release tag."
+          }
+          $remoteCommit = $remoteCommitOutput[0].Trim()
+          if ($remoteCommit -cne $env:EXPECTED_COMMIT) {
+            throw "The release tag moved after validation."
+          }
+
+          $releaseArgs = @(
+            "release", "create", $env:RELEASE_TAG,
+            "--repo", $env:GH_REPO,
+            "--verify-tag",
+            "--title", $env:RELEASE_TAG,
+            "--generate-notes",
+            "--fail-on-no-commits"
+          )
+          if ($env:IS_PRERELEASE -ceq "true") {
+            $releaseArgs += "--prerelease"
+          }
+          & gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release creation failed."
+          }

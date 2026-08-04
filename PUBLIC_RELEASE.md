@@ -2,7 +2,7 @@
 doc-version: V2.0-public-scope
 last-updated: 2026-08-04
 updated-by: Codex
-change-summary: Add the guarded profile-lease migration, ledger-autoheal opt-ins, alert routing and expanded regression boundary.
+change-summary: Define public version 1.0.0 and a gated annotated-tag GitHub Release workflow.
 -->
 
 # Public release scope
@@ -21,6 +21,7 @@ This file records the intended V2.0 public synchronization boundary.
   while Demo runtime wiring requires separate explicit opt-ins for exact close and open bookkeeping;
 - isolated regression tests that do not connect to production databases, place orders, start Agents or send messages;
 - `config.example.md`, `.gitignore`, dependency metadata and bilingual public documentation;
+- `VERSION`, `CHANGELOG.md`, release-contract validation and the gated tag-to-Release workflow;
 - privacy-preserving aggregate star history data, SVG, generator and scheduled workflow.
 
 ## Retained locally but excluded
@@ -74,6 +75,33 @@ available only under trigger dry-run until Gateway-level propagation is separate
 
 The workflow uses the repository-scoped `GITHUB_TOKEN` only at runtime. No personal access token or usable credential is stored in the repository.
 
-## Version lineage
+## Public release versioning
 
-The synchronized source identifies itself as V2.0. The remote repository previously used a `v3.1` README label. This change does not create a tag, Release, or final semantic-version decision; the maintainer will choose the public version number separately.
+Public releases follow Semantic Versioning. `VERSION` is the single release-version
+source and contains `1.0.0` for the initial prepared release. `CHANGELOG.md` contains
+the matching dated entry. Git tags and GitHub Releases add the `v` prefix, so this
+version is published as `v1.0.0`.
+
+The internal V2.0 identifier remains the authority for architecture, business
+contracts, document headers and schema lineage. It is deliberately independent from
+the public release number and is not rewritten during a release bump.
+
+Every release must follow this sequence:
+
+1. update `VERSION` and add the matching newest entry to `CHANGELOG.md` in a PR;
+2. pass the complete isolated CI, public-contract checks and an independent
+   redacted secret scan, including `scripts/check_release_version.py`;
+3. merge the reviewed PR into `main` and confirm the `main` CI result;
+4. create an annotated `v<version>` tag on that exact `main` commit and push only the tag;
+5. let `.github/workflows/release.yml` verify the tag object, version/changelog match,
+   `main` ancestry and reusable CI before it creates the GitHub Release.
+
+The release workflow never creates a tag. It uses `--verify-tag`, generates release
+notes only after all gates pass, and marks SemVer prerelease identifiers such as
+`1.1.0-beta.1` as GitHub prereleases. This PR prepares `1.0.0`; it does not merge the
+PR, create `v1.0.0`, or publish a GitHub Release.
+
+Before the first tag is pushed, the repository owner should protect `main`, restrict
+creation of release tags to maintainers, block updates and deletions for `v*`, and
+configure approval rules on the `github-release` Environment when a manual publication
+gate is desired. Workflow self-checks complement but do not replace repository rules.

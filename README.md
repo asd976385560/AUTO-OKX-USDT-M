@@ -2,7 +2,7 @@
 doc-version: V2.0
 last-updated: 2026-08-04
 updated-by: Codex
-change-summary: Sync portfolio risk, Demo sizing, profile leases, ledger autoheal, alert routing and point-in-time reporting contracts.
+change-summary: Add the 1.0.0 public release contract, changelog and gated tag-to-Release workflow.
 -->
 
 <p align="center">
@@ -58,7 +58,14 @@ V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确
 
 ## 版本线说明
 
-当前源码事实源自称 `V2.0`。GitHub 远端旧 README 曾使用 `v3.1` 标识，两者不是本次同步中自动推导出的可比较语义版本。本次不创建标签或 Release；最终公开版本号由维护者另行决定。
+公开发行采用语义化版本，唯一版本源是 [`VERSION`](VERSION)，当前准备版本为
+[`1.0.0`](CHANGELOG.md)，对应 Git tag 和 GitHub Release 名称
+`v1.0.0`。每次发布的变更记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+
+`V2.0` 继续表示系统架构、业务契约、文档和 schema 代际，不是公开发行版本，
+也不会被 `1.0.0` 替换。只有版本变更 PR 合并到 `main` 后，维护者创建并推送
+匹配的 annotated tag，且发布工作流的版本、主分支可达性、完整 CI 全部通过，
+才会创建 GitHub Release；当前 PR 本身不会创建 tag 或 Release。
 
 ## 本次同步
 
@@ -244,6 +251,7 @@ python scripts/apply_stage_profile_lease_schema.py --db-root <AUTHORIZED_DB_ROOT
 不访问交易所、不推送、不写运行数据库的基础检查：
 
 ```powershell
+python scripts/check_release_version.py --json
 python -m compileall -q collectors core scripts tests
 python -m unittest discover -s tests -p "test_*.py" -v
 python collectors/sources/_registry.py --validate

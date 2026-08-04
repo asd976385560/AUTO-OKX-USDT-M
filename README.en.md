@@ -2,7 +2,7 @@
 doc-version: V2.0
 last-updated: 2026-08-04
 updated-by: Codex
-change-summary: Sync portfolio risk, Demo sizing, profile leases, ledger autoheal, alert routing and point-in-time reporting contracts.
+change-summary: Add the 1.0.0 public release contract, changelog, and gated tag-to-Release workflow.
 -->
 
 <p align="center">
@@ -58,7 +58,18 @@ Copy `config.example.md` to a local `config.md` before filling it in. Environmen
 
 ## Version lineage
 
-The synchronized source identifies itself as `V2.0`. The previous remote README used a `v3.1` label. Those labels are not automatically comparable semantic versions. This synchronization does not create a tag or Release; the maintainer will choose the final public version separately.
+Public releases follow Semantic Versioning. [`VERSION`](VERSION) is the single
+release-version source; the currently prepared version is
+[`1.0.0`](CHANGELOG.md), with `v1.0.0` as its Git tag and
+GitHub Release name. Every published change is recorded in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+`V2.0` remains the generation identifier for the system architecture, business
+contracts, documentation, and schema. It is not the public release version and
+is not replaced by `1.0.0`. A GitHub Release is created only after the version
+PR is merged into `main`, a maintainer pushes the matching annotated tag, and
+the release workflow passes version, main-ancestry, and full CI checks. This PR
+does not itself create a tag or Release.
 
 ## Latest synchronization
 
@@ -246,6 +257,7 @@ python scripts/apply_stage_profile_lease_schema.py --db-root <AUTHORIZED_DB_ROOT
 Safe checks that do not contact OKX, send messages, or write runtime databases:
 
 ```powershell
+python scripts/check_release_version.py --json
 python -m compileall -q collectors core scripts tests
 python -m unittest discover -s tests -p "test_*.py" -v
 python collectors/sources/_registry.py --validate
