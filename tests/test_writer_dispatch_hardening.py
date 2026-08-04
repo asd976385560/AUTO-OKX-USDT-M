@@ -626,6 +626,7 @@ class DispatcherHardeningTests(unittest.TestCase):
     def test_fire_passes_canonical_db_root_into_build_and_runner(self):
         selected_root = dispatcher.trigger_agent._CANONICAL_DB_ROOT
         with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
              mock.patch.object(dispatcher.trigger_agent, "LOG_DIR", Path(tmp)), \
              mock.patch.object(dispatcher.trigger_agent, "build_cmd",
                                return_value=["child"]) as build, \

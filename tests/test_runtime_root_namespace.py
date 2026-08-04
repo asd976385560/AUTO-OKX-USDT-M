@@ -70,7 +70,9 @@ class RuntimeRootNamespaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_root = Path(tmp) / "db"
             ledger_path = db_root / "ledger.db"
-            with mock.patch.object(
+            with mock.patch.dict(
+                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False
+            ), mock.patch.object(
                 dispatcher,
                 "analysis_row",
                 return_value={
@@ -106,7 +108,9 @@ class RuntimeRootNamespaceTests(unittest.TestCase):
             db_root = Path(tmp) / "db"
             ledger_path = db_root / "ledger.db"
             con = mock.Mock()
-            with mock.patch.object(
+            with mock.patch.dict(
+                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False
+            ), mock.patch.object(
                 dispatcher,
                 "analysis_row",
                 return_value={
