@@ -1,10 +1,16 @@
 name: Release version
-run-name: Release ${{ github.ref_name }}
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable SemVer tag to publish or retry
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,6 +33,7 @@ jobs:
       - name: Check out complete history
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -39,14 +46,18 @@ jobs:
         id: validate
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
 
-          if ($env:GITHUB_REF_TYPE -cne "tag") {
-            throw "Release must be triggered by a tag."
+          if ($env:GITHUB_EVENT_NAME -ceq "push") {
+            if ($env:GITHUB_REF_TYPE -cne "tag" -or
+                $env:GITHUB_REF_NAME -cne $env:RELEASE_TAG) {
+              throw "A release push must be triggered by the matching tag."
+            }
+          } elseif ($env:GITHUB_EVENT_NAME -cne "workflow_dispatch") {
+            throw "Release must be a tag push or an explicit retry."
           }
 
           python scripts/check_release_version.py --tag $env:RELEASE_TAG --json
@@ -54,14 +65,25 @@ jobs:
             throw "VERSION, CHANGELOG.md, or release tag validation failed."
           }
 
-          $tagType = @(git cat-file -t $env:RELEASE_REF)
+          # actions/checkout fetches the event commit SHA back into refs/tags/<tag>,
+          # which turns an annotated tag into a lightweight local ref.  Fetch the
+          # authoritative remote tag into an isolated namespace and validate that
+          # object instead of trusting checkout's rewritten local tag.
+          $validatedTagRef = "refs/release-tags/$($env:RELEASE_TAG)"
+          git fetch --force --no-tags origin `
+            "refs/tags/$($env:RELEASE_TAG):$validatedTagRef"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch the authoritative remote release tag."
+          }
+
+          $tagType = @(git cat-file -t $validatedTagRef)
           if ($LASTEXITCODE -ne 0 -or $tagType.Count -ne 1) {
             throw "Could not resolve the release tag object."
           }
           if ($tagType[0].Trim() -cne "tag") {
             throw "Release tags must be annotated tags."
           }
-          $tagObjectOutput = @(git rev-parse --verify $env:RELEASE_REF)
+          $tagObjectOutput = @(git rev-parse --verify $validatedTagRef)
           if ($LASTEXITCODE -ne 0 -or $tagObjectOutput.Count -ne 1) {
             throw "Could not resolve the annotated tag object."
           }
@@ -76,7 +98,7 @@ jobs:
             throw "Could not fetch origin/main."
           }
 
-          $commitSpec = "$($env:RELEASE_REF)^{commit}"
+          $commitSpec = "$validatedTagRef^{commit}"
           $commitOutput = @(git rev-parse --verify $commitSpec)
           if ($LASTEXITCODE -ne 0 -or $commitOutput.Count -ne 1) {
             throw "Could not resolve the release tag to one commit."
@@ -112,6 +134,8 @@ jobs:
   regression:
     needs: validate-release
     uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.validate-release.outputs.tag }}
     permissions:
       contents: read
 
@@ -130,6 +154,8 @@ jobs:
       - name: Check out the validated release tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ needs.validate-release.outputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
