@@ -10,26 +10,41 @@ permissions:
 
 concurrency:
   group: update-star-statistics
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  STAR_STATS_BRANCH: star-statistics
 
 jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check out repository
+      - name: Check out trusted generator
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: Check out statistics data
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.STAR_STATS_BRANCH }}
+          path: stats
+          fetch-depth: 0
 
       - name: Generate aggregate star history
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python scripts/update_star_stats.py \
+          python source/scripts/update_star_stats.py \
             --repo "${GITHUB_REPOSITORY}" \
-            --json-output docs/data/star-history.json \
-            --svg-output docs/assets/star-history.svg
+            --json-output stats/docs/data/star-history.json \
+            --svg-output stats/docs/assets/star-history.svg
 
       - name: Commit changed statistics
+        working-directory: stats
         run: |
           if git diff --quiet -- docs/data/star-history.json docs/assets/star-history.svg; then
             echo "Star statistics are unchanged."
@@ -39,4 +54,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- docs/data/star-history.json docs/assets/star-history.svg
           git commit -m "chore: update star statistics [skip ci]"
-          git push
+          git fetch origin "${STAR_STATS_BRANCH}"
+          git rebase "origin/${STAR_STATS_BRANCH}"
+          git push origin "HEAD:${STAR_STATS_BRANCH}"

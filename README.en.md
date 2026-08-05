@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-04
+last-updated: 2026-08-05
 updated-by: Codex
-change-summary: Add the 1.0.0 public release contract, changelog, and gated tag-to-Release workflow.
+change-summary: Deliver generated Stars history from a dedicated data branch without bypassing main protection.
 -->
 
 <p align="center">
@@ -302,11 +302,11 @@ These limits are unchanged by public release work, documentation internationaliz
 
 ## Star history
 
-The badge shows the current star count. The repository's own GitHub Actions workflow checks every six hours and generates the chart below. Only daily aggregate totals are stored; user identities are discarded.
+The badge shows the current star count. The repository's own GitHub Actions workflow checks every six hours and generates the chart below. Only daily aggregate totals are stored; user identities are discarded. Generated files are committed to the dedicated `star-statistics` data branch without bypassing the PR and CI protections on `main`.
 
-[![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
+[![GitHub Star History](https://raw.githubusercontent.com/asd976385560/AUTO-OKX-USDT-M/star-statistics/docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
-The generator only uses the repository-scoped `GITHUB_TOKEN` while the workflow is running. It requires no personal PAT and never writes the token to files, logs, or the chart. Aggregate data is available in `docs/data/star-history.json`.
+The generator only uses the repository-scoped `GITHUB_TOKEN` while the workflow is running. It requires no personal PAT and never writes the token to files, logs, or the chart. Aggregate data is available at [`docs/data/star-history.json`](https://github.com/asd976385560/AUTO-OKX-USDT-M/blob/star-statistics/docs/data/star-history.json).
 
 ## License
 
