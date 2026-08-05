@@ -37,7 +37,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
 CST = timezone(timedelta(hours=8))
-DB_PATH = Path(_project_path('db', 'account.db'))
+DEFAULT_DB_ROOT = Path(
+    _project_os.environ.get("OKX_DB_ROOT") or _project_path("db")
+).resolve()
+DB_PATH = DEFAULT_DB_ROOT / "account.db"
 
 # 必填段 / 字段。只做存在性校验，不限制字数。
 REQUIRED_SECTIONS = [
@@ -147,12 +150,18 @@ def validate(content: str) -> dict:
     }
 
 
-def write_repair_queue(check_name: str, issue: str, fix_action: str) -> None:
+def write_repair_queue(
+    check_name: str,
+    issue: str,
+    fix_action: str,
+    db_path: str | Path | None = None,
+) -> None:
     """写 repair_queue 表（P3 校验失败时）"""
-    if not DB_PATH.exists():
+    account_db = Path(db_path) if db_path is not None else DB_PATH
+    if not account_db.exists():
         return
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        conn = sqlite3.connect(str(account_db), timeout=10)
         now_cst = datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')
         # created_utc 使用 CST，与 order_executor._enqueue_repair 保持同表同口径；
         # 业务域统一 CST，列名沿用不改（历史 Z 行由迁移批处理）。
@@ -167,14 +176,15 @@ def write_repair_queue(check_name: str, issue: str, fix_action: str) -> None:
         print(f"[validate_push][WARN] repair_queue 写入失败: {e}", file=sys.stderr)
 
 
-def close_healed_push_format() -> None:
+def close_healed_push_format(db_path: str | Path | None = None) -> None:
     """L1 自愈关单（D6 2026-07-15）：本次校验通过＝推送格式管道当前健康，同日更早的
     open push_format 行已自愈——自动关掉（closed_by 标 auto-heal，留审计痕迹）。
     任何异常静默 WARN，绝不影响校验主流程；列未迁移（无 closed_at）时自动跳过。"""
-    if not DB_PATH.exists():
+    account_db = Path(db_path) if db_path is not None else DB_PATH
+    if not account_db.exists():
         return
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        conn = sqlite3.connect(str(account_db), timeout=10)
         cols = {c[1] for c in conn.execute("PRAGMA table_info(repair_queue)").fetchall()}
         if "closed_at" not in cols:
             conn.close()
@@ -212,7 +222,13 @@ def main() -> int:
     # 关掉真实 open 行。生产管道不传本 flag，行为不变。
     ap.add_argument('--no-repair-queue', action='store_true',
                     help='跳过 repair_queue 写入与自愈关单（隔离/开发干跑用，纯校验零写库）')
+    ap.add_argument(
+        '--db-root',
+        default=str(DEFAULT_DB_ROOT),
+        help='运行时数据库根目录（repair_queue 读写其中 account.db）',
+    )
     args = ap.parse_args()
+    account_db = Path(args.db_root).resolve() / 'account.db'
 
     if args.stdin:
         raw = read_stdin_text()
@@ -243,6 +259,7 @@ def main() -> int:
                 'push_format',
                 f"推送格式错误: {', '.join(result['errors'][:3])}",
                 '使用 render_push_report.py 重新渲染，并按 templates/push_template.md §2 核对必填段',
+                account_db,
             )
         return 1
 
@@ -250,7 +267,7 @@ def main() -> int:
         print(f"[validate_push][WARN] {len(result['warnings'])} 个过时格式", file=sys.stderr)
 
     if not args.no_repair_queue:
-        close_healed_push_format()
+        close_healed_push_format(account_db)
     return 0
 
 

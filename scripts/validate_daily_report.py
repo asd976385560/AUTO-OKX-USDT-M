@@ -25,6 +25,7 @@ import json
 import re
 import sqlite3
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,35 @@ def _extract_report_ts(content: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _expected_daily_window(report_ts: str) -> tuple[str, str]:
+    """Independently derive the fixed ``[前一日 08:00, 当日 08:00)`` contract.
+
+    Deliberately re-states the anchor instead of importing it from
+    trade_report_stats: this validator exists to catch the producer drifting
+    from the contract, so sharing the constant would make the check tautological.
+    """
+    ref = trade_report_stats.parse_cst(report_ts)
+    end = ref.replace(hour=8, minute=0, second=0, microsecond=0)
+    if ref < end:
+        end -= timedelta(days=1)
+    start = end - timedelta(days=1)
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _extract_period_window(content: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"(?m)^>\s*统计窗口:\s*\["
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s*"
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+        r"\)，UTC\+8（固定24小时）\s*$",
+        content,
+    )
+    return (match.group(1), match.group(2)) if match else None
+
+
 def _extract_revision_line(content: str) -> dict | None:
     match = re.search(
         r"(?m)^>\s*report_revision:\s*(\d+)\s*\|\s*"
@@ -111,8 +141,8 @@ def _parse_profile_metrics(block: str | None) -> dict | None:
     if not block:
         return None
     patterns = {
-        "open_count": r"今日成交开仓:\s*(\d+)\s*笔",
-        "close_count": r"今日成交平仓:\s*(\d+)\s*笔",
+        "open_count": r"本复盘周期成交开仓:\s*(\d+)\s*笔",
+        "close_count": r"本复盘周期成交平仓:\s*(\d+)\s*笔",
         "risk_reject_count": r"开仓尝试被风控拒绝:\s*(\d+)\s*笔",
         "total_pnl": r"净 PnL:\s*\$?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
     }
@@ -158,6 +188,14 @@ def validate_report(
         return {"ok": False, "errors": errors, "checks": checks}
     if report_ts[:10] not in content.splitlines()[0]:
         errors.append("structure: title date differs from report ts")
+    start_ts, end_ts = _expected_daily_window(report_ts)
+    markdown_window = _extract_period_window(content)
+    if markdown_window is None:
+        errors.append("window: missing fixed 24h period line")
+    elif markdown_window != (start_ts, end_ts):
+        errors.append("window: markdown period is not trailing 24h")
+    else:
+        checks.append("daily_window_24h")
 
     revision_line = _extract_revision_line(content)
     if revision_line is None:
@@ -172,6 +210,7 @@ def validate_report(
         if metrics is None:
             errors.append(f"structure: incomplete {profile} trade metrics")
 
+    previous_row = None
     con = _open_readonly(account_db)
     try:
         rows = con.execute(
@@ -179,6 +218,11 @@ def validate_report(
             "FROM daily_reports WHERE ts=? ORDER BY profile",
             (report_ts,),
         ).fetchall()
+        previous_row = con.execute(
+            "SELECT ts,raw FROM daily_reports "
+            "WHERE profile='live' AND ts<? ORDER BY ts DESC LIMIT 1",
+            (report_ts,),
+        ).fetchone()
     finally:
         con.close()
     by_profile = {str(row["profile"]): row for row in rows}
@@ -266,7 +310,19 @@ def validate_report(
         if not any(error.startswith("reconciliation:") for error in errors):
             checks.append("reconciliation")
 
-    start_ts, end_ts = trade_report_stats.daily_window(report_ts)
+    if previous_row is not None:
+        previous_audit = _json_object(previous_row["raw"]).get(
+            "report_audit") or {}
+        previous_metrics = (
+            previous_audit.get("trade_metrics") or {}
+        ).get("live") or {}
+        previous_end = previous_metrics.get("period_end_ts")
+        if previous_end and previous_end != start_ts:
+            errors.append(
+                "window: gap or overlap with previous daily report")
+        elif previous_end == start_ts:
+            checks.append("daily_window_continuity")
+
     authoritative = {}
     for profile, trade_db in (
         ("live", live_trades_db), ("demo", demo_trades_db)
@@ -277,7 +333,7 @@ def validate_report(
             ledger_db,
             start_ts,
             end_ts,
-            end_exclusive=False,
+            end_exclusive=True,
         )
 
     for profile in ("live", "demo"):
@@ -299,7 +355,7 @@ def validate_report(
             and _same_number(row["total_pnl"], facts["realized_pnl"]),
             embedded.get("period_start_ts") == start_ts,
             embedded.get("period_end_ts") == end_ts,
-            embedded.get("period_end_exclusive") is False,
+            embedded.get("period_end_exclusive") is True,
         )
         if not all(comparisons):
             errors.append(f"audit: {profile} report-time facts differ")

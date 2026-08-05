@@ -20,6 +20,7 @@ import export_schema  # noqa: E402
 import push_pipeline  # noqa: E402
 import qq_push  # noqa: E402
 import schema_drift_check  # noqa: E402
+import validate_push_format  # noqa: E402
 
 
 QQ_SCHEMA = """
@@ -128,6 +129,42 @@ CREATE INDEX idx_sent_status_updated ON sent(updated_at, status);
                 finally:
                     con.close()
 
+    def test_pending_duplicate_is_not_reported_as_delivered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "dedupe.db"
+            event_log = root / "events.jsonl"
+            with mock.patch.object(qq_push, "DB", db), \
+                 mock.patch.object(qq_push, "EVENT_LOG", event_log):
+                first = qq_push._claim(
+                    "key", "hash", "preview", "alert:test", "alert"
+                )
+                pending = qq_push._claim(
+                    "key", "hash", "preview", "alert:test", "alert"
+                )
+                con = sqlite3.connect(db)
+                try:
+                    con.execute("UPDATE sent SET status='sent' WHERE k='key'")
+                    con.commit()
+                finally:
+                    con.close()
+                sent = qq_push._claim(
+                    "key", "hash", "preview", "alert:test", "alert"
+                )
+            self.assertEqual(first, "claimed")
+            self.assertEqual(pending, "duplicate_pending")
+            self.assertEqual(sent, "duplicate_sent")
+
+    def test_qq_runtime_paths_follow_custom_db_root(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sys, "argv", ["qq_push.py", "--db-root", tmp]), \
+             mock.patch.object(qq_push, "DB"), \
+             mock.patch.object(qq_push, "EVENT_LOG"):
+            selected = qq_push._configure_runtime_paths()
+            self.assertEqual(selected, Path(tmp).resolve())
+            self.assertEqual(qq_push.DB, selected / "qq_push_dedupe.db")
+            self.assertIn("qq_push_dedupe-r", qq_push.EVENT_LOG.name)
+
 
 class PushArchiveOrderingTests(unittest.TestCase):
     CONTENT = "第1轮\n📊 资产\n" + ("完整归档正文" * 80)
@@ -141,11 +178,13 @@ class PushArchiveOrderingTests(unittest.TestCase):
         send_exception: Exception | None = None,
     ) -> tuple[dict, list[str], Path]:
         calls: list[str] = []
+        self.last_script_args: dict[str, list[str]] = {}
         archive_path = root / "archive.md"
 
         def fake_run(script: str, args: list, stdin_text: str | None = None):
             name = Path(script).name
             calls.append(name)
+            self.last_script_args[name] = list(args)
             if name == "render_push_report.py":
                 content_path = Path(args[args.index("--out-file") + 1])
                 content_path.write_text(self.CONTENT, encoding="utf-8")
@@ -178,7 +217,9 @@ class PushArchiveOrderingTests(unittest.TestCase):
             mock.patch.object(push_pipeline, "RUNLOG", root / "runlog.jsonl"),
             mock.patch.object(push_pipeline, "_load_build", return_value=builder),
             mock.patch.object(push_pipeline, "_run", side_effect=fake_run),
-            mock.patch.object(push_pipeline, "_finish", side_effect=lambda rep: rep),
+            mock.patch.object(
+                push_pipeline, "_finish", side_effect=lambda rep, *_paths: rep
+            ),
         ):
             result = push_pipeline.run(
                 "2026-07-28T12:00", str(root / "db"), no_send=False
@@ -193,6 +234,30 @@ class PushArchiveOrderingTests(unittest.TestCase):
             )
             self.assertTrue(result["steps"]["archive"]["hard_check"])
             self.assertTrue(archive_path.read_text(encoding="utf-8").endswith(self.CONTENT))
+
+    def test_selected_db_root_reaches_validator_and_state_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run_pipeline(root)
+            selected = str((root / "db").resolve())
+            self.assertEqual(
+                self.last_script_args["validate_push_format.py"][-2:],
+                ["--db-root", selected],
+            )
+            self.assertEqual(
+                self.last_script_args["system_state_writer.py"][-2:],
+                ["--db-root", selected],
+            )
+            qq_args = self.last_script_args["qq_push.py"]
+            self.assertEqual(qq_args[-2:], ["--db-root", selected])
+            dkey = qq_args[qq_args.index("--dedupe-key") + 1]
+            self.assertTrue(dkey.startswith("push:r"), dkey)
+            content_path = Path(
+                self.last_script_args["render_push_report.py"][
+                    self.last_script_args["render_push_report.py"].index("--out-file") + 1
+                ]
+            )
+            self.assertTrue(content_path.parent.name.startswith("r"))
 
     def test_archive_hard_check_failure_blocks_send(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +290,72 @@ class PushArchiveOrderingTests(unittest.TestCase):
             self.assertEqual(result["fatal"], "send_failed")
             self.assertIn("TimeoutError", result["steps"]["send"]["err"])
             self.assertTrue(archive_path.exists())
+
+
+class PushValidatorDatabaseRootTests(unittest.TestCase):
+    REPAIR_SCHEMA = """
+    CREATE TABLE repair_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        check_name TEXT,
+        issue TEXT,
+        fix_action TEXT,
+        status TEXT,
+        created_utc TEXT,
+        closed_at TEXT,
+        closed_by TEXT,
+        resolution TEXT
+    );
+    """
+
+    def test_cli_writes_repair_to_selected_account_db_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected_root = root / "selected"
+            default_root = root / "default"
+            selected_root.mkdir()
+            default_root.mkdir()
+            selected_db = selected_root / "account.db"
+            default_db = default_root / "account.db"
+            _create_db(selected_db, self.REPAIR_SCHEMA)
+            _create_db(default_db, self.REPAIR_SCHEMA)
+            invalid = {
+                "ok": False,
+                "errors": ["test invalid"],
+                "warnings": [],
+                "missing_fields": ["test"],
+                "char_count": 80,
+            }
+            argv = [
+                "validate_push_format.py",
+                "--content",
+                "x" * 80,
+                "--db-root",
+                str(selected_root),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(validate_push_format, "DB_PATH", default_db),
+                mock.patch.object(validate_push_format, "validate", return_value=invalid),
+            ):
+                self.assertEqual(validate_push_format.main(), 1)
+
+            con = sqlite3.connect(selected_db)
+            try:
+                selected_rows = con.execute(
+                    "SELECT COUNT(*) FROM repair_queue WHERE check_name='push_format'"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            con = sqlite3.connect(default_db)
+            try:
+                default_rows = con.execute(
+                    "SELECT COUNT(*) FROM repair_queue WHERE check_name='push_format'"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            self.assertEqual(selected_rows, 1)
+            self.assertEqual(default_rows, 0)
 
 
 if __name__ == "__main__":

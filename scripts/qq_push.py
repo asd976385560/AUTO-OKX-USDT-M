@@ -13,10 +13,11 @@ Dedupe layers:
 调用方不得从正文猜测 cycle 或轮次；业务身份必须通过 --dedupe-key 显式声明。
 sent 表中其他格式的历史行只读保留，不参与当前键匹配。
 
-⚠️ --dedupe-key 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，runpy 前必须
-_strip_wrapper_args 剥掉，否则 raw SystemExit(2) → 所有带键推送全灭。
+⚠️ --dedupe-key / --db-root 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，
+runpy 前必须 _strip_wrapper_args 剥掉，否则 raw SystemExit(2)。
 
-Structured events are appended to <PROJECT_ROOT>/logs/push/qq_push_dedupe.jsonl.
+Structured events use qq_push_dedupe.jsonl for the canonical root and a root-hashed
+filename for non-default roots; dedupe SQLite truth always lives under that DB root.
 """
 from __future__ import annotations
 
@@ -44,7 +45,8 @@ from pathlib import Path
 
 ROOT = Path(_project_path())
 RAW = ROOT / "scripts" / "qq_push_raw.py"
-DB = ROOT / "db" / "qq_push_dedupe.db"
+DEFAULT_DB_ROOT = (ROOT / "db").resolve()
+DB = DEFAULT_DB_ROOT / "qq_push_dedupe.db"
 EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
 CST = timezone(timedelta(hours=8))
 SENT_TABLE_DDL = (
@@ -79,6 +81,22 @@ def _arg_value(names: tuple[str, ...]) -> str | None:
     return None
 
 
+def _configure_runtime_paths() -> Path:
+    """Bind dedupe truth and event evidence to the selected DB root."""
+    global DB, EVENT_LOG
+    raw_root = _arg_value(("--db-root",)) or os.environ.get("OKX_DB_ROOT")
+    runtime_root = Path(raw_root or DEFAULT_DB_ROOT).expanduser().resolve()
+    DB = runtime_root / "qq_push_dedupe.db"
+    if runtime_root == DEFAULT_DB_ROOT:
+        EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
+    else:
+        tag = "r" + hashlib.sha256(
+            os.path.normcase(os.fspath(runtime_root)).encode("utf-8")
+        ).hexdigest()[:10]
+        EVENT_LOG = ROOT / "logs" / "push" / f"qq_push_dedupe-{tag}.jsonl"
+    return runtime_root
+
+
 def _read_content_once() -> str:
     fp = _arg_value(("--content-file", "--file"))
     if fp:
@@ -102,7 +120,11 @@ def _dedupe_key(content: str) -> tuple[str, str, str | None, str]:
     """(key, content_hash, dkey, target)——身份优先显式 --dedupe-key，无则 content-hash。"""
     content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
     dkey = _arg_value(("--dedupe-key",))
-    target = _arg_value(("--target", "--group", "--to", "--group-openid")) or "default"
+    # --alert 走 C2C 私聊（告警与业务播报分流，2026-08-04）。target 参与 dedupe basis，
+    # 所以同一内容发到群和发到告警私聊互不去重——否则改路由后首条告警会被历史键吞掉。
+    target = _arg_value(("--target", "--group", "--to", "--group-openid"))
+    if not target:
+        target = "alert" if "--alert" in sys.argv else "default"
     basis = f"{target}|{dkey or content_hash}"
     key = hashlib.sha256(basis.encode("utf-8")).hexdigest()
     return key, content_hash, dkey, target
@@ -122,7 +144,8 @@ def _connect() -> sqlite3.Connection:
         raise
 
 
-def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: str) -> bool:
+def _claim(key: str, content_hash: str, preview: str,
+           dkey: str | None, target: str) -> str:
     con = _connect()
     try:
         con.execute(SENT_TABLE_DDL)
@@ -155,7 +178,7 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
                 preview=preview[:160],
             )
             print(f"[qq_push_dedupe] skip duplicate key={key[:12]} status={row[0]}")
-            return False
+            return "duplicate_sent" if row[0] == "sent" else "duplicate_pending"
         con.execute(
             "INSERT OR REPLACE INTO sent(k, content_hash, status, first_seen, updated_at, preview) "
             "VALUES(?, ?, ?, ?, ?, ?)",
@@ -171,7 +194,7 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
             target=target,
             preview=preview[:160],
         )
-        return True
+        return "claimed"
     finally:
         con.close()
 
@@ -196,24 +219,32 @@ def _strip_wrapper_args() -> None:
         if skip:
             skip = False
             continue
-        if a == "--dedupe-key":
+        if a in {"--dedupe-key", "--db-root"}:
             skip = True
             continue
-        if a.startswith("--dedupe-key="):
+        if a.startswith("--dedupe-key=") or a.startswith("--db-root="):
             continue
         argv.append(a)
     sys.argv[:] = argv
 
 
 def main() -> int:
+    _configure_runtime_paths()
     content = _read_content_once()
     if not content.strip():
         # 2026-07-02：空内容不 claim（防空 hash 毒化 dedup key、吞掉后续真实推送）、不外发。
         print("qq_push: 空内容，拒绝外发（exit 2）", file=sys.stderr)
         return 2
     key, content_hash, dkey, target = _dedupe_key(content)
-    if not _claim(key, content_hash, content, dkey, target):
+    claim_state = _claim(key, content_hash, content, dkey, target)
+    if claim_state == "duplicate_sent":
         return 0
+    if claim_state == "duplicate_pending":
+        print(
+            "qq_push: prior delivery is still pending; delivery not confirmed",
+            file=sys.stderr,
+        )
+        return 3
     _strip_wrapper_args()
     try:
         runpy.run_path(str(RAW), run_name="__main__")

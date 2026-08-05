@@ -1,24 +1,25 @@
 <!--
 doc: daily_template
 doc-version: V2.0-template
-last-updated: 2026-07-29
-updated-by: Codex
-change-summary: 增加维护ready前置闸、playbook当前事实源与revision受控补正契约。
+last-updated: 2026-07-31
+updated-by: Maintainer
+change-summary: 复盘口径统一到 08:00 锚点：日报窗 [前一日 08:00, 当日 08:00)（ts 抖动不再移窗）；周报窗改 [上周一 08:00, 本周一 08:00)，七份日报恰好平铺一周窗，日/周可互相对账。
 role: 日/周/月复盘模板（reviewer / okx-reviewer -> account.db + reports/daily-reports/ + reports/weekly/）
 权威: skill.md（复盘/推送相关节）+ scripts/daily_report_writer.py + scripts/validate_daily_report.py
 落点: account.db（daily_reports / weekly_reports / monthly_reports）+ reports/daily-reports/daily-YYYY-MM-DD.md + reports/weekly/weekly-YYYY-MM-DD.md
 writer: <PROJECT_ROOT>\scripts\daily_report_writer.py（唯一通道，禁手写 INSERT；默认 dry-run，--apply 才真写）
-推送: 经 qq_push.py 推统一默认 target，以 dedupe-key 区分 daily/weekly/monthly
+推送: 经不带 `--alert` 的 qq_push.py 推送至业务目标 `OKX_QQ_TARGET`，以 dedupe-key 区分 daily/weekly/monthly
 -->
 
 > ⚠️ **2026-07-29 一致性审计校正**：本模板已与当前统计、维护交接、对账和外发边界同步；与 skill.md / 对应 writer 代码冲突时以后者为准。
 
 # 复盘模板 — 日 / 周 / 月 -> account.db
 
-> reviewer（okx-reviewer）聚合账户绩效 + 信号/playbook 绩效 + demo vs live 对照，装配回执 JSON 喂 `<PROJECT_ROOT>\scripts\daily_report_writer.py` 落 `account.db`，并持续落盘日报/周报 UTF-8 Markdown；复盘正文经 `qq_push.py` 推统一默认 target。
-> 红线：写库必走 writer，禁手写 INSERT；时间 UTC+8 字符串；现仓/绩效以 OKX API + 库账本为准；`MAX(ts)` 词典序坑（查最新用 `rowid DESC` / `datetime(ts)`）。零模型名。
+> reviewer（okx-reviewer）聚合账户绩效 + 信号/playbook 绩效 + demo vs live 对照，装配回执 JSON 喂 `<PROJECT_ROOT>\scripts\daily_report_writer.py` 落 `account.db`，并持续落盘日报/周报 UTF-8 Markdown；复盘正文经不带 `--alert` 的 `qq_push.py` 推送至业务目标 `OKX_QQ_TARGET`。
+> 红线：写库必走 writer，禁手写 INSERT；时间 UTC+8 字符串；现仓/绩效以 OKX API + 库账本为准；查最新行用 ts 词典序（`MAX(ts)` / `ORDER BY ts DESC`，前提列格式统一），禁 `rowid DESC`（主要表 `INSERT OR REPLACE` 会改 rowid）。零模型名。
 > writer **默认 dry-run**，`--apply` 才真写；`--profiles both`（默认）一次 payload 同写 live/demo 双段，成功后勿再单独重复写 demo。
 > 08:05 开场必须先运行 `reviewer_preflight.py --wait-seconds 1200`；只接受当日 ready 清单、三个关键维护步骤与质量文件 SHA-256 全部一致。非 0 时不生成、不写库、不外发；`report_mode=provisional` 必须贯穿报告。
+> 日报成交、风控拒绝、周期 PnL 与 `account_bills` 统一使用固定24小时事实窗 `[前一日 08:00, 当日 08:00)`；累计 PnL、资金与持仓仍按报告 `ts` 回读。
 
 ## 1. 日报回执 JSON（write_daily -> daily_reports）
 
@@ -32,7 +33,7 @@ writer 按 profile 优先读 `live_`/`demo_` 前缀字段（`pf()`），兼容�
 ```json
 {
   "ts": "2026-06-24 08:00:00",
-  "summary": "当日 live 2 开 1 平，净 +12.4 USDT；demo 5 开 3 平，净 +88 USDT",
+  "summary": "本复盘周期 live 2 开 1 平，净 +12.4 USDT；demo 5 开 3 平，净 +88 USDT",
   "lessons": "BTC 趋势单守住，ETH 区间假突破止损 1 次",
   "raw": "{...完整原始复盘 JSON...}",
   "live_reconcile_status": "clean",
@@ -55,19 +56,19 @@ writer 按 profile 优先读 `live_`/`demo_` 前缀字段（`pf()`），兼容�
 |---|---|---|
 | `ts` | `ts`（缺则 now UTC+8） | 复盘时刻 `'YYYY-MM-DD HH:MM:SS'` |
 | `profile` | （写双段时各自 `live`/`demo`） | — |
-| `open_count` / `close_count` | `<pf>_open_count` / `<pf>_close_count` | 当日开/平笔数 |
-| `total_pnl` | `<pf>_total_pnl` | 当日净 realized pnl |
-| `total_fees` | `<pf>_total_fees` | 当日手续费 |
+| `open_count` / `close_count` | `<pf>_open_count` / `<pf>_close_count` | 固定24小时复盘周期的开/平笔数 |
+| `total_pnl` | `<pf>_total_pnl` | 固定24小时复盘周期净 realized pnl |
+| `total_fees` | `<pf>_total_fees` | 固定24小时复盘周期手续费 |
 | `best_trade` / `worst_trade` | `<pf>_best_trade` / `<pf>_worst_trade` | 最佳/最差笔（人读） |
-| `summary` / `lessons` | `summary` / `lessons`（双段共享） | 当日小结 / 教训 |
+| `summary` / `lessons` | `summary` / `lessons`（双段共享） | 本复盘周期小结 / 教训 |
 | `raw` | `raw` | 原始复盘 JSON 留痕 |
-| `trade_day_num` | writer 自动 | `next_trade_day_num`：同一天 live/demo **共享编号**；否则 `MAX+1`（禁跳号/回滚，事务内）。**禁**自己按 `MAX(ts)` 算（词典序坑） |
+| `trade_day_num` | writer 自动 | `next_trade_day_num`：同一天 live/demo **共享编号**；否则 `MAX+1`（禁跳号/回滚，事务内）。**禁**自己算编号——一律由 writer 在同一事务内续号（防跳号/并发错号） |
 
 > `live_reconcile_status`、`live_reconcile_issue_count` 和双盘 `risk_reject_count` 是报告状态/展示字段：风控拒绝必须与成交开仓分列。订单标识允许随日报外发用于逐笔对账；API 密钥、签名、会话令牌仍禁止进入报告。
 
 ## 2. 周报 / 月报回执（write_weekly / 同形月报）
 
-周报必填报告键 `week_start_ts`（本周一 `'YYYY-MM-DD HH:MM:SS'` UTC+8）；统计事实窗口固定为**上周一 00:00（含）到本周一 00:00（不含）**。PK = `week_start_ts + profile`，重复即报错不覆盖：
+周报必填报告键 `week_start_ts`（本周一 `'YYYY-MM-DD HH:MM:SS'` UTC+8，仍是 00:00 键）；统计事实窗口固定为**上周一 08:00（含）到本周一 08:00（不含）**——与日报同 08:00 相位，七份日报恰好平铺该窗，可互相对账。PK = `week_start_ts + profile`，重复即报错不覆盖：
 
 ```json
 {
@@ -96,17 +97,18 @@ writer 按 profile 优先读 `live_`/`demo_` 前缀字段（`pf()`），兼容�
 >
 > 周报除写 `weekly_reports` 外，必须持续生成 `reports/weekly/weekly-<本周一日期>.md`；数据库已有周报行不等于可以省略 Markdown。
 
-## 3. 复盘正文（统一 target + 落盘 .md）
+## 3. 复盘正文（业务目标 `OKX_QQ_TARGET` + 落盘 .md）
 
-复盘正文（日报落 `reports/daily-reports/daily-YYYY-MM-DD.md`，周报另落 `reports/weekly/weekly-<week_start>.md`，并推统一默认 target）建议结构：
+复盘正文（日报落 `reports/daily-reports/daily-YYYY-MM-DD.md`，周报另落 `reports/weekly/weekly-<week_start>.md`，并推送至业务目标 `OKX_QQ_TARGET`）建议结构：
 
 ```
 # 复盘 YYYY-MM-DD（第N交易日）
 
 ## 账户绩效
-🟢 实盘：equity $X | 当日净 X USDT | 开N/平M | 手续费 X
-🟡 模拟盘：equity $X | 当日净 X USDT | 开N/平M | 手续费 X
-（equity 取 OKX API / account_snapshots，查最新按 rowid DESC / datetime(ts)，禁 MAX(ts) 词典序）
+统计窗口：[前一日 08:00, 当日 08:00)，UTC+8（固定24小时）
+🟢 实盘：equity $X | 周期净 X USDT | 开N/平M | 手续费 X
+🟡 模拟盘：equity $X | 周期净 X USDT | 开N/平M | 手续费 X
+（equity 取 OKX API / account_snapshots，查最新按 `ORDER BY ts DESC`；禁 rowid DESC——该表 `INSERT OR REPLACE` 会改 rowid）
 
 ## 信号 / playbook 绩效
 - per-信号：各 analysis_signals action 命中率 / 平均收益（按 trade_experiences 关联）
@@ -157,8 +159,8 @@ pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\s
 | 输入 JSON 解析（含中文走 `--json-file`） | writer `load_payload` + `sanitize_text` | 解析失败 -> `fail()` |
 | 默认 dry-run 保护 | writer（`--apply` 才真写） | 无 `--apply` 只 print，不动库 |
 | 既有日报 revision 补正 | `daily_report_writer --backfill-daily-revision` 强制备份、目标行并发指纹、Markdown 单行与 live/demo 一致性检查 | 仅允许两行 raw + 一条 Markdown revision；不重算、不自动重发；重复执行幂等 |
-| 独立日报校验 | `scripts/validate_daily_report.py --file <日报 Markdown> --db-root <PROJECT_ROOT>\db` 只读复算标题/报告日期、live+demo 成交开/平、风控拒绝、对账状态、审计与 revision；周报另核 `[上周一, 本周一)` 和 `reports/weekly/` 文件 | exit 非 0 不推；修正文档后重验。**不得调用 15M `validate_push_format.py`** |
+| 独立日报校验 | `scripts/validate_daily_report.py --file <日报 Markdown> --db-root <PROJECT_ROOT>\db` 独立断言 `[前一日 08:00, 当日 08:00)` 固定24小时右开窗口及与上一日报连续，再只读复算标题/报告日期、live+demo 成交开/平、风控拒绝、对账状态、审计与 revision；周报另核 `[上周一 08:00, 本周一 08:00)` 和 `reports/weekly/` 文件 | exit 非 0 不推；修正文档后重验。**不得调用 15M `validate_push_format.py`** |
 | 订单标识外发边界 | 日报可列用于对账的 `ordId`/订单标识；凭据、签名、令牌禁止出现 | 凭据类内容立即阻断，订单标识本身不阻断 |
-| 外发入口 | `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<日期>:<用途>`，使用统一默认 target | 非统一入口不推 |
+| 外发入口 | `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<日期>:<用途>`，不带 `--alert`，目标只取 `OKX_QQ_TARGET` | 非统一入口或路由不符不推 |
 
 成功：writer 退出码 `0`（且 read-after-write 通过）；日报 Markdown 落盘；周一还必须存在对应 weekly Markdown；独立日报校验通过后才可外发。退出码非 0 -> Agent 视为 P0。

@@ -177,9 +177,36 @@ except Exception:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 # DB paths
 # ---------------------------------------------------------------------------
+_PRODUCTION_DB_ROOT = Path(_project_path('db')).resolve()
+
+
+def _runtime_db_root(explicit: str | Path | None = None) -> Path:
+    value = explicit if explicit is not None else os.environ.get("OKX_DB_ROOT")
+    return Path(value or _PRODUCTION_DB_ROOT).expanduser().resolve()
+
+
+def _runtime_db_path(
+    filename: str,
+    db_root: str | Path | None = None,
+    specific_env: str | None = None,
+) -> Path:
+    # An explicit root is an isolation boundary and therefore wins over legacy
+    # per-database environment overrides.
+    if db_root is not None:
+        return _runtime_db_root(db_root) / filename
+    if specific_env and os.environ.get(specific_env):
+        return Path(os.environ[specific_env]).expanduser().resolve()
+    return _runtime_db_root() / filename
+
+
+def _trade_db_path(profile: str, db_root: str | Path | None = None) -> Path | None:
+    filename = {"live": "live_trades.db", "demo": "demo_trades.db"}.get(profile)
+    return _runtime_db_path(filename, db_root) if filename else None
+
+
 DB_MAP = {
-    "live": Path(_project_path('db', 'live_trades.db')),
-    "demo": Path(_project_path('db', 'demo_trades.db')),
+    profile: _trade_db_path(profile)
+    for profile in ("live", "demo")
 }
 
 # ---------------------------------------------------------------------------
@@ -666,22 +693,25 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
 EQUITY_FALLBACK_MAX_AGE_SEC = 20 * 60
 
 
-def _equity_snapshot_fallback(profile: str) -> Optional[tuple]:
+def _equity_snapshot_fallback(
+    profile: str,
+    db_root: str | Path | None = None,
+) -> Optional[tuple]:
     """从 account.db account_snapshots 按 profile 取最新快照 equity。
 
     返回 (equity, snapshot_ts)；快照过旧/缺行/读取失败 → None（fail-safe）。
-    最新行按 rowid DESC（ts 是 TEXT，MAX(ts) 词典序不可靠）。
+    最新行按规范 CST ts 排序；rowid 只作同刻破同，避免补写旧槽顶到最新。
     """
     if profile not in DB_MAP:
         return None
     try:
-        acc_path = os.environ.get("OKX_ACCOUNT_DB", _project_path('db', 'account.db'))
+        acc_path = _runtime_db_path("account.db", db_root, "OKX_ACCOUNT_DB")
         acc = sqlite3.connect(f"file:{acc_path}?mode=ro", uri=True, timeout=5)
         try:
             acc.execute("PRAGMA busy_timeout=5000;")
             row = acc.execute(
                 "SELECT ts, totalEq FROM account_snapshots WHERE profile=? "
-                "ORDER BY rowid DESC LIMIT 1",
+                "ORDER BY ts DESC,rowid DESC LIMIT 1",
                 (profile,)).fetchone()
         finally:
             acc.close()
@@ -715,9 +745,12 @@ except Exception:  # noqa: BLE001 —— import 失败用本地等价实现（�
         return s + "-USDT-SWAP"
 
 
-def _analysis_context_for_cycle(cycle_id: str) -> dict:
+def _analysis_context_for_cycle(
+    cycle_id: str,
+    db_root: str | Path | None = None,
+) -> dict:
     """{symbol: {total, confidence, decision_card}}；异常返回空（非致命）。"""
-    ana_path = os.environ.get("OKX_ANALYSIS_DB", _project_path('db', 'analysis.db'))
+    ana_path = _runtime_db_path("analysis.db", db_root, "OKX_ANALYSIS_DB")
     out: dict = {}
     try:
         ana = sqlite3.connect(f"file:{ana_path}?mode=ro", uri=True, timeout=5)
@@ -865,14 +898,14 @@ def _write_trades(
     # 已备份的人工事实修复可通过维护专用入口保留历史 NULL，禁止用“修复执行时”
     # 的最新 account snapshot 污染旧 cycle；普通 receipt 字段无法开启该能力。
     if equity is None and not preserve_equity_none:
-        fb = _equity_snapshot_fallback(mode)
+        fb = _equity_snapshot_fallback(mode, db_root=db_path.parent)
         if fb is not None:
             equity = fb[0]
             equity_fallback_mark = {"equity_source": "account_snapshot_fallback",
                                     "equity_source_ts": fb[1]}
     pnl_session = data.get("pnl_session", 0.0)
     pnl_open = data.get("pnl_open", 0.0)
-    ana_context = _analysis_context_for_cycle(cycle_id)
+    ana_context = _analysis_context_for_cycle(cycle_id, db_root=db_path.parent)
     card_mode = (
         data.get("decision_protocol") == "decision_card_v1"
         or isinstance(data.get("decision_card"), dict)
@@ -1222,7 +1255,34 @@ def _derive_action_taken(t: dict) -> Optional[str]:
     return None  # none / 未知 → 不写经验
 
 
-def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
+def _regime_for_ts(
+    ts_cst: Optional[str],
+    db_root: str | Path | None = None,
+) -> Optional[str]:
+    """按成交时刻回查 regime.db 的 regime 事实标签；不可用即 None（非致命）。
+
+    只在回执缺 regime 时兜底。经验写入本身是非致命路径，这里同样吞异常——
+    宁可继续留 NULL，也不让 regime 查询失败连累交易记录。
+    """
+    try:
+        if _project_path('scripts') not in sys.path:
+            sys.path.insert(0, _project_path('scripts'))
+        from _regime_read import regime_at as _regime_at  # noqa: E402
+        # 与本模块 account.db 同源取库根：夹具把 OKX_ACCOUNT_DB 指到临时目录时，
+        # regime 查询跟着落到同一目录，不会穿到生产 regime.db。
+        acc_path = _runtime_db_path("account.db", db_root, "OKX_ACCOUNT_DB")
+        regime, _matched = _regime_at(os.path.dirname(acc_path), ts_cst)
+        return regime
+    except Exception:  # noqa: BLE001 —— regime 兜底失败不阻塞经验写
+        return None
+
+
+def write_experiences(
+    data: dict,
+    profile: str,
+    now_ts: Optional[str],
+    db_root: str | Path | None = None,
+) -> dict:
     """把本轮成交逐笔写进 account.db.trade_experiences（经验库，§8.5）。
 
     非致命：trade DB 与 account.db 跨库无法同事务，交易记录已先落库；此处失败只记 stderr。
@@ -1246,7 +1306,7 @@ def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
         if _project_path('scripts') not in sys.path:
             sys.path.insert(0, _project_path('scripts'))
         import trade_experience_writer as _tew  # noqa: E402
-        acc_path = os.environ.get("OKX_ACCOUNT_DB", _project_path('db', 'account.db'))
+        acc_path = _runtime_db_path("account.db", db_root, "OKX_ACCOUNT_DB")
         acc = sqlite3.connect(acc_path, timeout=10)
         acc.execute("PRAGMA busy_timeout=5000;")
         try:
@@ -1261,11 +1321,19 @@ def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
                     data.get("decision_protocol") == "decision_card_v1"
                     or isinstance(t.get("decision_card"), dict)
                 )
+                experience_ts = strict_cst_ts(t.get("fill_ts")) or now_ts
+                # 回执 JSON 从不带顶层 regime（实测 2026-06-20 起 207 行全 NULL），
+                # 导致 trade_experiences.regime 长期为空、历史基线的 regime 分组塌成
+                # 极小样本。缺失时按成交时刻回查 regime.db 权威事实标签；查不到就留
+                # NULL，不用"当前 regime"顶替（那是后见之明，会污染历史样本）。
+                cycle_regime = data.get("regime")
+                if cycle_regime in (None, ""):
+                    cycle_regime = _regime_for_ts(experience_ts, db_root=db_root)
                 payload = {
                     "cycle_id": data.get("cycle_id"),
                     "profile": profile,
                     "action_taken": at,
-                    "regime": data.get("regime"),
+                    "regime": cycle_regime,
                     "regime_stale": data.get("regime_stale", 0),
                     "confidence": None if is_card else data.get("confidence"),
                     "total_score": None if is_card else data.get("total_score"),
@@ -1274,7 +1342,6 @@ def write_experiences(data: dict, profile: str, now_ts: Optional[str]) -> dict:
                     "playbook_ref": data.get("playbook_ref"),
                     "trades": [t],
                 }
-                experience_ts = strict_cst_ts(t.get("fill_ts")) or now_ts
                 _tew.insert_or_update_experiences(
                     acc,
                     payload,
@@ -1449,11 +1516,20 @@ def replay_from_journal(args) -> int:
     if not jpath.exists():
         print(json.dumps({"ok": False, "error": f"journal 不存在: {jpath}"}, ensure_ascii=False))
         return 1
-    db_path = DB_MAP.get(args.profile)
+    db_path = _trade_db_path(args.profile, getattr(args, "db_root", None))
     if not db_path or not db_path.exists():
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1
+    if not args.replay_dry_run and not args.ordid:
+        print(json.dumps({
+            "ok": False,
+            "error": "journal apply 必须显式 --ordid 逐笔执行；"
+                     "先用 --replay-dry-run 只读预演，禁止无 ordId 批量重放",
+            "replayed": 0,
+        }, ensure_ascii=False))
+        return 2
     recs = []
+    blocked_unwinds = []
     bad_lines = 0  # 核验修：撕裂/坏行必须计数外显——静默跳过=真实成交从安全网里无声消失
     with open(jpath, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -1470,17 +1546,56 @@ def replay_from_journal(args) -> int:
                 continue
             if rec.get("profile") != args.profile:
                 continue
-            if args.ordid and _extract_ordid(rec["trade"]) != str(args.ordid):
-                continue
+            if args.ordid:
+                # Apply authorization accepts only the exchange's real ordId.
+                # algoId/recovered-timeout fallbacks are useful for diagnosis
+                # but are not a unique live-ledger repair identity.
+                strict_ordid = rec["trade"].get("ordId")
+                if not strict_ordid or str(strict_ordid) != str(args.ordid):
+                    continue
             if not args.ordid and str(rec.get("cycle_id") or "").startswith("TEST-"):
                 continue  # 微单测试记录默认不重放（显式 --ordid 才碰）
-            if not args.ordid and rec.get("unwind"):
+            if not args.replay_dry_run and rec.get("unwind"):
                 # 核验修：unwind close（SL 失败平裸仓）回执 trades=[]、账本无对应 open——
-                # 直接重放=close-without-open 净仓错向。默认不重放（plan 里标 unwind 供
-                # 监控 P1 人工），显式 --ordid 才碰（人工核实后 FOGO 式补账由主人决定）。
+                # 直接重放=close-without-open 净仓错向。dry plan 保留并标注 unwind
+                # 供监控 P1 人工核实；apply 即使给了 ordId 也继续硬阻断。
+                blocked_unwinds.append({
+                    "ordId": rec["trade"].get("ordId") or None,
+                    "cycle": rec.get("cycle_id"),
+                    "symbol": rec["trade"].get("symbol"),
+                    "action": rec["trade"].get("action"),
+                })
                 continue
             recs.append(rec)
-    con = connect(db_path)
+    if blocked_unwinds:
+        print(json.dumps({
+            "ok": False,
+            "error": "unwind journal 记录不得通过 trades_writer 直接重放；"
+                     "必须人工核对 open/close 链路",
+            "blocked_unwinds": blocked_unwinds,
+            "replayed": 0,
+        }, ensure_ascii=False))
+        return 3
+    if not args.replay_dry_run and args.ordid and len(recs) != 1:
+        print(json.dumps({
+            "ok": False,
+            "error": "--ordid 必须在所选 profile 的 journal 中唯一命中 1 条记录；"
+                     f"当前命中 {len(recs)} 条，已阻断",
+            "ordId": str(args.ordid),
+            "matched_records": len(recs),
+            "replayed": 0,
+        }, ensure_ascii=False))
+        return 3
+    if args.replay_dry_run:
+        # A planning scan is byte-read-only: do not call connect(), whose WAL
+        # pragma can create/change SQLite sidecars even without DML.
+        con = sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10
+        )
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+    else:
+        con = connect(db_path)
     try:
         classified = [(r, _journal_replay_status(con, r)) for r in recs]
     finally:
@@ -1581,7 +1696,9 @@ def replay_from_journal(args) -> int:
         # 经验挂钩只喂真正新落的行；重放命中已有行时不重喂经验库。
         exp_trades = res.pop("new_trades", None)
         exp_data = data if exp_trades is None else {**data, "trades": exp_trades}
-        exp = write_experiences(exp_data, args.profile, data.get("ts"))
+        exp = write_experiences(
+            exp_data, args.profile, data.get("ts"), db_root=db_path.parent
+        )
         res["exp"] = exp.get("exp", 0)
         results.append(res)
         if not res.get("ok"):
@@ -1608,7 +1725,7 @@ def commit_receipt(data: dict, profile: str,
         return {"ok": False, "error": f"profile 不支持: {profile}"}
     if not isinstance(data, dict):
         return {"ok": False, "error": "回执必须是 dict"}
-    target = Path(db_path or DB_MAP[profile])
+    target = Path(db_path or _trade_db_path(profile))
     if not target.exists():
         return {"ok": False, "error": f"DB 不存在: {target}"}
     payload = normalize_receipt(data)
@@ -1635,12 +1752,15 @@ def commit_receipt(data: dict, profile: str,
         exp_data,
         profile,
         result.get("writer_commit_at"),
+        db_root=target.parent,
     )
     result["exp"] = exp.get("exp", 0)
     if (nudge and result.get("ok") and not result.get("refused")
             and _nudge_mod is not None):
         try:
-            _nudge_mod.nudge(f"trades_writer:{profile}")
+            _nudge_mod.nudge(
+                f"trades_writer:{profile}", db_root=target.parent
+            )
         except Exception as exc:  # nudge 永不反向拖垮已提交的账本
             sys.stderr.write(
                 f"[trades_writer][WARN] dispatcher nudge 跳过（非致命）: {exc}\n")
@@ -1653,6 +1773,10 @@ def main() -> int:
     parser.add_argument("--json-file", type=str, help="从 UTF-8 文件读 JSON 回执（方案A：杜绝 echo 管道外层 shell GBK 编码坏码）")
     parser.add_argument("--cycle-id", type=str, help="cycle_id")
     parser.add_argument("--profile", type=str, choices=["live", "demo"], required=True)
+    parser.add_argument(
+        "--db-root", type=str,
+        help="运行时数据库目录（缺省读取 OKX_DB_ROOT，再回退项目 db）",
+    )
     # 旧 quick-write 参数只为让历史调用得到结构化拒绝原因而保留解析，
     # 不再出现在 --help，也绝不据此拼装缺少 decision_card 的伪回执。
     parser.add_argument("--decision", type=str, help=argparse.SUPPRESS)
@@ -1714,7 +1838,7 @@ def main() -> int:
         }, ensure_ascii=False))
         return 1
 
-    db_path = DB_MAP.get(args.profile)
+    db_path = _trade_db_path(args.profile, args.db_root)
     if not db_path or not db_path.exists():
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1

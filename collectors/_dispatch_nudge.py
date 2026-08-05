@@ -8,8 +8,8 @@ trader 落库→push 派发 1.2min）。okx-dispatcher cron（*/2min）保持原
   1. 暂停语义闸：okx-dispatcher cron enabled=1 才准 spawn（直读 openclaw.sqlite mode=ro，
      读失败/行缺失一律拒发 fail-closed）——保住「停 cron=停派发」不变量：P0 PAUSE 后已启动
      agent 收尾落库不得绕过暂停派 trader 下真单；停用 cron 的测试窗自动静默。
-  2. DRYRUN 拒发：env 见 OKX_TRIGGER_DRYRUN（任何值，存在即拒）——dryrun dispatcher 对真库
-     干跑仍写 stage_dispatch 闩锁，nudge 出去等于闩锁投毒。
+  2. DRYRUN 拒发：env 见 OKX_TRIGGER_DRYRUN（任何值，存在即拒）——dry-run
+     必须保持为显式人工验证上下文，writer 不把它扩散成额外 detached 派发。
   3. env 白名单：spawn 的 dispatcher 只继承系统基础键，OKX_* 全系 12 个消费键与 MX_APIKEY
      零透传——writer 跑在 LLM agent 会话内，agent shell 层可被注入任意 export，
      OKX_COLLECTORS_DIR（sys.path 劫持）/ OKX_OPENCLAW_BIN（起棒二进制替换）等不得
@@ -102,16 +102,21 @@ def _default_spawn(cmd: list, fh) -> None:
         cwd=_project_path(), close_fds=True, env=_spawn_env())
 
 
-def nudge(origin: str) -> dict:
-    """detached 起一次 dispatcher。返回 {"nudged": bool, "reason": str}；永不 raise、永不写 stdout。"""
+def nudge(origin: str, db_root=None) -> dict:
+    """detached 起一次生产 dispatcher；隔离 DB root 永不外拍生产。"""
     try:
         if os.environ.get("OKX_DISPATCH_NUDGE", "1") == "0":
             return {"nudged": False, "reason": "disabled"}
         if "OKX_TRIGGER_DRYRUN" in os.environ:
             return {"nudged": False, "reason": "dryrun_env"}
+        requested_root = Path(
+            db_root or os.environ.get("OKX_DB_ROOT") or _DB_ROOT
+        ).expanduser().resolve()
+        if requested_root != Path(_DB_ROOT).resolve():
+            return {"nudged": False, "reason": "non_production_db_root"}
         if not _dispatcher_cron_enabled():
             return {"nudged": False, "reason": "cron_disabled_or_unreadable"}
-        cmd = [sys.executable, _DISPATCHER, "--db-root", _DB_ROOT]
+        cmd = [sys.executable, _DISPATCHER, "--db-root", str(requested_root)]
         _LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(_LOG, "a", encoding="utf-8") as fh:
             ts = datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S")
@@ -154,7 +159,7 @@ def nudge_from_collector(origin: str, db_root, statuses, dry_collect: bool = Fal
         sts = statuses if isinstance(statuses, (list, tuple, set)) else [statuses]
         if not any(str(s) in _COLLECTOR_DONE_STATUS for s in sts):
             return {"nudged": False, "reason": "no_done_status"}
-        return nudge(origin)
+        return nudge(origin, db_root=db_root)
     except Exception as e:  # noqa: BLE001 —— 与守护闸 4 同源：非致命
         try:
             sys.stderr.write(f"[dispatch_nudge][WARN] collector nudge skipped (non-fatal): {e}\n")

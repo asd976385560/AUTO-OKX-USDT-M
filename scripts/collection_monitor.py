@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯脚本）。
 
-确定性检查账本健康、源时效和注入话术；超阈经 qq_push.py 推统一默认 target
-（告警用途键）。LLM 不参与检测环。
+确定性检查账本健康、源时效和注入话术；超阈必须经 qq_push.py --alert 推送，
+告警目标仅取 OKX_QQ_ALERT_TARGET（无内置回退）。业务报告不得带 --alert，
+其目标仅取 OKX_QQ_TARGET。LLM 不参与检测环。
 
 只在下述“真故障”告警，其余一律 audit-only（记 audit.jsonl 不推 QQ）：
   QQ 告警（P0/P1）：
@@ -47,6 +48,7 @@ def _project_path(*parts: str) -> str:
 
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -57,6 +59,13 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+if _project_path() not in sys.path:
+    sys.path.insert(0, _project_path())
+from collectors.cycle_contract import (  # noqa: E402
+    cycle_session_token,
+    cycle_status_token,
+    validate_cycle_id,
+)
 import ledger_invariants as li
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -67,7 +76,8 @@ if hasattr(sys.stderr, "reconfigure"):
 CST = timezone(timedelta(hours=8))
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
 WRAP = _project_path('scripts', 'run_okx_python.ps1')
-STATE_DIR = Path(_project_path('logs', 'monitor'))
+STATE_DIR_BASE = Path(_project_path('logs', 'monitor'))
+STATE_DIR = STATE_DIR_BASE
 STATE_FILE = STATE_DIR / "alert_state.json"
 AUDIT_FILE = STATE_DIR / "audit.jsonl"
 LOCK_FILE = STATE_DIR / "monitor.lock"
@@ -86,7 +96,7 @@ UNIFIED_LIVE_GRACE_SEC = 1800                   # 合并分析+实盘首棒给 3
 JOURNAL_GRACE_SEC = 900                         # journal 落痕后给 15min 让 trader 正常喂 writer，超则判未入账
 LOCK_STALE_SEC = 180                            # 锁陈旧阈（超此视为死锁可抢）
 TRADES_WRITER = _project_path('collectors', 'trades_writer.py')
-PROD_DB_ROOT = _project_path('db')                     # journal 自动重放仅限生产 root（writer DB_MAP 硬编码生产库）
+PROD_DB_ROOT = _project_path('db')                     # journal 自动重放仅限规范生产 root
 # P13（2026-07-14）：trader launch-but-failed 三态归因的 audit 账本落点（OpenClaw 2026.7.1+；
 # 表不存在/库不可读一律 fail-safe 回退单态口径，不影响告警本体）
 OPENCLAW_STATE_DB = os.environ.get(
@@ -94,6 +104,28 @@ OPENCLAW_STATE_DB = os.environ.get(
     str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite')))
 STAGE_STATUS_DIR = Path(os.environ.get(
     "OKX_STAGE_STATUS_DIR", _project_path('logs', 'stage-status')))
+
+
+def _root_namespace(db_root: str | Path) -> str:
+    resolved = Path(db_root).resolve()
+    if resolved == Path(PROD_DB_ROOT).resolve():
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
+
+
+def _configure_runtime_paths(db_root: str | Path) -> None:
+    global STATE_DIR, STATE_FILE, AUDIT_FILE, LOCK_FILE
+    namespace = _root_namespace(db_root)
+    STATE_DIR = STATE_DIR_BASE / namespace if namespace else STATE_DIR_BASE
+    STATE_FILE = STATE_DIR / "alert_state.json"
+    AUDIT_FILE = STATE_DIR / "audit.jsonl"
+    LOCK_FILE = STATE_DIR / "monitor.lock"
+
+
+def _is_production_db_root(db_root: str | Path) -> bool:
+    return Path(db_root).resolve() == Path(PROD_DB_ROOT).resolve()
 
 # 注入话术关键词（脚本级，非 LLM 语义）。匹配文本仅报"命中模式名"，不回灌原文（防自激）。
 INJECTION_PATTERNS = {
@@ -291,13 +323,22 @@ _ATTR_HINT = {
 }
 
 
-def _audit_attribution(book: str, cyc: str) -> str:
+def _audit_attribution(book: str, cyc: str,
+                       db_root: str | Path = PROD_DB_ROOT) -> str:
     """优先读 stage_runner 确定性终态，再回退 OpenClaw audit_events 三态归因。
 
     P13（2026-07-14）：直读 OpenClaw audit_events（metadata-only 账本，mode=ro）
     判 launch-but-failed 属哪层。session_key 复刻 trigger_agent.session_key 规则
-    （例如 `<SESSION_KEY>`）。任何异常返 'audit-unavailable'（fail-safe）。"""
-    status_path = STAGE_STATUS_DIR / f"{book}-{cyc.replace(':', '-')}.json"
+    （'agent:okx-live-trader:live-20260714-1945'）。任何异常返 'audit-unavailable'（fail-safe）。"""
+    try:
+        cyc = validate_cycle_id(cyc)
+    except ValueError:
+        return "audit-unavailable"
+    namespace = _root_namespace(db_root)
+    suffix = f"-{namespace}" if namespace else ""
+    status_path = STAGE_STATUS_DIR / (
+        f"{book}-{cycle_status_token(cyc)}{suffix}.json"
+    )
     try:
         runner = json.loads(status_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
@@ -311,7 +352,15 @@ def _audit_attribution(book: str, cyc: str) -> str:
     if runner_status == "succeeded":
         return "run-ok-no-db-row"
 
-    safe = cyc.replace("-", "").replace(":", "").replace("T", "-")
+    # Real Agent stages are deliberately unavailable for non-default roots:
+    # Gateway turns cannot prove propagation of the local DB-root override.
+    # Therefore a missing isolated status file must never fall back to the
+    # canonical OpenClaw audit database and borrow a production session with
+    # the same cycle id.
+    if namespace:
+        return "no-run"
+
+    safe = cycle_session_token(cyc)
     sk = f"agent:okx-{book}-trader:{book}-{safe}"
     try:
         con = sqlite3.connect(f"file:{OPENCLAW_STATE_DB}?mode=ro", uri=True, timeout=5)
@@ -379,7 +428,7 @@ def detect_trader_incomplete(db_root: str, now: datetime) -> list[dict]:
         finally:
             bcon.close()
         if n == 0:
-            missing.append((book, cyc, _audit_attribution(book, cyc)))
+            missing.append((book, cyc, _audit_attribution(book, cyc, db_root)))
     if not missing:
         return []
     cycles = sorted({cyc for _, cyc, _ in missing})
@@ -470,16 +519,16 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
     ~:03-:25）+ WAL + 合并闸幂等可容。"""
     sigs: list[dict] = []
     jdir = Path(os.environ.get("OKX_EXEC_JOURNAL_DIR") or (Path(db_root) / "journal"))
-    # writer 的 DB_MAP 硬编码生产库：db_root 指向副本时扫的是
-    # 副本 journal、写的却是生产账本（拿测试副本的 journal 污染真账）。非生产 root
-    # 一律降级 report-only，绝不自动重放。
-    prod_root = str(Path(db_root).resolve()).lower() == PROD_DB_ROOT
+    # 自动重放是生产专用动作；非生产 root 即使具备独立 writer 路径，也只报告。
+    prod_root = _is_production_db_root(db_root)
     for profile in ("live", "demo"):
         jf = jdir / f"exec_{profile}.jsonl"
         if not jf.exists():
             continue
         rc, out = run_script(TRADES_WRITER, ["--from-journal", str(jf),
-                                             "--profile", profile, "--replay-dry-run"])
+                                             "--profile", profile,
+                                             "--db-root", str(Path(db_root).resolve()),
+                                             "--replay-dry-run"])
         plan = _parse_json(out)
         if rc != 0 or not isinstance(plan, dict):
             sigs.append(_sig(f"journal_scan_unrunnable:{profile}", "P2",
@@ -526,8 +575,14 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
                 f"sz={e.get('sz')} ordId={e.get('ordId')}"
                 + ("[unwind]" if e.get("unwind") else "") for e in es[:6])
 
-        hint = (f"｜人工核实后重放: trades_writer.py --from-journal {jf} "
-                f"--profile {profile}（先 --replay-dry-run）")
+        resolved_root = Path(db_root).resolve()
+        hint = (
+            f"｜人工核实后先只读预演: trades_writer.py --from-journal {jf} "
+            f"--profile {profile} --db-root {resolved_root} --replay-dry-run；"
+            "核实预演输出无误后，只能对每个唯一真实 ordId 逐笔执行："
+            "保留同一 --db-root，追加 --ordid <ORD_ID> 并移除 --replay-dry-run；"
+            "无真实 ordId 或 unwind 记录继续阻断，禁止批量重放"
+        )
         if profile == "live":
             sigs.append(_sig("journal_unaccounted:live", "P1",
                              f"live 已成交未入账 {len(aged)} 笔(>15min): "
@@ -553,8 +608,9 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
         failed = []
         for e in autoable:
             rc2, out2 = run_script(TRADES_WRITER, ["--from-journal", str(jf),
-                                                   "--profile", "demo",
-                                                   "--ordid", str(e["ordId"])])
+                                                    "--profile", "demo",
+                                                    "--db-root", str(Path(db_root).resolve()),
+                                                    "--ordid", str(e["ordId"])])
             res2 = _parse_json(out2)
             if rc2 != 0 or not (res2 or {}).get("ok"):
                 failed.append(f"{e.get('symbol')} ordId={e.get('ordId')} rc={rc2}")
@@ -724,7 +780,7 @@ def build_alert(sigs: list[dict], now: datetime) -> str:
     return "\n".join(lines)
 
 
-def send_alert(text: str) -> tuple[int, str]:
+def send_alert(text: str, db_root: str | Path = PROD_DB_ROOT) -> tuple[int, str]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # 显式 --dedupe-key（批次戳=每批告警必达）；语义级重复抑制由本脚本
     # alert_state.json denoise 层负责。
@@ -732,7 +788,9 @@ def send_alert(text: str) -> tuple[int, str]:
     f = STATE_DIR / f"alert_{stamp}.txt"
     f.write_text(text, encoding="utf-8")
     rc, out = run_script(_project_path('scripts', 'qq_push.py'),
-                         ["--content-file", str(f), "--dedupe-key", f"monitor:{stamp}"],
+                         ["--content-file", str(f), "--alert",  # 告警路由仅取 OKX_QQ_ALERT_TARGET
+                          "--dedupe-key", f"monitor:{stamp}",
+                          "--db-root", str(Path(db_root).resolve())],
                          timeout=60)
     return rc, out[:400]
 
@@ -751,6 +809,17 @@ def main() -> int:
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--dry-run", action="store_true", help="只检测+报告，不推 QQ、不写状态")
     args = ap.parse_args()
+    runtime_db_root = Path(args.db_root).resolve()
+    _configure_runtime_paths(runtime_db_root)
+    if (not args.dry_run
+            and runtime_db_root != Path(PROD_DB_ROOT).resolve()):
+        print(
+            "collection_monitor: non-default db-root is dry-run only; "
+            "refusing shared alert/repair state",
+            file=sys.stderr,
+        )
+        return 2
+    args.db_root = str(runtime_db_root)
     now = now_cst()
 
     if not args.dry_run and not acquire_lock(now):
@@ -812,7 +881,7 @@ def main() -> int:
         }
 
         if to_alert and not args.dry_run:
-            rc, out = send_alert(build_alert(to_alert, now))
+            rc, out = send_alert(build_alert(to_alert, now), args.db_root)
             report["alert_sent"] = {"rc": rc, "out": out}
             if rc == 0 or "messageid" in out.lower():   # 送达（含偶发 rc=1 带 messageId）才固化去重
                 save_state(state)

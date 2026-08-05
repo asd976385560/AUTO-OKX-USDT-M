@@ -139,6 +139,11 @@ python scripts/check_trader_docs_sync.py
 
 确认 `$env:OKX_DB_ROOT` 不指向生产目录，再继续。
 
+隔离 root 只用于下面的 dry-run 验证。OpenClaw Agent turn 由 Gateway 服务端执行，
+不能把本地 cron 的环境继承当成远端工具进程已收到同一 root；公开触发器会拒绝
+“非默认 root + 真实 Agent 起棒”。隔离验收完成后，真实 Agent 只切到规范
+`<PROJECT_ROOT>/db`，除非已经另行实现并验证 Gateway 级 root 注入。
+
 ## 8. 创建 dry-run command cron
 
 以下命令使用占位符，必须逐一替换。`--no-dispatch` 只是源码保留的无副作用兼容参数，因此示例不依赖它；隔离由 `--dry-collect`、`OKX_TRIGGER_DRYRUN=1` 和独立数据库共同保证。

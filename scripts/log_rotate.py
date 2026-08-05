@@ -11,6 +11,7 @@
   log_rotate.py                      # dry-run，列将删文件与释放空间
   log_rotate.py --apply              # 真删（超 7 天）
   log_rotate.py --days 14 --apply    # 保留窗 14 天
+  log_rotate.py --dirs trigger,push,stage-status --days 7 --apply
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ if hasattr(sys.stdout, "reconfigure"):
 LOG_ROOT = Path(_project_path('logs'))
 # 轮转目标：per-cycle 高频落盘的调试日志目录。审计类 jsonl（qq_push_dedupe/pipeline_runs/
 # monitor audit）不在此删——它们是排障权威、体量小、单独按需管。
+# standalone 默认保持 trigger/push；daily_maintenance 显式追加 stage-status。
 DEFAULT_DIRS = ["trigger", "push"]
 # 保护：这些结构化审计/状态文件不删（即便在目标目录内）
 PROTECT_SUFFIX = (".jsonl",)

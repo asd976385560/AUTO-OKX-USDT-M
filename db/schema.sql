@@ -1,5 +1,5 @@
 -- OKX 永续合约自主交易系统 - 数据库 Schema
--- 导出时间: 2026-07-28 23:09:19 CST
+-- 导出时间: 2026-07-31 17:31:44 CST
 -- 版本: V2.0
 -- 数据库目录: <PROJECT_ROOT>\db\
 -- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）
@@ -858,6 +858,13 @@ CREATE TABLE stage_dispatch (
                 dispatched_at TEXT NOT NULL,
                 card_id       TEXT,
                 PRIMARY KEY (cycle_id, stage)
+            );
+
+CREATE TABLE stage_profile_leases (
+                profile       TEXT PRIMARY KEY,   -- 'live'|'demo'
+                cycle_id      TEXT NOT NULL,
+                acquired_at   TEXT NOT NULL,
+                expires_at    TEXT NOT NULL
             );
 
 CREATE INDEX idx_cr_cycle ON collection_runs(cycle_id);

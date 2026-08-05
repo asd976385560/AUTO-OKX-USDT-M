@@ -4,19 +4,32 @@
 背景：该表曾停更，导致压制策略缺少对照组——
 「不开仓」的机会成本无人量化，压制经验只能自证。本脚本按日回填：
 
-  取指定日 decision_card_v1 中 action=wait/hold 且有方向的候选；
+  取窗口内 decision_card_v1 中 **action=wait 且带方向** 的候选；
   无 decision_card 的兼容记录仍按 total/confidence 阈值读取，
   剔除同 cycle 同 symbol 已真实成交的行，按 15m kline 计算其后 4h 实际走幅与是否可达 1R
   （1R=按系统惯例 -2% SL 的对称目标 +2%；side 缺失按 long 惯例并在 notes 标注），
   幂等写入 missed_opportunities（同 ts+symbol 已存在则跳过）。
 
-调度：reviewer 每日复盘（08:05）跑 `--date yesterday`；也可手动补历史日。
+为什么只取 wait（2026-07-31 主人拍板）：
+  hold = 持有既有仓位，没有「本可入场却没入」的对照意义，方向恒为 null；
+  wait = 看到方向但本轮不入场，正是机会成本要量化的对象。
+  历史上 hold 曾带方向并贡献了约 3/4 的样本，那是旧契约下的语义混用，不再沿用。
+
+停写监控：窗口内存在 wait 信号却无一带方向 = 分析侧没在履行契约，
+本脚本会打 [WARN] 而不是静默写 0 —— 2026-07-29~31 的两天空窗就是这么被漏掉的。
+
+调度：reviewer 每日复盘（08:05）跑 `--as-of "<日报 ts>"`；也可手动补历史窗。
+事实窗与日报同源：`trade_report_stats.daily_window` 给出 `[前一日 08:00, 当日 08:00)`，
+按 cycle_id 半开过滤（cycle_id 为 'YYYY-MM-DDTHH:MM'，字典序即时序）。
+2026-07-31 前本脚本按自然日 `LIKE 'YYYY-MM-DD%'` 取数，与日报成交窗差 8 小时，
+同一份日报里"错失机会"和"成交统计"覆盖不同时段；现已统一。
 写库纪律：lessons.db writer=复盘链路，本脚本是该链路的确定性组件。
 ts 写 CST 'YYYY-MM-DD HH:MM:SS'（禁 JobB-/UTC-Z 混入——该表 ts 已有历史混格式之痛）。
 
 用法：
-  pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/scripts/missed_opps_writer.py --date 2026-07-11 [--dry-run]
-  --date yesterday（默认）
+  pwsh ... missed_opps_writer.py --as-of "2026-07-31 08:05:00" [--dry-run]
+  --date 2026-07-31   # 兼容入口：等价 --as-of 该日 08:05，窗口 [前一日 08:00, 当日 08:00)
+  --date yesterday    # 等价 --as-of 今日 08:05
 """
 
 import os as _project_os
@@ -32,9 +45,13 @@ def _project_path(*parts: str) -> str:
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trade_report_stats  # noqa: E402  日报事实窗唯一定义源
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -50,15 +67,27 @@ def _utcz_from_cst(cst_str: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", default="yesterday", help="CST 日期 YYYY-MM-DD 或 'yesterday'")
+    ap.add_argument("--as-of", dest="as_of",
+                    help="日报 ts（CST）；窗口取 [前一日 08:00, 当日 08:00)")
+    ap.add_argument("--date", default=None,
+                    help="兼容入口：YYYY-MM-DD 或 'yesterday'，等价 --as-of 该日 08:05")
     ap.add_argument("--db-root", default=_project_path('db'))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    day = (
-        (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        if args.date == "yesterday" else args.date
-    )
+    if args.as_of:
+        as_of = args.as_of
+    else:
+        anchor_day = (
+            datetime.now().strftime("%Y-%m-%d")
+            if (args.date or "yesterday") == "yesterday" else args.date
+        )
+        as_of = f"{anchor_day} 08:05:00"
+    start_ts, end_ts = trade_report_stats.daily_window(as_of)
+    # cycle_id 是 'YYYY-MM-DDTHH:MM'，字典序即时序，半开区间与日报成交窗一致。
+    start_cyc = start_ts[:16].replace(" ", "T")
+    end_cyc = end_ts[:16].replace(" ", "T")
+    print(f"[window] cycle_id ∈ [{start_cyc}, {end_cyc})  (as-of {as_of})")
     root = args.db_root
 
     ana = sqlite3.connect(f"file:{root}\\analysis.db?mode=ro", uri=True)
@@ -67,7 +96,8 @@ def main() -> int:
     for db in ("live_trades", "demo_trades"):
         con = sqlite3.connect(f"file:{root}\\{db}.db?mode=ro", uri=True)
         for cyc, sym in con.execute(
-            "SELECT cycle_id, symbol FROM trades WHERE cycle_id LIKE ?", (day + "%",)
+            "SELECT cycle_id, symbol FROM trades "
+            "WHERE cycle_id >= ? AND cycle_id < ?", (start_cyc, end_cyc)
         ):
             exe[(cyc, sym)] = True
         con.close()
@@ -76,9 +106,15 @@ def main() -> int:
         "SELECT cycle_id, symbol, total, confidence, side, decision_card, regime.regime "
         "FROM analysis_signals "
         "JOIN (SELECT cycle_id AS c2, regime FROM analysis_runs) regime ON regime.c2 = analysis_signals.cycle_id "
-        "WHERE analysis_signals.cycle_id LIKE ? AND action IN ('wait','hold')",
-        (day + "%",),
+        "WHERE analysis_signals.cycle_id >= ? AND analysis_signals.cycle_id < ? "
+        "AND action = 'wait'",
+        (start_cyc, end_cyc),
     ).fetchall()
+    # 契约健康度：窗口内有 wait 却全无方向 = 分析侧没填 side，对照组会静默断供。
+    wait_total = len(cands)
+    wait_directional = sum(
+        1 for row in cands if str(row[4] or "").lower() in ("long", "short")
+    )
     ana.close()
 
     les = sqlite3.connect(f"{root}\\lessons.db")
@@ -164,8 +200,17 @@ def main() -> int:
         mkt.close()
 
     tag = "DRY-RUN " if args.dry_run else ""
-    print(f"{tag}ok date={day} candidates={selected} written={written} "
-          f"dup_skipped={skipped} no_kline={nodata}")
+    print(f"{tag}ok window=[{start_cyc}, {end_cyc}) wait_signals={wait_total} "
+          f"directional={wait_directional} candidates={selected} "
+          f"written={written} dup_skipped={skipped} no_kline={nodata}")
+    if wait_total > 0 and wait_directional == 0:
+        # 静默写 0 正是 2026-07-29~31 对照组断供两天没被发现的原因，必须发声。
+        print(
+            f"[WARN] 窗口内 {wait_total} 条 wait 信号无一带方向（side 全为 null）→ "
+            "错失机会对照组本轮无输入。分析侧 action=wait 应在能判方向时填 "
+            "side=long|short（见 agents/analyst.md action/side 契约）。",
+            file=sys.stderr,
+        )
     return 0
 
 

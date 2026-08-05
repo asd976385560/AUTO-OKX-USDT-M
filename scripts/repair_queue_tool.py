@@ -25,15 +25,18 @@ CST = timezone(timedelta(hours=8))
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "account.db"
 
 
-def _conn(rw: bool) -> sqlite3.Connection:
-    con = (sqlite3.connect(str(DB_PATH), timeout=15) if rw
-           else sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=15))
+def _conn(rw: bool, db_path: Path = DB_PATH) -> sqlite3.Connection:
+    """Open exactly ``db_path``; callers using an isolated db-root must pass it."""
+    db_path = db_path.resolve()
+    con = (sqlite3.connect(str(db_path), timeout=15) if rw
+           else sqlite3.connect(db_path.as_uri() + "?mode=ro",
+                                uri=True, timeout=15))
     con.row_factory = sqlite3.Row
     return con
 
 
-def do_list(status_filter: str) -> int:
-    con = _conn(rw=False)
+def do_list(status_filter: str, db_path: Path = DB_PATH) -> int:
+    con = _conn(rw=False, db_path=db_path)
     q = "SELECT id, ts, check_name, status, substr(issue,1,60) issue FROM repair_queue"
     args: list = []
     if status_filter:
@@ -52,11 +55,18 @@ def do_list(status_filter: str) -> int:
 
 
 def do_close(ids: list[int] | None, bulk_pushformat: bool, resolution: str,
-             apply: bool) -> int:
+             apply: bool, closed_by: str = "repair_queue_tool:manual",
+             db_path: Path = DB_PATH, quiet: bool = False) -> int:
+    """关单唯一入口。`closed_by` 供确定性调用方（如 ledger_autoheal）标注来源，
+    人工 CLI 路径保持默认 `repair_queue_tool:manual` 不变。"""
+    def emit(*args, **kwargs) -> None:
+        if not quiet:
+            print(*args, **kwargs)
+
     if not resolution or len(resolution.strip()) < 8:
         print("[FAIL] --resolution 必填且须为有意义的处置说明（>=8 字符）", file=sys.stderr)
         return 2
-    con = _conn(rw=False)
+    con = _conn(rw=False, db_path=db_path)
     if bulk_pushformat:
         rows = con.execute(
             "SELECT id, ts, check_name, status FROM repair_queue "
@@ -72,29 +82,29 @@ def do_close(ids: list[int] | None, bulk_pushformat: bool, resolution: str,
             return 2
         already = [r["id"] for r in rows if r["status"] in ("closed", "resolved")]
         if already:
-            print(f"[WARN] 已是关闭态将跳过: {already}")
+            emit(f"[WARN] 已是关闭态将跳过: {already}")
             rows = [r for r in rows if r["status"] not in ("closed", "resolved")]
     con.close()
     if not rows:
-        print("无可关行。")
+        emit("无可关行。")
         return 0
     for r in rows:
-        print(f"  关 -> #{r['id']} {r['ts']} [{r['status']}] {r['check_name']}")
+        emit(f"  关 -> #{r['id']} {r['ts']} [{r['status']}] {r['check_name']}")
     if not apply:
-        print(f"\nDRY-RUN：{len(rows)} 行将被关（加 --apply 执行）")
+        emit(f"\nDRY-RUN：{len(rows)} 行将被关（加 --apply 执行）")
         return 0
     now_cst = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     target_ids = [r["id"] for r in rows]
-    wcon = _conn(rw=True)
+    wcon = _conn(rw=True, db_path=db_path)
     wcon.execute("PRAGMA busy_timeout=15000")
     with wcon:
         cur = wcon.execute(
             f"UPDATE repair_queue SET status='closed', closed_at=?, "
-            f"closed_by='repair_queue_tool:manual', resolution=? "
+            f"closed_by=?, resolution=? "
             f"WHERE id IN ({','.join('?' * len(target_ids))}) "
             f"AND status NOT IN ('closed','resolved')",
-            [now_cst, resolution.strip(), *target_ids])
-    print(f"已关 {cur.rowcount} 行（closed_by=repair_queue_tool:manual）")
+            [now_cst, closed_by, resolution.strip(), *target_ids])
+    emit(f"已关 {cur.rowcount} 行（closed_by={closed_by}）")
     wcon.close()
     return 0
 

@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-07-29
+last-updated: 2026-08-04
 updated-by: Codex
-change-summary: Sync the latest sanitized execution, reconciliation, macro, report, lifecycle and regression contracts.
+change-summary: Add the 1.0.0 public release contract, changelog, and gated tag-to-Release workflow.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Sync the latest sanitized execution, reconciliation, macro, repo
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo execution share the same hard risk limits, execution-intent idempotency, ledger-position consistency, and stop-loss requirements; only the execution environment changes.
+V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo share execution-intent idempotency, ledger-position consistency, fill confirmation, and stop-loss safety, while capacity is profile-specific: Live uses portfolio IMR and Demo uses directional real-time max-size.
 
 > [!WARNING]
 > This project can execute real trades. Keep `OKX_EXECUTOR_DRYRUN=1` and `OKX_TRIGGER_DRYRUN=1` during initial deployment, and validate everything against isolated databases. This project is not investment advice and does not guarantee profit.
@@ -58,19 +58,28 @@ Copy `config.example.md` to a local `config.md` before filling it in. Environmen
 
 ## Version lineage
 
-The synchronized source identifies itself as `V2.0`. The previous remote README used a `v3.1` label. Those labels are not automatically comparable semantic versions. This synchronization does not create a tag or Release; the maintainer will choose the final public version separately.
+Public releases follow Semantic Versioning. [`VERSION`](VERSION) is the single
+release-version source, and `v<VERSION>` is the corresponding Git tag and
+GitHub Release name. [`CHANGELOG.md`](CHANGELOG.md) must contain non-empty notes
+and links for every release; the workflow publishes that matching section as
+the Release body.
+
+`V2.0` remains the generation identifier for the system architecture, business
+contracts, documentation, and schema. It is not the public release version and
+is not replaced by a public release number. A GitHub Release is created only after the version
+PR is merged into `main`, a maintainer pushes the matching annotated tag, and
+the release workflow passes version, current-main ancestry, and full CI checks.
 
 ## Latest synchronization
 
-The 2026-07-29 public synchronization carries these production semantics while preserving portable paths and empty credential defaults:
+The 2026-08-04 public synchronization extends the July 29 baseline while preserving portable paths, empty credential defaults, and explicit write authorization:
 
-- a global `execution_intents` gate and idempotent replay of completed identical requests;
-- full-set consistency checks between OKX positions and the selected profile's trade ledger before order placement;
-- authoritative fill quantity, price, timestamp, and source requirements, with no synthetic fills from position deltas;
-- `stage_runner.py` verification of real business outputs after a child process exits;
-- public macro collection for Alternative.me, an ECB-derived DXY calculation, and two-source ETF-flow confirmation;
-- maintenance-ready manifests, reviewer hash validation, and separate valid-fill/risk-rejection reporting;
-- a public script lifecycle manifest and layered isolated regressions.
+- Live OPEN/ADD rejects the whole order when projected portfolio `account.imr/totalEq` would exceed 66.6%; Demo sizes from directional `account max-size` after target leverage is set;
+- `stage_profile_leases` prevent the same profile from overlapping across cycles, and the runner verifies real trade terminal state;
+- DXY observation-date deduplication and stale semantics, trade-time regime attribution, fixed 08:00 report windows, and projected push positions;
+- exact-evidence GHOST-EXACT and UNRECORDED ledger checks; Live autoheal is permanently read-only, while Demo close and open writes use separate explicit opt-ins; Demo UNRECORDED also requires a matching intent, ordId, and confirmed existing exchange stop, and it never places or replays orders;
+- separate business and alert destinations read only from `OKX_QQ_TARGET` and `OKX_QQ_ALERT_TARGET`;
+- expanded isolated regressions, lifecycle coverage, and a backup-gated profile-lease migration.
 
 ## Architecture
 
@@ -83,7 +92,7 @@ OpenClaw cron
                                       v
                               core/dispatcher.py
                                       │
-                    stage_dispatch stage lock
+               stage_dispatch lock + profile lease
                                       │
                  ┌────────────────────┴───────────────────┐
                  v                                        v
@@ -103,7 +112,7 @@ Core invariants:
 
 - `skill.md` is the V2.0 business fact source; this README is the public system map;
 - `ledger.db.stage_dispatch(cycle_id, stage)` is the idempotent stage-dispatch truth;
-- `ledger.db.execution_intents` blocks unresolved or ambiguous intents for an entire profile before any exchange I/O;
+- `ledger.db.execution_intents` blocks unresolved or ambiguous intents for an entire profile before any exchange I/O; exact recovery moves an intent to `reconciled`, which blocks replay of that logical order without freezing the profile;
 - every table or explicit key domain has one authoritative writer, while readers use SQLite `mode=ro`;
 - live opens only pass through `core/order_executor.py`, which always calls `core/risk_validator.py`;
 - the complete OKX position set must match the confirmed local trade ledger before ordering;
@@ -224,12 +233,30 @@ Main environment variables:
 | `MX_APIKEY` | MX data-source credential |
 | `OKX_PROXY_URL` | Optional proxy URL |
 | `OKX_QQ_TARGET` | QQ destination; no default |
+| `OKX_QQ_ALERT_TARGET` | Alert QQ destination; no default |
 | `OKX_EXECUTOR_DRYRUN` | `1` blocks trade-changing commands |
 | `OKX_TRIGGER_DRYRUN` | `1` blocks Agent and push triggers |
+| `OKX_LEDGER_AUTOHEAL_APPLY` | Demo only: `1` permits exact GHOST close bookkeeping; Live is permanently read-only |
+| `OKX_LEDGER_AUTOHEAL_UNRECORDED` | Demo only: must also be `1`, with matching execution_intent, ordId, and an active same-side full-size protective stop, to permit exact UNRECORDED open bookkeeping; missing evidence always remains report-only |
+
+`OKX_DB_ROOT` is supported by deterministic scripts, writers, push, and isolated dry-runs.
+Real Agent turns execute in the OpenClaw Gateway service, so a local child environment cannot
+prove that the remote tool process received the same root. The public trigger therefore fails
+closed for a real Agent launch with a non-default DB root and permits that combination only when
+`OKX_TRIGGER_DRYRUN=1`. After isolated validation, use canonical `<PROJECT_ROOT>/db` for real
+Agent deployment unless a maintainer separately implements and verifies Gateway-level injection.
+
+When upgrading an existing `ledger.db`, dispatcher will not create the new lease table implicitly. Dry-run against an isolated copy first, then explicitly provide a verified backup directory:
+
+```powershell
+python scripts/apply_stage_profile_lease_schema.py --db-root <ISOLATED_DB_ROOT>
+python scripts/apply_stage_profile_lease_schema.py --db-root <AUTHORIZED_DB_ROOT> --apply --backup-dir <VERIFIED_BACKUP_DIR>
+```
 
 Safe checks that do not contact OKX, send messages, or write runtime databases:
 
 ```powershell
+python scripts/check_release_version.py --json
 python -m compileall -q collectors core scripts tests
 python -m unittest discover -s tests -p "test_*.py" -v
 python collectors/sources/_registry.py --validate
@@ -239,20 +266,21 @@ python scripts/check_doc_versions.py --static-only
 python scripts/update_star_stats.py --self-test
 ```
 
-Pass an isolated directory to every database-writing tool. Agent, QQ, OpenClaw, and OKX entry points must remain in dry-run unless external execution is separately approved.
+Pass an isolated directory to every database-writing tool. Agent, QQ, OpenClaw, and OKX entry points must remain in dry-run unless external execution is separately approved; never turn an isolated-root dispatcher dry-run directly into a real Agent launch.
 
 ## Test boundary
 
 `tests/` is a minimal, layered, production-safe regression set for execution intents,
-ledger-position consistency, fill and stop-loss contracts, writers/dispatcher, reports,
-public macro data, and runtime repairs. It does not connect to production databases or
+ledger-position consistency, fill and stop-loss contracts, writers/dispatcher/profile leases,
+reports, public macro data, and guarded ledger repairs. It does not connect to production databases or
 send messages, and it is not a restored full money-path, exchange, or OpenClaw end-to-end suite.
 
 ## Risk summary
 
 Authoritative values live in `core/risk_validator.py`:
 
-- margin per trade is at most 20% of equity (`MAX_MARGIN_PCT`);
+- Live OPEN/ADD rejects the whole order when projected portfolio IMR exceeds 66.6% (`MAX_PORTFOLIO_IMR_RATIO`);
+- Demo OPEN sizes only from directional real-time `account max-size` and contract `minSz/lotSz`, never the Live balance formula;
 - at most 98% of currently available USDT margin may be used (`AVAILABLE_MARGIN_USE_PCT`);
 - leverage is capped at 10x (`MAX_LEVERAGE`);
 - notional per trade is at least 1% of equity (`MIN_NOTIONAL_PCT`);
@@ -261,6 +289,14 @@ Authoritative values live in `core/risk_validator.py`:
 - any mismatch between OKX positions and the local trade ledger fails closed before mark-price or order calls;
 - an independent stop loss must read back the current `algoId`, and confirmed fills must come from authoritative endpoints;
 - missing contract specifications, balances, available margin, or fill confirmation fail safe.
+
+Live ledger autoheal is permanently read-only: direct API/CLI write flags and environment opt-ins
+still run the full read-only classification, return a non-zero structured block, and never modify
+the trade ledger or repair queue. A Live repair requires one uniquely verified `ordId`, verified
+SQLite backups before a one-record apply, then fresh exchange-position, reconciliation, and ledger-
+invariant checks. The two environment opt-ins authorize Demo only; Demo UNRECORDED open still
+requires exact fills, order ownership, a same-side full-size protective stop, the per-run cap, and
+runner-exclusion checks. No autoheal path places or replays an order.
 
 These limits are unchanged by public release work, documentation internationalization, or star statistics.
 

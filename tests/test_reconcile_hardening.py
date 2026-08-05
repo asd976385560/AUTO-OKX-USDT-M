@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -200,6 +201,38 @@ class TraderDocContractTests(unittest.TestCase):
 
 
 class StageBusinessOutputTests(unittest.TestCase):
+    def test_runner_cli_uses_custom_db_root_for_verify_and_lease_release(self):
+        cycle = "2026-07-27T02:45"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            argv = [
+                "stage_runner.py", "--stage", "live", "--cycle", cycle,
+                "--mode", "full", "--db-root", str(root), "--", "child",
+            ]
+            with mock.patch.object(stage_runner.sys, "argv", argv), \
+                 mock.patch.object(stage_runner.subprocess, "run",
+                                   return_value=mock.Mock(returncode=0)) as run, \
+                 mock.patch.object(stage_runner, "_status_path",
+                                   return_value=root / "status.json"), \
+                 mock.patch.object(stage_runner, "_write_status"), \
+                 mock.patch.object(stage_runner, "verify_business_output",
+                                   return_value={"ok": True}) as verify, \
+                 mock.patch.object(stage_runner.ledger,
+                                   "release_profile_lease",
+                                   return_value=True) as release:
+                rc = stage_runner.main()
+
+            self.assertEqual(rc, 0)
+            verify.assert_called_once_with(
+                "live", cycle, "full", db_root=root
+            )
+            release.assert_called_once_with(
+                root / "ledger.db", "live", cycle
+            )
+            self.assertEqual(
+                run.call_args.kwargs["env"]["OKX_DB_ROOT"], str(root)
+            )
+
     def test_length_terminal_is_classified_without_model_chain_metadata(self):
         cycle = "2026-07-28T16:45"
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,10 +244,9 @@ class StageBusinessOutputTests(unittest.TestCase):
             session_id = "test-session"
             (session_dir / "sessions.json").write_text(
                 json.dumps({
-                    "agent:okx-live-trader:"
-                    + stage_runner._stage_session_key("live", cycle): {
+                    "agent:okx-live-trader:live-20260728-1645": {
                         "sessionId": session_id,
-                        "model": "test-model",
+                        "model": "must-not-be-emitted",
                     }
                 }),
                 encoding="utf-8",
@@ -224,8 +256,8 @@ class StageBusinessOutputTests(unittest.TestCase):
                     "type": "trace.items",
                     "data": {
                         "messages": [{
-                            "provider": "test-provider",
-                            "model": "test-model",
+                            "provider": "must-not-be-emitted",
+                            "model": "must-not-be-emitted",
                             "stopReason": "length",
                             "usage": {"totalTokens": 117740},
                         }]
@@ -297,8 +329,86 @@ class StageBusinessOutputTests(unittest.TestCase):
         self.assertEqual(
             result["failure_kind"], "business_output_missing")
 
+    def test_trade_error_or_inconsistent_order_count_is_not_success(self):
+        cycle = "2026-07-27T04:00"
+        for decision, n_orders in (("error", 0), ("traded", 0), ("hold", 1)):
+            with self.subTest(decision=decision, n_orders=n_orders):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _create_trade_db(root / "demo_trades.db")
+                    con = sqlite3.connect(root / "demo_trades.db")
+                    try:
+                        con.execute(
+                            "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                            (cycle, "2026-07-27 04:01:00", "demo",
+                             decision, n_orders, None, "", "{}"),
+                        )
+                        con.commit()
+                    finally:
+                        con.close()
+                    result = stage_runner.verify_business_output(
+                        "demo", cycle, "full", root)
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(
+                    result["failure_kind"], "business_verification_error")
+
+    def test_hold_zero_orders_is_valid_trade_terminal(self):
+        cycle = "2026-07-27T04:15"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_trade_db(root / "demo_trades.db")
+            con = sqlite3.connect(root / "demo_trades.db")
+            try:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-07-27 04:16:00", "demo",
+                     "hold", 0, None, "", "{}"),
+                )
+                con.commit()
+            finally:
+                con.close()
+            result = stage_runner.verify_business_output(
+                "demo", cycle, "full", root)
+        self.assertTrue(result["ok"], result)
+
 
 class MonitoringAndAlertTests(unittest.TestCase):
+    def test_post_push_reconcile_receives_custom_db_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = mock.Mock(returncode=0, stdout="ok", stderr="")
+            with mock.patch.object(
+                live_reconcile_monitor.subprocess, "run", return_value=fake
+            ) as run:
+                rc, _ = live_reconcile_monitor.run_reconcile("demo", root)
+            self.assertEqual(rc, 0)
+            argv = run.call_args.args[0]
+            self.assertIn("--db-root", argv)
+            self.assertEqual(argv[argv.index("--db-root") + 1], str(root))
+
+    def test_post_push_alert_uses_same_custom_db_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fake = mock.Mock(returncode=0, stdout="sent", stderr="")
+            argv = [
+                "live_reconcile_monitor.py", "--profile", "demo",
+                "--cycle", "2026-08-04T12:00", "--db-root", str(root),
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(live_reconcile_monitor, "active_runner",
+                                   return_value=None), \
+                 mock.patch.object(live_reconcile_monitor, "run_reconcile",
+                                   return_value=(1, "[GHOST-EXACT] synthetic")), \
+                 mock.patch.object(live_reconcile_monitor, "LOG_DIR", root / "logs"), \
+                 mock.patch.object(live_reconcile_monitor.subprocess, "run",
+                                   return_value=fake) as run:
+                self.assertEqual(live_reconcile_monitor.main(), 1)
+            push_argv = run.call_args.args[0]
+            self.assertEqual(
+                push_argv[push_argv.index("--db-root") + 1], str(root)
+            )
+            self.assertIn(":r", push_argv[push_argv.index("--dedupe-key") + 1])
+
     def test_post_push_monitor_detects_rc0_over_closed(self):
         out = "[OVER_CLOSED] 1 组:\n  LTC-USDT-SWAP long net=-2.8\n"
         result = live_reconcile_monitor.evaluate(0, out)
@@ -327,6 +437,55 @@ class MonitoringAndAlertTests(unittest.TestCase):
                     live_reconcile_monitor, "STAGE_STATUS_DIR", status_dir):
                 result = live_reconcile_monitor.active_live_runner()
         self.assertEqual(result["cycle_id"], "2026-07-27T10:30")
+
+    def test_post_push_monitor_supports_demo_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp)
+            (status_dir / "demo-2026-07-27T10-45.json").write_text(
+                json.dumps({
+                    "status": "running",
+                    "cycle_id": "2026-07-27T10:45",
+                    "started_at": live_reconcile_monitor.now_cst().strftime(
+                        "%Y-%m-%d %H:%M:%S"),
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                    live_reconcile_monitor, "STAGE_STATUS_DIR", status_dir):
+                result = live_reconcile_monitor.active_runner("demo")
+        self.assertEqual(result["cycle_id"], "2026-07-27T10:45")
+
+    def test_post_push_monitor_filters_active_status_by_db_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp) / "status"
+            status_dir.mkdir()
+            custom_root = Path(tmp) / "db"
+            custom_root.mkdir()
+            started = live_reconcile_monitor.now_cst().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            default_file = status_dir / "live-2026-08-04T11-45.json"
+            custom_ns = live_reconcile_monitor._root_namespace(custom_root)
+            custom_file = status_dir / f"live-2026-08-04T12-00-{custom_ns}.json"
+            default_file.write_text(json.dumps({
+                "status": "running", "cycle_id": "default",
+                "started_at": started,
+            }), encoding="utf-8")
+            custom_file.write_text(json.dumps({
+                "status": "running", "cycle_id": "custom",
+                "started_at": started,
+            }), encoding="utf-8")
+            with mock.patch.object(
+                live_reconcile_monitor, "STAGE_STATUS_DIR", status_dir
+            ):
+                custom = live_reconcile_monitor.active_runner(
+                    "live", custom_root
+                )
+                default = live_reconcile_monitor.active_runner(
+                    "live", live_reconcile_monitor.ROOT / "db"
+                )
+        self.assertEqual(custom["cycle_id"], "custom")
+        self.assertEqual(default["cycle_id"], "default")
 
     def test_business_missing_runner_maps_to_run_ok_no_db_row(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -419,6 +578,85 @@ class DailyReportCorrectionTests(unittest.TestCase):
 
 
 class TradeReportFactTests(unittest.TestCase):
+    def test_daily_window_is_fixed_trailing_24h(self):
+        start, end = trade_report_stats.daily_window(
+            "2026-07-31 08:05:00")
+        self.assertEqual(start, "2026-07-30 08:00:00")
+        self.assertEqual(end, "2026-07-31 08:00:00")
+
+    def test_daily_window_ignores_report_ts_jitter(self):
+        """报告 ts 抖动不得移动事实窗，否则相邻日报会缺口/重叠。"""
+        expected = ("2026-07-30 08:00:00", "2026-07-31 08:00:00")
+        for jittered in (
+            "2026-07-31 08:00:00",
+            "2026-07-31 08:05:00",
+            "2026-07-31 08:06:00",
+            "2026-07-31 08:36:16",
+            "2026-07-31 23:59:00",
+        ):
+            with self.subTest(ts=jittered):
+                self.assertEqual(
+                    trade_report_stats.daily_window(jittered), expected)
+
+    def test_daily_window_before_anchor_reports_last_complete_window(self):
+        start, end = trade_report_stats.daily_window(
+            "2026-07-31 07:30:00")
+        self.assertEqual(start, "2026-07-29 08:00:00")
+        self.assertEqual(end, "2026-07-30 08:00:00")
+
+    def test_consecutive_daily_windows_tile_exactly(self):
+        _, prev_end = trade_report_stats.daily_window("2026-07-30 08:12:00")
+        next_start, _ = trade_report_stats.daily_window("2026-07-31 08:05:00")
+        self.assertEqual(prev_end, next_start)
+
+    def test_daily_prepare_uses_half_open_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_db = root / "live_trades.db"
+            demo_db = root / "demo_trades.db"
+            ledger_db = root / "ledger.db"
+            _create_trade_db(live_db)
+            _create_trade_db(demo_db)
+            _create_ledger_db(ledger_db)
+            con = sqlite3.connect(live_db)
+            try:
+                for cycle, ts in (
+                    ("before", "2026-07-30 07:59:59"),
+                    ("start", "2026-07-30 08:00:00"),
+                    ("inside", "2026-07-31 07:59:59"),
+                    ("end", "2026-07-31 08:00:00"),
+                ):
+                    con.execute(
+                        "INSERT INTO trades("
+                        "cycle_id,ts,symbol,action,side,sz,fill_px,pnl,raw)"
+                        " VALUES(?,?,?,?,?,?,?,?,?)",
+                        (cycle, ts, "BTC-USDT-SWAP", "open", "long",
+                         1, 10, 0, '{"ok":true}'),
+                    )
+                con.commit()
+            finally:
+                con.close()
+            with (
+                mock.patch.object(
+                    daily_report_writer, "LIVE_TRADES_DB", live_db),
+                mock.patch.object(
+                    daily_report_writer, "DEMO_TRADES_DB", demo_db),
+                mock.patch.object(
+                    daily_report_writer, "LEDGER_DB", ledger_db),
+            ):
+                prepared = daily_report_writer.prepare_daily_payload({
+                    "ts": "2026-07-31 08:05:00",
+                    "live_reconcile_status": "clean",
+                    "live_reconcile_issue_count": 0,
+                })
+
+        self.assertEqual(prepared["period_start_ts"],
+                         "2026-07-30 08:00:00")
+        self.assertEqual(prepared["period_end_ts"],
+                         "2026-07-31 08:00:00")
+        self.assertTrue(prepared["period_end_exclusive"])
+        self.assertEqual(prepared["live_open_count"], 2)
+
     def test_fill_counts_exclude_rejects_and_risk_rejects_are_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -615,8 +853,10 @@ class TradeReportFactTests(unittest.TestCase):
             con = sqlite3.connect(demo_db)
             try:
                 for cycle, ts in (
-                    ("inside", "2026-07-26 23:59:00"),
-                    ("outside", "2026-07-27 00:01:00"),
+                    ("before", "2026-07-20 07:59:59"),
+                    ("start", "2026-07-20 08:00:00"),
+                    ("inside", "2026-07-27 07:59:59"),
+                    ("end", "2026-07-27 08:00:00"),
                 ):
                     con.execute(
                         "INSERT INTO trades("
@@ -642,10 +882,27 @@ class TradeReportFactTests(unittest.TestCase):
                 })
 
         self.assertEqual(prepared["period_start_ts"],
-                         "2026-07-20 00:00:00")
+                         "2026-07-20 08:00:00")
         self.assertEqual(prepared["period_end_ts"],
-                         "2026-07-27 00:00:00")
-        self.assertEqual(prepared["demo_open_count"], 1)
+                         "2026-07-27 08:00:00")
+        self.assertEqual(prepared["demo_open_count"], 2)
+
+    def test_weekly_window_is_tiled_by_seven_daily_windows(self):
+        """七份日报必须恰好平铺周报窗，否则日/周口径无法互相对账。"""
+        week_start = "2026-07-27 00:00:00"
+        w_start, w_end = trade_report_stats.weekly_window(week_start)
+        edges = []
+        cursor = datetime.strptime(w_end, "%Y-%m-%d %H:%M:%S")
+        for _ in range(7):
+            d_start, d_end = trade_report_stats.daily_window(
+                cursor.strftime("%Y-%m-%d 08:05:00"))
+            edges.append((d_start, d_end))
+            cursor -= timedelta(days=1)
+        edges.reverse()
+        self.assertEqual(edges[0][0], w_start)
+        self.assertEqual(edges[-1][1], w_end)
+        for earlier, later in zip(edges, edges[1:]):
+            self.assertEqual(earlier[1], later[0])
 
 
 if __name__ == "__main__":

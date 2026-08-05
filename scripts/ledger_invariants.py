@@ -155,7 +155,7 @@ def execution_intent_findings(
     stale_after = now - timedelta(minutes=max(1, stale_min))
     valid_states = {
         "reserved", "submitting", "submitted", "completed",
-        "uncertain", "failed_clean",
+        "uncertain", "failed_clean", "reconciled",
     }
     findings: list[dict[str, Any]] = []
     for row in rows:

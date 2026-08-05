@@ -57,6 +57,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import ledger          # noqa: E402  connect/cycle_id_for/try_stage/stage_dispatched
 import trigger_agent   # noqa: E402  fire 适配层
+from cycle_contract import validate_cycle_id  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 MAX_AGE_SEC = 900  # analysis 写出 ≤15min 内仍可起 trader；超过视陈旧不追
@@ -65,6 +66,16 @@ LOOKBACK_SLOTS = 4  # P4b：dispatch_once 回扫最近 N+1 个 15min 槽，给 p
 PUSH_VERIFY_MIN_SEC = 900   # push 派发后给足 15min 送达，再核验
 PUSH_VERIFY_MAX_SEC = 2400  # 只核验最近 40min 内派发的 push；窗口自然滚动即幂等，无需去重状态
 PUSH_EVENT_LOG = Path(_project_path('logs', 'push', 'qq_push_dedupe.jsonl'))
+CANONICAL_DB_ROOT = Path(_project_path('db')).resolve()
+
+
+def _root_namespace(db_root: Path | str) -> str:
+    resolved = Path(db_root).resolve()
+    if resolved == CANONICAL_DB_ROOT:
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
 
 
 def now_cst() -> str:
@@ -98,10 +109,22 @@ def trade_written(db_root: Path, profile: str, cycle: str) -> bool:
     if not db.exists():
         return False
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
     try:
-        return con.execute(
-            "SELECT COUNT(*) FROM trade_cycles WHERE cycle_id=?",
-            (cycle,)).fetchone()[0] > 0
+        row = con.execute(
+            "SELECT decision,n_orders FROM trade_cycles WHERE cycle_id=?",
+            (cycle,)).fetchone()
+        if row is None:
+            return False
+        decision = str(row["decision"] or "").strip().lower()
+        try:
+            n_orders = int(row["n_orders"])
+        except (TypeError, ValueError):
+            return False
+        return (
+            (decision == "traded" and n_orders > 0)
+            or (decision in {"hold", "skip"} and n_orders == 0)
+        )
     finally:
         con.close()
 
@@ -131,10 +154,34 @@ def _collection_ready(ledger_path, cycle: str, max_age: int = COLLECT_MAX_AGE) -
 # ---------------------------------------------------------------------------
 def _fire_stage(ledger_path, cycle: str, stage: str, mode: str,
                 fire_fn: Callable, result: list) -> None:
-    """抢锁 → fire；起棒失败释放锁（下轮重试）。幂等真值认 stage_dispatch。"""
+    """抢 profile 租约 + cycle 闩锁 → fire；起棒失败释放（下轮重试）。
+
+    ``OKX_TRIGGER_DRYRUN=1`` 只调用 trigger 的干跑分支来记录待执行命令，
+    不获取或写入任何持久闩锁。否则一次干跑会让后续真实派发误以为该 stage
+    已经执行，而 dry-run 又没有监督 runner 可以完成或接管该租约。
+    """
+    cycle = validate_cycle_id(cycle)
     if ledger.stage_dispatched(ledger_path, cycle, stage):
         return
+
+    if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
+        try:
+            key = fire_fn(stage, cycle, mode)
+            result.append(f"dry_run fired {stage} {cycle} (key={key})")
+            log(f"{cycle}: dry-run fired {stage} (mode={mode}); no latch written")
+        except Exception as e:
+            result.append(f"fire_failed {stage} {cycle}: {e}")
+            log(f"{cycle}: dry-run fire {stage} FAILED; no latch written: {e}")
+        return
+
+    leased = stage in {"live", "demo"}
+    if leased and not ledger.try_profile_lease(ledger_path, stage, cycle):
+        result.append(f"deferred {stage} {cycle}: profile lease busy")
+        log(f"{cycle}: stage={stage} deferred (same-profile task still active)")
+        return
     if not ledger.try_stage(ledger_path, cycle, stage):
+        if leased:
+            ledger.release_profile_lease(ledger_path, stage, cycle)
         return  # 并发对手赢了锁
     try:
         key = fire_fn(stage, cycle, mode)
@@ -155,6 +202,8 @@ def _fire_stage(ledger_path, cycle: str, stage: str, mode: str,
         log(f"{cycle}: fired {stage} (mode={mode})")
     except Exception as e:
         ledger.release_stage(ledger_path, cycle, stage)
+        if leased:
+            ledger.release_profile_lease(ledger_path, stage, cycle)
         result.append(f"fire_failed {stage} {cycle}: {e}")
         log(f"{cycle}: fire {stage} FAILED, latch released: {e}")
 
@@ -219,15 +268,45 @@ def _unified_live_candidate(db_root: Path, ledger_path, cycles: list,
 def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
                    max_age: int = MAX_AGE_SEC, now: Optional[datetime] = None,
                    fire_fn: Callable = trigger_agent.fire,
-                   allow_unified_live: bool = True) -> list:
+                   allow_unified_live: bool = True,
+                   allow_agent_stages: Optional[bool] = None) -> list:
+    cycle = validate_cycle_id(cycle)
     out: list = []
+    # ``dispatch_once`` normally binds the selected root before calling here,
+    # but this function is also a public test/diagnostic seam.  Bind the
+    # canonical trigger here as well so a direct custom-root call cannot put a
+    # latch in the isolated ledger while launching push (or dry-run Agent
+    # artifacts) against the production root.
+    default_trigger = fire_fn is trigger_agent.fire
+    effective_fire = fire_fn
+    if default_trigger:
+        effective_fire = lambda stage, dispatch_cycle_id, mode: trigger_agent.fire(
+            stage, dispatch_cycle_id, mode, db_root=db_root
+        )
+    if allow_agent_stages is None:
+        allow_agent_stages = (
+            not default_trigger
+            or os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
+            or Path(db_root).resolve() == CANONICAL_DB_ROOT
+        )
     a = analysis_row(db_root, cycle)
     if not a:
         # 采集齐且新鲜后直接起 unified live（分析+实盘同一 Agent）。
         # 人工回滚 analyst 槽由 candidate 跳过，待其写 analysis 后走 full live。
         try:
             if allow_unified_live and _collection_ready(ledger_path, cycle):
-                _fire_stage(ledger_path, cycle, "live", "unified", fire_fn, out)
+                if allow_agent_stages:
+                    _fire_stage(
+                        ledger_path, cycle, "live", "unified", effective_fire, out
+                    )
+                else:
+                    out.append(
+                        f"blocked live {cycle}: non-default db_root requires dry-run"
+                    )
+                    log(
+                        f"{cycle}: live Agent blocked before lease/latch; "
+                        "non-default db_root requires OKX_TRIGGER_DRYRUN=1"
+                    )
         except Exception as e:
             log(f"{cycle}: unified live dispatch error (ignored): {e}")
         return out
@@ -242,6 +321,11 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # WARN 防刷屏：stage_dispatch 哨兵行 (cycle,'skip_warn') 唯一约束保每 cycle 只打一次。
     if status != "ok" or mode != "full":
         reason = f"status={status or '<missing>'},mode={mode or '<missing>'}"
+        if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
+            out.append(f"dry_run skip {cycle} analysis {reason}, no latch written")
+            log(f"{cycle}: dry-run WARN analysis {reason} -> skip live/demo/push; "
+                "no skip_warn latch written")
+            return out
         if (not ledger.stage_dispatched(ledger_path, cycle, "skip_warn")
                 and ledger.try_stage(ledger_path, cycle, "skip_warn")):
             out.append(f"skip {cycle} analysis {reason}, no trader/push")
@@ -252,8 +336,17 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # unified 轮的 live 闩锁已在首棒存在，只会派 demo；人工回滚 analyst 轮若
     # live 尚未派，则在此补派 full live。同一循环由闩锁区分两种路径。
     if age <= max_age:
-        for stage in ("live", "demo"):
-            _fire_stage(ledger_path, cycle, stage, mode, fire_fn, out)
+        if allow_agent_stages:
+            for stage in ("live", "demo"):
+                _fire_stage(ledger_path, cycle, stage, mode, effective_fire, out)
+        else:
+            out.append(
+                f"blocked live/demo {cycle}: non-default db_root requires dry-run"
+            )
+            log(
+                f"{cycle}: live/demo Agents blocked before lease/latch; "
+                "non-default db_root requires OKX_TRIGGER_DRYRUN=1"
+            )
     else:
         if not ledger.stage_dispatched(ledger_path, cycle, "live"):
             out.append(f"stale {cycle} age={age}s>{max_age}s skip trader")
@@ -262,16 +355,16 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # stage push：双盘 trade_cycles 都已写 → 抢锁起 push（独立于 analysis 新鲜度）
     if (trade_written(db_root, "live", cycle)
             and trade_written(db_root, "demo", cycle)):
-        _fire_stage(ledger_path, cycle, "push", mode, fire_fn, out)
+        _fire_stage(ledger_path, cycle, "push", mode, effective_fire, out)
     return out
 
 
 def _delivered_dedupe_keys(event_log: Path, floor_ts: str) -> set:
     """qq_push_dedupe.jsonl 尾部「已送达」的显式身份键集合（ts>=floor_ts）。
 
-    送达形态两种：mark(status=sent)=真发成功；duplicate_skip=同键已有 sent、
-    本次派发被合并（skip 不写 dedupe 库，只能从事件流看到）。按 dedupe_key
-    归集，避免相邻 push 互相掩盖。
+    送达形态两种：mark(status=sent)=真发成功；duplicate_skip 且
+    existing_status=sent=同键已有确认送达。pending duplicate 仍属未知，绝不能
+    冒充送达。按 dedupe_key 归集，避免相邻 push 互相掩盖。
     """
     if not event_log.exists():
         return set()
@@ -284,14 +377,15 @@ def _delivered_dedupe_keys(event_log: Path, floor_ts: str) -> set:
             continue
         if (ev.get("ts") or "") < floor_ts or not ev.get("dedupe_key"):
             continue
-        if ev.get("event") == "duplicate_skip" or (
+        if (ev.get("event") == "duplicate_skip"
+                and ev.get("existing_status") == "sent") or (
                 ev.get("event") == "mark" and ev.get("status") == "sent"):
             out.add(ev["dedupe_key"])
     return out
 
 
 def verify_push_delivery(db_root: Path, ledger_path, now: Optional[datetime] = None,
-                         event_log: Path = PUSH_EVENT_LOG) -> None:
+                         event_log: Path | None = None) -> None:
     """push 送达核验（alert-only，只告警不补派不重试）。
 
     trigger 起纯脚本 push 后，进程启动成功不代表消息已送达。送达真值 =
@@ -301,6 +395,15 @@ def verify_push_delivery(db_root: Path, ledger_path, now: Optional[datetime] = N
     WARN，滚出窗口自然停）。
     """
     now = now or datetime.now(CST)
+    db_root = Path(db_root).resolve()
+    namespace = _root_namespace(db_root)
+    if event_log is None:
+        event_log = (
+            PUSH_EVENT_LOG if not namespace
+            else PUSH_EVENT_LOG.with_name(
+                f"qq_push_dedupe-{namespace}.jsonl"
+            )
+        )
     lo = (now - timedelta(seconds=PUSH_VERIFY_MAX_SEC)).strftime("%Y-%m-%d %H:%M:%S")
     hi = (now - timedelta(seconds=PUSH_VERIFY_MIN_SEC)).strftime("%Y-%m-%d %H:%M:%S")
     con = ledger.connect(ledger_path, readonly=True)
@@ -321,7 +424,7 @@ def verify_push_delivery(db_root: Path, ledger_path, now: Optional[datetime] = N
         # 按 cycle 精确关联：pipeline 的身份键=push:{cycle}、
         # 无显式 --target 时 target='default'（qq_push._dedupe_key 同式），sent 表主键
         # 可确定性重算，禁止用“派发后有任意 sent”宽判。
-        dkey = f"push:{cyc}"
+        dkey = f"push:{namespace}:{cyc}" if namespace else f"push:{cyc}"
         skey = hashlib.sha256(f"default|{dkey}".encode("utf-8")).hexdigest()
         delivered = dkey in delivered_keys
         if not delivered and dedupe_db.exists():
@@ -351,6 +454,17 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
     """
     if ledger_path is None:
         ledger_path = db_root / "ledger.db"
+    effective_fire = fire_fn
+    default_trigger = fire_fn is trigger_agent.fire
+    if default_trigger:
+        effective_fire = lambda stage, cycle, mode: trigger_agent.fire(
+            stage, cycle, mode, db_root=db_root
+        )
+    allow_agent_stages = (
+        not default_trigger
+        or os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
+        or Path(db_root).resolve() == CANONICAL_DB_ROOT
+    )
     now = now or datetime.now(CST)
     cycles = [
         ledger.cycle_id_for(now - timedelta(minutes=ledger.SLOT_MINUTES * i))
@@ -366,8 +480,9 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
     out: list = []
     for cycle in cycles:
         out += dispatch_cycle(db_root, ledger_path, cycle, max_age=max_age,
-                              now=now, fire_fn=fire_fn,
-                              allow_unified_live=(cycle == cand))
+                              now=now, fire_fn=effective_fire,
+                              allow_unified_live=(cycle == cand),
+                              allow_agent_stages=allow_agent_stages)
     try:
         verify_push_delivery(db_root, ledger_path, now=now)
     except Exception as e:
@@ -381,7 +496,7 @@ def main() -> int:
     ap.add_argument("--db-root", required=True)
     ap.add_argument("--max-age", type=int, default=MAX_AGE_SEC)
     args = ap.parse_args()
-    db_root = Path(args.db_root)
+    db_root = Path(args.db_root).resolve()
     ledger.init_ledger(db_root / "ledger.db")  # 幂等保 stage_dispatch 存在
     actions = dispatch_once(db_root, max_age=args.max_age)
     if not actions:

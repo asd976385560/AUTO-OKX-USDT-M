@@ -48,8 +48,7 @@ class RepairQueueCommandTests(unittest.TestCase):
                 oe._project_path("scripts", "run_okx_python.ps1"),
                 fix_action)
             self.assertIn(
-                oe._project_path("scripts", "_okxcli.py"),
-                fix_action)
+                oe._project_path("scripts", "_okxcli.py"), fix_action)
 
 
 def _valid_receipt_context(cycle_id: str) -> dict:
@@ -111,6 +110,10 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 path, receipt={"ok": True, "cycle_id": cycle}, **kwargs)
         elif state == "failed_clean":
             oe.ei.mark_failed_clean(path, error="confirmed_no_fill", **kwargs)
+        elif state == "reconciled":
+            oe.ei.mark_reconciled(
+                path, ord_id="RECONCILED-ORDER",
+                receipt={"reconciled_by": "isolated-test"}, **kwargs)
         else:
             raise AssertionError(state)
 
@@ -171,7 +174,7 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 [("CYCLE-PENDING", "BTC-USDT-SWAP", "reserved")],
             )
 
-    def test_completed_and_failed_clean_do_not_block_profile(self):
+    def test_terminal_states_do_not_block_profile(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ledger.db"
             clean = self._reserve(path, "CLEAN", "BTC-USDT-SWAP")
@@ -182,6 +185,17 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
             self.assertEqual(done["status"], "reserved")
             self._transition(
                 path, done, "DONE", "ETH-USDT-SWAP", "completed")
+
+            recovered = self._reserve(path, "RECOVERED", "XRP-USDT-SWAP")
+            self.assertEqual(recovered["status"], "reserved")
+            self._transition(
+                path, recovered, "RECOVERED", "XRP-USDT-SWAP", "reconciled")
+
+            same_recovered = self._reserve(
+                path, "RECOVERED", "XRP-USDT-SWAP")
+            self.assertEqual(same_recovered["status"], "blocked")
+            self.assertEqual(same_recovered["reason"], "intent_reconciled")
+            self.assertEqual(same_recovered["pending_count"], 0)
 
             next_intent = self._reserve(path, "NEXT", "SOL-USDT-SWAP")
             self.assertEqual(next_intent["status"], "reserved")
@@ -255,6 +269,7 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
                 return_value={
                     "ok": True, "total_equity": 1000.0,
                     "available_margin": 900.0, "settlement_ccy": "USDT",
+                    "account_imr": 100.0,
                 }))
             positions_mock = stack.enter_context(mock.patch.object(
                 oe, "fetch_open_positions", return_value=api_positions))
@@ -407,6 +422,193 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
             self.assertEqual(result["exchange_groups"], 1)
 
 
+class LiveAccountImrGateTests(unittest.TestCase):
+    @staticmethod
+    def _rejected_risk(reason: str = "test_stop") -> dict:
+        return {
+            "approved": False,
+            "approved_sz": 0.0,
+            "clamped": False,
+            "adjustments": [],
+            "reject_reason": reason,
+            "reject_detail": "stop before exchange writes",
+            "math": {},
+        }
+
+    def _run_live(self, capacity: dict, *, caller_account_imr=0.0,
+                  use_real_validator: bool = False,
+                  validator_exception: Exception | None = None):
+        get_balance = mock.Mock(return_value={"ok": True, "data": [{}]})
+        extract_capacity = mock.Mock(return_value=capacity)
+        fetch_positions = mock.Mock(return_value=[])
+        verify_positions = mock.Mock(return_value={
+            "ok": True,
+            "profile": "live",
+            "ledger_groups": 0,
+            "exchange_groups": 0,
+            "diffs": [],
+        })
+        get_mark = mock.Mock(return_value=100.0)
+        fetch_specs = mock.Mock(return_value={
+            "ct_val": 1.0,
+            "lot_sz": 0.1,
+            "min_sz": 0.1,
+            "source": "test",
+            "spec_source": "test",
+        })
+        set_leverage = mock.Mock(return_value={"ok": True})
+        place_market_open = mock.Mock()
+        place_algo_sl = mock.Mock()
+        validate_mock = mock.Mock(
+            return_value=self._rejected_risk())
+        if validator_exception is not None:
+            validate_mock.side_effect = validator_exception
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                oe.ox, "is_dryrun", return_value=False))
+            stack.enter_context(mock.patch.object(
+                oe, "validate_receipt_context", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                oe.ei, "reserve",
+                return_value={"status": "reserved", "fingerprint": "FP"}))
+            mark_failed_clean = stack.enter_context(
+                mock.patch.object(oe.ei, "mark_failed_clean"))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "get_balance", get_balance))
+            stack.enter_context(mock.patch.object(
+                oe.ac, "extract_settlement_capacity", extract_capacity))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_open_positions", fetch_positions))
+            stack.enter_context(mock.patch.object(
+                oe, "_verify_pretrade_ledger_positions", verify_positions))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "get_mark_price", get_mark))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_instrument_specs", fetch_specs))
+            if not use_real_validator:
+                stack.enter_context(mock.patch.object(
+                    oe.rv, "validate", validate_mock))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "set_leverage", set_leverage))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_market_open", place_market_open))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_algo_sl", place_algo_sl))
+
+            result = oe.open_position(
+                "BTC-USDT-SWAP", "long", 0.1, 5.0, 95.0, "live",
+                equity=1.0,
+                available_margin=1.0,
+                account_imr=caller_account_imr,
+                cycle_id="IMR-GATE",
+                receipt_context={"cycle_id": "IMR-GATE"},
+            )
+
+        return {
+            "result": result,
+            "get_balance": get_balance,
+            "extract_capacity": extract_capacity,
+            "fetch_positions": fetch_positions,
+            "verify_positions": verify_positions,
+            "get_mark": get_mark,
+            "fetch_specs": fetch_specs,
+            "validate": validate_mock,
+            "mark_failed_clean": mark_failed_clean,
+            "set_leverage": set_leverage,
+            "place_market_open": place_market_open,
+            "place_algo_sl": place_algo_sl,
+        }
+
+    def test_unexpected_validator_exception_cleans_reserved_intent(self):
+        state = self._run_live({
+            "ok": True,
+            "total_equity": 100.0,
+            "available_margin": 90.0,
+            "settlement_ccy": "USDT",
+            "account_imr": 10.0,
+        }, validator_exception=ValueError("synthetic validator failure"))
+
+        self.assertFalse(state["result"]["ok"])
+        self.assertEqual(
+            state["result"]["reject_reason"], "risk_validation_exception")
+        state["mark_failed_clean"].assert_called_once()
+        state["set_leverage"].assert_not_called()
+        state["place_market_open"].assert_not_called()
+
+    def test_non_dryrun_live_uses_api_account_imr_and_ignores_caller(self):
+        state = self._run_live({
+            "ok": True,
+            "total_equity": 100.0,
+            "available_margin": 90.0,
+            "settlement_ccy": "USDT",
+            "source": "details.USDT.min(availBal,availEq)",
+            "account_imr": 12.5,
+        }, caller_account_imr=9999.0)
+
+        state["get_balance"].assert_called_once_with("live")
+        state["extract_capacity"].assert_called_once()
+        self.assertEqual(
+            state["validate"].call_args.kwargs["account_imr"], 12.5)
+        self.assertEqual(state["result"]["capacity"]["account_imr"], 12.5)
+        self.assertEqual(
+            state["result"]["capacity"]["source"],
+            "details.USDT.min(availBal,availEq)",
+        )
+        state["set_leverage"].assert_not_called()
+        state["place_market_open"].assert_not_called()
+
+    def test_missing_or_invalid_api_account_imr_fails_before_mark_and_writes(self):
+        for value in (None, "nan", -1.0):
+            with self.subTest(account_imr=value):
+                state = self._run_live({
+                    "ok": True,
+                    "total_equity": 100.0,
+                    "available_margin": 90.0,
+                    "settlement_ccy": "USDT",
+                    "account_imr": value,
+                })
+
+                self.assertFalse(state["result"]["ok"])
+                self.assertEqual(
+                    state["result"]["reject_reason"],
+                    "account_imr_fetch_failed",
+                )
+                state["fetch_positions"].assert_not_called()
+                state["verify_positions"].assert_not_called()
+                state["get_mark"].assert_not_called()
+                state["fetch_specs"].assert_not_called()
+                state["validate"].assert_not_called()
+                state["set_leverage"].assert_not_called()
+                state["place_market_open"].assert_not_called()
+                state["place_algo_sl"].assert_not_called()
+
+    def test_projected_portfolio_imr_over_66_6pct_never_writes_exchange(self):
+        state = self._run_live({
+            "ok": True,
+            "total_equity": 100.0,
+            "available_margin": 90.0,
+            "settlement_ccy": "USDT",
+            "source": "details.USDT.min(availBal,availEq)",
+            "account_imr": 66.7,
+        }, caller_account_imr=0.0, use_real_validator=True)
+
+        self.assertFalse(state["result"]["ok"])
+        self.assertEqual(
+            state["result"]["reject_reason"],
+            "portfolio_margin_cap_exceeded",
+        )
+        self.assertAlmostEqual(
+            state["result"]["risk"]["math"]["account_imr"], 66.7)
+        self.assertGreater(
+            state["result"]["risk"]["math"]["projected_portfolio_imr_ratio"],
+            state["result"]["risk"]["math"]["max_portfolio_imr_ratio"],
+        )
+        state["set_leverage"].assert_not_called()
+        state["place_market_open"].assert_not_called()
+        state["place_algo_sl"].assert_not_called()
+
+
 class StopLossDirectionTests(unittest.TestCase):
     def _validate(self, side: str, sl: float):
         return rv.validate(
@@ -419,6 +621,7 @@ class StopLossDirectionTests(unittest.TestCase):
             lot_sz=1.0,
             equity=1000.0,
             available_margin=1000.0,
+            account_imr=0.0,
             open_positions=[],
             sl_trigger_px=sl,
         )
@@ -439,6 +642,42 @@ class StopLossDirectionTests(unittest.TestCase):
                 self.assertFalse(result["approved"])
                 self.assertEqual(result["reject_reason"], "sl_direction_invalid")
 
+
+class NonFiniteRiskInputTests(unittest.TestCase):
+    def test_non_finite_money_path_inputs_are_rejected_without_math_errors(self):
+        base = {
+            "symbol": "BTC-USDT-SWAP",
+            "side": "long",
+            "intended_sz": 1.0,
+            "lev": 5.0,
+            "mark_px": 100.0,
+            "ct_val": 1.0,
+            "lot_sz": 1.0,
+            "equity": 1000.0,
+            "available_margin": 900.0,
+            "account_imr": 10.0,
+            "open_positions": [],
+            "sl_trigger_px": 95.0,
+        }
+        expected = {
+            "mark_px": "bad_mark_px",
+            "ct_val": "instrument_unknown",
+            "lot_sz": "instrument_unknown",
+            "intended_sz": "bad_sz",
+            "equity": "bad_equity",
+        }
+        for field, reason in expected.items():
+            with self.subTest(field=field):
+                payload = dict(base)
+                payload[field] = float("nan")
+                result = rv.validate(**payload)
+                self.assertFalse(result["approved"])
+                self.assertEqual(result["reject_reason"], reason)
+
+    def test_numeric_adapter_drops_nan_and_infinity(self):
+        for value in ("NaN", "Infinity", "-Infinity", float("nan")):
+            with self.subTest(value=value):
+                self.assertIsNone(oe._to_float(value))
 
 class StopLossReadbackTests(unittest.TestCase):
     @staticmethod
@@ -640,6 +879,7 @@ class OpenFillTruthTests(unittest.TestCase):
                 return_value={
                     "ok": True, "total_equity": 1000.0,
                     "available_margin": 900.0, "settlement_ccy": "USDT",
+                    "account_imr": 100.0,
                 }))
             stack.enter_context(mock.patch.object(
                 oe, "fetch_open_positions", return_value=[]))
@@ -695,11 +935,17 @@ class OpenFillTruthTests(unittest.TestCase):
         self.assertTrue(result["sl_verified"])
         trade = result["trades"][0]
         self.assertEqual(trade["sz"], 2.0)
+        self.assertEqual(trade["fill_sz"], 2.0)
         self.assertEqual(trade["approved_sz"], 5.0)
         self.assertTrue(trade["partial_fill"])
         self.assertEqual(trade["fill_source"], "fills")
         self.assertEqual(trade["fill_ts"], "2024-01-01 08:00:01")
         self.assertEqual(trade["ts_source"], "fills.fillTime")
+        receipt = {
+            **_valid_receipt_context("CYCLE-1"),
+            **result,
+        }
+        self.assertEqual(trades_writer.validate(receipt), [])
         self.assertTrue(journal_mock.called)
         self.assertEqual(verify_mock.call_args.kwargs["expected_algo_id"], "A-SL")
 

@@ -98,6 +98,46 @@ def _load_vec(row: sqlite3.Row) -> list[float]:
     })
 
 
+def _experience_summary(
+    neighbors: list[tuple[float, sqlite3.Row]],
+    now: datetime,
+) -> dict[str, Any]:
+    n = len(neighbors)
+    if n < 3:
+        return {
+            "n": n,
+            "sufficient": False,
+            "credibility": 0.0,
+            "reason": (
+                "no_experiences" if n == 0
+                else "insufficient_samples (n<3)"
+            ),
+        }
+    sims = [s for s, _ in neighbors]
+    pnls = [r["pnl_pct"] for _, r in neighbors if r["pnl_pct"] is not None]
+    ages = [_age_days(r["ts"], now) for _, r in neighbors]
+    wr_at_sim = (
+        sum(1 for p in pnls if p > 0) / len(pnls) if pnls else 0.0)
+    conf_sim = sum(sims) / len(sims)
+    avg_age = sum(ages) / len(ages)
+    age_decay = 0.5 ** (avg_age / 60.0)
+    credibility = wr_at_sim * conf_sim * age_decay * min(n / 20.0, 1.0)
+    return {
+        "n": n,
+        "sufficient": True,
+        "win_rate": round(wr_at_sim, 4),
+        "avg_sim": round(conf_sim, 4),
+        "avg_age_days": round(avg_age, 1),
+        "age_decay": round(age_decay, 4),
+        "credibility": round(credibility, 4),
+        "low_credibility": credibility < 0.2,
+        "avg_pnl_pct": (
+            round(sum(pnls) / len(pnls), 4) if pnls else None),
+        "wins": sum(1 for p in pnls if p > 0),
+        "losses": sum(1 for p in pnls if p <= 0),
+    }
+
+
 def find_similar_experience(
     symbol: str,
     side: str,
@@ -120,6 +160,8 @@ def find_similar_experience(
         "matches": [],
         "matched_wins": [],
         "matched_losses": [],
+        "cross_symbol_wins": [],
+        "cross_symbol_losses": [],
         "missed_opportunities": [],
         "summary": {
             "n": 0,
@@ -127,6 +169,13 @@ def find_similar_experience(
             "credibility": 0.0,
             "reason": "no_experiences",
         },
+        "cross_summary": {
+            "n": 0,
+            "sufficient": False,
+            "credibility": 0.0,
+            "reason": "no_experiences",
+        },
+        "query_symbol": symbol,
         "query_vec": query_vec,
     }
     if not account.exists():
@@ -173,14 +222,39 @@ def find_similar_experience(
             "playbook_ref": r["playbook_ref"],
             "cycle_id": r["cycle_id"],
             "profile": r["profile"],
+            "symbol": r["symbol"],
             "outcome": "win" if r["pnl_pct"] > 0 else "loss",
             "lesson": _without_legacy_scores(r["experience_summary"]),
             "raw_snippet": _without_legacy_scores((r["raw"] or "")[:200]),
         })
 
+    query_symbol = str(symbol or "").strip().upper()
+    exact_neighbors = [
+        (s, r) for s, r in neighbors
+        if str(r["symbol"] or "").strip().upper() == query_symbol
+    ]
+    cross_neighbors = [
+        (s, r) for s, r in neighbors
+        if str(r["symbol"] or "").strip().upper() != query_symbol
+    ]
+    exact_matches = [
+        m for m in all_matches
+        if str(m.get("symbol") or "").strip().upper() == query_symbol
+    ]
+    cross_matches = [
+        m for m in all_matches
+        if str(m.get("symbol") or "").strip().upper() != query_symbol
+    ]
+
     side_cap = max(1, top_k // 2)
-    matched_wins = [m for m in all_matches if m["outcome"] == "win"][:side_cap]
-    matched_losses = [m for m in all_matches if m["outcome"] == "loss"][:side_cap]
+    matched_wins = [
+        m for m in exact_matches if m["outcome"] == "win"][:side_cap]
+    matched_losses = [
+        m for m in exact_matches if m["outcome"] == "loss"][:side_cap]
+    cross_symbol_wins = [
+        m for m in cross_matches if m["outcome"] == "win"][:side_cap]
+    cross_symbol_losses = [
+        m for m in cross_matches if m["outcome"] == "loss"][:side_cap]
     matches = sorted(
         matched_wins + matched_losses,
         key=lambda item: item["sim"],
@@ -209,43 +283,16 @@ def find_similar_experience(
         finally:
             lcon.close()
 
-    n = len(neighbors)
-    if n < 3:
-        return {"matches": matches,
-                "matched_wins": matched_wins,
-                "matched_losses": matched_losses,
-                "missed_opportunities": missed,
-                "summary": {"n": n, "sufficient": False, "credibility": 0.0,
-                            "reason": "insufficient_samples (n<3)"},
-                "query_vec": query_vec}
-
-    sims = [s for s, _ in neighbors]
-    pnls = [r["pnl_pct"] for _, r in neighbors if r["pnl_pct"] is not None]
-    ages = [_age_days(r["ts"], now) for _, r in neighbors]
-    wr_at_sim = (sum(1 for p in pnls if p > 0) / len(pnls)) if pnls else 0.0
-    conf_sim = sum(sims) / len(sims)
-    avg_age = sum(ages) / len(ages)
-    age_decay = 0.5 ** (avg_age / 60.0)
-    credibility = wr_at_sim * conf_sim * age_decay * min(n / 20.0, 1.0)
-
     return {
         "matches": matches,
         "matched_wins": matched_wins,
         "matched_losses": matched_losses,
+        "cross_symbol_wins": cross_symbol_wins,
+        "cross_symbol_losses": cross_symbol_losses,
         "missed_opportunities": missed,
-        "summary": {
-            "n": n,
-            "sufficient": True,
-            "win_rate": round(wr_at_sim, 4),
-            "avg_sim": round(conf_sim, 4),
-            "avg_age_days": round(avg_age, 1),
-            "age_decay": round(age_decay, 4),
-            "credibility": round(credibility, 4),
-            "low_credibility": credibility < 0.2,
-            "avg_pnl_pct": round(sum(pnls) / len(pnls), 4) if pnls else None,
-            "wins": sum(1 for p in pnls if p > 0),
-            "losses": sum(1 for p in pnls if p <= 0),
-        },
+        "summary": _experience_summary(exact_neighbors, now),
+        "cross_summary": _experience_summary(cross_neighbors, now),
+        "query_symbol": symbol,
         "query_vec": query_vec,
     }
 
@@ -254,7 +301,7 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
     """Return the decision-useful subset without raw/vector payload bloat."""
     keep_match = (
         "sim", "pnl_pct", "hold_hours", "hit_1R", "age_days",
-        "playbook_ref", "cycle_id", "profile", "outcome", "lesson",
+        "playbook_ref", "cycle_id", "profile", "symbol", "outcome", "lesson",
     )
     keep_missed = (
         "ts", "symbol", "regime", "direction_hint", "actual_4h_pct",
@@ -270,6 +317,8 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "summary": result.get("summary") or {},
+        "cross_summary": result.get("cross_summary") or {},
+        "query_symbol": result.get("query_symbol"),
         "matched_wins": [
             pick(item, keep_match)
             for item in (result.get("matched_wins") or [])
@@ -278,6 +327,16 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "matched_losses": [
             pick(item, keep_match)
             for item in (result.get("matched_losses") or [])
+            if isinstance(item, dict)
+        ],
+        "cross_symbol_wins": [
+            pick(item, keep_match)
+            for item in (result.get("cross_symbol_wins") or [])
+            if isinstance(item, dict)
+        ],
+        "cross_symbol_losses": [
+            pick(item, keep_match)
+            for item in (result.get("cross_symbol_losses") or [])
             if isinstance(item, dict)
         ],
         "missed_opportunities": [

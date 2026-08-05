@@ -60,6 +60,13 @@ SRC_XSEARCH = "x_search"
 DONE_STATUS = ("ok", "degraded")
 
 SLOT_MINUTES = 15
+PROFILE_LEASE_COLUMNS = ("profile", "cycle_id", "acquired_at", "expires_at")
+PROFILE_LEASE_SCHEMA = (
+    ("profile", "TEXT", 0, 1),
+    ("cycle_id", "TEXT", 1, 0),
+    ("acquired_at", "TEXT", 1, 0),
+    ("expires_at", "TEXT", 1, 0),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +129,59 @@ def connect(path: str | os.PathLike, readonly: bool = False) -> sqlite3.Connecti
     return con
 
 
+def _require_profile_lease_migrated(path: Path) -> None:
+    """Existing databases must receive the lease table through the guarded migration.
+
+    This inspection is deliberately read-only.  It prevents dispatcher startup from
+    turning ``CREATE TABLE IF NOT EXISTS`` into an implicit, unbacked schema change.
+    A brand-new database is still initialized in one pass by :func:`init_ledger`.
+    """
+    con = sqlite3.connect(
+        path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5
+    )
+    try:
+        present = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("stage_profile_leases",),
+        ).fetchone() is not None
+        table_info = (
+            tuple(
+                con.execute("PRAGMA table_info(stage_profile_leases)")
+            )
+            if present
+            else ()
+        )
+        schema = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in table_info
+        )
+    finally:
+        con.close()
+
+    if not present:
+        raise RuntimeError(
+            "existing ledger.db is missing stage_profile_leases; run "
+            "scripts/apply_stage_profile_lease_schema.py --apply "
+            "--backup-dir <verified-backup-dir> before starting dispatcher"
+        )
+    if schema != PROFILE_LEASE_SCHEMA:
+        raise RuntimeError(
+            "incompatible stage_profile_leases schema; guarded migration or "
+            f"manual review required (schema={list(schema)})"
+        )
+
+
 def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
-    """幂等建表。"""
-    Path(str(path)).parent.mkdir(parents=True, exist_ok=True)
-    con = connect(path)
+    """Initialize a new ledger or verify an existing ledger before idempotent DDL.
+
+    Existing databases are never upgraded implicitly: the profile-lease table must
+    already have been installed by the backup-guarded migration script.
+    """
+    ledger_path = Path(str(path))
+    if ledger_path.is_file():
+        _require_profile_lease_migrated(ledger_path)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    con = connect(ledger_path)
     try:
         con.executescript(
             """
@@ -148,6 +204,15 @@ def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
                 dispatched_at TEXT NOT NULL,
                 card_id       TEXT,
                 PRIMARY KEY (cycle_id, stage)
+            );
+
+            -- 跨 cycle 的同 profile 串行租约。stage_dispatch 只按 cycle 幂等，
+            -- 无法阻止上一轮长任务与下一轮同 profile 重叠。
+            CREATE TABLE IF NOT EXISTS stage_profile_leases (
+                profile       TEXT PRIMARY KEY,   -- 'live'|'demo'
+                cycle_id      TEXT NOT NULL,
+                acquired_at   TEXT NOT NULL,
+                expires_at    TEXT NOT NULL
             );
 
             -- 开仓副作用幂等：同 profile/cycle/symbol/side 只允许一个逻辑意图。
@@ -398,6 +463,77 @@ def release_stage(path: str | os.PathLike, cycle_id: str, stage: str) -> None:
         con.execute("DELETE FROM stage_dispatch WHERE cycle_id=? AND stage=?",
                     (cycle_id, stage))
         con.commit()
+    finally:
+        con.close()
+
+
+def try_profile_lease(
+    path: str | os.PathLike,
+    profile: str,
+    cycle_id: str,
+    ttl_sec: int = 3600,
+    now: datetime | None = None,
+) -> bool:
+    """原子抢同 profile 跨 cycle 租约；未过期的其他 cycle 一律 defer。
+
+    监督 runner 正常结束时显式释放；进程被强杀时由一小时 TTL 兜底，避免永久
+    卡死。TTL 高于 live/demo 现役超时，禁止活任务仍在时被下一轮抢占。
+    """
+    if profile not in {"live", "demo"}:
+        raise ValueError(f"profile lease only supports live|demo, got {profile!r}")
+    if ttl_sec <= 0:
+        raise ValueError("ttl_sec must be positive")
+    at = now or datetime.now(CST)
+    acquired_at = at.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (at + timedelta(seconds=ttl_sec)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT cycle_id,expires_at FROM stage_profile_leases "
+            "WHERE profile=?",
+            (profile,),
+        ).fetchone()
+        if row is not None and str(row["expires_at"]) > acquired_at:
+            con.rollback()
+            # 即使 owner cycle 相同也不能“可重入”：这通常是并发 dispatcher
+            # 在首个进程尚未写 stage_dispatch 前撞入。若放行，输掉 cycle 闩锁
+            # 的进程会把赢家租约误释放。
+            return False
+        if row is not None:
+            con.execute(
+                "DELETE FROM stage_profile_leases WHERE profile=?",
+                (profile,),
+            )
+        con.execute(
+            "INSERT INTO stage_profile_leases"
+            "(profile,cycle_id,acquired_at,expires_at) VALUES(?,?,?,?)",
+            (profile, cycle_id, acquired_at, expires_at),
+        )
+        con.commit()
+        return True
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def release_profile_lease(
+    path: str | os.PathLike,
+    profile: str,
+    cycle_id: str,
+) -> bool:
+    """只释放匹配 owner cycle 的租约，防旧 runner 误删新租约。"""
+    con = connect(path)
+    try:
+        cur = con.execute(
+            "DELETE FROM stage_profile_leases WHERE profile=? AND cycle_id=?",
+            (profile, cycle_id),
+        )
+        con.commit()
+        return cur.rowcount > 0
     finally:
         con.close()
 

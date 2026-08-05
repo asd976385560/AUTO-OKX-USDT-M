@@ -1,9 +1,9 @@
 <!--
 doc: analysis_template
 doc-version: V2.0-template
-last-updated: 2026-07-29
-updated-by: Codex
-change-summary: 对齐严格status/protocol、writer提交时间、动作方向与Windows UTF-8调用契约。
+last-updated: 2026-07-31
+updated-by: Maintainer
+change-summary: wait 的 side 恢复为可选方向（hold 仍恒 null）：wait 方向是错失机会对照组的唯一输入，2026-07-29 误收紧为 null 致 missed_opportunities 静默断供两天。
 role: 分析回执模板（analyst -> analysis.db）
 权威: skill.md §8 + collectors/analyst_writer.py
 落点: <PROJECT_ROOT>\db\analysis.db（analysis_runs + analysis_signals）
@@ -136,7 +136,7 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
 | `symbol` | str | 是 | `'BTC-USDT-SWAP'` 等 OKX SWAP instId |
 | `dim1`..`dim5` / `total` / `confidence` | null | - | 旧协议兼容列。`decision_card_v1` 一律填 null；不用于排序、仓位或执行。 |
 | `action` | str | 是 | 仅允许 `'open_long'`/`'open_short'`/`'hold'`/`'close'`/`'wait'`。未知动作必须由 writer 拒绝，trader 不得猜测。 |
-| `side` | str 或 null | - | `open_long` 必须 `long`，`open_short` 必须 `short`；hold/wait 必须 null；close 必须明确 `long` 或 `short`。 |
+| `side` | str 或 null | - | `open_long` 必须 `long`，`open_short` 必须 `short`；`hold` 必须 null（持有既有仓位，无方向）；**`wait` 可选 `long`/`short`/null**——能判方向就填，它是错失机会对照组的唯一输入；close 必须明确 `long` 或 `short`。 |
 | `entry_hint` | num 或 null | - | 建议入场价（trader 参考，非硬约束）。 |
 | `stop_hint` | num 或 null | - | 建议止损价。**live/demo trader 开仓必带方向正确的 SL**：long 严格低于 mark、short 严格高于 mark，且偏离不超过 30%；此 hint 仅供 trader 形成 `sl_trigger_px`，最终由确定性风控复核。 |
 | `tp_hint` | num 或 null | - | 建议止盈价。 |

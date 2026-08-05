@@ -75,6 +75,9 @@ def main():
     if os.path.exists(market):
         try:
             mc = connect_ro(market)  # 只读 mode=ro（2026-07-03）
+            # MAX(ts) 在本表安全且唯一可行（2026-07-29 审计实测）：tick_snapshots.ts 全列
+            # 统一 UTC-Z（ts_audit MIXED=0 持续巡检），词典序即时序，且走覆盖索引 ~2ms。
+            # 勿改 rowid DESC——本表 INSERT OR REPLACE 会改 rowid；勿改 datetime(ts)——全排序 ~436ms。
             tick_raw = mc.execute("SELECT MAX(ts) FROM tick_snapshots").fetchone()[0]
             mc.close()
             tick_dt = parse_any_ts(tick_raw)

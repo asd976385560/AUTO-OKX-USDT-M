@@ -119,7 +119,7 @@ def ledger_rows(con):
     """全量 trades 行 → {(symbol, side): [row, ...]}（rowid 序）。"""
     by_key = defaultdict(list)
     for r in con.execute(
-            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl "
+            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl, raw "
             "FROM trades ORDER BY rowid"):
         by_key[(r["symbol"], norm_side(r["side"]))].append(r)
     return by_key
@@ -197,6 +197,47 @@ def fetch_reduce_fills(profile, sym, side, t0_ms):
     return merged
 
 
+def fetch_open_fills(profile, sym, side, t0_ms):
+    """回读 sym 的**开仓腿**成交（P2·2026-08-04）——`fetch_reduce_fills` 的镜像。
+
+    开仓腿判定：side=同向（long→buy / short→sell）且 posSide 匹配持仓方向；
+    posSide 非 long/short（net 模式历史）时要求 fillPnl==0（开仓不产生已实现盈亏，
+    与平仓腿的 fillPnl≠0 正好互补）。
+    """
+    open_side = "buy" if side == "long" else "sell"
+    merged, seen = [], set()
+    errors = []
+    for extra in ([], ["--archive"]):
+        try:
+            fills = rows_of(okx_json("swap", "fills", "--instId", sym, *extra,
+                                     global_args=["--profile", profile]))
+        except Exception as e:  # noqa: BLE001 —— 单源失败不致命，两源全失败才报
+            errors.append(f"fills{' --archive' if extra else ''} 失败: {e}")
+            continue
+        for x in fills:
+            if not isinstance(x, dict):
+                continue
+            key = x.get("tradeId") or (
+                f"{x.get('ordId')}|{x.get('fillTime')}|{x.get('fillSz')}|{x.get('fillPx')}")
+            if key in seen:
+                continue
+            seen.add(key)
+            if int(x.get("fillTime") or 0) < t0_ms:
+                continue
+            if x.get("side") != open_side:
+                continue
+            ps = x.get("posSide")
+            if ps in ("long", "short"):
+                if ps != side:
+                    continue
+            elif abs(f(x.get("fillPnl"), 0.0) or 0.0) > 1e-12:
+                continue  # net 模式无 posSide：以 fillPnl==0 认开仓腿
+            merged.append(x)
+    if not merged and len(errors) >= 2:
+        raise RuntimeError("; ".join(errors))
+    return merged
+
+
 def group_by_ord(fills):
     """fills → [{ordId, sz, pnl, wavg_px, t_last_ms, fills}]（按时间升序）。"""
     groups = defaultdict(list)
@@ -215,35 +256,89 @@ def group_by_ord(fills):
     return out
 
 
-def consume_recorded(groups, rows, t0_dt):
-    """账本已有 close/stop_loss/reduce 行 → 销账对应 fills 组（sz 相等 + 时间窗内）。
+CLOSE_ACTIONS = ("close", "stop_loss", "reduce")
+OPEN_ACTIONS = ("open", "add")
 
-    返回 (remaining_groups, consume_notes)。销不掉的账本 close 行只记备注
-    （可能超 fills API 窗口）——最终以「剩余组合计 == 幽灵 sz」硬门兜底。
+
+def _recorded_ord_ids(row) -> set[str]:
+    """Extract authoritative exchange order identities from one ledger row."""
+    try:
+        raw_value = row["raw"]
+    except (KeyError, IndexError, TypeError):
+        return set()
+    try:
+        raw = json.loads(raw_value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    raw_ord_ids = raw.get("ord_ids") or []
+    if not isinstance(raw_ord_ids, (list, tuple, set)):
+        raw_ord_ids = [raw_ord_ids]
+    values = [raw.get("ordId"), *raw_ord_ids]
+    return {str(value) for value in values if value not in (None, "")}
+
+
+def consume_recorded(groups, rows, t0_dt, actions=CLOSE_ACTIONS):
+    """账本已有成交行 → 优先按 ordId、否则按唯一 sz+时间候选销账。
+
+    `actions` 默认平仓腿（幽灵仓补 close 用）；P2 补 open 时传 `OPEN_ACTIONS`
+    销账已记录的开仓行，逻辑完全对称。
+
+    返回 (remaining_groups, consume_notes)。销不掉的账本行只记备注
+    （可能超 fills API 窗口）——最终以「剩余组合计 == 目标 sz」硬门兜底。
     """
     notes, remaining = [], list(groups)
     for r in rows:
         act = (r["action"] or "").lower()
-        if act not in ("close", "stop_loss", "reduce"):
+        if act not in actions:
             continue
         r_dt = parse_ts(r["ts"])
         if r_dt is None or (t0_dt is not None and r_dt < t0_dt):
             continue
         r_sz = f(r["sz"], 0.0) or 0.0
-        best, best_gap = None, None
-        for g in remaining:
-            if abs(g["sz"] - r_sz) > SZ_TOL:
+        ord_ids = _recorded_ord_ids(r)
+        if ord_ids:
+            identified = [g for g in remaining if str(g.get("ordId")) in ord_ids]
+            identified_sz = sum(g["sz"] for g in identified)
+            if identified and abs(identified_sz - r_sz) <= SZ_TOL:
+                for group in identified:
+                    remaining.remove(group)
+                notes.append(
+                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
+                    f"ordId={','.join(sorted(ord_ids))} 已按身份销账"
+                )
+            else:
+                notes.append(
+                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 的 "
+                    f"ordId 身份与 fills 数量不一致，拒绝弱匹配"
+                )
+            continue
+
+        candidates = []
+        for group in remaining:
+            if abs(group["sz"] - r_sz) > SZ_TOL:
                 continue
-            gap = abs((fill_dt(g["t_last_ms"]) - r_dt).total_seconds())
-            if gap <= CONSUME_WINDOW_MIN * 60 and (best_gap is None or gap < best_gap):
-                best, best_gap = g, gap
-        if best is not None:
-            remaining.remove(best)
-            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
-                         f"ordId={best['ordId']} 已销账")
+            gap = abs((fill_dt(group["t_last_ms"]) - r_dt).total_seconds())
+            if gap <= CONSUME_WINDOW_MIN * 60:
+                candidates.append((gap, group))
+        if len(candidates) == 1:
+            group = candidates[0][1]
+            remaining.remove(group)
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
+                f"ordId={group['ordId']} 已按唯一数量/时间候选销账"
+            )
+        elif len(candidates) > 1:
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 有 "
+                f"{len(candidates)} 个等量时间候选，拒绝弱匹配并转人工"
+            )
         else:
-            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
-                         f"（可能超 API 窗口，靠合计硬门兜底）")
+            notes.append(
+                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
+                f"（可能超 API 窗口，靠合计硬门兜底）"
+            )
     return remaining, notes
 
 
@@ -583,6 +678,221 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def match_exact_groups(remaining, target_sz):
+    """精确匹配判定（唯一定义源）——幽灵仓补 close 与 UNRECORDED 补 open 共用。
+
+    规则（满足其一才算精确，匹配集张数合计恒 == target_sz）：
+      a) 剩余组张数合计 == target_sz → 全部剩余组即匹配集；
+      b) 恰有唯一一个剩余组 sz == target_sz → 该组即匹配集（其余为独立未记账成交）。
+    返回 (matched_or_None, leftover, reason)；matched 为 None 表示模糊。
+    """
+    rem_sz = sum(g["sz"] for g in remaining)
+    if remaining and abs(rem_sz - target_sz) <= SZ_TOL:
+        return list(remaining), [], None
+    hits = [g for g in remaining if abs(g["sz"] - target_sz) <= SZ_TOL]
+    if len(hits) == 1:
+        leftover = [g for g in remaining if g is not hits[0]]
+        return hits, leftover, None
+    reason = (f"剩余 fills 组无法唯一对齐 sz={target_sz:g}（sz 相等组 {len(hits)} 个）"
+              if remaining else "窗口内无未销账的成交")
+    return None, list(remaining), reason
+
+
+def apply_unrecorded(db_path, profile, sym, side, missing_sz, matched, con_ro,
+                     *, lev=None, card=None, intent=None, sl_probe=None):
+    """P2·2026-08-04：把交易所已有、账本却没记的仓位补成一行 `open`。
+
+    与 `apply_reconcile`（补 close）互为镜像，共用 `maintenance_write_trades` 宽松路径。
+    **不编造决策卡**：`card` 由调用方从 `analysis_signals` 取真卡；取不到就传 None，
+    此时 payload 不带 `decision_protocol`（合法），并在 degradation 标注卡缺失。
+
+    `intent` = `execution_intents` 归属证据（T1 有 / T2 无）；`sl_probe` = 交易所侧
+    algo 止损探测结果。两者都只入 raw 留痕，不参与放行判定（判定在调用方）。
+    """
+    all_fills = [x for g in matched for x in g["fills"]]
+    tot_sz = sum(f(x.get("fillSz"), 0.0) or 0.0 for x in all_fills)
+    wavg_px = (sum((f(x.get("fillPx"), 0.0) or 0.0) * (f(x.get("fillSz"), 0.0) or 0.0)
+                   for x in all_fills) / tot_sz) if tot_sz else None
+    open_dt = fill_dt(max(int(x.get("fillTime") or 0) for x in all_fills))
+    open_ts = open_dt.strftime(TS_FMT)
+    ord_ids = sorted({g["ordId"] for g in matched})
+    # cycle 归属优先用 intent 的真 cycle_id（T1）；无 intent 则落成交时刻所在槽（T2）
+    cycle_id = (intent or {}).get("cycle_id") or slot_cycle_id(open_dt)
+
+    prev = con_ro.execute(
+        "SELECT cycle_id, ts, decision, n_orders, equity, note, raw FROM trade_cycles "
+        "WHERE cycle_id=?", (cycle_id,)).fetchone()
+    prev_trades = con_ro.execute(
+        "SELECT symbol, action, side, sz, fill_px, lev, margin, notional, score_total, "
+        "reasoning, deviation, degradation, pnl, raw FROM trades WHERE cycle_id=? "
+        "ORDER BY rowid", (cycle_id,)).fetchall()
+    trades = [dict(t) for t in prev_trades]
+
+    fills_evidence = [{"ts": fill_dt(x.get("fillTime")).strftime(TS_FMT),
+                       "px": x.get("fillPx"), "sz": x.get("fillSz"),
+                       "ordId": x.get("ordId"), "tradeId": x.get("tradeId"),
+                       "execType": x.get("execType")}
+                      for x in all_fills[:RAW_FILLS_CAP]]
+    # 末道防线：卡不合法就降级为无卡（带着坏卡写会被 writer 整单拒绝→补账失败→交易继续冻结）。
+    # 与 ledger_autoheal._card_for 的前置校验重复是有意的：本函数对任何调用方都必须安全。
+    if card is not None:
+        try:
+            from core.decision_card import validate_card  # noqa: PLC0415
+
+            if validate_card(card, "decision_card"):
+                card = None
+        except Exception:  # noqa: BLE001
+            card = None
+
+    degradation = []
+    if card is None:
+        degradation.append("decision_card_missing")
+    if intent is None:
+        degradation.append("no_execution_intent")
+    if sl_probe is not None and not sl_probe.get("has_sl"):
+        degradation.append("naked_position_no_algo_sl")
+
+    recon_trade = {
+        "symbol": sym,
+        "action": "open",
+        "side": side,
+        "sz": tot_sz,
+        "fill_px": round(wavg_px, 8) if wavg_px else None,
+        "lev": lev,
+        "margin": None,
+        "notional": None,
+        "score_total": None,
+        "reasoning": (
+            f"ledger_autoheal 补账（UNRECORDED）：交易所有仓账本无；"
+            f"fills 实证 {len(all_fills)} 笔 ordId={','.join(ord_ids)} "
+            f"开仓时刻={open_ts} sz={tot_sz:g}"
+            + ("；intent 归属已核" if intent else "；**无 execution_intent 归属证据**")
+        ),
+        "deviation": None,
+        "degradation": ",".join(degradation) or None,
+        "pnl": 0.0,
+        "raw": {
+            "reconcile_source": "exchange_fills_unrecorded",
+            "open_ts": open_ts,
+            "ord_ids": ord_ids,
+            "fills": fills_evidence,
+            "intent": intent,
+            "sl_probe": sl_probe,
+            "decision_card_source": "analysis_signals" if card else None,
+        },
+    }
+    if card:
+        recon_trade["decision_card"] = card
+    trades.append(recon_trade)
+
+    prev_note = (prev["note"] if prev else "") or ""
+    data = {
+        "cycle_id": cycle_id,
+        "ts": (prev["ts"] if (prev and prev_trades) else open_ts),
+        "decision": "traded",
+        "action": (f"autoheal-unrecorded: {sym} {side} open {tot_sz:g} "
+                   f"@ {wavg_px:.6g}" if wavg_px else
+                   f"autoheal-unrecorded: {sym} {side} open {tot_sz:g}"),
+        "note": (f"ledger_autoheal 补 UNRECORDED open sz={tot_sz:g}"
+                 + (f" | 原行 note: {prev_note[:300]}" if prev_note else "")),
+        "n_orders": len(trades),
+        "equity": (prev["equity"] if prev else None),
+        "trades": trades,
+        "raw": {
+            "reconcile_source": "exchange_fills_unrecorded",
+            "reconciled_at": datetime.now(CST).strftime(TS_FMT),
+            "symbol": sym, "side": side, "missing_sz": missing_sz,
+            "open_ts": open_ts, "wavg_px": wavg_px, "ord_ids": ord_ids,
+            "fills": fills_evidence, "intent": intent, "sl_probe": sl_probe,
+            "degradation": degradation,
+        },
+        "_profile": profile,
+    }
+    if card:
+        data["decision_protocol"] = "decision_card_v1"
+        data["decision_card"] = card
+
+    result = trades_writer.maintenance_write_trades(
+        data, Path(db_path), trusted_timestamp=data["ts"], preserve_equity_none=True)
+    if not result.get("ok") or result.get("refused"):
+        raise RuntimeError(f"trades_writer 拒绝补 open: {result}")
+    exp = trades_writer.write_experiences(
+        {"cycle_id": cycle_id, "trades": [recon_trade]}, profile, open_ts)
+    return {"cycle_id": cycle_id, "open_ts": open_ts, "sz": tot_sz,
+            "wavg_px": wavg_px, "ord_ids": ord_ids, "writer": result, "exp": exp,
+            "degradation": degradation, "merged_prev_trades": len(prev_trades)}
+
+
+def classify(profile, by_key, nets, ven):
+    """账本轧差 ↔ OKX 现仓差异分级（唯一定义源）。
+
+    只做判定：不打印、不写库。内部会为幽灵组回读 fills（只读 API）。
+    调用方一律 import 本函数，**禁止各处自写分级规则**——CLI 与
+    `ledger_autoheal.py` 共用同一套 EXACT/FUZZY 口径，避免两边漂移。
+
+    返回 dict:
+      ghosts      [((sym, side), ghost_sz), ...]        账本 > 现仓
+      over_closed [((sym, side), net), ...]             账本净持仓为负
+      unrecorded  [((sym, side), venue_sz), ...]        现仓 > 账本
+      exact       [((sym, side), ghost_sz, matched, detail), ...]  可补
+      fuzzy       [((sym, side), ghost_sz, reason, detail), ...]   只报告
+    """
+    ghosts, over_closed = [], []
+    for k, net in nets.items():
+        if net < -SZ_TOL:
+            over_closed.append((k, net))
+            continue
+        ven_sz = ven.get(k, 0.0)
+        if net > ven_sz + SZ_TOL:
+            ghosts.append((k, net - ven_sz))
+    unrecorded = [(k, sz) for k, sz in ven.items()
+                  if sz > nets.get(k, 0.0) + SZ_TOL]
+
+    exact, fuzzy = [], []
+    for (sym, side), ghost_sz in ghosts:
+        rows = by_key[(sym, side)]
+        opens = [parse_ts(r["ts"]) for r in rows
+                 if (r["action"] or "").lower() in ("open", "add")]
+        opens = [d for d in opens if d is not None]
+        if not opens:
+            fuzzy.append(((sym, side), ghost_sz, "账本无可解析的 open 行 ts", []))
+            continue
+        t0_dt = min(opens) - timedelta(minutes=OPEN_TS_BUFFER_MIN)
+        t0_ms = int(t0_dt.timestamp() * 1000)
+        try:
+            fills = fetch_reduce_fills(profile, sym, side, t0_ms)
+        except Exception as e:  # noqa: BLE001
+            fuzzy.append(((sym, side), ghost_sz, f"fills API 失败: {e}", []))
+            continue
+        groups = group_by_ord(fills)
+        remaining, notes = consume_recorded(groups, rows, t0_dt)
+        rem_sz = sum(g["sz"] for g in remaining)
+        detail = [f"窗口起点 {t0_dt.strftime(TS_FMT)}，平仓腿 fills {len(fills)} 笔 / "
+                  f"{len(groups)} 组，销账后剩 {len(remaining)} 组合计 {rem_sz:g} 张"]
+        detail += notes
+        for g in remaining:
+            detail.append(f"  剩余组 ordId={g['ordId']} sz={g['sz']:g} "
+                          f"px≈{g['wavg_px']:.6g} pnl={g['pnl']:+.6g} "
+                          f"t={fill_dt(g['t_last_ms']).strftime(TS_FMT)}")
+        hit, leftover, reason = match_exact_groups(remaining, ghost_sz)
+        if hit is None:
+            fuzzy.append(((sym, side), ghost_sz, reason, detail))
+            continue
+        if leftover:
+            detail.append(f"  规则b命中：唯一 ordId={hit[0]['ordId']} 组 "
+                          f"sz={hit[0]['sz']:g} == 幽灵 sz；其余 {len(leftover)} 组"
+                          f"为独立未记账成交（只报告不写）")
+            for g in leftover:
+                detail.append(f"  [LEFTOVER] ordId={g['ordId']} sz={g['sz']:g} "
+                              f"px≈{g['wavg_px']:.6g} pnl={g['pnl']:+.6g} "
+                              f"t={fill_dt(g['t_last_ms']).strftime(TS_FMT)} "
+                              f"—— 疑似未记账小额往返（净额自平），人工核")
+        exact.append(((sym, side), ghost_sz, hit, detail))
+
+    return {"ghosts": ghosts, "over_closed": over_closed,
+            "unrecorded": unrecorded, "exact": exact, "fuzzy": fuzzy}
+
+
 def main():
     ap = argparse.ArgumentParser(description="交易所侧/执行后平仓漏落账对账")
     ap.add_argument("--profile", choices=["live", "demo"], required=True)
@@ -627,16 +937,11 @@ def main():
     print(f"OKX 现仓 {len(ven)} 组: "
           + ("; ".join(f"{k[0]}/{k[1]}={v:g}" for k, v in ven.items()) or "空"))
 
-    ghosts, over_closed = [], []
-    for k, net in nets.items():
-        if net < -SZ_TOL:
-            over_closed.append((k, net))
-            continue
-        ven_sz = ven.get(k, 0.0)
-        if net > ven_sz + SZ_TOL:
-            ghosts.append((k, net - ven_sz))
-    unrecorded = [(k, sz) for k, sz in ven.items()
-                  if sz > nets.get(k, 0.0) + SZ_TOL]
+    verdict = classify(args.profile, by_key, nets, ven)
+    ghosts = verdict["ghosts"]
+    over_closed = verdict["over_closed"]
+    unrecorded = verdict["unrecorded"]
+    exact, fuzzy = verdict["exact"], verdict["fuzzy"]
 
     if over_closed:
         print(f"\n[OVER_CLOSED] {len(over_closed)} 组（账本净持仓为负=close 多于 open，"
@@ -675,53 +980,6 @@ def main():
         print("\n结论: 无幽灵仓（账本 ≤ 现仓）✓")
         con.close()
         return 0
-
-    exact, fuzzy = [], []
-    for (sym, side), ghost_sz in ghosts:
-        rows = by_key[(sym, side)]
-        opens = [parse_ts(r["ts"]) for r in rows
-                 if (r["action"] or "").lower() in ("open", "add")]
-        opens = [d for d in opens if d is not None]
-        if not opens:
-            fuzzy.append(((sym, side), ghost_sz, "账本无可解析的 open 行 ts", []))
-            continue
-        t0_dt = min(opens) - timedelta(minutes=OPEN_TS_BUFFER_MIN)
-        t0_ms = int(t0_dt.timestamp() * 1000)
-        try:
-            fills = fetch_reduce_fills(args.profile, sym, side, t0_ms)
-        except Exception as e:  # noqa: BLE001
-            fuzzy.append(((sym, side), ghost_sz, f"fills API 失败: {e}", []))
-            continue
-        groups = group_by_ord(fills)
-        remaining, notes = consume_recorded(groups, rows, t0_dt)
-        rem_sz = sum(g["sz"] for g in remaining)
-        detail = [f"窗口起点 {t0_dt.strftime(TS_FMT)}，平仓腿 fills {len(fills)} 笔 / "
-                  f"{len(groups)} 组，销账后剩 {len(remaining)} 组合计 {rem_sz:g} 张"]
-        detail += notes
-        for g in remaining:
-            detail.append(f"  剩余组 ordId={g['ordId']} sz={g['sz']:g} "
-                          f"px≈{g['wavg_px']:.6g} pnl={g['pnl']:+.6g} "
-                          f"t={fill_dt(g['t_last_ms']).strftime(TS_FMT)}")
-        if remaining and abs(rem_sz - ghost_sz) <= SZ_TOL:
-            exact.append(((sym, side), ghost_sz, remaining, detail))
-            continue
-        # 规则 b：唯一单组 sz == 幽灵 sz（其余剩余组=独立未记账成交，只报告不写）
-        hits = [g for g in remaining if abs(g["sz"] - ghost_sz) <= SZ_TOL]
-        if len(hits) == 1:
-            leftover = [g for g in remaining if g is not hits[0]]
-            detail.append(f"  规则b命中：唯一 ordId={hits[0]['ordId']} 组 "
-                          f"sz={hits[0]['sz']:g} == 幽灵 sz；其余 {len(leftover)} 组"
-                          f"为独立未记账成交（只报告不写）")
-            for g in leftover:
-                detail.append(f"  [LEFTOVER] ordId={g['ordId']} sz={g['sz']:g} "
-                              f"px≈{g['wavg_px']:.6g} pnl={g['pnl']:+.6g} "
-                              f"t={fill_dt(g['t_last_ms']).strftime(TS_FMT)} "
-                              f"—— 疑似未记账小额往返（净额自平），人工核")
-            exact.append(((sym, side), ghost_sz, hits, detail))
-        else:
-            reason = (f"剩余 fills 组无法唯一对齐幽灵 sz（sz 相等组 {len(hits)} 个）"
-                      if remaining else "窗口内无未销账的平仓 fills")
-            fuzzy.append(((sym, side), ghost_sz, reason, detail))
 
     for (sym, side), ghost_sz, matched, detail in exact:
         close_dt = fill_dt(max(g["t_last_ms"] for g in matched))

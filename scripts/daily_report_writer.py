@@ -90,7 +90,8 @@ def _snapshot_equity(db_path, profile: str, as_of_ts: str | None = None):
                     "ORDER BY datetime(ts) DESC,rowid DESC LIMIT 1", (profile, as_of_ts)).fetchone()
             else:
                 r = con.execute(
-                    "SELECT totalEq FROM account_snapshots WHERE profile=? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT totalEq FROM account_snapshots WHERE profile=? "
+                    "ORDER BY ts DESC,rowid DESC LIMIT 1",
                     (profile,)).fetchone()
         finally:
             con.close()
@@ -109,23 +110,25 @@ def _authoritative_cum_pnl(db_path, profile: str, as_of_ts: str | None = None):
         return None
 
 
-def _account_bill_net_for_day(
-    db_path, profile: str, date_str: str, as_of_ts: str
+def _account_bill_net_for_window(
+    db_path, profile: str, start_ts: str, end_ts: str
 ):
-    """OKX 账单当日净变动：交易(type=2)+资金费(type=8)，含手续费。
+    """OKX 账单复盘周期净变动：交易(type=2)+资金费(type=8)，含手续费。
 
     返回值带账单覆盖上限，避免把尚未采到报告时点的部分账单冒充完整日净收益。
     """
     try:
-        con = sqlite3.connect(str(db_path))
+        path = Path(db_path).resolve()
+        con = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10)
         try:
             row = con.execute(
                 "SELECT SUM(COALESCE(bal_change,0)),"
                 "SUM(COALESCE(fee,0)),SUM(COALESCE(pnl,0)),"
                 "MIN(ts),MAX(ts),COUNT(*) FROM account_bills "
                 "WHERE profile=? AND type IN ('2','8') "
-                "AND ts>=? AND ts<=?",
-                (profile, f"{date_str} 00:00:00", as_of_ts),
+                "AND ts>=? AND ts<?",
+                (profile, start_ts, end_ts),
             ).fetchone()
         finally:
             con.close()
@@ -136,6 +139,8 @@ def _account_bill_net_for_day(
             "fees": float(row[1] or 0),
             "pnl_and_funding": float(row[2] or 0),
             "first_ts": row[3], "last_ts": row[4], "rows": int(row[5]),
+            "period_start_ts": start_ts, "period_end_ts": end_ts,
+            "period_end_exclusive": True,
         }
     except Exception:
         return None
@@ -163,7 +168,8 @@ def _snapshot_positions_summary(db_path, profile: str, as_of_ts: str | None = No
                     "ORDER BY datetime(ts) DESC,rowid DESC LIMIT 1", (profile, as_of_ts)).fetchone()
             else:
                 batch = con.execute(
-                    "SELECT ts FROM position_snapshots WHERE profile=? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT ts FROM position_snapshots WHERE profile=? "
+                    "ORDER BY ts DESC,rowid DESC LIMIT 1",
                     (profile,)).fetchone()
             if not batch:
                 return None
@@ -689,7 +695,12 @@ def _prepare_trade_payload(
     period_kind: str,
 ) -> dict:
     """Hydrate report metrics from fill/intent ledgers and audit overrides."""
-    out = dict(payload)
+    out = {
+        **payload,
+        "period_start_ts": trade_report_stats.fmt_ts(start_ts),
+        "period_end_ts": trade_report_stats.fmt_ts(end_ts),
+        "period_end_exclusive": bool(end_exclusive),
+    }
     stats_by_profile = {}
     corrections = []
     paths = {"live": LIVE_TRADES_DB, "demo": DEMO_TRADES_DB}
@@ -771,7 +782,7 @@ def _prepare_trade_payload(
 
 
 def prepare_daily_payload(payload: dict) -> dict:
-    """Make filled trades/reject attempts authoritative for a daily report."""
+    """Make the fixed trailing-24h facts authoritative for a daily report."""
     report_ts = trade_report_stats.fmt_ts(payload.get("ts") or now_cst())
     start_ts, end_ts = trade_report_stats.daily_window(report_ts)
     out = {**payload, "ts": report_ts}
@@ -779,26 +790,31 @@ def prepare_daily_payload(payload: dict) -> dict:
         out,
         start_ts=start_ts,
         end_ts=end_ts,
-        end_exclusive=False,
+        end_exclusive=True,
         include_avg_hold=False,
         period_kind="daily",
     )
 
 
 def prepare_weekly_payload(payload: dict) -> dict:
-    """Use the previous complete Monday-to-Monday interval for weekly facts."""
+    """Use the previous complete Monday-to-Monday interval for weekly facts.
+
+    事实窗锚在 08:00（`[上周一 08:00, 本周一 08:00)`），与日报同相位，
+    使一周七份日报恰好平铺该区间；`week_start_ts` 仍是 本周一 00:00:00 报告键。
+    """
     week_start_raw = payload.get("week_start_ts")
     if not week_start_raw:
         raise ValueError(
             "weekly 必填 week_start_ts（报告键：本周一 00:00:00）")
     week_start = trade_report_stats.parse_cst(str(week_start_raw))
+    default_start, default_end = trade_report_stats.weekly_window(week_start)
     start_ts = payload.get("period_start_ts")
     if start_ts:
         start = trade_report_stats.fmt_ts(start_ts)
     else:
-        start = (week_start - timedelta(days=7)).strftime(TS_FMT)
+        start = default_start
     end = trade_report_stats.fmt_ts(
-        payload.get("period_end_ts") or week_start.strftime(TS_FMT))
+        payload.get("period_end_ts") or default_end)
     out = {
         **payload,
         "week_start_ts": week_start.strftime(TS_FMT),
@@ -1286,7 +1302,7 @@ def rewrite_null_and_renumber(con, apply: bool) -> dict:
 
 
 def write_markdown(payload: dict, apply: bool) -> str:
-    """写 reports/daily-reports/daily-YYYY-MM-DD.md（v7.3 交易 PnL + 账户账单净变动）"""
+    """写 reports/daily-reports/daily-YYYY-MM-DD.md（v7.4 固定24h复盘窗口）"""
     if not apply:
         ts = payload.get("ts", now_cst())
         date_str = ts[:10]
@@ -1299,6 +1315,15 @@ def write_markdown(payload: dict, apply: bool) -> str:
     date_str = ts[:10]
     path = REPORTS_DIR / f"daily-{date_str}.md"
     _augment_operational_anomalies(payload)
+    default_start, default_end = trade_report_stats.daily_window(ts)
+    period_start_ts = trade_report_stats.fmt_ts(
+        payload.get("period_start_ts") or default_start)
+    period_end_ts = trade_report_stats.fmt_ts(
+        payload.get("period_end_ts") or default_end)
+    period_end_exclusive = bool(
+        payload.get("period_end_exclusive", True))
+    if not period_end_exclusive:
+        raise ValueError("日报复盘窗口必须使用右开区间 [start,end)")
 
     # v7.0e.1: live / demo 数据分别读
     def v(prefix, key, default=0):
@@ -1312,7 +1337,8 @@ def write_markdown(payload: dict, apply: bool) -> str:
     live_eq = _live_eq_db if _live_eq_db is not None else (_live_eq or 0)
     _live_cum_db = _authoritative_cum_pnl(DB_PATH, 'live', ts)
     live_realized_pnl = _live_cum_db if _live_cum_db is not None else v('live', 'realized_pnl', 0)
-    live_bill_net = _account_bill_net_for_day(DB_PATH, 'live', date_str, ts)
+    live_bill_net = _account_bill_net_for_window(
+        DB_PATH, 'live', period_start_ts, period_end_ts)
     live_open = v('live', 'open_count')
     live_close = v('live', 'close_count')
     live_pnl_today = v('live', 'total_pnl', 0)
@@ -1337,7 +1363,8 @@ def write_markdown(payload: dict, apply: bool) -> str:
         )
     _demo_cum_db = _authoritative_cum_pnl(DB_PATH, 'demo', ts)
     demo_realized_pnl = _demo_cum_db if _demo_cum_db is not None else v('demo', 'realized_pnl', 0)
-    demo_bill_net = _account_bill_net_for_day(DB_PATH, 'demo', date_str, ts)
+    demo_bill_net = _account_bill_net_for_window(
+        DB_PATH, 'demo', period_start_ts, period_end_ts)
     try:
         le, de = float(live_eq), float(demo_eq)
         lr, dr = float(live_realized_pnl), float(demo_realized_pnl)
@@ -1394,10 +1421,11 @@ def write_markdown(payload: dict, apply: bool) -> str:
         if demo_bill_net else "账单未覆盖"
     )
 
-    md = f"""# 📊 小灵日报 {date_str}（v7.3 交易PnL + 账户账单净变动）
+    md = f"""# 📊 小灵日报 {date_str}（v7.4 固定24h复盘窗口）
 
-> 自动生成 by daily_report_writer.py (P7 复盘写入器) — v7.3 收益口径拆分
+> 自动生成 by daily_report_writer.py (P7 复盘写入器) — v7.4 收益口径拆分
 > ts: {ts} | live/demo 同日共享 trade_day_num（见 db）
+> 统计窗口: [{period_start_ts}, {period_end_ts})，UTC+8（固定24小时）
 > **报告状态：{report_banner}**
 > report_revision: {revision_number} | revision_kind: {revision_kind} | resend_review_required: {str(resend_review_required).lower()} | auto_resend: false
 
@@ -1410,17 +1438,17 @@ def write_markdown(payload: dict, apply: bool) -> str:
 |---|---|
 | 资金总额 | ${float(live_eq):.2f} |
 | 累计交易PnL（未扣手续费/资金费） | ${float(live_realized_pnl):.2f} |
-| 当日账户账单净变动（含手续费/资金费） | {live_bill_line} |
+| 本复盘周期账户账单净变动（含手续费/资金费） | {live_bill_line} |
 
 ### 🟡 模拟盘（demo）
 | 项 | 数值 |
 |---|---|
 | 资金总额 | ${float(demo_eq):.2f} |
 | 累计交易PnL（未扣手续费/资金费） | ${float(demo_realized_pnl):.2f} |
-| 当日账户账单净变动（含手续费/资金费） | {demo_bill_line} |
+| 本复盘周期账户账单净变动（含手续费/资金费） | {demo_bill_line} |
 
 > 累计交易PnL = 冻结基线 + reset 后 trades.pnl；不含手续费、资金费和浮动盈亏。
-> 当日账户账单净变动 = OKX account_bills 中 type=2/8 的 bal_change；仅代表上表注明的采集覆盖时段。
+> 本复盘周期账户账单净变动 = OKX account_bills 中 type=2/8 的 bal_change；严格使用上方固定24小时统计窗口，仅代表注明的账单采集覆盖。
 
 > 严禁 live+demo 收益混合 / 用 demo 收益粉饰 live
 
@@ -1435,16 +1463,16 @@ def write_markdown(payload: dict, apply: bool) -> str:
 ## 🎯 交易（实盘 / 模拟盘分开）
 
 ### 🟢 实盘
-- 今日成交开仓: {int(live_open)} 笔
-- 今日成交平仓: {int(live_close)} 笔
+- 本复盘周期成交开仓: {int(live_open)} 笔
+- 本复盘周期成交平仓: {int(live_close)} 笔
 - 开仓尝试被风控拒绝: {live_rejects}
 - 净 PnL: ${float(live_pnl_today):.2f}
 - 手续费: ${float(live_fees):.2f}
 - 最佳: {live_best} | 最差: {live_worst}
 
 ### 🟡 模拟盘
-- 今日成交开仓: {int(demo_open)} 笔
-- 今日成交平仓: {int(demo_close)} 笔
+- 本复盘周期成交开仓: {int(demo_open)} 笔
+- 本复盘周期成交平仓: {int(demo_close)} 笔
 - 开仓尝试被风控拒绝: {demo_rejects}
 - 净 PnL: ${float(demo_pnl_today):.2f}
 - 手续费: ${float(demo_fees):.2f}
@@ -1476,7 +1504,7 @@ def write_markdown(payload: dict, apply: bool) -> str:
 
 ---
 
-🤖 自动生成 by 小灵 🧚‍♀️ | {now_cst()} CST | daily_report_writer.py v1.3 (v7.3)
+🤖 自动生成 by 小灵 🧚‍♀️ | {now_cst()} CST | daily_report_writer.py v1.4 (v7.4)
 """
     _atomic_write_text(path, md)
     print(f"[OK] wrote markdown: {path} ({path.stat().st_size}B)")

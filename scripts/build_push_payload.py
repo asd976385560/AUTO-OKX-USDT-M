@@ -344,7 +344,7 @@ def _latest_position_snapshot(db_root, prof, as_of):
     batches = _rows(
         db_root, "account.db",
         "SELECT ts,MAX(rowid) AS batch_rowid FROM position_snapshots "
-        "WHERE profile=? GROUP BY ts ORDER BY batch_rowid DESC",
+        "WHERE profile=? GROUP BY ts ORDER BY ts DESC",
         (prof,),
     )
     candidates = []
@@ -418,9 +418,20 @@ def _usd_broad_summary(macro: dict) -> str:
     if legacy:
         return _short_dxy(legacy)
     value = _float_or_none(
-        macro.get("dxy_broad_usd_trade_weighted",
-                  macro.get("usd_broad")))
-    zone = str(macro.get("dxy_zone") or "").strip()
+        macro.get(
+            "dxy_broad_usd_trade_weighted",
+            macro.get(
+                "dxy_broad_value",
+                macro.get("usd_broad_dtwexbgs", macro.get("usd_broad")),
+            ),
+        )
+    )
+    zone = str(
+        macro.get("dxy_broad_zone")
+        or macro.get("dxy_zone")
+        or macro.get("usd_broad_zone")
+        or ""
+    ).strip()
     parts = ["USD_BROAD"]
     if value is not None:
         parts.append(str(_r2(value)))
@@ -431,7 +442,8 @@ def _usd_broad_summary(macro: dict) -> str:
 
 def latest_cycle(db_root: str) -> str | None:
     r = _one(db_root, "analysis.db",
-             "SELECT cycle_id FROM analysis_runs ORDER BY rowid DESC LIMIT 1")
+             "SELECT cycle_id FROM analysis_runs "
+             "ORDER BY ts DESC,rowid DESC LIMIT 1")
     return r["cycle_id"] if r else None
 
 
@@ -467,7 +479,7 @@ def _action_from_trades(trades: list) -> str | None:
 def _map_decision(dec: str) -> str:
     d = str(dec or "").lower()
     return {"traded": "TRADED", "hold": "HOLD", "skip": "WAIT",
-            "degraded": "HOLD"}.get(d, "HOLD")
+            "degraded": "DEGRADED", "error": "ERROR"}.get(d, "UNKNOWN")
 
 
 def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
@@ -511,7 +523,11 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     action = _action_from_trades(all_trades)
     if action in (None, "TRADED"):
         decs = [_map_decision(books[p]["tc"].get("decision")) for p in ("live", "demo")]
-        action = "HOLD" if "HOLD" in decs else (decs[0] if decs else "HOLD")
+        action = next(
+            (label for label in ("ERROR", "DEGRADED", "UNKNOWN", "HOLD", "WAIT", "TRADED")
+             if label in decs),
+            "UNKNOWN",
+        )
 
     if all_trades:
         syms, seen = [], set()
@@ -532,7 +548,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     # ── summary（确定性组装，含市场实质）────────────────
     _ACTION_CN = {"HOLD": "HOLD 维持", "WAIT": "WAIT 观望", "OPEN_LONG": "开多",
                   "OPEN_SHORT": "开空", "CLOSE": "平仓", "STOP_LOSS": "止损",
-                  "ADJUST": "调整", "ADD": "加仓", "REDUCE": "减仓", "TRADED": "已成交"}
+                  "ADJUST": "调整", "ADD": "加仓", "REDUCE": "减仓",
+                  "TRADED": "已成交", "DEGRADED": "DEGRADED 降级",
+                  "ERROR": "ERROR 失败", "UNKNOWN": "UNKNOWN 未知"}
     def _action_cn(value):
         return "/".join(_ACTION_CN.get(part, part) for part in str(value).split("/"))
 
@@ -659,7 +677,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         # ctVal/净值缺失 → 字段 None，render 静默省略（不断行）。
         eqr = _one(db_root, "account.db",
                    "SELECT totalEq FROM account_snapshots WHERE profile=? "
-                   "ORDER BY rowid DESC LIMIT 1", (prof,))
+                   "ORDER BY ts DESC,rowid DESC LIMIT 1", (prof,))
         eq = eqr["totalEq"] if eqr and isinstance(eqr["totalEq"], (int, float)) \
             and eqr["totalEq"] > 0 else None
         out = []
@@ -692,7 +710,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     def _assets(prof):
         a = _one(db_root, "account.db",
                  "SELECT totalEq,availBal,upl FROM account_snapshots "
-                 "WHERE profile=? ORDER BY rowid DESC LIMIT 1", (prof,)) or {}
+                 "WHERE profile=? ORDER BY ts DESC,rowid DESC LIMIT 1",
+                 (prof,)) or {}
         cum = None
         try:
             sys.path.insert(0, _project_path('scripts'))
@@ -708,30 +727,181 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     assets = {"live": _assets("live"), "demo": _assets("demo")}
 
     # ── 风控段（确定性计算）───────────────────────────────
-    def _single_trade_margin_pct():
-        """本 cycle 各盘 OPEN/ADD 中最大的单笔保证金占净值比例。
+    def _walk_mappings(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from _walk_mappings(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from _walk_mappings(child)
 
-        MAX_MARGIN_PCT=20% 是“每笔交易”硬上限，不是组合总占用上限。旧实现用
-        ``(totalEq-availBal)/totalEq`` 冒充单笔比例；多币种账户的 totalEq 含 BTC/ETH/OKB，
-        availBal 却只是 USDT，二者相减既不是保证金、也不是单笔口径。
+    def _live_portfolio_imr_summary():
+        """组装 Live 组合 IMR 展示证据。
+
+        当前值与预计值只接受本轮 executor ``risk.math`` 中由同次 Live balance
+        生成的 canonical 字段。没有权威 ``account.imr/totalEq`` 证据时保持空值，
+        不用逐仓保证金求和、``mgnRatio``、gross 或 net 猜测组合 IMR。
         """
-        values = []
-        for prof in ("live", "demo"):
-            eq = _float_or_none(assets[prof].get("equity"))
-            if eq is None or eq <= 0:
+        candidates = []
+        for node in _walk_mappings(books["live"].get("raw")):
+            current_ratio = _float_or_none(
+                node.get("current_portfolio_imr_ratio"))
+            projected_ratio = _float_or_none(
+                node.get("projected_portfolio_imr_ratio"))
+            if current_ratio is None and projected_ratio is None:
                 continue
-            for trade in books[prof]["trades"]:
-                if str(trade.get("action") or "").lower() not in _OPEN:
-                    continue
-                margin = _float_or_none(trade.get("margin"))
-                if margin is None:
-                    notional = _float_or_none(trade.get("notional"))
-                    lev = _float_or_none(trade.get("lev"))
-                    if notional is not None and lev is not None and lev > 0:
-                        margin = abs(notional) / lev
-                if margin is not None and margin >= 0:
-                    values.append(abs(margin) / eq * 100)
-        return round(max(values), 2) if values else None
+            if ((current_ratio is not None and current_ratio < 0)
+                    or (projected_ratio is not None and projected_ratio < 0)):
+                continue
+            candidates.append({
+                "account_imr": _float_or_none(node.get("account_imr")),
+                "incremental_order_imr": _float_or_none(
+                    node.get("incremental_order_imr")),
+                "projected_account_imr": _float_or_none(
+                    node.get("projected_account_imr")),
+                "current_portfolio_imr_ratio": current_ratio,
+                "projected_portfolio_imr_ratio": projected_ratio,
+                "max_portfolio_imr_ratio": _float_or_none(
+                    node.get("max_portfolio_imr_ratio")),
+                "portfolio_imr_ratio_unit": str(
+                    node.get("portfolio_imr_ratio_unit") or "fraction"),
+                "portfolio_imr_source": str(
+                    node.get("portfolio_imr_source")
+                    or "account.balance.imr"),
+            })
+
+        # 同一 cycle 若有多个 OPEN/ADD 尝试，选择预计比例最高的一条完整 risk
+        # 记录作保守展示，但绝不把不同记录的金额/比率拼成一个伪快照。
+        selected = max(
+            candidates,
+            key=lambda item: (
+                item["projected_portfolio_imr_ratio"]
+                if item["projected_portfolio_imr_ratio"] is not None
+                else item["current_portfolio_imr_ratio"]
+            ),
+            default={},
+        )
+
+        return {
+            "account_imr": _r2(selected.get("account_imr")),
+            "incremental_order_imr": _r2(
+                selected.get("incremental_order_imr")),
+            "projected_account_imr": _r2(
+                selected.get("projected_account_imr")),
+            "current_portfolio_imr_ratio": selected.get(
+                "current_portfolio_imr_ratio"),
+            "projected_portfolio_imr_ratio": selected.get(
+                "projected_portfolio_imr_ratio"),
+            "max_portfolio_imr_ratio": (
+                selected.get("max_portfolio_imr_ratio") or 0.666
+            ),
+            "portfolio_imr_ratio_unit": selected.get(
+                "portfolio_imr_ratio_unit", "fraction"),
+            "portfolio_imr_source": selected.get(
+                "portfolio_imr_source", "account.balance.imr"),
+            "current_portfolio_imr_source": selected.get(
+                "portfolio_imr_source"),
+        }
+
+    def _demo_capacity_summary():
+        """提取 Demo OPEN 的交易所实时容量留痕，绝不以快照 availBal 兜底。"""
+        raw = books["demo"].get("raw")
+        candidates = []
+        seen = set()
+        for node in _walk_mappings(raw):
+            source = str(node.get("source") or "")
+            has_exchange_cap = any(
+                node.get(key) not in (None, "")
+                for key in (
+                    "max_size", "exchange_max_sz", "exchange_max_size",
+                    "max_sz_exchange",
+                )
+            )
+            if "max-size" not in source and not has_exchange_cap:
+                continue
+            direction_field = node.get(
+                "direction_field", node.get("side_field"))
+            exchange_max = _float_or_none(node.get("max_size"))
+            if exchange_max is None:
+                exchange_max = _float_or_none(node.get("exchange_max_sz"))
+            if exchange_max is None:
+                exchange_max = _float_or_none(node.get("exchange_max_size"))
+            if exchange_max is None:
+                exchange_max = _float_or_none(node.get("max_sz_exchange"))
+            if exchange_max is None:
+                exchange_max = _float_or_none(node.get("direction_value"))
+            if exchange_max is None:
+                if str(direction_field).lower() == "maxsell":
+                    exchange_max = _float_or_none(
+                        node.get("max_sell", node.get("maxSell")))
+                else:
+                    exchange_max = _float_or_none(
+                        node.get("max_buy", node.get("maxBuy")))
+            key = (
+                str(node.get("inst_id") or node.get("instId") or
+                    node.get("symbol") or ""),
+                str(node.get("side") or ""),
+                str(direction_field or ""),
+                exchange_max,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "source": source or "account.max-size",
+                "profile": "demo",
+                "inst_id": key[0] or None,
+                "side": key[1] or None,
+                "td_mode": node.get("td_mode", node.get("tdMode")),
+                "direction_field": direction_field,
+                "direction_value": _float_or_none(node.get("direction_value")),
+                "max_size": exchange_max,
+                "exchange_max_sz": exchange_max,
+                "requested_lev": _float_or_none(node.get("requested_lev")),
+                "effective_lev": _float_or_none(node.get("effective_lev")),
+            })
+
+        opens = [
+            trade for trade in books["demo"]["trades"]
+            if str(trade.get("action") or "").lower() in _OPEN
+        ]
+        entries = []
+        for trade in opens:
+            symbol = str(trade.get("symbol") or "")
+            side = str(trade.get("side") or "").lower()
+            cap = next(
+                (item for item in candidates
+                 if (not item.get("inst_id") or item.get("inst_id") == symbol)
+                 and (not item.get("side")
+                      or str(item.get("side")).lower() == side)),
+                {},
+            )
+            entries.append({
+                **cap,
+                "inst_id": cap.get("inst_id") or symbol or None,
+                "side": cap.get("side") or trade.get("side"),
+                "actual_open_sz": _float_or_none(trade.get("sz")),
+                "effective_lev": (
+                    cap.get("effective_lev")
+                    if cap.get("effective_lev") is not None
+                    else _float_or_none(trade.get("lev"))
+                ),
+            })
+        if not entries and candidates:
+            # REJECT 轮也保留实时容量证据，但明确没有实际成交。
+            entries = [{**item, "actual_open_sz": None} for item in candidates]
+        first = entries[0] if entries else {}
+        return {
+            "sizing_policy": "okx_demo_max_size_only",
+            "entries": entries,
+            "source": first.get("source"),
+            "inst_id": first.get("inst_id"),
+            "actual_open_sz": first.get("actual_open_sz"),
+            "max_size": first.get("max_size"),
+            "exchange_max_sz": first.get("exchange_max_sz"),
+            "effective_lev": first.get("effective_lev"),
+        }
 
     def _side_pct(pos):
         # 2026-07-15：改用真名义 notional_usd 加权（旧 sz×avgPx 漏乘 ctVal，跨币种权重
@@ -748,28 +918,28 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         return round(max(longn, total - longn) / total * 100, 1)
 
     live_lev = max((p["lev"] or 0 for p in live_pos), default="-")
-    position_margin_pcts = [
-        float(p["margin_pct"])
-        for p in positions
-        if isinstance(p.get("margin_pct"), (int, float)) and p["margin_pct"] >= 0
-    ]
+    live_portfolio_imr = _live_portfolio_imr_summary()
     risk = {
-        "margin_pct": _single_trade_margin_pct(),
-        "margin_pct_scope": "max_current_cycle_open_trade",
-        # 无 OPEN/ADD 的轮次不能把存量仓位冒充“单笔 20%”硬闸值；另给一个
-        # 明确标注为观察口径的当前最大持仓保证金，避免简报长期显示裸 “-”。
-        "max_position_margin_pct": (
-            round(max(position_margin_pcts), 2) if position_margin_pcts else None
-        ),
-        "max_position_margin_pct_scope": "max_current_position_observation",
+        # 新 payload 只发组合 IMR 契约；旧 margin_pct/live_margin_pct 仅由
+        # render 对历史 payload 做只读兼容，本 builder 不再生成。
+        **live_portfolio_imr,
+        "demo_capacity": _demo_capacity_summary(),
         "available_margin": {
             "live_usdt": assets["live"].get("availBal"),
             "demo_usdt": assets["demo"].get("availBal"),
+            "demo_scope": "account_snapshot_display_only_not_open_capacity",
         },
         "lev": live_lev if live_lev != 0 else "-",
         "side_pct": _side_pct(live_pos),
         "position_count": len(live_pos),
-        "status": "PASS" if books["live"]["tc"].get("decision") != "degraded" else "DEGRADED",
+        "status": (
+            "PASS"
+            if str(books["live"]["tc"].get("decision") or "").lower()
+            in {"traded", "hold", "skip"}
+            else str(
+                books["live"]["tc"].get("decision") or "UNKNOWN"
+            ).upper()
+        ),
     }
 
     # ── 行情段（真价，修 ETH 抄占位价 bug）────────────────
@@ -796,8 +966,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     exceptions = [{"name": f["source"], "status": f["status"],
                    "detail": (f["err"] or "-")[:120]} for f in faults]
     for p in ("live", "demo"):
-        if books[p]["tc"].get("decision") == "degraded":
-            exceptions.append({"name": f"{p}_trader", "status": "degraded",
+        decision = str(books[p]["tc"].get("decision") or "").lower()
+        if decision in {"degraded", "error"}:
+            exceptions.append({"name": f"{p}_trader", "status": decision,
                                "detail": str(books[p]["tc"].get("note"))[:120]})
 
     # ── HH:01 宏观 + 全市场段（:00 整点，恢复 agent 每整点带的段）──
@@ -870,6 +1041,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             "tvl": (f"{_tvl / 1e9:.1f}B" if isinstance(_tvl, (int, float)) else "-"),
             "degraded_sources": ",".join(f["source"] for f in faults) or "无",
         }
+        # 下面两处 MAX(ts) 取最新批次：本表 ts 全列统一 UTC-Z（ts_audit MIXED=0），词典序即
+        # 时序，走覆盖索引 ~2ms。勿改 rowid DESC（INSERT OR REPLACE 会改 rowid）；勿改
+        # datetime(ts)（临时 B 树全排序 ~436ms，本函数每 15min 跑）。2026-07-29 审计实测。
         try:  # 全市场 TOP 涨跌 + 资金费异常
             tks = [t for t in _rows(db_root, "market.db",
                    "SELECT symbol,chg24h FROM tick_snapshots WHERE ts=("

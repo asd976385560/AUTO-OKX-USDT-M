@@ -8,7 +8,8 @@ okx-daily-maintenance，07:55 起跑）。
         ③ quality_metrics.py（质量指标；完成后立即原子发布 reviewer ready handoff）
         ④ ledger_invariants.py（只读：近24h重复执行、负净仓、经验数量错配、
           未决/含糊执行意图；有发现 rc=1，使日维护失败外显，不自动补单/改账）
-        ⑤ log_rotate.py --apply --days 7（logs/trigger+push 超 7 天轮转）
+        ⑤ log_rotate.py --apply --days 7 --dirs trigger,push,stage-status
+          （三类高频调试日志超 7 天轮转）
         ⑥ audit_snapshot.py（audit_events 增量导出，防滚动窗丢失）
         ⑦ reports_rotate.py --apply（reports/agents+push 超 30 天月度压包，
           封顶无界增长——2026-07-17 主人拍板）
@@ -16,7 +17,8 @@ okx-daily-maintenance，07:55 起跑）。
         ⑨ collect_macro_events.py（未来7天高重要度经济日历）
 每步独立 fail-safe：一步失败/超时不阻断下一步；任一失败聚合 exit 1（cron 记 error
 可见），全过 exit 0。新增日频运维项往这里加，不再开新 cron。
-注意：本 cron 含会修改 demo 账本的 reconcile；隔离测试期间必须随业务 cron 一并停用。
+注意：本 cron 因含 reconcile（demo 会真动账本）已入 fulltest BUSINESS_CRONS——
+测试窗内随业务 cron 一并停/复。
 """
 from __future__ import annotations
 
@@ -71,7 +73,11 @@ STEPS = [
         str(SCRIPTS / "ledger_invariants.py"),
         "--profile", "both", "--window-min", "1440", "--compact",
     ], 120, (0,)),
-    ("log_rotate", [str(SCRIPTS / "log_rotate.py"), "--apply", "--days", "7"], 120, (0,)),
+    ("log_rotate", [
+        str(SCRIPTS / "log_rotate.py"),
+        "--apply", "--days", "7",
+        "--dirs", "trigger,push,stage-status",
+    ], 120, (0,)),
     ("audit_snapshot", [str(SCRIPTS / "audit_snapshot.py")], 120, (0,)),
     ("reports_rotate", [str(SCRIPTS / "reports_rotate.py"), "--apply"], 120, (0,)),
     # 公开日频宏观：rc=2 表示部分可选源不可达；数据自身 freshness 另行外显，

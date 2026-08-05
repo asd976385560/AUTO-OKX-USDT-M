@@ -15,7 +15,7 @@ v3（2026-07-03）：对账基准切 V2.0 真账本 demo_trades.db（trades 轧�
 
 退出码: 0=账实一致；1=仅 pnl 待回填（drill 历史行,良性）；3=ghost/unrecorded/sz_diff 账实差异；2=API/库错误
 用法: ... run_okx_python.ps1 scripts/demo_account_check.py [--db-root <PROJECT_ROOT>\\db]
-写维护不在公开版本中提供；请先备份，并通过经过复核的独立流程处理。
+写维护统一走 scripts/drill_reconcile.py --apply --backup-dir <目录>。
 """
 
 import os as _project_os
@@ -176,14 +176,15 @@ def main():
     ap.add_argument(
         "--apply",
         action="store_true",
-        help="已停用；公开版本仅提供只读核对",
+        help="已停用；写维护统一走 drill_reconcile.py",
     )
     ap.add_argument("--backup-dir", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.apply:
         print(
-            "[demo_check][ERROR] 本脚本只读；公开版本不提供自动写维护"
+            "[demo_check][ERROR] 本脚本只读；写维护请使用 "
+            "drill_reconcile.py --apply --backup-dir <目录>"
         )
         sys.exit(2)
 
@@ -205,7 +206,10 @@ def main():
         f"{datetime.now(timezone.utc).strftime('%H:%M:%S')}Z (REPORT-ONLY) =="
     )
     print(f"DEMO_EQUITY totalEq={total_eq} availBal={avail} upl={round(upl_sum,4)} source=OKX_API")
-    print(f"（↑ demo equity 唯一口径：P5 current_equity / 推送『模拟盘资金』一律用 totalEq={total_eq}）")
+    print(
+        f"（↑ demo 资产/绩效展示唯一口径：P5 current_equity / 推送『模拟盘资金』"
+        f"一律用 totalEq={total_eq}；非开仓容量，OPEN 只认实时 max-size）"
+    )
     print(f"虚拟盘 {len(ven)} 仓: " + ("; ".join(ven_detail) if ven_detail else "空"))
 
     # 2026-07-03 对账基准切换（主人拍板）：drill.db.drill_trades（V1.x 演练账本，06-13 起死库，
@@ -274,7 +278,7 @@ def main():
         print("\n结论: 账实差异（exit 3：ghost/unrecorded/sz_diff，基准=demo_trades.db 轧差）")
         sys.exit(3)
     if notes and any("pnl=" in x for x in notes):
-        print("\n结论: 仅 pnl 待维护（exit 1；公开版本不自动写维护）")
+        print("\n结论: 仅 pnl 待维护（exit 1；写维护统一走 drill_reconcile.py）")
         sys.exit(1)
     print("\n结论: 账实一致 ✓")
     sys.exit(0)

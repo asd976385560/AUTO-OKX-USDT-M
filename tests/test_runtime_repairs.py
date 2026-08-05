@@ -285,7 +285,7 @@ class DailyInspectionRegressionTests(unittest.TestCase):
 
             results = []
             with mock.patch.dict(
-                os.environ, {"OPENCLAW_STATE_DB": str(openclaw_db)}, clear=False
+                os.environ, {"OKX_OPENCLAW_STATE_DB": str(openclaw_db)}, clear=False
             ):
                 query_state.check_collection_failures(
                     str(root), stale_min=15, hh01_only=False, results=results
@@ -295,6 +295,23 @@ class DailyInspectionRegressionTests(unittest.TestCase):
         self.assertEqual(len(results[0]["collection_errors"]), 1)
         self.assertEqual(len(results[0]["cron_errors"]), 1)
         self.assertEqual(len(results[0]["active_cron_errors"]), 1)
+
+    def test_prefixed_openclaw_state_db_wins_over_legacy_alias(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OKX_OPENCLAW_STATE_DB": "preferred.sqlite",
+                "OPENCLAW_STATE_DB": "legacy.sqlite",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                query_state._openclaw_state_db(), "preferred.sqlite")
+
+        with mock.patch.dict(
+            os.environ, {"OPENCLAW_STATE_DB": "legacy.sqlite"}, clear=True
+        ):
+            self.assertEqual(query_state._openclaw_state_db(), "legacy.sqlite")
 
     def test_regime_check_prefers_authoritative_public_macro_observations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,6 +374,84 @@ class DailyInspectionRegressionTests(unittest.TestCase):
 
 
 class ExecutionAndPushContractTests(unittest.TestCase):
+    @staticmethod
+    def _render_without_authoritative_overrides(payload):
+        with (
+            mock.patch.object(
+                render_push_report,
+                "authoritative_cycle_count",
+                return_value=None,
+            ),
+            mock.patch.object(
+                render_push_report,
+                "authoritative_cycle_duration",
+                return_value=None,
+            ),
+            mock.patch.object(
+                render_push_report,
+                "authoritative_equity",
+                return_value=None,
+            ),
+            mock.patch.object(
+                render_push_report,
+                "authoritative_cum_pnl",
+                return_value=None,
+            ),
+            mock.patch.object(
+                render_push_report,
+                "authoritative_position_count",
+                return_value=None,
+            ),
+        ):
+            return render_push_report.render(payload)
+
+    def test_push_renders_live_portfolio_imr_contract(self):
+        rendered = self._render_without_authoritative_overrides({
+            "cycle_id": "TEST-PORTFOLIO-IMR",
+            "cycle_count": 0,
+            "action_taken": "HOLD",
+            "assets": {
+                "live": {"equity": 1000, "availBal": 400, "positions": 1},
+                "demo": {"equity": 1000, "availBal": 900, "positions": 0},
+            },
+            "market": {"btc": 65000},
+            "positions": [],
+            "risk": {
+                "current_portfolio_imr_ratio": 0.50,
+                "projected_portfolio_imr_ratio": 0.61,
+                "max_portfolio_imr_ratio": 0.666,
+                "portfolio_imr_ratio_unit": "fraction",
+                "lev": 5,
+                "status": "PASS",
+            },
+        })
+
+        self.assertIn(
+            "Live组合保证金 当前 50.0% | 预计 61.0% / 66.6%",
+            rendered["content"],
+        )
+        self.assertNotIn("Live单笔保证金", rendered["content"])
+
+    def test_push_labels_legacy_single_order_margin_as_history_only(self):
+        rendered = self._render_without_authoritative_overrides({
+            "cycle_id": "TEST-LEGACY-MARGIN",
+            "cycle_count": 0,
+            "action_taken": "HOLD",
+            "assets": {
+                "live": {"equity": 1000, "availBal": 400, "positions": 0},
+                "demo": {"equity": 1000, "availBal": 900, "positions": 0},
+            },
+            "market": {"btc": 65000},
+            "positions": [],
+            "risk": {"margin_pct": 2.5, "status": "PASS"},
+        })
+
+        self.assertIn(
+            "Live组合保证金 当前 - / 66.6% | "
+            "旧payload单笔字段 2.5000%（历史只读）",
+            rendered["content"],
+        )
+
     def test_close_receipt_always_carries_dispatched_cycle_id(self):
         cycle_id = "2026-07-27T21:45"
         receipt_context = {

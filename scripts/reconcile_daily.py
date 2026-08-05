@@ -5,7 +5,10 @@ reconcile_exchange_closes.py 本体不动（比对/分类/--apply 全复用）�
 （主人 2026-07-16 拍板）：
   demo → dry 检；rc=1（GHOST-EXACT 可修）→ --apply 自动补账 → dry 复检验证归零；
          rc=3（FUZZY/含糊）→ P1 人工。
-  live → **永远只 dry**；rc∈{1,3} → P1 告警附人工命令，绝不自动 --apply。
+  live → **所有路径永久只 dry**；rc∈{1,3} → P1 告警附人工命令，本脚本和
+         scripts/ledger_autoheal.py 均绝不自动 --apply。GHOST-EXACT 也只能按唯一 ordId、
+         已验证备份和逐笔写后复核流程人工修复；FUZZY / OVER_CLOSED / UNRECORDED 同样
+         保持只读分类并转人工。
   rc=2（API/账本错误）→ 两盘均 P1。
 推送经 scripts/qq_push.py，--dedupe-key reconcile:{YYYYMMDD}（显式身份键契约；
 当日重跑同键去重、送达失败可重试）。
@@ -228,7 +231,8 @@ def main() -> int:
         f = LOG_DIR / f"alert_{stamp}.txt"
         f.write_text(text, encoding="utf-8")
         cmd = [PWSH, "-NoProfile", "-File", WRAP, QQ_PUSH,
-               "--content-file", str(f), "--dedupe-key", dedupe]
+               "--content-file", str(f), "--alert",  # 告警走 C2C 私聊（2026-08-04）
+               "--dedupe-key", dedupe]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", timeout=60,
