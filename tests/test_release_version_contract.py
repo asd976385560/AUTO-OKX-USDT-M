@@ -200,8 +200,12 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for expected in (
             'tags:',
             '"v*.*.*"',
+            "workflow_dispatch:",
+            "inputs.tag || github.ref_name",
             "uses: ./.github/workflows/ci.yml",
             "git cat-file -t",
+            "refs/release-tags/",
+            '"refs/tags/$($env:RELEASE_TAG):$validatedTagRef"',
             "git merge-base --is-ancestor",
             "check_release_version.py --tag",
             "--notes-out .release-notes.md",
@@ -211,9 +215,15 @@ class ReleaseVersionContractTests(unittest.TestCase):
             '"--notes-file", ".release-notes.md"',
         ):
             self.assertIn(expected, release)
+        self.assertNotIn("git cat-file -t $env:RELEASE_REF", release)
         self.assertNotIn("git tag ", release)
         self.assertNotIn("--generate-notes", release)
         self.assertIn("workflow_call:", ci)
+        self.assertIn("checkout_ref:", ci)
+        self.assertIn("inputs.checkout_ref || github.ref", ci)
+        self.assertIn(
+            "checkout_ref: ${{ needs.validate-release.outputs.tag }}", release
+        )
         self.assertIn("check_release_version.py --json", ci)
         self.assertIn("check_public_boundary.py --json", ci)
         self.assertIn("a26af69be951a213d495a4c3e4e4022e16d87065", release)

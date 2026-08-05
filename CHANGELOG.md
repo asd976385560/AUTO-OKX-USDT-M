@@ -5,6 +5,12 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- Release validation now preserves the authoritative remote annotated tag in an
+  isolated Git ref, and an explicit retry path can republish an existing immutable
+  tag without creating, moving or deleting that tag.
+
 ## [1.0.0] - 2026-08-04
 
 ### Added

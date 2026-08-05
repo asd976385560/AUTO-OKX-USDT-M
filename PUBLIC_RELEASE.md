@@ -100,6 +100,12 @@ commit against the current `main` immediately before publication, publishes the
 validated matching `CHANGELOG.md` section as release notes, and marks SemVer
 prerelease identifiers such as `1.1.0-beta.1` as GitHub prereleases.
 
+If a tag-triggered run fails before publication, a maintainer may explicitly retry
+the workflow with the same existing immutable tag. The retry fetches the remote
+annotated tag into an isolated validation ref, checks out and tests that tag, and
+repeats all ancestry, environment and remote-object gates. It never recreates or
+moves the release tag.
+
 Before the first tag is pushed, the repository owner should protect `main`, restrict
 creation of release tags to maintainers, block updates and deletions for `v*`, and
 configure approval rules on the `github-release` Environment when a manual publication
