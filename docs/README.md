@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-public-index
-last-updated: 2026-07-29
+last-updated: 2026-08-05
 updated-by: Codex
-change-summary: Index the latest public lifecycle, tests and sanitized documentation surface.
+change-summary: Link generated Stars artifacts from their dedicated data branch.
 -->
 
 # 文档状态索引 / Documentation Index
@@ -21,8 +21,8 @@ Public code facts come from root-level `skill.md`, the public READMEs, `config.e
 - [公开发布边界 / Public release scope](../PUBLIC_RELEASE.md)
 - [公开脚本生命周期 / Public script lifecycle](../scripts/lifecycle.json)
 - [隔离回归测试 / Isolated regression tests](../tests/)
-- [Stars 每日聚合数据 / Daily aggregate star data](data/star-history.json)
-- [Stars 趋势图 / Star history chart](assets/star-history.svg)
+- [Stars 每日聚合数据 / Daily aggregate star data](https://github.com/asd976385560/AUTO-OKX-USDT-M/blob/star-statistics/docs/data/star-history.json)
+- [Stars 趋势图 / Star history chart](https://raw.githubusercontent.com/asd976385560/AUTO-OKX-USDT-M/star-statistics/docs/assets/star-history.svg)
 
 Stars 数据和图表由公开工作流生成，只包含按日累计数量，不包含 stargazer 用户身份。
 

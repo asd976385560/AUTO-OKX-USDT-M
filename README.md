@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-04
+last-updated: 2026-08-05
 updated-by: Codex
-change-summary: Add the 1.0.0 public release contract, changelog and gated tag-to-Release workflow.
+change-summary: Deliver generated Stars history from a dedicated data branch without bypassing main protection.
 -->
 
 <p align="center">
@@ -294,11 +294,11 @@ ledger invariants。两个环境开关仅授权 Demo；Demo UNRECORDED open 仍�
 
 ## Stars 趋势
 
-动态徽章显示当前 Stars 数；下图由仓库自己的 GitHub Actions 每 6 小时检查并生成，只保存每日聚合数量，不保存用户身份。
+动态徽章显示当前 Stars 数；下图由仓库自己的 GitHub Actions 每 6 小时检查并生成，只保存每日聚合数量，不保存用户身份。生成结果提交到专用的 `star-statistics` 数据分支，不绕过 `main` 的 PR 和 CI 保护。
 
-[![GitHub Star History](docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
+[![GitHub Star History](https://raw.githubusercontent.com/asd976385560/AUTO-OKX-USDT-M/star-statistics/docs/assets/star-history.svg)](https://github.com/asd976385560/AUTO-OKX-USDT-M/stargazers)
 
-统计脚本仅使用工作流运行期间的仓库级 `GITHUB_TOKEN`，不需要个人 PAT，也不会把 Token 写入文件、日志或图表。明细见 `docs/data/star-history.json`。
+统计脚本仅使用工作流运行期间的仓库级 `GITHUB_TOKEN`，不需要个人 PAT，也不会把 Token 写入文件、日志或图表。明细见 [`docs/data/star-history.json`](https://github.com/asd976385560/AUTO-OKX-USDT-M/blob/star-statistics/docs/data/star-history.json)。
 
 ## 许可证
 
