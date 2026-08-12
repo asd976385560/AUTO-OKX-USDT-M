@@ -12,26 +12,14 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sqlite3
 import sys
 from pathlib import Path
 
-sys.path.insert(0, _project_path('collectors'))
-sys.path.insert(0, _project_path('scripts'))
+sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r"./scripts")
 
 import ledger  # noqa: E402
 from _http import make_client  # noqa: E402
@@ -149,7 +137,7 @@ def collect(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="公开宏观数据采集")
-    parser.add_argument("--db-root", default=_project_path('db'))
+    parser.add_argument("--db-root", default=r"./db")
     parser.add_argument(
         "--backfill",
         action="store_true",

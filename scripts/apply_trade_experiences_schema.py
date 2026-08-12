@@ -15,8 +15,8 @@ schema（§8.5）：
 索引：(profile,regime,side)、(symbol,ts)。
 
 用法：
-  python apply_trade_experiences_schema.py --db-root <PROJECT_ROOT>\\db [--dry-run]
-  python apply_trade_experiences_schema.py --db-root <PROJECT_ROOT>\\db \
+  python apply_trade_experiences_schema.py --db-root ./db [--dry-run]
+  python apply_trade_experiences_schema.py --db-root ./db \
       --apply --backup-dir <BACKUP_DIR> [--verify]
 """
 from __future__ import annotations

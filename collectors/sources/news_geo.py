@@ -16,21 +16,42 @@ import news_writer  # noqa: E402
 from _mx_news_common import GEO_QUERIES, api_key, normalize, search  # noqa: E402
 
 
-def fetch_items(errors: list[str] | None = None) -> list[dict]:
+def fetch_items(errors: list[str] | None = None,
+                retry_stats: dict | None = None) -> list[dict]:
     key = api_key()
     if not key:
         if errors is not None:
             errors.append("MX_APIKEY missing")
         return []
     rows: list[dict] = []
+    recovered = 0
+    final_failed = 0
     for index, query in enumerate(GEO_QUERIES):
-        try:
-            rows.extend(search(query, key=key))
-        except Exception as exc:  # noqa: BLE001
+        last_error: Exception | None = None
+        for attempt, timeout_sec in ((1, 6.0), (2, 4.0)):
+            if attempt == 2:
+                time.sleep(0.5)
+            try:
+                rows.extend(search(query, key=key, timeout_sec=timeout_sec))
+                if attempt == 2:
+                    recovered += 1
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        else:
+            final_failed += 1
             if errors is not None:
-                errors.append(f"{query}: {type(exc).__name__}: {exc}"[:150])
+                errors.append(
+                    f"{query}: {type(last_error).__name__}: {last_error}"[:150])
         if index + 1 < len(GEO_QUERIES):
             time.sleep(0.5)
+
+    if retry_stats is not None:
+        retry_stats.update({
+            "queries": len(GEO_QUERIES),
+            "recovered_after_retry": recovered,
+            "final_failed": final_failed,
+        })
 
     items = []
     seen_codes: set[str] = set()
@@ -52,13 +73,15 @@ def fetch_items(errors: list[str] | None = None) -> list[dict]:
 
 def collect(db_path: str, apply: bool = False) -> dict:
     errors: list[str] = []
-    items = fetch_items(errors)
+    retry_stats: dict = {}
+    items = fetch_items(errors, retry_stats)
     err_txt = "; ".join(errors)[:150] if errors else None
     if not apply:
         out = {
             "ok": not (err_txt and not items),
             "dry_run": True,
             "fetched": len(items),
+            "retry_stats": retry_stats,
             "sample": [{"t": i["title"][:70], "et": i["event_time"]}
                        for i in items[:8]],
         }
@@ -69,6 +92,7 @@ def collect(db_path: str, apply: bool = False) -> dict:
         return {"ok": False, "fetched": 0, "inserted": 0, "err": err_txt}
     result = news_writer.write_news(items, db_path)
     result["fetched"] = len(items)
+    result["retry_stats"] = retry_stats
     if err_txt:
         result["err"] = err_txt
     return result

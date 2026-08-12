@@ -21,18 +21,6 @@ playbook 规则——把"等实盘 n≥10"的周/月级验证提速到分钟级�
       [--symbols top:22|BTC-USDT-SWAP,ETH-USDT-SWAP] [--tf 4H] [--workers 8]
       [--annotate-playbook 354 --apply]
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import json
 import re
@@ -157,7 +145,7 @@ def pick_symbols(db_root, spec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rule", required=True)
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--symbols", default="top:22")
     ap.add_argument("--tf", default="4H")
     ap.add_argument("--workers", type=int, default=8)

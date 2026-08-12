@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-r"""V2.0 §8.5 —— 经验相似度工具。
+r"""V2.0 §8.5 —— 经验相似度工具（重建 2026-06-26）。
 
-本模块严格对齐两处公开消费者的调用契约：
+原件于 2026-06-25 ~22:40 随 _okxcli.py 一并丢失（见 memory
+v2-incident-20260625-missing-modules）。本重建严格对齐两处消费者的事实契约：
   - find_similar_experience.py / trade_experience_writer.py 调
     `experience_vector(dict)` -> 定长 10 维 list[float]；`cosine(a, b)` -> float。
   - 入参 dict 键（消费者实际传）：symbol / side / regime / action /
@@ -91,7 +92,13 @@ def experience_vector(d: Mapping[str, Any]) -> list[float]:
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    """余弦相似度；任一零向量或长度不匹配 -> 0.0（安全，不抛）。"""
+    """余弦相似度；任一零向量或长度不匹配 -> 0.0（安全，不抛）。
+
+    [LEGACY v1] 2026-08-10 Wave2 序9 起相似度改用 similarity_v2；本函数与
+    10 维向量仅保留用于旧向量追溯（终稿放行条件：旧向量可追溯），不再参与
+    生产匹配。v1 的致命缺陷：有效维只有方向/regime 家族/开平/md5 symbol 桶，
+    同 side+regime+action 的任意两标的余弦≈1.0（HYPE↔BZ 伪近邻实锤）。
+    """
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -111,3 +118,77 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if na <= 0.0 or nb <= 0.0:
         return 0.0
     return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+# ---------------------------------------------------------------------------
+# 相似度 v2（2026-08-10 Wave2 序9，特征集按终稿方案清单）
+# ---------------------------------------------------------------------------
+SIMILARITY_VERSION = "similarity_v2"
+
+# 数值特征 → 贴近度尺度（exp(-|q-r|/scale)）；尺度=该特征"半衰差"数量级，
+# 定死为常量（禁 registry/LLM 调参，与风控常量同纪律）。
+V2_NUMERIC_SCALES = {
+    "stop_distance_pct": 0.02,   # 止损距离：差 2% → e^-1
+    "planned_rr": 0.6,           # 计划盈亏比
+    "funding_rate": 0.0005,      # 资金费率（8h）
+    "vol_24h_pct": 0.025,        # 24h 高低幅
+}
+V2_TREND_KEYS = ("trend_1h", "trend_4h")  # -1|0|1；相等=1 否则 0
+V2_HARD_GATES = ("asset_class", "side", "action")
+
+
+def experience_features_v2(d: Mapping[str, Any]) -> dict[str, Any]:
+    """把（拟）经验规整成 v2 特征 dict（不做任何 I/O；市场态字段由调用方
+    经 experience_features 派生器补齐，缺失=None 如实留空）。"""
+    return {
+        "v": 2,
+        "asset_class": _s(d.get("asset_class")) or None,
+        "side": ("long" if "long" in _s(d.get("side")) or _s(d.get("side")) == "buy"
+                 else ("short" if "short" in _s(d.get("side"))
+                       or _s(d.get("side")) == "sell" else None)),
+        "action": ("open" if "open" in _s(d.get("action"))
+                   else ("close" if "close" in _s(d.get("action")) else None)),
+        "regime": _s(d.get("regime")) or None,
+        "stop_distance_pct": d.get("stop_distance_pct"),
+        "planned_rr": d.get("planned_rr"),
+        "funding_rate": d.get("funding_rate"),
+        "vol_24h_pct": d.get("vol_24h_pct"),
+        "trend_1h": d.get("trend_1h"),
+        "trend_4h": d.get("trend_4h"),
+    }
+
+
+def similarity_v2(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
+    """v2 相似度 ∈ [0,1]：硬门（资产类别/方向/动作不同=0）+ 数值特征贴近度
+    × 覆盖惩罚。regime 家族只在双方均为 crypto 时计入（BTC 口径对股票/商品
+    型标的无解释力，终稿序11）。确定性、无 I/O。"""
+    for key in V2_HARD_GATES:
+        q, r = qf.get(key), rf.get(key)
+        if not q or not r or q != r:
+            return 0.0
+    scores: list[float] = []
+    for key, scale in V2_NUMERIC_SCALES.items():
+        q, r = qf.get(key), rf.get(key)
+        if q is None or r is None:
+            continue
+        try:
+            scores.append(math.exp(-abs(float(q) - float(r)) / scale))
+        except (TypeError, ValueError):
+            continue
+    for key in V2_TREND_KEYS:
+        q, r = qf.get(key), rf.get(key)
+        if q is None or r is None:
+            continue
+        scores.append(1.0 if q == r else 0.0)
+    if qf.get("asset_class") == "crypto":
+        q, r = qf.get("regime"), rf.get("regime")
+        if q and r:
+            scores.append(1.0 if q == r else 0.3)
+    total_soft = len(V2_NUMERIC_SCALES) + len(V2_TREND_KEYS) + (
+        1 if qf.get("asset_class") == "crypto" else 0)
+    if not scores:
+        # 只过了硬门、无任何软特征可比：给保底相似度，覆盖=0 的惩罚显式化
+        return 0.30
+    coverage = len(scores) / total_soft
+    return round(
+        (sum(scores) / len(scores)) * (0.5 + 0.5 * math.sqrt(coverage)), 4)

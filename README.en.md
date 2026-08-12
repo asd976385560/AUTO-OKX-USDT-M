@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-05
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Deliver generated Stars history from a dedicated data branch without bypassing main protection.
+change-summary: Sync the live-only runtime, consolidated collection, multitimeframe evidence and public safety boundary.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Deliver generated Stars history from a dedicated data branch wit
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and news sources without APIs. Live and demo share execution-intent idempotency, ledger-position consistency, fill confirmation, and stop-loss safety, while capacity is profile-specific: Live uses portfolio IMR and Demo uses directional real-time max-size.
+V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and no-API news collection. The current runtime is live-only: one unified live Agent performs analysis before deterministic multitimeframe evidence, account facts, hard risk gates, execution, and same-process writer submission.
 
 > [!WARNING]
 > This project can execute real trades. Keep `OKX_EXECUTOR_DRYRUN=1` and `OKX_TRIGGER_DRYRUN=1` during initial deployment, and validate everything against isolated databases. This project is not investment advice and does not guarantee profit.
@@ -72,34 +72,32 @@ the release workflow passes version, current-main ancestry, and full CI checks.
 
 ## Latest synchronization
 
-The 2026-08-04 public synchronization extends the July 29 baseline while preserving portable paths, empty credential defaults, and explicit write authorization:
+The 2026-08-12 synchronization uses the actual runtime source and reapplies portable public safety boundaries before it enters this repository:
 
-- Live OPEN/ADD rejects the whole order when projected portfolio `account.imr/totalEq` would exceed 66.6%; Demo sizes from directional `account max-size` after target leverage is set;
-- `stage_profile_leases` prevent the same profile from overlapping across cycles, and the runner verifies real trade terminal state;
-- DXY observation-date deduplication and stale semantics, trade-time regime attribution, fixed 08:00 report windows, and projected push positions;
-- exact-evidence GHOST-EXACT and UNRECORDED ledger checks; Live autoheal is permanently read-only, while Demo close and open writes use separate explicit opt-ins; Demo UNRECORDED also requires a matching intent, ordId, and confirmed existing exchange stop, and it never places or replays orders;
-- separate business and alert destinations read only from `OKX_QQ_TARGET` and `OKX_QQ_ALERT_TARGET`;
-- expanded isolated regressions, lifecycle coverage, and a backup-gated profile-lease migration.
+- Demo runtime capability, roles, and database initialization targets are retired; the main chain is unified live → push;
+- `collect_cycle.py` aggregates hourly fast → news → slow and quarter-hour fast → news runs with per-step results and failure isolation;
+- every OPEN/ADD is bound to exact closed 15m/1H/4H evidence for the same cycle and independently revalidated by the writer and executor; news time layers, asset classes, experience contracts, and model-shadow evaluation are included;
+- Live risk gates combine the 66.6% portfolio IMR cap, 15% single-order incremental IMR cap, 5% stop-loss risk cap, available margin, finite-number checks, ledger-position consistency, and actor attestation;
+- Push uses a 17-field complete-report contract and separately audits scheduled slots, archives, and exact delivery receipts;
+- public paths are project-relative or placeholders, migrations default to dry-run and require explicit authorization plus verified backups, and public `ledger_autoheal.py` is permanently read-only;
+- business and alert destinations come only from `OKX_QQ_TARGET` and `OKX_QQ_ALERT_TARGET`; real credentials, destinations, host state, databases, logs, and incident-repair tools are excluded.
 
 ## Architecture
 
 ```text
 OpenClaw cron
-  ├─ fast_collect.py ───────────────┐
-  ├─ slow_collect.py ───────────────┼─> ledger.db
-  └─ sources/news_collect.py ───────┘
+  ├─ collect_cycle.py --tier hourly ──> fast → news → slow ─┐
+  └─ collect_cycle.py --tier quarter ─> fast → news ────────┴─> ledger.db
                                       │
                                       v
                               core/dispatcher.py
                                       │
                stage_dispatch lock + profile lease
                                       │
-                 ┌────────────────────┴───────────────────┐
-                 v                                        v
-       unified live trader                         demo trader
-       analysis + live execution                   demo execution
-                 │                                        │
-                 └───────────────┬────────────────────────┘
+                                 v
+                       unified live trader
+                       analysis + live execution
+                                 │
                                  v
                     stage_runner terminal/output check
                                  │
@@ -116,7 +114,8 @@ Core invariants:
 - every table or explicit key domain has one authoritative writer, while readers use SQLite `mode=ro`;
 - live opens only pass through `core/order_executor.py`, which always calls `core/risk_validator.py`;
 - the complete OKX position set must match the confirmed local trade ledger before ordering;
-- live and demo opens both require stop loss and share the same hard limits;
+- only `profile=live` is supported; every non-live profile fails closed in the trading path;
+- live opens require a stop loss and must pass portfolio, single-order margin, and single-order stop-risk hard limits;
 - current positions come from the OKX API, never from inferred local snapshots;
 - a confirmed fill requires authoritative `fill_sz`, `fill_px`, `fill_ts`, and `ts_source`;
 - push delivery always goes through `scripts/push_pipeline.py`.
@@ -127,7 +126,6 @@ Core invariants:
 |---|---|---|---|
 | analyst | `agents/analyst.md` | Manual rollback analysis outside the default chain | Manual |
 | unified live trader | `agents/live_trader.md` | Analysis, live decisions, hard risk checks, and execution | dispatcher |
-| demo trader | `agents/demo_trader.md` | Demo execution using shared analysis and risk limits | dispatcher |
 | news scout | `agents/news_scout.md` | Structured X and no-API news collection | Optional cron |
 | reviewer | `agents/reviewer.md` | Daily, weekly, and monthly review summaries | Daily cron |
 
@@ -179,7 +177,6 @@ $openclawRoot = Join-Path $HOME '.openclaw'
 
 openclaw agents add okx-analyst --workspace (Join-Path $openclawRoot 'workspace-okx-analyst') --non-interactive
 openclaw agents add okx-live-trader --workspace (Join-Path $openclawRoot 'workspace-okx-live-trader') --non-interactive
-openclaw agents add okx-demo-trader --workspace (Join-Path $openclawRoot 'workspace-okx-demo-trader') --non-interactive
 openclaw agents add okx-news-scout --workspace (Join-Path $openclawRoot 'workspace-okx-news-scout') --non-interactive
 openclaw agents add okx-reviewer --workspace (Join-Path $openclawRoot 'workspace-okx-reviewer') --non-interactive
 
@@ -197,11 +194,10 @@ The default scheduling contract comes from `skill.md`:
 
 | Work | Type | Schedule |
 |---|---|---|
-| fast collect | command | `0,15,30,45 * * * *` |
-| slow collect | command | `2 * * * *` |
+| hourly collection | command | `0 * * * *`, fast → news → slow |
+| quarter collection | command | `15,30,45 * * * *`, fast → news |
 | dispatcher | command | `*/2 * * * *` |
-| registry news | command | `3,18,33,48 * * * *` |
-| news scout | agent | `5,20,35,50 * * * *`, optional |
+| news scout | agent | `10,25,40,55 * * * *`, optional |
 | daily maintenance | command | once daily; requires separate approval before enabling |
 | reviewer | agent | once daily |
 
@@ -236,8 +232,6 @@ Main environment variables:
 | `OKX_QQ_ALERT_TARGET` | Alert QQ destination; no default |
 | `OKX_EXECUTOR_DRYRUN` | `1` blocks trade-changing commands |
 | `OKX_TRIGGER_DRYRUN` | `1` blocks Agent and push triggers |
-| `OKX_LEDGER_AUTOHEAL_APPLY` | Demo only: `1` permits exact GHOST close bookkeeping; Live is permanently read-only |
-| `OKX_LEDGER_AUTOHEAL_UNRECORDED` | Demo only: must also be `1`, with matching execution_intent, ordId, and an active same-side full-size protective stop, to permit exact UNRECORDED open bookkeeping; missing evidence always remains report-only |
 
 `OKX_DB_ROOT` is supported by deterministic scripts, writers, push, and isolated dry-runs.
 Real Agent turns execute in the OpenClaw Gateway service, so a local child environment cannot
@@ -280,8 +274,9 @@ send messages, and it is not a restored full money-path, exchange, or OpenClaw e
 Authoritative values live in `core/risk_validator.py`:
 
 - Live OPEN/ADD rejects the whole order when projected portfolio IMR exceeds 66.6% (`MAX_PORTFOLIO_IMR_RATIO`);
-- Demo OPEN sizes only from directional real-time `account max-size` and contract `minSz/lotSz`, never the Live balance formula;
 - at most 98% of currently available USDT margin may be used (`AVAILABLE_MARGIN_USE_PCT`);
+- incremental IMR for each OPEN/ADD is capped at 15% of equity, with a 14.7% sizing budget for headroom;
+- stop-loss risk for each OPEN/ADD is capped at 5% of equity;
 - leverage is capped at 10x (`MAX_LEVERAGE`);
 - notional per trade is at least 1% of equity (`MIN_NOTIONAL_PCT`);
 - stop-loss deviation from mark price is capped at 30% (`MAX_SL_DEVIATION`);
@@ -290,13 +285,12 @@ Authoritative values live in `core/risk_validator.py`:
 - an independent stop loss must read back the current `algoId`, and confirmed fills must come from authoritative endpoints;
 - missing contract specifications, balances, available margin, or fill confirmation fail safe.
 
-Live ledger autoheal is permanently read-only: direct API/CLI write flags and environment opt-ins
+Public ledger autoheal is permanently read-only: direct API/CLI write flags and legacy environment opt-ins
 still run the full read-only classification, return a non-zero structured block, and never modify
-the trade ledger or repair queue. A Live repair requires one uniquely verified `ordId`, verified
+the trade ledger or repair queue. A manual repair requires one uniquely verified `ordId`, verified
 SQLite backups before a one-record apply, then fresh exchange-position, reconciliation, and ledger-
-invariant checks. The two environment opt-ins authorize Demo only; Demo UNRECORDED open still
-requires exact fills, order ownership, a same-side full-size protective stop, the per-run cap, and
-runner-exclusion checks. No autoheal path places or replays an order.
+invariant checks. Public code exposes no automatic bookkeeping-write path. No autoheal path places,
+replays, or amends an order.
 
 These limits are unchanged by public release work, documentation internationalization, or star statistics.
 

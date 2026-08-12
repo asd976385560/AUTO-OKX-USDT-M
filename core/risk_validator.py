@@ -3,10 +3,9 @@
 
 把 live_trader.md §3 现为「LLM 散文 + 手算硬上限」的风控搬成一段纯函数代码：
 输入 symbol/side/intended_sz/lev/mark_px/ct_val/lot_sz/equity/容量/现仓 →
-按 profile 分流容量口径：live 校预计成交后组合 IMR/totalEq≤66.6%、可用保证金×98%、
-名义≥1%；
-Demo 仅使用 OKX Demo ``account max-size`` 的本次方向结果作为物理容量，并继续校
-杠杆≤10x、交易所 minSz/lotSz 与止损距
+校预计成交后组合 IMR/totalEq≤66.6%、单笔增量保证金≤15%净值、单笔止损风险
+（含双边费用与滑点缓冲）≤5%净值、可用保证金×98%、名义≥1%、杠杆≤10x、
+交易所 minSz/lotSz 与止损距
 → 返回 approved_sz 或拒因。**LLM 物理越不过它**（live 下单唯一路径 order_executor 内部
 强制调本闸）。
 
@@ -18,8 +17,6 @@ Demo 仅使用 OKX Demo ``account max-size`` 的本次方向结果作为物理�
     approved_sz × mark_px × ct_val ÷ effective_lev」，再叠加账户实时 IMR。
   - **硬上限 = 模块级常量**（hardcoded）：仅主人改码才动，禁 registry/LLM 改
     （红线「不放宽风控自学」）。
-  - **demo**：不使用 Live 的账户百分比仓位闸；容量只认目标合约、方向、
-    仓位模式和当前杠杆下 OKX Demo 实时返回的最大可开张数，查询失败即拒绝。
 
 本模块零模型名 / 零 provider 字段（红线 #1 天然合规）。
 """
@@ -29,8 +26,7 @@ import math
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
-# 风控常量。组合 IMR、名义下限和可用额折扣仅适用于 live；
-# 杠杆与止损安全约束适用于 live/demo。
+# 风控常量（2026-08-06 demo 下线后只剩 live 一套口径）。
 # ---------------------------------------------------------------------------
 MAX_PORTFOLIO_IMR_RATIO = 0.666  # 预计成交后组合 account.imr / totalEq 硬上限
 MAX_LEVERAGE = 10.0          # 杠杆 ≤ 10x（越界 → reject）
@@ -39,6 +35,23 @@ MIN_NOTIONAL_PCT = 0.01      # 单笔名义价值 ≥ 1% 净值（不足 → cla
 MAX_SL_DEVIATION = 0.30      # 止损价偏离 mark_px ≤ 30%（超 → reject，防填错标的）
 # 市价单按 mark_px 估增量 IMR，另保留可用资金余量，避免本笔耗尽结算币保证金。
 AVAILABLE_MARGIN_USE_PCT = 0.98
+# 单笔增量保证金硬上限（2026-08-08 主人拍板）：每次 OPEN/ADD 的增量 IMR ≤ 15% 净值。
+# 直接动因：08-08 06:30 SNDK 单笔 606 USDT ≈ 60% 净值——组合闸 63.8%<66.6% 如设计放行，
+# 但决策卡把 10 张保证金自估成 "$50-80"（实际 $1212，错 10-20 倍）；历史 137 笔 OPEN/ADD
+# 仅 5 笔 >15%，均值 5.1%，上限只削极端单。定仓预算另留市价滑点余量：
+# budget = 0.15×0.98 = 14.7% 净值；对外硬边界 15% 供成交后审计
+# （order_executor 回执 single_order_cap_breached：滑点突破只告警不阻断、不追溯现仓）。
+MAX_SINGLE_ORDER_IMR_RATIO = 0.15
+SINGLE_ORDER_SIZING_HEADROOM_PCT = 0.98
+# 单笔止损风险预算（2026-08-10 Wave1 主人拍板）：风险 = 名义×(止损距离+费用/滑点
+# 缓冲) ≤ 5% 净值。5% 为主人确认的当前硬预算；它与 15% 单笔增量保证金闸
+# 正交，专门约束“止损被打时最多损失多少净值”。
+# 与保证金/可用资金闸取最小、按 lot 向下缩量；lot 粒度容不下时整笔拒绝。
+# live OPEN/ADD 恒带 SL（executor 入口 no_sl 硬拒），本闸在生产恒有输入；
+# sl_trigger_px=None 只发生在非下单路径，此时跳过并在 math 留痕。
+MAX_SINGLE_ORDER_RISK_PCT_EQUITY = 0.05
+RISK_FEE_BUFFER_PCT = 0.0010       # taker 0.05% × 双边，计入风险距离
+RISK_SLIPPAGE_BUFFER_PCT = 0.0010  # 入场 + SL 触发市价滑点合并预算
 
 _EPS = 1e-9
 
@@ -207,10 +220,9 @@ def validate(
       }
     """
     open_positions = open_positions or []
-    profile_label = "demo" if (
-        str(profile).lower() == "demo" or "demo" in str(profile).lower()
-    ) else "live"
-    is_demo = profile_label == "demo"
+    # 2026-08-06 demo 全量下线：本模块只服务 live；order_executor 已在入口
+    # _require_live_profile() 硬拒非 live profile。
+    profile_label = "live"
     side = str(side or "").lower()
     adjustments: list[str] = []
 
@@ -240,25 +252,24 @@ def validate(
         "portfolio_observation": portfolio_observation(open_positions, equity),
     }
 
-    # ── 数据完备性（instrument 未知/缺 = 下架或不存在；demo 也拒，因物理无法定仓）──
+    # ── 数据完备性（instrument 未知/缺 = 下架或不存在 → 物理无法定仓）──
     if not _is_finite_number(mark_px) or float(mark_px) <= 0:
         return _reject("bad_mark_px", f"mark_px 非法: {mark_px}")
     mark_px = float(mark_px)
-    if not is_demo and (not _is_finite_number(equity) or float(equity) <= 0):
+    if not _is_finite_number(equity) or float(equity) <= 0:
         return _reject("bad_equity", f"equity 非法: {equity}")
     if (not _is_finite_number(ct_val) or float(ct_val) <= 0
             or not _is_finite_number(lot_sz) or float(lot_sz) <= 0):
         return _reject("instrument_unknown",
                        f"{symbol} ctVal/lotSz 缺失（下架/不存在/未缓存）: "
                        f"ctVal={ct_val} lotSz={lot_sz}")
-    ct_val = float(ct_val)
-    lot_sz = float(lot_sz)
-    if not is_demo:
-        equity = float(equity)
     if side not in ("long", "short"):
         return _reject("bad_side", f"side 非法: {side!r}")
     if not _is_finite_number(intended_sz) or float(intended_sz) <= 0:
         return _reject("bad_sz", f"intended_sz 非法: {intended_sz}")
+    equity = float(equity)
+    ct_val = float(ct_val)
+    lot_sz = float(lot_sz)
     intended_sz = float(intended_sz)
     math_box.update({
         "intended_sz": intended_sz,
@@ -274,9 +285,8 @@ def validate(
     if not math.isfinite(lev) or lev <= 0:
         return _reject("bad_lev", f"lev 非有限正数: {lev}")
     math_box["lev"] = lev
-    # Live 同时依赖结算币可用保证金与账户实时组合 IMR；Demo 禁止从这些余额字段推算
-    # 开仓容量，后续只接受 exchange_max_size。参数即便被 caller 传入，也只作观察。
-    if not is_demo:
+    # Live 同时依赖结算币可用保证金与账户实时组合 IMR。
+    if True:
         if available_margin is None:
             return _reject(
                 "available_margin_missing",
@@ -344,46 +354,52 @@ def validate(
     per_contract_notional = mark_px * ct_val            # 每张名义（USDT）
     per_contract_margin = per_contract_notional / effective_lev  # 每张保证金（USDT）
     available_margin_budget = None
-    if not is_demo and available_margin is not None:
+    if available_margin is not None:
         available_margin_budget = available_margin * AVAILABLE_MARGIN_USE_PCT
-    if is_demo:
-        notional_floor = None
-        max_sz_available = None
-        min_notional_sz = None
-    else:
-        # Live 张数只按当前可用结算币×98%收敛；组合66.6%是随后执行的整单拒绝闸，
-        # 不按剩余组合空间 clamp。
-        notional_floor = MIN_NOTIONAL_PCT * equity      # live：1% 净值
-        max_sz_available = _round_down_to_step(
-            available_margin_budget / per_contract_margin, lot_sz)
-        min_notional_sz = _round_up_to_step(
-            notional_floor / per_contract_notional, lot_sz)
+    # Live 张数只按当前可用结算币×98%收敛；组合66.6%是随后执行的整单拒绝闸，
+    # 不按剩余组合空间 clamp。
+    notional_floor = MIN_NOTIONAL_PCT * equity      # live：1% 净值
+    max_sz_available = _round_down_to_step(
+        available_margin_budget / per_contract_margin, lot_sz)
+    min_notional_sz = _round_up_to_step(
+        notional_floor / per_contract_notional, lot_sz)
     # 最小可交易单位 = 一个 lot
     min_unit_margin = lot_sz * per_contract_margin
+    # 单笔增量保证金：硬边界 15% 净值；定仓预算再留 2% 滑点余量（=14.7%），
+    # 保证市价成交后仍在硬边界内。
+    single_order_margin_cap = MAX_SINGLE_ORDER_IMR_RATIO * equity
+    single_order_sizing_budget = (
+        single_order_margin_cap * SINGLE_ORDER_SIZING_HEADROOM_PCT)
+    max_sz_single_order = _round_down_to_step(
+        single_order_sizing_budget / per_contract_margin, lot_sz)
+    # 单笔止损风险预算（Wave1 序 7）：与保证金维度正交——保证金闸管"占用多少"，
+    # 本闸管"止损打掉会亏多少"。SNDK 教训：15% IMR 闸对 24% 净值的止损风险无感知。
+    single_order_risk_cap = MAX_SINGLE_ORDER_RISK_PCT_EQUITY * equity
 
     math_box.update({
         "per_contract_notional": per_contract_notional,
         "per_contract_margin": per_contract_margin,
         "available_margin_raw": available_margin,
-        "available_margin_use_pct": (
-            None if is_demo else AVAILABLE_MARGIN_USE_PCT
-        ),
+        "available_margin_use_pct": AVAILABLE_MARGIN_USE_PCT,
         "available_margin_budget": available_margin_budget,
-        "margin_budget_binding": (
-            None if is_demo else "available_margin"
-        ),
+        "margin_budget_binding": "available_margin",
         "notional_floor": notional_floor,
         "max_sz_available": max_sz_available,
         "min_notional_sz": min_notional_sz,
         "min_unit_margin": min_unit_margin,
-        "account_imr": None if is_demo else account_imr,
-        "max_portfolio_imr_ratio": (
-            None if is_demo else MAX_PORTFOLIO_IMR_RATIO
-        ),
-        "portfolio_imr_ratio_unit": None if is_demo else "fraction",
-        "portfolio_imr_source": (
-            None if is_demo else "account.balance.imr"
-        ),
+        "max_single_order_imr_ratio": MAX_SINGLE_ORDER_IMR_RATIO,
+        "single_order_sizing_headroom_pct": SINGLE_ORDER_SIZING_HEADROOM_PCT,
+        "single_order_margin_cap": single_order_margin_cap,
+        "single_order_sizing_budget": single_order_sizing_budget,
+        "max_sz_single_order": max_sz_single_order,
+        "max_single_order_risk_pct_equity": MAX_SINGLE_ORDER_RISK_PCT_EQUITY,
+        "risk_fee_buffer_pct": RISK_FEE_BUFFER_PCT,
+        "risk_slippage_buffer_pct": RISK_SLIPPAGE_BUFFER_PCT,
+        "single_order_risk_cap": single_order_risk_cap,
+        "account_imr": account_imr,
+        "max_portfolio_imr_ratio": MAX_PORTFOLIO_IMR_RATIO,
+        "portfolio_imr_ratio_unit": "fraction",
+        "portfolio_imr_source": "account.balance.imr",
     })
 
     new_open = existing_position is None
@@ -425,7 +441,24 @@ def validate(
                 f"> {MAX_SL_DEVIATION:.0%}（疑填错标的）",
             )
 
-    # ── live/demo 公共安全闸：必须在 Demo set_leverage 前完成 ──
+    # ── 单笔止损风险预算（Wave1 序 7；有 SL 才可算，live 下单路径恒有）──
+    max_sz_risk = None
+    per_contract_risk = None
+    risk_dist_pct = None
+    if sl_dev is not None:
+        risk_dist_pct = sl_dev + RISK_FEE_BUFFER_PCT + RISK_SLIPPAGE_BUFFER_PCT
+        per_contract_risk = per_contract_notional * risk_dist_pct
+        max_sz_risk = _round_down_to_step(
+            single_order_risk_cap / per_contract_risk, lot_sz)
+        math_box.update({
+            "risk_dist_pct": risk_dist_pct,
+            "per_contract_risk": per_contract_risk,
+            "max_sz_risk": max_sz_risk,
+        })
+    else:
+        math_box["single_order_risk_cap_skipped"] = "no_sl_provided"
+
+    # ── 公共安全闸 ──
     if lev > MAX_LEVERAGE + _EPS:
         return _reject("leverage_exceeds",
                        f"杠杆 {lev}x > 硬上限 {MAX_LEVERAGE:.0f}x")
@@ -436,103 +469,14 @@ def validate(
         )
 
     rounded_intended = _round_down_to_step(intended_sz, lot_sz)
-    if is_demo:
-        # minSz/lotSz 是交易所物理下单条件，不是项目定义的“最低开仓限制”。
-        # 低于 minSz 时拒绝，禁止擅自把用户/Agent 的仓位向上放大。
-        if min_order_size is None:
-            return _reject(
-                "instrument_unknown",
-                f"{symbol} Demo minSz 缺失，无法验证交易所物理最小下单量",
-            )
-        try:
-            exchange_min_size = float(min_order_size)
-        except (TypeError, ValueError):
-            return _reject(
-                "instrument_unknown",
-                f"{symbol} Demo minSz 非法: {min_order_size}",
-            )
-        if not math.isfinite(exchange_min_size) or exchange_min_size <= 0:
-            return _reject(
-                "instrument_unknown",
-                f"{symbol} Demo minSz 非有限正数: {min_order_size}",
-            )
-        exchange_min_size = _round_up_to_step(exchange_min_size, lot_sz)
-        math_box["exchange_min_size"] = exchange_min_size
-        math_box["sizing_policy"] = "okx_demo_max_size_only"
-        math_box["capacity_source"] = "account.max-size"
-        if rounded_intended + _EPS < exchange_min_size:
-            return _reject(
-                "exchange_min_size",
-                f"intended {intended_sz} 张按 lotSz 取整为 {rounded_intended}，"
-                f"低于 OKX Demo minSz {exchange_min_size}；不自动上调",
-            )
-
-        # 第一阶段只做公共安全与交易所规格预检。执行器据此确认请求安全后，
-        # 才允许新开修改杠杆并实时查询 max-size。
-        if preflight_only:
-            math_box["approved_notional"] = (
-                rounded_intended * per_contract_notional)
-            math_box["approved_margin"] = (
-                rounded_intended * per_contract_margin)
-            return _approve(
-                rounded_intended,
-                abs(rounded_intended - intended_sz) > _EPS,
-            )
-
-        if exchange_max_size is None:
-            return _reject(
-                "exchange_max_size_missing",
-                "OKX Demo 实时最大可开张数未知，拒开（禁回退 balance/totalEq/live 公式）",
-            )
-        try:
-            exchange_max_size = float(exchange_max_size)
-        except (TypeError, ValueError):
-            return _reject(
-                "bad_exchange_max_size",
-                f"OKX Demo max-size 非法: {exchange_max_size}",
-            )
-        if not math.isfinite(exchange_max_size) or exchange_max_size < 0:
-            return _reject(
-                "bad_exchange_max_size",
-                f"OKX Demo max-size 非有限非负数: {exchange_max_size}",
-            )
-        max_sz_exchange = _round_down_to_step(exchange_max_size, lot_sz)
-        math_box["exchange_max_size_raw"] = exchange_max_size
-        math_box["max_sz_exchange"] = max_sz_exchange
-        math_box["margin_budget_binding"] = "exchange_max_size"
-        if max_sz_exchange + _EPS < exchange_min_size:
-            return _reject(
-                "exchange_capacity_below_minimum",
-                f"OKX Demo 当前方向最大可开 {max_sz_exchange} 张，"
-                f"低于交易所 minSz {exchange_min_size}",
-            )
-
-        approved_sz = rounded_intended
-        clamped = abs(approved_sz - intended_sz) > _EPS
-        if clamped:
-            adjustments.append(
-                f"lotSz 取整: {intended_sz} → {approved_sz}")
-        if approved_sz > max_sz_exchange + _EPS:
-            approved_sz = max_sz_exchange
-            clamped = True
-            adjustments.append(
-                f"intended {intended_sz} 张 → approved {approved_sz} 张"
-                "（OKX Demo 交易所实时最大可开张数）")
-        if approved_sz + _EPS < exchange_min_size or approved_sz <= 0:
-            return _reject(
-                "exchange_capacity_below_minimum",
-                f"OKX Demo 当前方向可批准 {approved_sz} 张，"
-                f"低于交易所 minSz {exchange_min_size}",
-            )
-        math_box["approved_notional"] = approved_sz * per_contract_notional
-        math_box["approved_margin"] = approved_sz * per_contract_margin
-        return _approve(approved_sz, clamped)
-
+    # demo 的两阶段定仓分支（minSz/lotSz 物理下单校验 + preflight_only 预检 +
+    # exchange_max_size 收敛）随 2026-08-06 全量下线整块移除。preflight_only 是
+    # 那条路径专用的入口，现已无任何合法用法——保留参数并硬拒，避免残留调用方
+    # 以为自己拿到了一次「只预检不定仓」的放行。
     if preflight_only:
-        # 当前仅供 Demo 两阶段执行使用；live 若误用也不应绕过完整预算闸。
         return _reject(
             "preflight_profile_invalid",
-            "preflight_only 仅允许 Demo 执行路径使用",
+            "preflight_only 随 demo 两阶段执行路径于 2026-08-06 下线，已无合法用法",
         )
 
     # ── Live 仓位预算闸（1% / 可用保证金×98% / 组合 IMR 66.6%）──
@@ -551,6 +495,16 @@ def validate(
     #    条件，同侧集中度交 LLM 自主判断、失误走经验学习闭环（trade_experiences/missed_opps）。
     #    同侧暴露仍记 math_box["same_side_existing_notional"]（上方 #闸前装配）供回执观察。
 
+    # 单笔预算连最小可交易单位都容不下 → 本地拒绝（与可用资金闸同型）。
+    if min_unit_margin > single_order_sizing_budget + _EPS:
+        return _reject(
+            "single_order_cap_infeasible",
+            f"最小 {lot_sz} 张保证金 {min_unit_margin:.2f} > 单笔定仓预算 "
+            f"{single_order_sizing_budget:.2f}"
+            f"（{MAX_SINGLE_ORDER_IMR_RATIO:.0%} 净值×"
+            f"{SINGLE_ORDER_SIZING_HEADROOM_PCT:.0%} 滑点余量），禁开仓",
+        )
+
     # 互斥可行性：名义下限张数 > 可用资金最大张数 → reject。
     if min_notional_sz > max_sz_available + _EPS:
         return _reject(
@@ -558,6 +512,30 @@ def validate(
             f"当前可用保证金预算 {available_margin_budget:.2f} 最多开 "
             f"{max_sz_available} 张，达不到名义下限 {min_notional_sz} 张",
         )
+    # 名义 1% 下限与单笔 15% 上限冲突（lot 粒度导致）→ 整笔拒绝，不上调绕闸。
+    if min_notional_sz > max_sz_single_order + _EPS:
+        return _reject(
+            "single_order_cap_infeasible",
+            f"名义 1% 下限需 {min_notional_sz} 张，超过单笔保证金上限最多 "
+            f"{max_sz_single_order} 张，整笔拒绝",
+        )
+    # 止损风险预算的可行性（与保证金闸同型；只在有 SL 时生效）。
+    if max_sz_risk is not None:
+        if lot_sz * per_contract_risk > single_order_risk_cap + _EPS:
+            return _reject(
+                "single_order_risk_cap_infeasible",
+                f"最小 {lot_sz} 张的止损风险 "
+                f"{lot_sz * per_contract_risk:.2f} > 单笔风险预算 "
+                f"{single_order_risk_cap:.2f}"
+                f"（{MAX_SINGLE_ORDER_RISK_PCT_EQUITY:.0%} 净值；"
+                f"止损距 {sl_dev:.2%}+缓冲），禁开仓",
+            )
+        if min_notional_sz > max_sz_risk + _EPS:
+            return _reject(
+                "single_order_risk_cap_infeasible",
+                f"名义 1% 下限需 {min_notional_sz} 张，超过单笔止损风险预算最多 "
+                f"{max_sz_risk} 张（止损距 {sl_dev:.2%} 过宽），整笔拒绝",
+            )
 
     # 仅按可用资金/名义下限 clamp；组合66.6%越界时整笔 reject，不缩量。
     approved_sz = _round_down_to_step(intended_sz, lot_sz)
@@ -567,6 +545,21 @@ def validate(
         clamped = True
         adjustments.append(f"intended {intended_sz} 张 → approved {approved_sz} 张"
                            "（当前可用保证金上限）")
+    if approved_sz > max_sz_single_order:
+        approved_sz = max_sz_single_order
+        clamped = True
+        adjustments.append(
+            f"intended {intended_sz} 张 → approved {approved_sz} 张"
+            f"（单笔保证金上限 {MAX_SINGLE_ORDER_IMR_RATIO:.0%} 净值，"
+            f"定仓预算 {single_order_sizing_budget:.2f} USDT）")
+    if max_sz_risk is not None and approved_sz > max_sz_risk:
+        approved_sz = max_sz_risk
+        clamped = True
+        adjustments.append(
+            f"intended {intended_sz} 张 → approved {approved_sz} 张"
+            f"（单笔止损风险预算 {MAX_SINGLE_ORDER_RISK_PCT_EQUITY:.0%} 净值 "
+            f"= {single_order_risk_cap:.2f} USDT，止损距 {sl_dev:.2%}+缓冲 "
+            f"{RISK_FEE_BUFFER_PCT + RISK_SLIPPAGE_BUFFER_PCT:.2%}）")
     if approved_sz < min_notional_sz:
         approved_sz = min_notional_sz
         clamped = True
@@ -588,10 +581,19 @@ def validate(
         "approved_notional": approved_notional,
         "approved_margin": incremental_order_imr,
         "incremental_order_imr": incremental_order_imr,
+        "single_order_imr_ratio": incremental_order_imr / equity,
         "projected_account_imr": projected_account_imr,
         "current_portfolio_imr_ratio": current_portfolio_imr_ratio,
         "projected_portfolio_imr_ratio": projected_portfolio_imr_ratio,
     })
+    if per_contract_risk is not None:
+        approved_risk_usdt = approved_sz * per_contract_risk
+        math_box.update({
+            "approved_risk_usdt": approved_risk_usdt,
+            "single_order_risk_pct_equity": approved_risk_usdt / equity,
+            "approved_stop_loss_usdt": (
+                approved_sz * per_contract_notional * sl_dev),
+        })
     if projected_portfolio_imr_ratio > MAX_PORTFOLIO_IMR_RATIO + _EPS:
         return _reject(
             "portfolio_margin_cap_exceeded",
@@ -603,7 +605,9 @@ def validate(
 
 
 # ---------------------------------------------------------------------------
-# 预算辅助（供 decision_briefing 调，让 LLM 提 sz 前就知边界）
+# 预算辅助（2026-08-08 核实：当前无生产调用方——briefing 未接线；字段与 validate
+# 同口径维护，供测试与后续接线。Agent 侧的确定性预算入口是 live_decision_facts
+# 的 balance.single_order_margin_budget_usdt）
 # ---------------------------------------------------------------------------
 def position_budget(mark_px: float, ct_val: float, lot_sz: float,
                     equity: Optional[float], lev: float,
@@ -612,55 +616,21 @@ def position_budget(mark_px: float, ct_val: float, lot_sz: float,
                     profile: str = "live",
                     exchange_max_size: Optional[float] = None,
                     min_order_size: Optional[float] = None) -> dict[str, Any]:
-    """按 profile 给出开仓容量提示。
+    """给出 Live 开仓容量提示（不预批订单）。
 
-    Live 返回可用资金张数上限与组合 IMR 剩余空间提示；执行时超66.6%仍整单拒绝，
-    不由本 helper 自动改小订单。Demo 不做本地比例换算，必须由调用方提供 OKX Demo
-    本次方向 ``exchange_max_size``，仅按 lotSz/minSz 归一。最终以 :func:`validate`
-    为准。
+    返回可用资金张数上限、组合 IMR 剩余空间与单笔 15% 预算提示
+    （``single_order_sizing_budget``/``max_sz_single_order`` 等，2026-08-08 与
+    validate 同口径）；执行时超 66.6% 仍整单拒绝，不由本 helper 自动改小订单。
+    最终以 :func:`validate` 为准。（Demo 的 exchange_max_size 归一分支已随
+    2026-08-06 demo 全量下线移除；``exchange_max_size``/``min_order_size`` 参数
+    仅为签名兼容保留。）
     """
-    try:
-        mark_px = float(mark_px)
-        ct_val = float(ct_val)
-        lot_sz = float(lot_sz)
-        lev = float(lev)
-    except (TypeError, ValueError, OverflowError):
-        return {"ok": False}
-    if (not all(math.isfinite(value) for value in (mark_px, ct_val, lot_sz, lev))
-            or min(mark_px, ct_val, lot_sz, lev) <= 0):
-        return {"ok": False}
-
-    is_demo = (
-        str(profile).lower() == "demo" or "demo" in str(profile).lower())
+    # demo 的 exchange_max_size 归一分支随 2026-08-06 全量下线移除。
     common = [mark_px, ct_val, lot_sz, lev]
     if not all(common) or min(common) <= 0:
         return {"ok": False}
     per_contract_notional = mark_px * ct_val
     per_contract_margin = per_contract_notional / lev
-    if is_demo:
-        try:
-            raw_max = float(exchange_max_size)
-            raw_min = float(min_order_size)
-        except (TypeError, ValueError):
-            return {"ok": False}
-        if (not math.isfinite(raw_max) or raw_max < 0
-                or not math.isfinite(raw_min) or raw_min <= 0):
-            return {"ok": False}
-        max_sz = _round_down_to_step(raw_max, lot_sz)
-        exchange_min_sz = _round_up_to_step(raw_min, lot_sz)
-        return {
-            "ok": True,
-            "profile": "demo",
-            "sizing_policy": "okx_demo_max_size_only",
-            "max_sz_exchange": max_sz,
-            "exchange_min_size": exchange_min_sz,
-            "min_notional_sz": None,
-            "per_contract_margin": per_contract_margin,
-            "per_contract_notional": per_contract_notional,
-            "available_margin_budget": None,
-            "margin_budget_binding": "exchange_max_size",
-            "feasible": max_sz + _EPS >= exchange_min_sz,
-        }
     if equity is None or equity <= 0:
         return {"ok": False}
     try:
@@ -674,6 +644,10 @@ def position_budget(mark_px: float, ct_val: float, lot_sz: float,
     available_margin_budget = available_margin * AVAILABLE_MARGIN_USE_PCT
     max_sz_available = _round_down_to_step(
         available_margin_budget / per_contract_margin, lot_sz)
+    single_order_sizing_budget = (
+        MAX_SINGLE_ORDER_IMR_RATIO * equity * SINGLE_ORDER_SIZING_HEADROOM_PCT)
+    max_sz_single_order = _round_down_to_step(
+        single_order_sizing_budget / per_contract_margin, lot_sz)
     portfolio_imr_budget = MAX_PORTFOLIO_IMR_RATIO * equity
     remaining_portfolio_imr = max(0.0, portfolio_imr_budget - account_imr)
     max_sz_portfolio = _round_down_to_step(
@@ -682,6 +656,9 @@ def position_budget(mark_px: float, ct_val: float, lot_sz: float,
     return {
         "ok": True,
         "max_sz_available": max_sz_available,
+        "max_sz_single_order": max_sz_single_order,
+        "single_order_sizing_budget": single_order_sizing_budget,
+        "max_single_order_imr_ratio": MAX_SINGLE_ORDER_IMR_RATIO,
         "max_sz_portfolio_observation": max_sz_portfolio,
         "min_notional_sz": min_sz,
         "per_contract_margin": per_contract_margin,
@@ -697,6 +674,8 @@ def position_budget(mark_px: float, ct_val: float, lot_sz: float,
         "available_margin_budget": available_margin_budget,
         "margin_budget_binding": "available_margin",
         "feasible": (
-            min_sz <= max_sz_available and min_sz <= max_sz_portfolio
+            min_sz <= max_sz_available
+            and min_sz <= max_sz_single_order
+            and min_sz <= max_sz_portfolio
         ),
     }

@@ -16,22 +16,11 @@ sent 表中其他格式的历史行只读保留，不参与当前键匹配。
 ⚠️ --dedupe-key / --db-root 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，
 runpy 前必须 _strip_wrapper_args 剥掉，否则 raw SystemExit(2)。
 
-Structured events use qq_push_dedupe.jsonl for the canonical root and a root-hashed
-filename for non-default roots; dedupe SQLite truth always lives under that DB root.
+Structured events use qq_push_dedupe.jsonl for the canonical root and a
+root-hashed filename for non-default roots; dedupe SQLite truth always lives
+under that DB root.
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import hashlib
 import json
@@ -43,7 +32,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(_project_path())
+ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
 RAW = ROOT / "scripts" / "qq_push_raw.py"
 DEFAULT_DB_ROOT = (ROOT / "db").resolve()
 DB = DEFAULT_DB_ROOT / "qq_push_dedupe.db"
@@ -87,7 +78,9 @@ def _configure_runtime_paths() -> Path:
     raw_root = _arg_value(("--db-root",)) or os.environ.get("OKX_DB_ROOT")
     runtime_root = Path(raw_root or DEFAULT_DB_ROOT).expanduser().resolve()
     DB = runtime_root / "qq_push_dedupe.db"
-    if runtime_root == DEFAULT_DB_ROOT:
+    if os.path.normcase(os.fspath(runtime_root)) == os.path.normcase(
+        os.fspath(DEFAULT_DB_ROOT)
+    ):
         EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
     else:
         tag = "r" + hashlib.sha256(
@@ -144,8 +137,13 @@ def _connect() -> sqlite3.Connection:
         raise
 
 
-def _claim(key: str, content_hash: str, preview: str,
-           dkey: str | None, target: str) -> str:
+def _claim(
+    key: str,
+    content_hash: str,
+    preview: str,
+    dkey: str | None,
+    target: str,
+) -> str:
     con = _connect()
     try:
         con.execute(SENT_TABLE_DDL)

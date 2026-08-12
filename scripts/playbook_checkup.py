@@ -9,21 +9,9 @@
   3. 周度统计快照打印（有战绩/胜者/弃用计数）
 
 用法:
-  pwsh ... run_okx_python.ps1 scripts/playbook_checkup.py [--db-root <PROJECT_ROOT>\\db] [--apply]
+  pwsh ... run_okx_python.ps1 scripts/playbook_checkup.py [--db-root ./db] [--apply]
 默认 dry-run；退出码 0=成功（含 dry-run），1=异常。
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import sqlite3
 import sys
@@ -36,7 +24,7 @@ DEPRECATE_WR = 0.30
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--apply", action="store_true", help="执行降级写库（默认 dry-run）")
     ap.add_argument("--candidates", type=int, default=3)
     args = ap.parse_args()
@@ -93,10 +81,15 @@ def main():
         "ORDER BY RANDOM() LIMIT ?",
         (args.candidates,),
     ).fetchall()
-    print(f"\n[实验候选] 本周抽样 {len(cands)} 条未验证条目 → 请经 hypotheses_writer.py 登记 demo 实验:")
+    # 2026-08-06 demo 全量下线：原文写「登记 demo 实验」「falsifiable=demo 实测」——
+    # 这是给 reviewer 的周一指令，模拟盘没了照念就是让它去登记一个跑不了的实验。
+    # 改为 live 观察口径：不新开仓验证，只在**已发生**的 live 成交里累积样本。
+    print(f"\n[实验候选] 本周抽样 {len(cands)} 条未验证条目 → 请经 hypotheses_writer.py 登记假设:")
     for r in cands:
         print(f"  #{r['id']} [{r['category']}] {r['summary'][:60]}")
-        print(f"    建议假设格式: hypothesis_id=PB-EXP-{r['id']}, falsifiable=demo 实测 n≥5 后按 wr/avg 判存废")
+        print(f"    建议假设格式: hypothesis_id=PB-EXP-{r['id']}, "
+              f"falsifiable=live 已发生成交累积 n≥5 后按 wr/avg 判存废"
+              f"（观察既有成交，不为验证假设而开仓）")
 
     con.close()
     print("\nOK playbook 体检完成")

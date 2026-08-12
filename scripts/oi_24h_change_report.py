@@ -4,25 +4,13 @@ Compute 24h OI change from latest snapshot in market.db derivatives
 Handles mixed format: 'YYYY-MM-DD HH:MM:SS' (UTC+8) vs 'YYYY-MM-DDTHH:MM:SSZ' (ISO UTC).
 Outputs TOP3 by |change%|.
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import json
 import sys
 from datetime import datetime, timezone, timedelta
 
 from _db_ro import connect_ro
 
-DB_PATH = _project_path('db', 'market.db')
+DB_PATH = r"./db/market.db"
 
 
 def parse_ts(s: str) -> datetime | None:

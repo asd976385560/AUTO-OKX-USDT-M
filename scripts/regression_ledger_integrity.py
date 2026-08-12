@@ -26,15 +26,20 @@ CREATE TABLE trade_experiences (
  profile TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT, action TEXT,
  regime TEXT, regime_stale INTEGER DEFAULT 0, score_total INTEGER,
  confidence REAL, playbook_ref TEXT, hypothesis_id TEXT, market_snapshot TEXT,
- experience_vector TEXT, pnl_pct REAL, hold_hours REAL, hit_1R INTEGER,
+ experience_vector TEXT, pnl_pct REAL, hold_hours REAL, is_gross_profit_close INTEGER,
  status TEXT DEFAULT 'open', raw TEXT, experience_summary TEXT
 );
 """
 
 
 def _card(cycle: str) -> dict:
+    # `status` 是 validate_receipt_context 的必检字段（order_executor:993）。
+    # 本 fixture 长期缺它，导致整个回归脚本在第 112 行断言就失败——**这与
+    # 2026-08-06 的 demo 下线无关**，08-04 的备份里该检查就已存在，属于契约
+    # 加字段时漏改 fixture。补上后本脚本才真正跑得完。
     return {
         "cycle_id": cycle,
+        "status": "ok",
         "decision_protocol": "decision_card_v1",
         "decision_card": {
             "direction_evidence": ["d"], "opposing_evidence": ["o"],
@@ -54,7 +59,7 @@ def _card(cycle: str) -> dict:
 
 def _payload(cycle: str, action: str, trades: list[dict]) -> dict:
     return {
-        "cycle_id": cycle, "profile": "demo",
+        "cycle_id": cycle, "profile": "live",
         "action_taken": action, "trades": trades,
     }
 

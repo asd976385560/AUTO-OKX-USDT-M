@@ -1,7 +1,7 @@
 -- OKX 永续合约自主交易系统 - 数据库 Schema
--- 导出时间: 2026-07-31 17:31:44 CST
+-- 导出时间: 2026-08-12 04:34:42 CST
 -- 版本: V2.0
--- 数据库目录: <PROJECT_ROOT>\db\
+-- 数据库目录: db\
 -- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）
 -- 核心拆分库由 init_v20_dbs.py 初始化；增量变更走 apply_* 幂等迁移脚本
 
@@ -34,6 +34,14 @@ CREATE TABLE derivatives (
     PRIMARY KEY (ts, symbol)
 );
 
+CREATE TABLE instrument_class (
+    symbol      TEXT PRIMARY KEY,          -- 完整 instId（<BASE>-USDT-SWAP）
+    asset_class TEXT NOT NULL CHECK (asset_class IN
+        ('crypto','tokenized_stock','tokenized_commodity','tokenized_index_etf')),
+    source      TEXT NOT NULL,             -- curated | default_crypto | manual
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE instruments_cache (
             instId    TEXT PRIMARY KEY,
             ctVal     REAL,
@@ -63,6 +71,26 @@ CREATE TABLE macro_registry (
     recommended_freq TEXT,
     last_checked_utc TEXT,
     notes            TEXT
+);
+
+CREATE TABLE market_contract_statistics (
+    ts TEXT NOT NULL,
+    collected_ts TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL CHECK (timeframe = '15m'),
+    oi_contracts REAL NOT NULL CHECK (oi_contracts >= 0),
+    oi_ccy REAL NOT NULL CHECK (oi_ccy >= 0),
+    oi_usd REAL NOT NULL CHECK (oi_usd >= 0),
+    taker_sell_usd REAL NOT NULL CHECK (taker_sell_usd >= 0),
+    taker_buy_usd REAL NOT NULL CHECK (taker_buy_usd >= 0),
+    taker_buy_ratio REAL CHECK (
+        taker_buy_ratio IS NULL
+        OR (taker_buy_ratio >= 0 AND taker_buy_ratio <= 1)
+    ),
+    raw TEXT NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (cycle_id, symbol, timeframe, source)
 );
 
 CREATE TABLE market_microstructure (
@@ -143,6 +171,10 @@ CREATE TABLE tick_snapshots (
     PRIMARY KEY (ts, symbol)
 );
 
+CREATE INDEX idx_contract_statistics_cycle ON market_contract_statistics(cycle_id, source);
+
+CREATE INDEX idx_contract_statistics_symbol_ts ON market_contract_statistics(symbol, ts);
+
 CREATE INDEX idx_derivatives_symbol_ts ON derivatives(symbol, ts);
 
 CREATE INDEX idx_flow_cycle
@@ -206,7 +238,7 @@ CREATE TABLE news_items (
     url         TEXT,
     sentiment   REAL,
     raw         TEXT
-, ingested_at TEXT, event_time TEXT, severity TEXT, tags TEXT);
+, ingested_at TEXT, event_time TEXT, severity TEXT, tags TEXT, event_occurred_at TEXT, event_time_confidence TEXT, published_at TEXT, first_seen_at TEXT, last_seen_at TEXT, cluster_id TEXT, source_grade TEXT, primary_source_url TEXT, event_date_source TEXT, event_key TEXT, news_time_version INTEGER);
 
 CREATE INDEX idx_coin_sentiment_symbol_ts ON coin_sentiment(symbol, ts);
 
@@ -347,16 +379,20 @@ CREATE TABLE position_snapshots (
     PRIMARY KEY (ts, profile, symbol)
 );
 
-CREATE TABLE repair_queue (
+CREATE TABLE "repair_queue" (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          TEXT NOT NULL,
     check_name  TEXT NOT NULL,
     issue       TEXT NOT NULL,
     fix_action  TEXT,
-    status      TEXT NOT NULL DEFAULT 'pending',
+    status      TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('open','pending','closed','resolved')),
     cycle_id    INTEGER,
-    created_utc TEXT NOT NULL
-, closed_at TEXT, closed_by TEXT, resolution TEXT);
+    created_utc TEXT NOT NULL,
+    closed_at   TEXT,
+    closed_by   TEXT,
+    resolution  TEXT
+);
 
 CREATE TABLE scoring_history (
     ts            TEXT NOT NULL,
@@ -411,7 +447,7 @@ CREATE TABLE trade_events (
     raw             TEXT
 );
 
-CREATE TABLE trade_experiences (
+CREATE TABLE "trade_experiences" (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     cycle_id           TEXT NOT NULL,
     ts                 TEXT NOT NULL,        -- UTC+8 'YYYY-MM-DD HH:MM:SS'
@@ -427,13 +463,15 @@ CREATE TABLE trade_experiences (
     hypothesis_id      TEXT,
     market_snapshot    TEXT,                 -- JSON：regime/支撑阻力/衍生品极值/新闻摘要
     experience_vector  TEXT,                 -- JSON 数组：判定向量（算相似用）
-    pnl_pct            REAL,                 -- 平仓时填
+    pnl_pct            REAL,                 -- 平仓时填；毛口径（不含手续费/资金费）
     hold_hours         REAL,
-    hit_1R             INTEGER,              -- 1=达 1R | 0=否 | NULL=未平
+    is_gross_profit_close INTEGER,           -- 1=毛利>0 | 0=毛利<=0 | NULL=未平/未知；2026-08-10 由 hit_1R 更名（旧名谎称"达1R"，实义只是毛利为正）
     status             TEXT DEFAULT 'open',  -- open | closed
     raw                TEXT,                 -- 完整回执 JSON（事实正本）
-    experience_summary TEXT                  -- L2 异步：LLM 1-2 行教训（maintainer 落）
-, open_sz REAL, remaining_sz REAL, realized_pnl REAL NOT NULL DEFAULT 0, close_count INTEGER NOT NULL DEFAULT 0, closed_at TEXT);
+    experience_summary TEXT,                 -- L2 异步：确定性教训摘要
+    open_sz REAL, remaining_sz REAL, realized_pnl REAL NOT NULL DEFAULT 0, close_count INTEGER NOT NULL DEFAULT 0, closed_at TEXT,
+    ever_hit_1r        INTEGER               -- 1=持仓期间曾达+1R | 0=有路径证据确证未达 | NULL=无价格路径证据（2026-08-10 新增；Wave2 MFE 埋点前恒 NULL）
+, initial_risk_usdt REAL, mfe_r REAL, mae_r REAL, realized_r_net REAL, close_at_1r INTEGER, exit_category TEXT, path_coverage TEXT, experience_summary_version INTEGER, path_metric_version INTEGER);
 
 CREATE TABLE weekly_reports (
     week_start_ts   TEXT NOT NULL,
@@ -510,7 +548,7 @@ CREATE TABLE error_patterns (
     last_seen_utc     TEXT NOT NULL
 , outcome TEXT, outcome_note TEXT, retired INTEGER DEFAULT 0);
 
-CREATE TABLE missed_opportunities (
+CREATE TABLE "missed_opportunities" (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              TEXT NOT NULL,
     symbol          TEXT NOT NULL,
@@ -518,10 +556,11 @@ CREATE TABLE missed_opportunities (
     regime          TEXT,
     direction_hint  TEXT,
     actual_4h_pct   REAL,
-    would_hit_1R    INTEGER,
+    would_hit_1r_fixed2pct INTEGER,   -- 固定±2%代理口径"本可达1R"；2026-08-10 由 would_hit_1R 更名，与真实计划止损口径无关
     notes           TEXT,
-    reviewed_utc    TEXT NOT NULL
-, decision_card TEXT);
+    reviewed_utc    TEXT NOT NULL,
+    decision_card   TEXT
+);
 
 CREATE TABLE param_suggestions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -571,15 +610,15 @@ CREATE INDEX idx_signal_perf_updated ON signal_perf(updated_utc);
 -- 数据库: drill.db
 -- ============================================================
 
-CREATE TABLE drill_account_snapshots (
+CREATE TABLE "drill_account_snapshots" (
         ts TEXT PRIMARY KEY,
         total_eq REAL,
         avail_bal REAL,
         margin_used REAL,
         position_count INTEGER
-    , profile TEXT DEFAULT 'demo');
+    , profile TEXT DEFAULT 'live');
 
-CREATE TABLE drill_cycle_runs (
+CREATE TABLE "drill_cycle_runs" (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts_start TEXT NOT NULL,
         ts_end TEXT,
@@ -589,7 +628,7 @@ CREATE TABLE drill_cycle_runs (
         trades_opened INTEGER,
         trades_closed INTEGER,
         error TEXT
-    , profile TEXT DEFAULT 'demo');
+    , profile TEXT DEFAULT 'live');
 
 CREATE TABLE drill_learnings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -619,7 +658,7 @@ CREATE TABLE drill_suggestions (
     created_utc TEXT NOT NULL
 );
 
-CREATE TABLE drill_trades (
+CREATE TABLE "drill_trades" (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts TEXT NOT NULL,
         symbol TEXT NOT NULL,
@@ -638,7 +677,7 @@ CREATE TABLE drill_trades (
         pnl_pct REAL,
         status TEXT DEFAULT 'open',
         source_suggestion_id INTEGER
-    , close_reason TEXT, profile TEXT DEFAULT 'demo', cycle_id INTEGER);
+    , close_reason TEXT, profile TEXT DEFAULT 'live', cycle_id INTEGER);
 
 -- ============================================================
 -- 数据库: regime.db
@@ -747,46 +786,7 @@ CREATE INDEX idx_analysis_signals_cycle ON analysis_signals(cycle_id);
 CREATE TABLE trade_cycles (
     cycle_id     TEXT PRIMARY KEY,
     ts           TEXT NOT NULL,
-    mode         TEXT,               -- live|demo（由 trades_writer 按 profile 写入）
-    decision     TEXT,               -- traded|hold|skip|degraded
-    n_orders     INTEGER DEFAULT 0,
-    equity       REAL,
-    note         TEXT,
-    raw          TEXT
-);
-
-CREATE TABLE trades (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    cycle_id     TEXT,
-    ts           TEXT NOT NULL,
-    symbol       TEXT NOT NULL,
-    action       TEXT NOT NULL,      -- open|close|add|reduce|...
-    side         TEXT,               -- long|short
-    sz           REAL,
-    fill_px      REAL,
-    lev          REAL,
-    margin       REAL,
-    notional     REAL,
-    score_total  INTEGER,
-    reasoning    TEXT,
-    deviation    TEXT,               -- 偏离分析建议的说明（若有）
-    degradation  TEXT,               -- 本轮降级标记（partial / 数据缺失）
-    pnl          REAL,
-    raw          TEXT
-);
-
-CREATE INDEX idx_trades_cycle ON trades(cycle_id);
-
-CREATE INDEX idx_trades_symbol_ts ON trades(symbol, ts);
-
--- ============================================================
--- 数据库: demo_trades.db
--- ============================================================
-
-CREATE TABLE trade_cycles (
-    cycle_id     TEXT PRIMARY KEY,
-    ts           TEXT NOT NULL,
-    mode         TEXT,               -- live|demo（由 trades_writer 按 profile 写入）
+    mode         TEXT,               -- live（由 trades_writer 按 profile 写入）
     decision     TEXT,               -- traded|hold|skip|degraded
     n_orders     INTEGER DEFAULT 0,
     equity       REAL,

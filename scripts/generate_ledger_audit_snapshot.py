@@ -8,18 +8,6 @@ not by themselves make the current repair state fail.
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import shutil
@@ -30,9 +18,9 @@ from pathlib import Path
 from typing import Any
 
 CST = timezone(timedelta(hours=8))
-LEDGERS = {"live": "live_trades.db", "demo": "demo_trades.db"}
+LEDGERS = {"live": "live_trades.db"}
 DB_CHECKS = (
-    "ledger.db", "account.db", "live_trades.db", "demo_trades.db",
+    "ledger.db", "account.db", "live_trades.db",
     "analysis.db", "market.db", "regime.db",
 )
 EPS = 1e-7
@@ -347,7 +335,8 @@ def _experience_status(db_root: Path) -> tuple[dict[str, Any], list[dict[str, An
                 "missing_or_size_mismatch_groups": mismatch,
             }
         eth = _dicts(con.execute(
-            "SELECT id,cycle_id,ts,status,pnl_pct,hold_hours,hit_1R,"
+            "SELECT id,cycle_id,ts,status,pnl_pct,hold_hours,"
+            "is_gross_profit_close,"
             "remaining_sz,raw FROM trade_experiences "
             "WHERE profile='live' AND symbol='ETH-USDT-SWAP' "
             "AND cycle_id='2026-07-26T00:00' ORDER BY id"
@@ -583,10 +572,10 @@ def build_snapshot(db_root: Path, recent_days: int) -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate current ledger audit snapshot")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument(
         "--out",
-        default=_project_path('reports', 'quality', 'ledger_audit_snapshot_20260726.json'),
+        default=r"./reports/quality/ledger_audit_snapshot_20260726.json",
     )
     ap.add_argument("--recent-days", type=int, default=7)
     ap.add_argument("--backup-dir")

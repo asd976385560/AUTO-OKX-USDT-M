@@ -184,7 +184,7 @@ def main() -> int:
     parser.add_argument(
         "--db-root",
         default=str(_PROJECT_ROOT / "db"),
-        help="directory containing ledger.db (default: <PROJECT_ROOT>/db)",
+        help="directory containing ledger.db (default: ./db)",
     )
     add_migration_arguments(parser)
     args = parser.parse_args()

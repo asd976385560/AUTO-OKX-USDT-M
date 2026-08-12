@@ -105,7 +105,6 @@ Thumbs.db
 /scripts/microtest_order.py
 /scripts/phase5_writer.py
 /scripts/query_cross_market.ps1
-/scripts/validate_receipt.py
 /scripts/_okx_private_http.py
 /scripts/migrate_ledger_integrity.py
 /scripts/migrate_weekly_win_rate_pct.py

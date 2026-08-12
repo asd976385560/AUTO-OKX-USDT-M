@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯脚本）。
 
-确定性检查账本健康、源时效和注入话术；超阈必须经 qq_push.py --alert 推送，
-告警目标仅取 OKX_QQ_ALERT_TARGET（无内置回退）。业务报告不得带 --alert，
-其目标仅取 OKX_QQ_TARGET。LLM 不参与检测环。
+确定性检查账本健康、源时效和注入话术；超阈经 qq_push.py 推统一默认 target
+（告警用途键）。LLM 不参与检测环。
 
 只在下述“真故障”告警，其余一律 audit-only（记 audit.jsonl 不推 QQ）：
   QQ 告警（P0/P1）：
@@ -13,10 +12,8 @@ r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯�
     · trader 已派但超宽限仍未落 trade_cycles：单轮即 P1
     · 单槽 ≥2 源同时 error/timeout（齐活率成片塌陷）→ P1
     · 注入话术命中（脚本关键词扫，非 LLM 语义）→ P1
-    · 执行 journal 已成交未入账 >15min：live → P1 人工；demo 自动
-      重放失败/含糊/ordId 身份冲突 → P1
-  audit-only（不推 QQ）：非必需源 stale、孤立单轮丢轮、push 未送达、周末稀疏、
-      demo journal 自动重放成功（自愈留痕）。
+    · 执行 journal 已成交未入账 >15min → P1 人工（附重放命令，不自动执行）
+  audit-only（不推 QQ）：非必需源 stale、孤立单轮丢轮、push 未送达、周末稀疏。
 
 降噪：
   · health_check 三态分流：全通=采集器性能超时(降级)／某源不可达=疑真断／工具自身不可用=分流不确定(不臆断)
@@ -24,28 +21,16 @@ r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯�
   · 已报去重（cycle 级）+ cooldown（无 cycle 型 3h）；状态文件原子写 + 损坏隔离；单实例锁防 cron 重叠
 
 红线：全 DB mode=ro 只读；**只告警，绝不补派/重试/拉起/热改 registry**（≠watchdog）。
-**唯一例外**：demo 执行 journal 未入账自动经
-trades_writer --from-journal 补账本行——补的是账（写 demo_trades.db，经硬化 writer
-合并闸幂等），非补派/拉起 agent；live 永远只 dry+P1 人工。
+2026-08-06 demo 全量下线前，本模块有**唯一一处例外**：demo 执行 journal 未入账会自动经
+`trades_writer --from-journal` 补账本行（补账而非补派）。该分支随 demo 一并删除，
+**本模块现已无任何写账本路径**——journal 未入账一律只报 P1 附重放命令，人工核实执行。
 账本不变量命中只同步 account.db.repair_queue 元数据（幂等开/闭工单），不改交易事实。
 
 用法：
-  collection_monitor.py --db-root <PROJECT_ROOT>\db            # 真跑（超阈会真推 QQ）
-  collection_monitor.py --db-root <PROJECT_ROOT>\db --dry-run  # 只检测+报告，不推 QQ、不写状态
+  collection_monitor.py --db-root ./db            # 真跑（超阈会真推 QQ）
+  collection_monitor.py --db-root ./db --dry-run  # 只检测+报告，不推 QQ、不写状态
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import hashlib
@@ -53,20 +38,26 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-if _project_path() not in sys.path:
-    sys.path.insert(0, _project_path())
+import _proc  # 子进程超时整树杀（详见模块 docstring）
+import ledger_invariants as li
 from collectors.cycle_contract import (  # noqa: E402
     cycle_session_token,
     cycle_status_token,
     validate_cycle_id,
 )
-import ledger_invariants as li
+
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+
+
+def _project_path(*parts: str) -> str:
+    return str(_PROJECT_ROOT.joinpath(*parts))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -75,8 +66,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 CST = timezone(timedelta(hours=8))
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
-WRAP = _project_path('scripts', 'run_okx_python.ps1')
-STATE_DIR_BASE = Path(_project_path('logs', 'monitor'))
+WRAP = _project_path("scripts", "run_okx_python.ps1")
+STATE_DIR_BASE = Path(_project_path("logs", "monitor"))
 STATE_DIR = STATE_DIR_BASE
 STATE_FILE = STATE_DIR / "alert_state.json"
 AUDIT_FILE = STATE_DIR / "audit.jsonl"
@@ -95,20 +86,21 @@ TRADER_GRACE_SEC = 900                          # trader 派后给 15min 写 tra
 UNIFIED_LIVE_GRACE_SEC = 1800                   # 合并分析+实盘首棒给 30min；full live/demo 仍 15min
 JOURNAL_GRACE_SEC = 900                         # journal 落痕后给 15min 让 trader 正常喂 writer，超则判未入账
 LOCK_STALE_SEC = 180                            # 锁陈旧阈（超此视为死锁可抢）
-TRADES_WRITER = _project_path('collectors', 'trades_writer.py')
-PROD_DB_ROOT = _project_path('db')                     # journal 自动重放仅限规范生产 root
+TRADES_WRITER = _project_path("collectors", "trades_writer.py")
+PROD_DB_ROOT = _project_path("db")
 # P13（2026-07-14）：trader launch-but-failed 三态归因的 audit 账本落点（OpenClaw 2026.7.1+；
 # 表不存在/库不可读一律 fail-safe 回退单态口径，不影响告警本体）
 OPENCLAW_STATE_DB = os.environ.get(
     "OKX_OPENCLAW_STATE_DB",
-    str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite')))
+    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"))
 STAGE_STATUS_DIR = Path(os.environ.get(
-    "OKX_STAGE_STATUS_DIR", _project_path('logs', 'stage-status')))
+    "OKX_STAGE_STATUS_DIR", _project_path("logs", "stage-status")))
 
 
 def _root_namespace(db_root: str | Path) -> str:
     resolved = Path(db_root).resolve()
-    if resolved == Path(PROD_DB_ROOT).resolve():
+    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
+            os.fspath(Path(PROD_DB_ROOT).resolve())):
         return ""
     return "r" + hashlib.sha256(
         os.path.normcase(os.fspath(resolved)).encode("utf-8")
@@ -125,7 +117,7 @@ def _configure_runtime_paths(db_root: str | Path) -> None:
 
 
 def _is_production_db_root(db_root: str | Path) -> bool:
-    return Path(db_root).resolve() == Path(PROD_DB_ROOT).resolve()
+    return _root_namespace(db_root) == ""
 
 # 注入话术关键词（脚本级，非 LLM 语义）。匹配文本仅报"命中模式名"，不回灌原文（防自激）。
 INJECTION_PATTERNS = {
@@ -157,11 +149,13 @@ def _ro(db_root: str, name: str):
 
 
 def run_script(script: str, args: list, timeout: int = 90) -> tuple[int, str]:
+    # 保留 wrapper：本脚本仅 on-demand 手工运行，启动方式不保证在 wrapper 下，
+    # 内层各步需靠它拿 PYTHONPATH/代理/凭证。超时改走整树杀（详见 _proc 模块）。
     cmd = [PWSH, "-NoProfile", "-File", WRAP, script, *args]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, creationflags=_CREATE_NO_WINDOW)
-        return p.returncode, (p.stdout or "")
+        rc, out, _err, _to = _proc.run_guarded(
+            cmd, timeout=timeout, creationflags=_CREATE_NO_WINDOW)
+        return rc, out
     except Exception as e:
         return 99, f"__RUN_ERR__ {type(e).__name__}: {e}"
 
@@ -199,7 +193,7 @@ def _sig(key, sev, detail, *, cycles=None, source_like=False, audit_only=False,
 def detect_source_freshness(db_root: str) -> list[dict]:
     """B. 必需源断流/超时告警（abort_sources=required 缺 OR required present-but-stale）→ P0。
     非必需源 stale → audit-only，只标记调研不告警。"""
-    rc, out = run_script(_project_path('scripts', 'source_freshness.py'), ["--db-root", db_root])
+    rc, out = run_script(r"./scripts/source_freshness.py", ["--db-root", db_root])
     data = _parse_json(out)
     if data is None:
         return [_sig("source_freshness_unrunnable", "P2",
@@ -299,7 +293,7 @@ def detect_completion(db_root: str, now: datetime) -> list[dict]:
 def detect_lost_cycles(db_root: str) -> list[dict]:
     """D1. 丢轮 form① decision_fired_no_analysis（复用 query_state --check lost_cycles）→ P1。
     只消费 lost_cycles，**不用 --check all**（避免 news/account/cycle_fresh/regime 越权误报）。"""
-    rc, out = run_script(_project_path('scripts', 'query_state.py'),
+    rc, out = run_script(r"./scripts/query_state.py",
                          ["--check", "lost_cycles", "--db-root", db_root, "--json"])
     data = _parse_json(out)
     if data is None:
@@ -323,8 +317,11 @@ _ATTR_HINT = {
 }
 
 
-def _audit_attribution(book: str, cyc: str,
-                       db_root: str | Path = PROD_DB_ROOT) -> str:
+def _audit_attribution(
+    book: str,
+    cyc: str,
+    db_root: str | Path = PROD_DB_ROOT,
+) -> str:
     """优先读 stage_runner 确定性终态，再回退 OpenClaw audit_events 三态归因。
 
     P13（2026-07-14）：直读 OpenClaw audit_events（metadata-only 账本，mode=ro）
@@ -352,11 +349,9 @@ def _audit_attribution(book: str, cyc: str,
     if runner_status == "succeeded":
         return "run-ok-no-db-row"
 
-    # Real Agent stages are deliberately unavailable for non-default roots:
-    # Gateway turns cannot prove propagation of the local DB-root override.
-    # Therefore a missing isolated status file must never fall back to the
-    # canonical OpenClaw audit database and borrow a production session with
-    # the same cycle id.
+    # An isolated DB root must never inherit attribution from the canonical
+    # OpenClaw session ledger.  Its namespaced stage-runner status is the only
+    # admissible evidence source.
     if namespace:
         return "no-run"
 
@@ -398,7 +393,7 @@ def detect_trader_incomplete(db_root: str, now: datetime) -> list[dict]:
             "SELECT s.cycle_id, s.stage, s.dispatched_at, "
             "EXISTS(SELECT 1 FROM stage_dispatch a "
             "       WHERE a.cycle_id=s.cycle_id AND a.stage='analyst') AS legacy_cycle "
-            "FROM stage_dispatch s WHERE s.stage IN ('live','demo') "
+            "FROM stage_dispatch s WHERE s.stage='live' "
             "AND s.dispatched_at>=? AND s.dispatched_at<=? AND s.cycle_id NOT LIKE 'TEST-%'",
             (lo, hi)).fetchall()
     finally:
@@ -488,7 +483,7 @@ def detect_injection() -> list[dict]:
     """F. 注入话术脚本扫描：只扫 logs/trigger（**排除 logs/monitor 自身防自激**）；
     命中只报模式名 + 文件，**不回灌匹配原文** → P1。"""
     sigs = []
-    d = Path(_project_path('logs', 'trigger'))
+    d = Path(r"./logs/trigger")
     if not d.exists():
         return sigs
     files = sorted(d.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:12]
@@ -510,25 +505,30 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
     """H. order_executor 执行 journal ↔ 账本对账。
 
     journal=成交即留痕（executor 成功路径同进程落 JSONL）；落痕 >15min 仍未入账
-    =trader 会话在成交后、喂 writer 前被杀。
-    处置分级：demo → 自动 trades_writer --from-journal 重放
-    （成功=audit-only 自愈留痕，失败=P1）；live → 永远只 P1 附重放命令，人工核实执行。
-    检测复用 writer --replay-dry-run（监控与重放同一套过滤/归因逻辑，不分叉）；
-    无 ordId 的记录（如 recovered_timeout）两盘一律 P1 人工——含糊面不自动动账。
-    本函数使 monitor 成为 demo_trades.db 第二写入方：低碰撞（:09/:39 vs trader
-    ~:03-:25）+ WAL + 合并闸幂等可容。"""
+    =trader 会话在成交后、喂 writer 前被杀。检测复用 writer --replay-dry-run
+    （监控与重放同一套过滤/归因逻辑，不分叉）；一律只 P1 附重放命令，人工核实执行。
+
+    2026-08-06 demo 全量下线后**本函数不再写任何账本**：原先 demo 腿会自动
+    `trades_writer --from-journal --profile demo` 重放，是 demo_trades.db 的第二
+    写入方；live 腿从来只报不写。demo 腿删除后自动写入面归零，`dry_run` 参数与
+    `prod_root`/`PROD_DB_ROOT` 生产库判别也随之失去意义（后者已删）。`dry_run` 仍保留在签名里，
+    调用方无需改动，语义上现在恒等于 report-only。"""
     sigs: list[dict] = []
     jdir = Path(os.environ.get("OKX_EXEC_JOURNAL_DIR") or (Path(db_root) / "journal"))
-    # 自动重放是生产专用动作；非生产 root 即使具备独立 writer 路径，也只报告。
-    prod_root = _is_production_db_root(db_root)
-    for profile in ("live", "demo"):
+    for profile in ("live",):
         jf = jdir / f"exec_{profile}.jsonl"
         if not jf.exists():
             continue
-        rc, out = run_script(TRADES_WRITER, ["--from-journal", str(jf),
-                                             "--profile", profile,
-                                             "--db-root", str(Path(db_root).resolve()),
-                                             "--replay-dry-run"])
+        resolved_root = str(Path(db_root).resolve())
+        rc, out = run_script(
+            TRADES_WRITER,
+            [
+                "--from-journal", str(jf),
+                "--profile", profile,
+                "--db-root", resolved_root,
+                "--replay-dry-run",
+            ],
+        )
         plan = _parse_json(out)
         if rc != 0 or not isinstance(plan, dict):
             sigs.append(_sig(f"journal_scan_unrunnable:{profile}", "P2",
@@ -575,53 +575,15 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
                 f"sz={e.get('sz')} ordId={e.get('ordId')}"
                 + ("[unwind]" if e.get("unwind") else "") for e in es[:6])
 
-        resolved_root = Path(db_root).resolve()
         hint = (
-            f"｜人工核实后先只读预演: trades_writer.py --from-journal {jf} "
-            f"--profile {profile} --db-root {resolved_root} --replay-dry-run；"
-            "核实预演输出无误后，只能对每个唯一真实 ordId 逐笔执行："
-            "保留同一 --db-root，追加 --ordid <ORD_ID> 并移除 --replay-dry-run；"
-            "无真实 ordId 或 unwind 记录继续阻断，禁止批量重放"
+            f"｜逐笔人工核实 ordId 后重放: trades_writer.py "
+            f"--from-journal {jf} --profile {profile} "
+            f"--db-root {resolved_root} --replay-dry-run；"
+            f"确认单笔后再以 --ordid <ORD_ID> 定向处理"
         )
-        if profile == "live":
-            sigs.append(_sig("journal_unaccounted:live", "P1",
-                             f"live 已成交未入账 {len(aged)} 笔(>15min): "
-                             f"{_desc(aged)}{hint}"))
-            continue
-        # demo 分流（核验修：混批不瘫痪自愈——含糊面 P1、可自动面照常重放）：
-        #   无 ordId（recovered_timeout 等）/ unwind（close-without-open）→ P1 人工；
-        #   带真 ordId 且非 unwind → 逐笔 --ordid 自动重放。
-        manual = [e for e in aged if not e.get("ordId") or e.get("unwind")]
-        autoable = [e for e in aged if e.get("ordId") and not e.get("unwind")]
-        if manual:
-            sigs.append(_sig("journal_unaccounted:demo_manual", "P1",
-                             f"demo 含糊记录(无ordId/unwind)未入账 {len(manual)} 笔: "
-                             f"{_desc(manual)}{hint}"))
-        if not autoable:
-            continue
-        if dry_run or not prod_root:
-            why = "[dry-run]" if dry_run else f"[非生产 db-root {db_root}，禁自动动账]"
-            sigs.append(_sig("journal_unaccounted:demo", "P2",
-                             f"{why} demo 将自动重放 {len(autoable)} 笔: {_desc(autoable)}",
-                             audit_only=dry_run))
-            continue
-        failed = []
-        for e in autoable:
-            rc2, out2 = run_script(TRADES_WRITER, ["--from-journal", str(jf),
-                                                    "--profile", "demo",
-                                                    "--db-root", str(Path(db_root).resolve()),
-                                                    "--ordid", str(e["ordId"])])
-            res2 = _parse_json(out2)
-            if rc2 != 0 or not (res2 or {}).get("ok"):
-                failed.append(f"{e.get('symbol')} ordId={e.get('ordId')} rc={rc2}")
-        if failed:
-            sigs.append(_sig("journal_unaccounted:demo", "P1",
-                             f"demo journal 自动重放失败 {len(failed)}/{len(autoable)}: "
-                             f"{'; '.join(failed[:4])}｜需人工处置"))
-        else:
-            sigs.append(_sig("journal_replayed:demo", "P2",
-                             f"demo journal 自动重放成功 {len(autoable)} 笔: "
-                             f"{_desc(autoable)}", audit_only=True))
+        sigs.append(_sig("journal_unaccounted:live", "P1",
+                         f"live 已成交未入账 {len(aged)} 笔(>15min): "
+                         f"{_desc(aged)}{hint}"))
     return sigs
 
 
@@ -632,7 +594,9 @@ def detect_ledger_invariants(
     root = Path(db_root)
     since = (now - timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
     findings: list[dict] = []
-    for profile in ("live", "demo"):
+    # 2026-08-06 demo 全量下线：这里原是 for profile in ("live","demo")，
+    # 而 li.trade_net_findings 用 mode=ro 打开 {profile}_trades.db——库一删就抛。
+    for profile in ("live",):
         findings.extend(li.trade_net_findings(root, profile))
         findings.extend(li.duplicate_execution_findings(root, profile, since))
         findings.extend(li.execution_intent_findings(root, profile, now))
@@ -646,12 +610,65 @@ def detect_ledger_invariants(
     return sigs, findings
 
 
+MONITOR_REPAIR_QUEUE_PREFIXES = (
+    "ledger_invariant:negative_net:",
+    "ledger_invariant:duplicate_intent:",
+    "ledger_invariant:execution_intent:",
+)
+
+
+def sync_monitor_repair_queue(
+    account: sqlite3.Connection,
+    findings: list[dict],
+    ts: str,
+) -> dict:
+    """Synchronize only invariant families detected by this monitor.
+
+    Experience-position/schema findings are owned by the full
+    ``ledger_invariants.py`` maintenance pass and are intentionally outside
+    this list.  Keeping the ownership list explicit prevents an empty monitor
+    result from closing those still-active work items.
+    """
+    unmanaged = [
+        str(item.get("check_name") or "")
+        for item in findings
+        if not any(
+            str(item.get("check_name") or "").startswith(prefix)
+            for prefix in MONITOR_REPAIR_QUEUE_PREFIXES
+        )
+    ]
+    if unmanaged:
+        raise ValueError(
+            "collection_monitor received unmanaged repair_queue findings: "
+            + ", ".join(unmanaged[:5])
+        )
+
+    result = {"inserted": 0, "closed": 0, "families": {}}
+    for prefix in MONITOR_REPAIR_QUEUE_PREFIXES:
+        family_findings = [
+            item for item in findings
+            if str(item.get("check_name") or "").startswith(prefix)
+        ]
+        family_result = li.sync_repair_queue(
+            account,
+            family_prefix=prefix,
+            findings=family_findings,
+            ts=ts,
+            closed_by="collection_monitor",
+            resolution="collection monitor invariant healed",
+        )
+        result["families"][prefix] = family_result
+        result["inserted"] += family_result["inserted"]
+        result["closed"] += family_result["closed"]
+    return result
+
+
 # ── 降噪 ────────────────────────────────────────────────────────────────────
 def triage_source_signals(sigs: list[dict]) -> None:
     """源类信号 health_check 三态分流：0=全通降级perf／1=某源不可达标疑真断／99=工具不可用标不确定。"""
     if not any(s.get("source_like") and not s.get("audit_only") for s in sigs):
         return
-    rc, _ = run_script(_project_path('scripts', 'health_check.py'), [], timeout=60)
+    rc, _ = run_script(r"./scripts/health_check.py", [], timeout=60)
     for s in sigs:
         if not s.get("source_like"):
             continue
@@ -780,17 +797,20 @@ def build_alert(sigs: list[dict], now: datetime) -> str:
     return "\n".join(lines)
 
 
-def send_alert(text: str, db_root: str | Path = PROD_DB_ROOT) -> tuple[int, str]:
+def send_alert(
+    text: str,
+    db_root: str | Path = PROD_DB_ROOT,
+) -> tuple[int, str]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # 显式 --dedupe-key（批次戳=每批告警必达）；语义级重复抑制由本脚本
     # alert_state.json denoise 层负责。
     stamp = f"{now_cst():%Y%m%d_%H%M%S}"
     f = STATE_DIR / f"alert_{stamp}.txt"
     f.write_text(text, encoding="utf-8")
-    rc, out = run_script(_project_path('scripts', 'qq_push.py'),
-                         ["--content-file", str(f), "--alert",  # 告警路由仅取 OKX_QQ_ALERT_TARGET
-                          "--dedupe-key", f"monitor:{stamp}",
-                          "--db-root", str(Path(db_root).resolve())],
+    rc, out = run_script(r"./scripts/qq_push.py",
+                         ["--content-file", str(f), "--alert",  # C2C 私聊（2026-08-04）
+                          "--db-root", str(Path(db_root).resolve()),
+                          "--dedupe-key", f"monitor:{stamp}"],
                          timeout=60)
     return rc, out[:400]
 
@@ -806,20 +826,18 @@ def audit(record: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="within-day 采集/派单/推送健康监控（纯脚本）")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=_project_path("db"))
     ap.add_argument("--dry-run", action="store_true", help="只检测+报告，不推 QQ、不写状态")
     args = ap.parse_args()
-    runtime_db_root = Path(args.db_root).resolve()
-    _configure_runtime_paths(runtime_db_root)
-    if (not args.dry_run
-            and runtime_db_root != Path(PROD_DB_ROOT).resolve()):
-        print(
-            "collection_monitor: non-default db-root is dry-run only; "
-            "refusing shared alert/repair state",
-            file=sys.stderr,
+    db_root = Path(args.db_root).resolve()
+    args.db_root = str(db_root)
+    _configure_runtime_paths(db_root)
+    if not args.dry_run and not _is_production_db_root(db_root):
+        log(
+            "拒绝对非默认 DB root 执行可写监控；"
+            "隔离目录仅允许配合 --dry-run 使用"
         )
         return 2
-    args.db_root = str(runtime_db_root)
     now = now_cst()
 
     if not args.dry_run and not acquire_lock(now):
@@ -855,10 +873,11 @@ def main() -> int:
                     str(Path(args.db_root) / "account.db"), timeout=8)
                 try:
                     account.execute("BEGIN IMMEDIATE")
-                    queue_sync = li.sync_repair_queue(
-                        account, family_prefix="ledger_invariant:",
-                        findings=invariant_findings,
-                        ts=now.strftime("%Y-%m-%d %H:%M:%S"))
+                    queue_sync = sync_monitor_repair_queue(
+                        account,
+                        invariant_findings,
+                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
                     account.commit()
                 except Exception:
                     account.rollback()

@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-public-scope
-last-updated: 2026-08-04
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Define public version 1.0.0 and a gated annotated-tag GitHub Release workflow.
+change-summary: Record the sanitized live-only runtime synchronization and permanently read-only public recovery boundary.
 -->
 
 # Public release scope
@@ -17,8 +17,8 @@ This file records the intended V2.0 public synchronization boundary.
 - the public-only `scripts/lifecycle.json` and its read-only validator;
 - audited current schema migrations that default to read-only dry-run and require
   explicit `--apply --backup-dir` with verified SQLite online backups before writes;
-- guarded ledger reconciliation and autoheal code; Live autoheal is permanently read-only,
-  while Demo runtime wiring requires separate explicit opt-ins for exact close and open bookkeeping;
+- guarded ledger reconciliation and autoheal code; the public autoheal surface is permanently
+  report-only and rejects every write flag or legacy write environment setting;
 - isolated regression tests that do not connect to production databases, place orders, start Agents or send messages;
 - `config.example.md`, `.gitignore`, dependency metadata and bilingual public documentation;
 - `VERSION`, `CHANGELOG.md`, release-contract validation and the gated tag-to-Release workflow;
@@ -29,7 +29,8 @@ This file records the intended V2.0 public synchronization boundary.
 - `docs/archive/` and `scripts/archive/`;
 - internal host runbooks, execution records and OpenClaw baselines;
 - full-environment orchestration and host sampling scripts;
-- Drill, Phase 5 and legacy/compatibility one-off backfill tools;
+- production repair, account-history backfill, real-order microtest, Drill, Phase 5 and
+  legacy/compatibility one-off tools;
 - the local ANT/Clash bridge tool tree, which has its own host and network security boundary;
 - all credentials, databases, SQLite sidecars, execution journals (`*.jsonl`), logs,
   reports, memory, temporary data, local dependencies and caches.
@@ -51,17 +52,15 @@ are also excluded from the public lifecycle manifest and its tests.
 
 ## Public write gates
 
-The profile-lease schema migration defaults to inspection and requires `--apply` plus a
-verified SQLite backup directory. Live ledger autoheal is permanently read-only at runtime,
-direct API, and CLI boundaries; a requested Live write is classified fully, returned as a
-non-zero structured block, and never changes the trade ledger or repair queue. Live repairs
-remain manual and require one unique exchange `ordId`, verified SQLite backups, one-record apply,
-and fresh exchange-position, reconciliation, and invariant checks. For Demo only,
-`OKX_LEDGER_AUTOHEAL_APPLY=1` permits exact GHOST close bookkeeping, while an exact
-UNRECORDED open additionally requires `OKX_LEDGER_AUTOHEAL_UNRECORDED=1`, a matching
-`execution_intent` ordId, and a confirmed existing exchange-side protective stop; no-intent
-T2 or missing/unknown-stop findings remain P0 report-only. Neither path places or replays an
-order. Existing ledgers fail closed until the lease migration is run with
+Published schema migrations default to inspection and require explicit `--apply` plus a
+verified SQLite backup directory before any write. Public ledger autoheal is permanently
+read-only at runtime, direct API, and CLI boundaries; every requested write is classified,
+returned as a non-zero structured block, and never changes the trade ledger or repair queue.
+Repairs remain outside the automatic public path and require one unique exchange `ordId`,
+verified SQLite backups, one-record apply through a separately reviewed tool, and fresh
+exchange-position, reconciliation, and invariant checks. The public runtime supports only
+`profile=live`; legacy Demo write switches have no effect. No autoheal path places, replays,
+or amends an order. Existing ledgers fail closed until required migrations are run with
 `--apply --backup-dir`; dispatcher never performs that upgrade implicitly. Business and
 alert delivery use separate environment-only destinations and have no embedded fallback
 identifiers. Deterministic push and runtime artifacts are namespaced by non-default DB root.

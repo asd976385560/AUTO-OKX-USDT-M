@@ -6,9 +6,11 @@
 
   取窗口内 decision_card_v1 中 **action=wait 且带方向** 的候选；
   无 decision_card 的兼容记录仍按 total/confidence 阈值读取，
-  剔除同 cycle 同 symbol 已真实成交的行，按 15m kline 计算其后 4h 实际走幅与是否可达 1R
-  （1R=按系统惯例 -2% SL 的对称目标 +2%；side 缺失按 long 惯例并在 notes 标注），
-  幂等写入 missed_opportunities（同 ts+symbol 已存在则跳过）。
+  剔除同 cycle 同 symbol 已真实成交的行，按 15m kline 计算其后 4h 实际走幅与
+  would_hit_1r_fixed2pct（**固定 ±2% 代理口径**：-2% SL 的对称目标 +2%；与候选
+  真实计划止损无关，列名 2026-08-10 由 would_hit_1R 更名以杜绝口径混用；side
+  缺失按 long 惯例并在 notes 标注），幂等写入 missed_opportunities（同 ts+symbol
+  已存在则跳过）。
 
 为什么只取 wait（2026-07-31 主人拍板）：
   hold = 持有既有仓位，没有「本可入场却没入」的对照意义，方向恒为 null；
@@ -31,18 +33,6 @@ ts 写 CST 'YYYY-MM-DD HH:MM:SS'（禁 JobB-/UTC-Z 混入——该表 ts 已有�
   --date 2026-07-31   # 兼容入口：等价 --as-of 该日 08:05，窗口 [前一日 08:00, 当日 08:00)
   --date yesterday    # 等价 --as-of 今日 08:05
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import json
 import os
@@ -71,7 +61,7 @@ def main() -> int:
                     help="日报 ts（CST）；窗口取 [前一日 08:00, 当日 08:00)")
     ap.add_argument("--date", default=None,
                     help="兼容入口：YYYY-MM-DD 或 'yesterday'，等价 --as-of 该日 08:05")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -93,14 +83,16 @@ def main() -> int:
     ana = sqlite3.connect(f"file:{root}\\analysis.db?mode=ro", uri=True)
     mkt = sqlite3.connect(f"file:{root}\\market.db?mode=ro", uri=True)
     exe = {}  # (cycle_id, symbol) 已成交集合
-    for db in ("live_trades", "demo_trades"):
-        con = sqlite3.connect(f"file:{root}\\{db}.db?mode=ro", uri=True)
-        for cyc, sym in con.execute(
-            "SELECT cycle_id, symbol FROM trades "
-            "WHERE cycle_id >= ? AND cycle_id < ?", (start_cyc, end_cyc)
-        ):
-            exe[(cyc, sym)] = True
-        con.close()
+    # 2026-08-06 demo 全量下线：原先还扫 demo_trades.db。错失机会的判定是
+    # 「分析给了 wait 而实际没成交」，demo 成交曾算作「抓住了」——demo 停跑后
+    # 那个来源恒为空，留着只会在库删除后抛 unable to open database file。
+    con = sqlite3.connect(f"file:{root}\\live_trades.db?mode=ro", uri=True)
+    for cyc, sym in con.execute(
+        "SELECT cycle_id, symbol FROM trades "
+        "WHERE cycle_id >= ? AND cycle_id < ?", (start_cyc, end_cyc)
+    ):
+        exe[(cyc, sym)] = True
+    con.close()
 
     cands = ana.execute(
         "SELECT cycle_id, symbol, total, confidence, side, decision_card, regime.regime "
@@ -163,15 +155,11 @@ def main() -> int:
             hi = max(r[2] for r in rows)
             lo = min(r[3] for r in rows)
             direction = side if side in ("long", "short") else "long"
+            # 2026-08-10 r-semantics：恒用固定 2% 代理口径，列名 would_hit_1r_fixed2pct
+            # 才始终为真。旧的"卡上 risk_pct 覆盖"分支已删——它混入过小数比例
+            # （0.025 被当 0.025% 用，阈值缩小 100 倍恒判 1）且让列名对那些行撒谎；
+            # 按真实计划止损的 1R 属 Wave1 EV 计算器，另立字段。
             risk_pct = R_PCT
-            if is_card:
-                try:
-                    rr = card.get("risk_reward") or {}
-                    candidate_risk = rr.get("risk_pct") if isinstance(rr, dict) else None
-                    if candidate_risk is not None and float(candidate_risk) > 0:
-                        risk_pct = float(candidate_risk)
-                except (TypeError, ValueError):
-                    risk_pct = R_PCT
             if direction == "short":
                 actual = (px0 - close4) / px0 * 100.0
                 hit_1r = 1 if (px0 - lo) / px0 * 100.0 >= risk_pct else 0
@@ -187,7 +175,7 @@ def main() -> int:
                 les.execute(
                     "INSERT INTO missed_opportunities"
                     "(ts, symbol, score, regime, direction_hint, actual_4h_pct, "
-                    "would_hit_1R, notes, reviewed_utc, decision_card)"
+                    "would_hit_1r_fixed2pct, notes, reviewed_utc, decision_card)"
                     "VALUES (?,?,?,?,?,?,?,?,datetime('now'),?)",
                     (slot_cst, sym, total if total is not None else 0, regime,
                      direction, round(actual, 3), hit_1r, note, card_raw),

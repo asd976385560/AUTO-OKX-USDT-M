@@ -11,7 +11,7 @@ analyst 已写进 analysis.db 的产出，本脚本 verbatim 取用而非复述�
 数据来源（全部只读 mode=ro）：
   analysis.db  analysis_runs[cycle]（regime/market_summary/raw/missing_sources）
                analysis_signals[cycle]（每币 action/side/decision_card/reasoning）
-  live/demo_trades.db  trade_cycles[cycle]（decision/n_orders/note/raw）+ trades[cycle]（逐笔）
+  live_trades.db  trade_cycles[cycle]（decision/n_orders/note/raw）+ trades[cycle]（逐笔）
   market.db    tick_snapshots（BTC/ETH 真价 + chg24h）
   regime.db    cross_market（regime/dxy/vix）
   account.db   account_snapshots / position_snapshots（资金/持仓兜底；render 另有权威覆盖）
@@ -21,28 +21,23 @@ analyst 已写进 analysis.db 的产出，本脚本 verbatim 取用而非复述�
 资金/持仓数/累计收益/轮次/耗时/channel 由 render 权威覆盖，本脚本填真兜底值即可。
 
 用法:
-  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root <PROJECT_ROOT>\\db] [--out-file x.json]
+  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root ./db] [--out-file x.json]
   缺 --cycle 时取 analysis_runs 最新 cycle。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.risk_validator import MAX_PORTFOLIO_IMR_RATIO
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -50,7 +45,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_DB = _project_path('db')
+DEFAULT_DB = r"./db"
 
 # trades.action(+side) → 标准枚举（render/validate 只认单枚举，禁复合标签）
 _OPEN = {"open", "add"}
@@ -173,11 +168,62 @@ def _public_macro_snapshot(db_root):
 def _loads(s):
     if not s:
         return {}
+    # trade_cycles.raw 已经反序列化为 dict；再次 json.loads(dict) 会抛异常并
+    # 静默回退空卡，导致 push 又选到 analysis 阶段的旧 decision_card。
+    if isinstance(s, (dict, list)):
+        return s
     try:
         v = json.loads(s)
         return v if isinstance(v, (dict, list)) else {}
     except Exception:
         return {}
+
+
+def _open_trade_decisions(trades):
+    """Return one frozen decision entry per actual OPEN/ADD symbol+side leg.
+
+    Multiple fills of the same leg share one market decision.  If their frozen
+    cards disagree, keep the leg but mark it conflicting so report validation
+    fails closed instead of choosing one silently.
+    """
+    entries = []
+    by_leg = {}
+    for trade in trades or []:
+        if str(trade.get("action") or "").lower() not in _OPEN:
+            continue
+        symbol = str(trade.get("symbol") or "").strip()
+        side = str(trade.get("side") or "").strip().lower()
+        key = (symbol, side)
+        raw = _loads(trade.get("raw"))
+        card = _loads(raw.get("decision_card")) if isinstance(raw, dict) else {}
+        card = card if isinstance(card, dict) else {}
+        if key not in by_leg:
+            entry = {
+                "symbol": symbol,
+                "side": side,
+                "decision_card": card,
+                "conflicting_cards": False,
+            }
+            by_leg[key] = entry
+            entries.append(entry)
+            continue
+        existing = by_leg[key]
+        previous = existing.get("decision_card") or {}
+        if not previous and card:
+            existing["decision_card"] = card
+        elif previous and card and previous != card:
+            existing["decision_card"] = {}
+            existing["conflicting_cards"] = True
+    return entries
+
+
+def _first_open_trade_card(trades):
+    """Return the first non-conflicting card frozen on an OPEN/ADD ledger leg."""
+    for entry in _open_trade_decisions(trades):
+        card = entry.get("decision_card")
+        if isinstance(card, dict) and card:
+            return card
+    return {}
 
 
 def _summary_section(value):
@@ -507,28 +553,65 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     open_cands = [s for s in sigs if str(s.get("action") or "").startswith("open")]
 
     # ── 交易段（双盘）─────────────────────────────────────
+    # 2026-08-06 demo 全量下线：只剩 live 一本账。
     books = {}
-    for prof in ("live", "demo"):
-        tc = _one(db_root, f"{prof}_trades.db",
-                  "SELECT decision,n_orders,equity,note,raw FROM trade_cycles WHERE cycle_id=?",
-                  (cycle,)) or {}
+    for prof in ("live",):
+        tc_row = _one(db_root, f"{prof}_trades.db",
+                      "SELECT decision,n_orders,equity,note,raw FROM trade_cycles WHERE cycle_id=?",
+                      (cycle,))
+        tc = tc_row or {}
         tr = _rows(db_root, f"{prof}_trades.db",
-                   "SELECT ts,symbol,action,side,sz,fill_px,lev,margin,notional,pnl,reasoning "
+                   "SELECT ts,symbol,action,side,sz,fill_px,lev,margin,notional,pnl,reasoning,raw "
                    "FROM trades WHERE cycle_id=? ORDER BY id", (cycle,))
-        books[prof] = {"tc": tc, "trades": tr, "raw": _loads(tc.get("raw"))}
+        tc_raw = _loads(tc.get("raw"))
+        # 2026-08-08 单笔保证金闸：从回执 raw.trades 透传单笔审计字段
+        # （执行时 equity 口径，比 payload 侧重算更权威；缺失静默省略）。
+        _receipt_trades = [t for t in (tc_raw.get("trades") or [])
+                           if isinstance(t, dict)]
+        for _row in tr:
+            _match = next(
+                (t for t in _receipt_trades
+                 if t.get("symbol") == _row.get("symbol")
+                 and t.get("action") == _row.get("action")
+                 and t.get("side") == _row.get("side")), None)
+            if _match:
+                for _k in ("single_order_imr_ratio",
+                           "max_single_order_imr_ratio",
+                           "single_order_cap_breached", "risk_clamped",
+                           "single_order_risk_pct_equity",
+                           "max_single_order_risk_pct_equity",
+                           "single_order_risk_cap_breached"):
+                    if _match.get(_k) is not None:
+                        _row[_k] = _match.get(_k)
+        # present=False 专指「本轮 trade_cycles 行尚未落库」，与「行在但 decision 未知」
+        # 严格区分：缺行不得当成 UNKNOWN 动作——那会让 render 的标题校验挂掉。
+        books[prof] = {"tc": tc, "trades": tr, "raw": tc_raw,
+                       "present": tc_row is not None}
 
-    all_trades = books["live"]["trades"] + books["demo"]["trades"]
+    all_trades = books["live"]["trades"]
 
     # ── headline action / symbol / confidence ─────────────
     action = _action_from_trades(all_trades)
     if action in (None, "TRADED"):
-        decs = [_map_decision(books[p]["tc"].get("decision")) for p in ("live", "demo")]
+        # 只由已落库的盘推导头条动作：未落库的盘没有动作可言，拿它顶 UNKNOWN
+        # 会把一轮干净的 live HOLD 报成未知。
+        decs = [_map_decision(books[p]["tc"].get("decision"))
+                for p in ("live",) if books[p]["present"]]
         action = next(
             (label for label in ("ERROR", "DEGRADED", "UNKNOWN", "HOLD", "WAIT", "TRADED")
              if label in decs),
             "UNKNOWN",
         )
 
+    open_trade = next(
+        (row for row in all_trades
+         if str(row.get("action") or "").lower() in _OPEN),
+        None,
+    )
+    open_trade_symbol = str((open_trade or {}).get("symbol") or "").strip()
+    open_trade_side = str((open_trade or {}).get("side") or "").strip().lower()
+    open_trade_decisions = _open_trade_decisions(all_trades)
+    open_trade_card = _first_open_trade_card(all_trades)
     if all_trades:
         syms, seen = [], set()
         for t in all_trades:
@@ -536,11 +619,15 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             if s and s not in seen:
                 seen.add(s); syms.append(s)
         symbol = "/".join(syms[:3])
-        conf_sig = next((s for s in sigs if _short(s.get("symbol")) == syms[0]), top_sig)
+        card_symbol = _short((open_trade or all_trades[0]).get("symbol"))
+        conf_sig = next(
+            (s for s in sigs if _short(s.get("symbol")) == card_symbol),
+            top_sig,
+        )
     else:
         symbol = _short(top_sig.get("symbol")) or "BTC"
         conf_sig = top_sig
-    card = _loads(conf_sig.get("decision_card"))
+    card = open_trade_card or _loads(conf_sig.get("decision_card"))
     if not isinstance(card, dict):
         card = {}
     confidence = "-"  # 旧推送键保留；新协议不显示或消费评分
@@ -550,22 +637,19 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                   "OPEN_SHORT": "开空", "CLOSE": "平仓", "STOP_LOSS": "止损",
                   "ADJUST": "调整", "ADD": "加仓", "REDUCE": "减仓",
                   "TRADED": "已成交", "DEGRADED": "DEGRADED 降级",
-                  "ERROR": "ERROR 失败", "UNKNOWN": "UNKNOWN 未知"}
+                  "ERROR": "ERROR 失败", "UNKNOWN": "UNKNOWN 未知",
+                  "PENDING": "PENDING 未落库"}
     def _action_cn(value):
         return "/".join(_ACTION_CN.get(part, part) for part in str(value).split("/"))
 
     action_cn = _action_cn(action)
     # 两盘动作逐盘推导（成交行优先、无成交回退 decision）；
-    # 一致才冠“实盘/模拟双盘”，分歧则并列展示。
-    book_acts = {}
-    for prof in ("live", "demo"):
-        book_acts[prof] = (_action_from_trades(books[prof]["trades"])
-                           or _map_decision(books[prof]["tc"].get("decision")))
-    if book_acts["live"] == book_acts["demo"]:
-        head_cn = f"双盘{action_cn}"
-    else:
-        head_cn = (f"live {_action_cn(book_acts['live'])}"
-                   f"/demo {_action_cn(book_acts['demo'])}")
+    # 2026-08-06 demo 全量下线：只剩实盘一段，不再有双盘一致/分歧之分。
+    book_acts = {"live": (
+        "PENDING" if not books["live"]["present"]
+        else (_action_from_trades(books["live"]["trades"])
+              or _map_decision(books["live"]["tc"].get("decision"))))}
+    head_cn = f"实盘{action_cn}"
     news_evts = news.get("events", []) if isinstance(news, dict) else []
     top_news = ""
     for e in news_evts:
@@ -579,12 +663,41 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
 
     # ── decision.reason（主体=headline 币 analyst 理由，恒在且最相关；叠成交理由+宏观+校准+教训）──
     live_raw = books["live"]["raw"]
-    demo_raw = books["demo"]["raw"]
     reason_bits = []
+    live_facts = live_raw.get("live_facts")
+    facts_authoritative = (
+        isinstance(live_facts, dict) and live_facts.get("status") == "ok"
+    )
+    if facts_authoritative:
+        trade_card = _loads(live_raw.get("decision_card"))
+        if isinstance(trade_card, dict) and trade_card and not open_trade_card:
+            # analysis card 生成于实时 facts 之前；交易回执 card 才能引用已核验现仓。
+            card = trade_card
+    if facts_authoritative:
+        fact_parts = []
+        for item in live_facts.get("positions") or []:
+            if not isinstance(item, dict):
+                continue
+            sl = item.get("sl") if isinstance(item.get("sl"), dict) else {}
+            fact_parts.append(
+                f"{_short(item.get('instId'))} {item.get('posSide')} "
+                f"{item.get('contracts')}张(ctVal={item.get('ctVal')}) "
+                f"持有{item.get('position_age_hours')}h mark={item.get('markPx')} "
+                f"SL={sl.get('trigger_px') if sl.get('verified') else '未核验'}"
+            )
+        ratio = (live_facts.get("balance") or {}).get(
+            "current_portfolio_imr_ratio"
+        )
+        if ratio is not None:
+            fact_parts.append(f"IMR/权益={float(ratio) * 100:.2f}%")
+        if fact_parts:
+            reason_bits.append(
+                f"交易所事实({live_facts.get('as_of')})：" + "；".join(fact_parts)
+            )
     if card.get("agent_judgement"):
         reason_bits.append(f"Agent裁决：{card['agent_judgement']}")
     head_reason = conf_sig.get("reasoning")
-    if head_reason:
+    if head_reason and not facts_authoritative:
         reason_bits.append(str(head_reason))
     if all_trades:  # 有成交补该笔下单理由（与信号理由互补）
         tr0 = all_trades[0].get("reasoning")
@@ -612,7 +725,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         if parts:
             reason_bits.append("校准30d " + " ".join(parts[:2]))
     lessons = (live_raw.get("applied_lessons") or live_raw.get("lessons_matched")
-               or demo_raw.get("lesson_applied") or [])  # trader raw 键逐轮变名，全兜
+               or [])  # trader raw 键逐轮变名，全兜
     if isinstance(lessons, str):
         lessons = [lessons]
     lesson_strs = [s for s in (_fmt_lesson(x) for x in lessons[:3]) if s][:2]
@@ -629,7 +742,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         play["play_id"] = p0.get("id", "-")
         play["play_title"] = str(p0.get("note") or p0.get("summary") or p0.get("title") or "-")[:60]
         play["hit_rate"] = _num_or_dash(p0.get("wr"))
-    cited = (live_raw.get("experiences_cited") or demo_raw.get("experiences_cited") or [])
+    cited = (live_raw.get("experiences_cited") or [])
     if cited and isinstance(cited[0], dict):
         c = cited[0]
         play.update(play_id=c.get("id", play["play_id"]),
@@ -653,14 +766,69 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     def _fmt_trades(tr):
         out = []
         for t in tr:
-            out.append({"symbol": t.get("symbol"), "action": t.get("action"),
-                        "side": t.get("side"), "sz": t.get("sz"),
-                        "fill_px": _px(t.get("fill_px")), "lev": t.get("lev"),
-                        "pnl": _r2(t.get("pnl"))})
+            row = {"symbol": t.get("symbol"), "action": t.get("action"),
+                   "side": t.get("side"), "sz": t.get("sz"),
+                   "fill_px": _px(t.get("fill_px")), "lev": t.get("lev"),
+                   "pnl": _r2(t.get("pnl"))}
+            # 2026-08-08 单笔保证金审计透传（字段缺失省略，历史 payload 形状不变）
+            for k in ("single_order_imr_ratio", "max_single_order_imr_ratio",
+                      "single_order_cap_breached", "risk_clamped",
+                      "single_order_risk_pct_equity",
+                      "max_single_order_risk_pct_equity",
+                      "single_order_risk_cap_breached"):
+                if t.get(k) is not None:
+                    row[k] = t.get(k)
+            out.append(row)
         return out
 
     # ── 持仓段（as-of 最近快照 + 其后全部已落账成交，剔哨兵）──
+    def _positions_from_live_facts():
+        facts = books["live"].get("raw", {}).get("live_facts")
+        if not isinstance(facts, dict) or facts.get("status") != "ok":
+            return None
+        fact_positions = facts.get("positions")
+        if not isinstance(fact_positions, list):
+            return None
+        balance = facts.get("balance") if isinstance(
+            facts.get("balance"), dict
+        ) else {}
+        equity = _float_or_none(balance.get("totalEq"))
+        out = []
+        for item in fact_positions:
+            if not isinstance(item, dict):
+                return None
+            sl = item.get("sl") if isinstance(item.get("sl"), dict) else {}
+            avg_px = _float_or_none(item.get("avgPx"))
+            sl_px = _float_or_none(sl.get("trigger_px")) if sl.get("verified") else None
+            imr = _float_or_none(item.get("position_imr"))
+            age = _float_or_none(item.get("position_age_hours"))
+            sl_pct = None
+            if avg_px and sl_px:
+                sl_pct = round(abs(sl_px - avg_px) / avg_px * 100, 1)
+            out.append({
+                "symbol": item.get("instId"),
+                "side": item.get("posSide"),
+                "sz": item.get("contracts"),
+                "avgPx": _px(avg_px),
+                "lev": item.get("lever"),
+                "upl": _r2(item.get("upl")),
+                "notional_usd": _r2(item.get("mark_notional_usdt")),
+                "margin_usd": _r2(imr),
+                "margin_pct": (
+                    round(imr / equity * 100, 1)
+                    if imr is not None and equity else None
+                ),
+                "hold_min": round(age * 60) if age is not None else None,
+                "sl_pct": sl_pct,
+                "profile": "live",
+            })
+        return out
+
     def _positions(prof):
+        if prof == "live":
+            canonical = _positions_from_live_facts()
+            if canonical is not None:
+                return canonical
         snapshot_ts, rows = _latest_position_snapshot(db_root, prof, now)
         # 只把这些行用于持仓内存投影；headline / execution / trades 段仍严格展示
         # 当前 cycle，避免把交错 cycle 的成交误报为本轮执行。
@@ -703,8 +871,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         return out
 
     live_pos = _positions("live")
-    demo_pos = _positions("demo")
-    positions = live_pos + demo_pos
+    positions = live_pos
 
     # ── 资产段兜底（render 权威覆盖）──────────────────────
     def _assets(prof):
@@ -714,17 +881,17 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                  (prof,)) or {}
         cum = None
         try:
-            sys.path.insert(0, _project_path('scripts'))
+            sys.path.insert(0, r"./scripts")
             import cum_pnl
             info = cum_pnl.cum_for(db_root, prof)
             cum = info.get("cum_pnl") if info.get("ok") else None
         except Exception:
             pass
-        n_pos = len(live_pos if prof == "live" else demo_pos)
+        n_pos = len(live_pos)
         return {"equity": a.get("totalEq"), "realized_pnl": cum, "positions": n_pos,
                 "availBal": a.get("availBal")}
 
-    assets = {"live": _assets("live"), "demo": _assets("demo")}
+    assets = {"live": _assets("live")}
 
     # ── 风控段（确定性计算）───────────────────────────────
     def _walk_mappings(value):
@@ -794,7 +961,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             "projected_portfolio_imr_ratio": selected.get(
                 "projected_portfolio_imr_ratio"),
             "max_portfolio_imr_ratio": (
-                selected.get("max_portfolio_imr_ratio") or 0.666
+                selected.get("max_portfolio_imr_ratio")
+                or MAX_PORTFOLIO_IMR_RATIO
             ),
             "portfolio_imr_ratio_unit": selected.get(
                 "portfolio_imr_ratio_unit", "fraction"),
@@ -804,105 +972,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                 "portfolio_imr_source"),
         }
 
-    def _demo_capacity_summary():
-        """提取 Demo OPEN 的交易所实时容量留痕，绝不以快照 availBal 兜底。"""
-        raw = books["demo"].get("raw")
-        candidates = []
-        seen = set()
-        for node in _walk_mappings(raw):
-            source = str(node.get("source") or "")
-            has_exchange_cap = any(
-                node.get(key) not in (None, "")
-                for key in (
-                    "max_size", "exchange_max_sz", "exchange_max_size",
-                    "max_sz_exchange",
-                )
-            )
-            if "max-size" not in source and not has_exchange_cap:
-                continue
-            direction_field = node.get(
-                "direction_field", node.get("side_field"))
-            exchange_max = _float_or_none(node.get("max_size"))
-            if exchange_max is None:
-                exchange_max = _float_or_none(node.get("exchange_max_sz"))
-            if exchange_max is None:
-                exchange_max = _float_or_none(node.get("exchange_max_size"))
-            if exchange_max is None:
-                exchange_max = _float_or_none(node.get("max_sz_exchange"))
-            if exchange_max is None:
-                exchange_max = _float_or_none(node.get("direction_value"))
-            if exchange_max is None:
-                if str(direction_field).lower() == "maxsell":
-                    exchange_max = _float_or_none(
-                        node.get("max_sell", node.get("maxSell")))
-                else:
-                    exchange_max = _float_or_none(
-                        node.get("max_buy", node.get("maxBuy")))
-            key = (
-                str(node.get("inst_id") or node.get("instId") or
-                    node.get("symbol") or ""),
-                str(node.get("side") or ""),
-                str(direction_field or ""),
-                exchange_max,
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append({
-                "source": source or "account.max-size",
-                "profile": "demo",
-                "inst_id": key[0] or None,
-                "side": key[1] or None,
-                "td_mode": node.get("td_mode", node.get("tdMode")),
-                "direction_field": direction_field,
-                "direction_value": _float_or_none(node.get("direction_value")),
-                "max_size": exchange_max,
-                "exchange_max_sz": exchange_max,
-                "requested_lev": _float_or_none(node.get("requested_lev")),
-                "effective_lev": _float_or_none(node.get("effective_lev")),
-            })
-
-        opens = [
-            trade for trade in books["demo"]["trades"]
-            if str(trade.get("action") or "").lower() in _OPEN
-        ]
-        entries = []
-        for trade in opens:
-            symbol = str(trade.get("symbol") or "")
-            side = str(trade.get("side") or "").lower()
-            cap = next(
-                (item for item in candidates
-                 if (not item.get("inst_id") or item.get("inst_id") == symbol)
-                 and (not item.get("side")
-                      or str(item.get("side")).lower() == side)),
-                {},
-            )
-            entries.append({
-                **cap,
-                "inst_id": cap.get("inst_id") or symbol or None,
-                "side": cap.get("side") or trade.get("side"),
-                "actual_open_sz": _float_or_none(trade.get("sz")),
-                "effective_lev": (
-                    cap.get("effective_lev")
-                    if cap.get("effective_lev") is not None
-                    else _float_or_none(trade.get("lev"))
-                ),
-            })
-        if not entries and candidates:
-            # REJECT 轮也保留实时容量证据，但明确没有实际成交。
-            entries = [{**item, "actual_open_sz": None} for item in candidates]
-        first = entries[0] if entries else {}
-        return {
-            "sizing_policy": "okx_demo_max_size_only",
-            "entries": entries,
-            "source": first.get("source"),
-            "inst_id": first.get("inst_id"),
-            "actual_open_sz": first.get("actual_open_sz"),
-            "max_size": first.get("max_size"),
-            "exchange_max_sz": first.get("exchange_max_sz"),
-            "effective_lev": first.get("effective_lev"),
-        }
-
+    #  随 2026-08-06 demo 全量下线移除：它提取 Demo OPEN
+    # 的交易所实时 max-size 留痕，对应的 sizing_policy 分支已从 risk_validator 删除。
     def _side_pct(pos):
         # 2026-07-15：改用真名义 notional_usd 加权（旧 sz×avgPx 漏乘 ctVal，跨币种权重
         # 失真——BTC 一张被放大 100 倍）；notional 缺失行回退旧口径保持可算。
@@ -923,11 +994,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         # 新 payload 只发组合 IMR 契约；旧 margin_pct/live_margin_pct 仅由
         # render 对历史 payload 做只读兼容，本 builder 不再生成。
         **live_portfolio_imr,
-        "demo_capacity": _demo_capacity_summary(),
         "available_margin": {
             "live_usdt": assets["live"].get("availBal"),
-            "demo_usdt": assets["demo"].get("availBal"),
-            "demo_scope": "account_snapshot_display_only_not_open_capacity",
         },
         "lev": live_lev if live_lev != 0 else "-",
         "side_pct": _side_pct(live_pos),
@@ -965,13 +1033,23 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                    "WHERE cycle_id=? AND status!='ok'", (cycle,))
     exceptions = [{"name": f["source"], "status": f["status"],
                    "detail": (f["err"] or "-")[:120]} for f in faults]
-    for p in ("live", "demo"):
+    for p in ("live",):
+        if not books[p]["present"]:
+            # push 闸要求 live 落库，缺行出现即为真异常。
+            exceptions.append({
+                "name": f"{p}_trader", "status": "pending",
+                "detail": "本轮 trade_cycles 未落库——push 闸要求 live 落库，"
+                          "出现即为异常"})
+            continue
         decision = str(books[p]["tc"].get("decision") or "").lower()
         if decision in {"degraded", "error"}:
             exceptions.append({"name": f"{p}_trader", "status": decision,
                                "detail": str(books[p]["tc"].get("note"))[:120]})
 
     # ── HH:01 宏观 + 全市场段（:00 整点，恢复 agent 每整点带的段）──
+    # 键名 is_hh01 为历史遗留（旧世界慢采 :02、扩展段标 HH:01）；2026-08-08 采集
+    # 整并后慢采归 :00 hourly，判定一直是 :00。键名保留兼容历史归档 payload 重渲染，
+    # 展示文案已改 HH:00。
     is_hh01 = str(hhmm).endswith(":00")
     macro_block = {}
     if is_hh01:
@@ -1072,7 +1150,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         "hhmm": hhmm,
         "cycle_count": 0,          # render 权威覆盖
         "cycle_duration_s": 0,     # render 权威覆盖
-        "channel": "live|demo",    # render 硬编码覆盖
+        "channel": "live",        # render 硬编码覆盖
         "symbol": symbol or "BTC",
         "confidence": confidence,
         "summary": summary,
@@ -1082,6 +1160,16 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             "reason": reason,
             "decision_protocol": "decision_card_v1" if card else "legacy_score",
             "decision_card": card,
+            "multitimeframe_analysis": (
+                card.get("multitimeframe_analysis")
+                if isinstance(card.get("multitimeframe_analysis"), dict)
+                else None
+            ),
+            "multitimeframe_expected_symbol": open_trade_symbol or None,
+            "multitimeframe_expected_side": (
+                open_trade_side if open_trade_side in {"long", "short"} else None
+            ),
+            "multitimeframe_analyses": open_trade_decisions,
             **play,
         },
         "execution": {
@@ -1089,11 +1177,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             # 报 build 真读到的双盘 trades 落库行数（0 是合法值），
             # 不使用与 cycle 无法可靠关联的代理值。
             "db_rows_live": len(books["live"]["trades"]),
-            "db_rows_demo": len(books["demo"]["trades"]),
         },
         "risk": risk,
-        "trades": {"live": _fmt_trades(books["live"]["trades"]),
-                   "demo": _fmt_trades(books["demo"]["trades"])},
+        "trades": {"live": _fmt_trades(books["live"]["trades"])},
         "assets": assets,
         "market": market,
         "positions": positions,

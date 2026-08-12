@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-security
-last-updated: 2026-08-04
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Reconfirm environment-only delivery targets and explicit database-write gates for the synchronized release.
+change-summary: Reconfirm sanitized runtime boundaries, live-only execution and report-only public autoheal.
 -->
 
 # Security Policy
@@ -20,10 +20,10 @@ Business and alert destinations must be supplied separately through `OKX_QQ_TARG
 their documented `--apply --backup-dir` gate. Live ledger autoheal is permanently read-only,
 including direct API/CLI calls; Live repair remains a unique-ordId, verified-backup,
 one-record-at-a-time manual workflow with fresh post-write reconciliation and invariant checks.
-The close/open opt-ins authorize Demo only. Demo UNRECORDED bookkeeping requires matching
-intent/ordId evidence and a confirmed active reduce-only stop covering the same position;
-missing or unknown protection remains report-only. These settings do not
-authorize order placement or replay.
+The public runtime supports only `profile=live`. Legacy autoheal write flags and environment
+switches do not authorize bookkeeping writes: they produce a non-zero structured refusal and
+leave the trade ledger and repair queue unchanged. No recovery setting authorizes order
+placement, amendment, or replay.
 
 CI runs `scripts/check_public_boundary.py` across every tracked path and UTF-8
 source file. It blocks runtime database/log/report artifacts, concrete delivery

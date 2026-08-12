@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -13,9 +13,111 @@ from unittest import mock
 
 from collectors import analyst_writer, trades_writer
 from core import dispatcher
+from core import multitimeframe_gate as mtf_gate
+from core.experience_contract import build_contract
+from core.instrument_context import build_instrument_context
 
 
 CST = timezone(timedelta(hours=8))
+
+
+class AnalysisValidationBudgetTests(unittest.TestCase):
+    def test_two_failures_block_cycle_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(
+                    analyst_writer, "VALIDATION_STATE_DIR", Path(tmp)):
+            cycle = "2026-08-11T18:30"
+            first = analyst_writer._record_validation_failure(
+                cycle, "hash-1", ["first error"])
+            self.assertEqual(first["failed_attempts"], 1)
+            self.assertFalse(first["blocked"])
+            error, _ = analyst_writer._validation_guard(
+                cycle, "hash-2", validate_only=True)
+            self.assertIsNone(error)
+
+            second = analyst_writer._record_validation_failure(
+                cycle, "hash-2", ["second error"])
+            self.assertEqual(second["failed_attempts"], 2)
+            self.assertTrue(second["blocked"])
+            for validate_only in (True, False):
+                error, state = analyst_writer._validation_guard(
+                    cycle, "hash-3", validate_only=validate_only)
+                self.assertIn("budget exhausted", error)
+                self.assertTrue(state["blocked"])
+
+    def test_formal_write_must_match_validated_payload(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(
+                    analyst_writer, "VALIDATION_STATE_DIR", Path(tmp)):
+            cycle = "2026-08-11T18:45"
+            state = analyst_writer._record_validation_success(cycle, "same")
+            self.assertEqual(state["validated_payload_sha256"], "same")
+            error, _ = analyst_writer._validation_guard(
+                cycle, "same", validate_only=False)
+            self.assertIsNone(error)
+            error, _ = analyst_writer._validation_guard(
+                cycle, "changed", validate_only=False)
+            self.assertIn("不一致", error)
+            error, _ = analyst_writer._validation_guard(
+                cycle, "changed", validate_only=True)
+            self.assertIn("禁止通过后再次改写", error)
+
+
+def _market_evidence_contract(cycle_id: str, symbol: str) -> dict:
+    cycle = mtf_gate.parse_cycle_cst(cycle_id)
+    values = {
+        "o": 100.0, "h": 102.0, "l": 99.0, "c": 101.0,
+        "v": 1000.0, "ma5": 100.0, "ma20": 99.0,
+        "atr14": 2.0, "rsi14": 55.0, "macd_hist": 0.5,
+    }
+    return mtf_gate.seal_evidence_contract({
+        "protocol": mtf_gate.EVIDENCE_PROTOCOL,
+        "mode": "read_only",
+        "symbol": symbol,
+        "cycle_id": cycle_id,
+        "required_timeframes": list(mtf_gate.TIMEFRAME_SECONDS),
+        "minimum_bars_for_full_indicators": (
+            mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS),
+        "timeframes": {
+            timeframe: {
+                "expected_closed_bar_ts": (
+                    mtf_gate.expected_closed_bar_start(cycle, timeframe)),
+                "observed_bar_ts": (
+                    mtf_gate.expected_closed_bar_start(cycle, timeframe)),
+                "bars_seen": mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS,
+                "ready": True,
+                "values": dict(values),
+            }
+            for timeframe in mtf_gate.TIMEFRAME_SECONDS
+        },
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    })
+
+
+def _multitimeframe_analysis(
+    cycle_id: str, side: str, symbol: str,
+) -> dict:
+    return {
+        "cycle_id": cycle_id,
+        "required_timeframes": ["15m", "1H", "4H"],
+        "timeframes": {
+            "15m": {"direction": side, "evidence": ["15m"],
+                    "relative_rank": 2},
+            "1H": {"direction": "neutral", "evidence": ["1H"],
+                   "relative_rank": 3},
+            "4H": {"direction": side, "evidence": ["4H"],
+                   "relative_rank": 1},
+        },
+        "selected_timeframe": "4H",
+        "selected_direction": side,
+        "selection_reason": "isolated relative selection",
+        "selection_method": (
+            "relative_rank_1_among_15m_1H_4H_not_calibrated"),
+        "calibrated_confidence": None,
+        "confidence_claim_allowed": False,
+        "evidence_contract": _market_evidence_contract(cycle_id, symbol),
+    }
 
 
 def _valid_card(label: str = "isolated test") -> dict:
@@ -24,7 +126,9 @@ def _valid_card(label: str = "isolated test") -> dict:
         "opposing_evidence": ["counter"],
         "execution_conditions": {"status": "ready"},
         "invalidation_point": {"condition": "invalidated"},
-        "risk_reward": {"summary": "bounded"},
+        # Wave1 序5 起 open 卡须含数值 entry/stop/target（writer 重算 RR/EV）
+        "risk_reward": {"entry": 100.0, "stop": 97.0, "target": 106.0,
+                        "rr": 2.0, "summary": "bounded"},
         "portfolio_impact": {"summary": "isolated"},
         "historical_experience": {
             "matched_wins": [],
@@ -36,6 +140,55 @@ def _valid_card(label: str = "isolated test") -> dict:
         "agent_judgement": label,
         "reference_overrides": [],
     }
+
+
+def _experience_contract(cycle_id: str, symbol: str, side: str,
+                         regime: str = "", db_root: Path | None = None) -> dict:
+    def summary(scope: str) -> dict:
+        return {
+            "scope": scope,
+            "n": 0,
+            "wins": 0,
+            "losses": 0,
+            "sufficient": False,
+            "credibility": 0.0,
+            "reason": "no_experiences",
+        }
+
+    setup = {"stop_distance_pct": 0.03, "planned_rr": 2.0}
+    setup["setup_hash"] = hashlib.sha256(json.dumps(
+        setup, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    query = {
+            "symbol": symbol,
+            "side": side,
+            "regime": regime,
+            "action": "open",
+            "profile": "live",
+            "as_of": cycle_id.replace("T", " ") + ":00",
+            "min_sim": 0.5,
+            "top_k": 8,
+            "setup": setup,
+            "instrument_context": build_instrument_context(
+                symbol, regime, cycle_id, db_root or Path(".")),
+        }
+    return build_contract(
+        query,
+        exact_setup=summary("same_symbol_side_action_regime"),
+        same_symbol_similar=summary("same_symbol_similar"),
+        cross_symbol_similar=summary("cross_symbol_similar"),
+    )
+
+
+def _card_with_contract(cycle_id: str, symbol: str, side: str,
+                        regime: str = "", db_root: Path | None = None) -> dict:
+    card = _valid_card()
+    card["multitimeframe_analysis"] = _multitimeframe_analysis(
+        cycle_id, side, symbol)
+    card["historical_experience"]["evidence_contract"] = (
+        _experience_contract(cycle_id, symbol, side, regime, db_root)
+    )
+    return card
 
 
 def _create_analysis_db(path: Path) -> None:
@@ -76,6 +229,41 @@ def _create_analysis_db(path: Path) -> None:
         )
 
 
+def _create_market_db(path: Path, cycle_id: str,
+                      symbol: str = "BTC-USDT-SWAP") -> None:
+    with closing(sqlite3.connect(path)) as con:
+        con.execute(
+            "CREATE TABLE derivatives("
+            "ts TEXT,symbol TEXT,funding_rate REAL)"
+        )
+        con.execute(
+            "CREATE TABLE kline_cache("
+            "ts TEXT,symbol TEXT,tf TEXT,o REAL,h REAL,l REAL,c REAL,v REAL,"
+            "ma5 REAL,ma20 REAL,atr14 REAL,rsi14 REAL,macd_hist REAL,"
+            "PRIMARY KEY(ts,symbol,tf))"
+        )
+        cycle = mtf_gate.parse_cycle_cst(cycle_id)
+        for timeframe, seconds in mtf_gate.TIMEFRAME_SECONDS.items():
+            expected = datetime.fromisoformat(
+                mtf_gate.expected_closed_bar_start(cycle, timeframe).replace(
+                    "Z", "+00:00"))
+            rows = []
+            for offset in range(
+                    mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS - 1, -1, -1):
+                ts = (expected - timedelta(seconds=seconds * offset)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                rows.append((
+                    ts, symbol, timeframe,
+                    100.0, 102.0, 99.0, 101.0, 1000.0,
+                    100.0, 99.0, 2.0, 55.0, 0.5,
+                ))
+            con.executemany(
+                "INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+        con.commit()
+
+
 def _create_trade_db(path: Path) -> None:
     with closing(sqlite3.connect(path)) as con:
         con.executescript(
@@ -111,6 +299,17 @@ def _create_trade_db(path: Path) -> None:
             );
             """
         )
+
+
+def _write_trade_cycle(path: Path, cycle: str, decision: str,
+                       n_orders: int) -> None:
+    with closing(sqlite3.connect(path)) as con:
+        con.execute(
+            "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+            (cycle, "2026-07-29 12:01:00", "full", decision, n_orders,
+             None, "", "{}"),
+        )
+        con.commit()
 
 
 class AnalystWriterHardeningTests(unittest.TestCase):
@@ -184,6 +383,19 @@ class AnalystWriterHardeningTests(unittest.TestCase):
         }
         errors = analyst_writer.validate_receipt(bad)
         self.assertTrue(any("不一致" in item for item in errors), errors)
+
+        missing_evidence = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "open_long",
+                "side": "long",
+                "decision_card": _valid_card(),
+            }],
+        }
+        errors = analyst_writer.validate_receipt(missing_evidence)
+        self.assertTrue(
+            any("evidence_contract" in item for item in errors), errors)
 
         unknown = {
             **base,
@@ -287,7 +499,13 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                     (payload["cycle_id"],),
                 ).fetchone()
             self.assertNotEqual(ts, payload["ts"])
-            self.assertEqual(json.loads(raw_text)["reported_ts"], payload["ts"])
+            persisted = json.loads(raw_text)
+            self.assertEqual(persisted["reported_ts"], payload["ts"])
+            self.assertEqual(persisted["decision_protocol"], "decision_card_v1")
+            self.assertEqual(persisted["status"], "skipped")
+            self.assertEqual(persisted["signals"], [])
+            self.assertEqual(persisted["raw"], {"reason": "gate"})
+            self.assertEqual(persisted["raw_schema_version"], 2)
 
     def test_direct_write_cannot_bypass_validation_and_labels_are_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,6 +531,8 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                 refused = analyst_writer.write_analysis(bad)
             self.assertFalse(refused["ok"], refused)
 
+            _create_market_db(
+                db.parent / "market.db", "2026-07-29T12:30")
             good = {
                 **bad,
                 "cycle_id": "2026-07-29T12:30",
@@ -322,7 +542,13 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                     "symbol": "BTC-USDT-SWAP",
                     "action": "OPEN_LONG",
                     "side": "LONG",
-                    "decision_card": _valid_card(),
+                    "decision_card": _card_with_contract(
+                        "2026-07-29T12:30",
+                        "BTC-USDT-SWAP",
+                        "long",
+                        db_root=db.parent,
+                    ),
+                    "raw": "agent short text",
                 }],
             }
             with mock.patch.object(analyst_writer, "DB_PATH", db):
@@ -333,11 +559,59 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                     "SELECT status FROM analysis_runs WHERE cycle_id=?",
                     (good["cycle_id"],),
                 ).fetchone()[0]
-                action, side = con.execute(
-                    "SELECT action,side FROM analysis_signals WHERE cycle_id=?",
+                action, side, signal_raw = con.execute(
+                    "SELECT action,side,raw FROM analysis_signals WHERE cycle_id=?",
                     (good["cycle_id"],),
                 ).fetchone()
             self.assertEqual((status, action, side), ("ok", "open_long", "long"))
+            signal_raw_obj = json.loads(signal_raw)
+            self.assertEqual(signal_raw_obj["schema_version"], 1)
+            self.assertEqual(signal_raw_obj["source"], "analyst_writer")
+            self.assertEqual(signal_raw_obj["input_kind"], "str")
+            self.assertEqual(signal_raw_obj["payload"], "agent short text")
+            self.assertEqual(
+                signal_raw_obj["canonical_signal"]["symbol"],
+                "BTC-USDT-SWAP",
+            )
+
+    def test_open_evidence_resealed_after_tamper_still_fails_market_truth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cycle_id = "2026-07-29T13:00"
+            _create_market_db(root / "market.db", cycle_id)
+            card = _card_with_contract(
+                cycle_id, "BTC-USDT-SWAP", "long", db_root=root)
+            contract = card["multitimeframe_analysis"]["evidence_contract"]
+            contract["timeframes"]["4H"]["values"]["rsi14"] = 70.0
+            card["multitimeframe_analysis"]["evidence_contract"] = (
+                mtf_gate.seal_evidence_contract(contract)
+            )
+            payload = {
+                "cycle_id": cycle_id,
+                "ts": "2026-07-29 13:01:00",
+                "mode": "full",
+                "status": "ok",
+                "decision_protocol": "decision_card_v1",
+                "regime": "",
+                "market_summary": {
+                    name: {} for name in analyst_writer.MARKET_SUMMARY_SECTIONS
+                },
+                "signals": [{
+                    "symbol": "BTC-USDT-SWAP",
+                    "action": "open_long",
+                    "side": "long",
+                    "decision_card": card,
+                }],
+            }
+
+            with mock.patch.object(
+                    analyst_writer, "DB_PATH", root / "analysis.db"):
+                errors = analyst_writer.validate_receipt(payload)
+
+            self.assertTrue(
+                any("与 market.db 本 cycle" in item for item in errors),
+                errors,
+            )
 
 
 class TradesWriterHardeningTests(unittest.TestCase):
@@ -599,54 +873,6 @@ class TradesWriterHardeningTests(unittest.TestCase):
 
 
 class DispatcherHardeningTests(unittest.TestCase):
-    def test_public_runner_uses_current_python_and_propagates_db_root(self):
-        trigger_source = Path(dispatcher.trigger_agent.__file__).read_text(
-            encoding="utf-8"
-        )
-        self.assertNotIn("pythoncore-", trigger_source)
-        self.assertIn(
-            'os.environ.get("OKX_PYTHON_BIN", sys.executable)',
-            trigger_source,
-        )
-
-        custom_root = Path("isolated") / "db"
-        with mock.patch.object(dispatcher.trigger_agent, "_PYTHON_EXE",
-                               sys.executable):
-            command = dispatcher.trigger_agent._supervised_cmd(
-                "live", "2026-07-29T12:00", "full", ["child"],
-                db_root=custom_root,
-            )
-        self.assertEqual(command[0], sys.executable)
-        self.assertIn("--db-root", command)
-        self.assertEqual(
-            command[command.index("--db-root") + 1],
-            os.fspath(custom_root.resolve()),
-        )
-
-    def test_fire_passes_canonical_db_root_into_build_and_runner(self):
-        selected_root = dispatcher.trigger_agent._CANONICAL_DB_ROOT
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.dict(os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
-             mock.patch.object(dispatcher.trigger_agent, "LOG_DIR", Path(tmp)), \
-             mock.patch.object(dispatcher.trigger_agent, "build_cmd",
-                               return_value=["child"]) as build, \
-             mock.patch.object(dispatcher.trigger_agent, "_supervised_cmd",
-                               return_value=["runner"]) as supervised, \
-             mock.patch.object(dispatcher.trigger_agent.subprocess, "Popen",
-                               return_value=mock.Mock()), \
-             mock.patch.object(dispatcher.trigger_agent, "_probe_launch"):
-            dispatcher.trigger_agent.fire(
-                "live", "2026-07-29T12:00", "full", db_root=selected_root
-            )
-
-        build.assert_called_once_with(
-            "live", "2026-07-29T12:00", "full", db_root=selected_root
-        )
-        supervised.assert_called_once_with(
-            "live", "2026-07-29T12:00", "full", ["child"],
-            db_root=selected_root,
-        )
-
     def test_profile_lease_serializes_cycles_and_owner_only_releases(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "ledger.db"
@@ -689,6 +915,86 @@ class DispatcherHardeningTests(unittest.TestCase):
                         dispatcher.trade_written(root, "live", cycle),
                         expected,
                     )
+
+    def test_push_fires_on_live_alone_without_demo(self):
+        """2026-08-06 解耦：push 是纯汇报、一分钱不碰，不得被 demo 账本卡住
+        （8-05 一个 demo 幽灵仓让 demo+push 死锁 2h14m）。demo 停派后恒无该行，
+        所以既不阻断也不告警——告警会变成每轮一条的纯噪音。"""
+        cycle = "2026-07-29T12:00"
+        # analysis 已过 max_age：trader 不会被追起，只剩 push 闸可评估
+        now = datetime(2026, 7, 29, 12, 40, tzinfo=CST)
+        analysis = {"mode": "full", "status": "ok", "ts": "2026-07-29 12:01:00"}
+        # CI keeps trigger dry-run enabled globally for safety.  This test
+        # specifically verifies the persistent stage latch, so exercise the
+        # non-dry-run dispatcher with an injected fire function and temp DBs.
+        with mock.patch.dict(
+                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
+                tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _create_trade_db(root / "demo_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+
+            def run() -> tuple[list, list]:
+                fired: list = []
+                with mock.patch.object(
+                        dispatcher, "analysis_row", return_value=analysis):
+                    output = dispatcher.dispatch_cycle(
+                        root, ledger_path, cycle, now=now,
+                        fire_fn=lambda *a, **k: fired.append(a) or "card")
+                return [a[0] for a in fired], output
+
+            stages, out = run()
+            self.assertIn("push", stages, (stages, out))
+            self.assertFalse([m for m in out if "未落库" in m], out)
+
+            # 同 cycle 再扫：push 闩锁不重派
+            stages2, _ = run()
+            self.assertNotIn("push", stages2, stages2)
+
+    def test_demo_stage_is_never_auto_dispatched(self):
+        """demo 自 2026-08-06 停自动派发：新鲜 analysis 也只起 live，不起 demo。
+        需要跑 demo 时走 trigger_agent.py --stage demo 手动起。"""
+        cycle = "2026-07-29T12:00"
+        now = datetime(2026, 7, 29, 12, 5, tzinfo=CST)   # analysis 新鲜
+        analysis = {"mode": "full", "status": "ok", "ts": "2026-07-29 12:04:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _create_trade_db(root / "demo_trades.db")
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            stages = [a[0] for a in fired]
+            self.assertNotIn("demo", stages, (stages, out))
+            self.assertIn("live", stages, (stages, out))   # 回滚轮补派 full live 不变
+
+    def test_push_still_requires_live_trade_cycles(self):
+        """解耦只放开 demo；live 未落库仍然不许 push（没有实盘事实可汇报）。"""
+        cycle = "2026-07-29T12:00"
+        now = datetime(2026, 7, 29, 12, 40, tzinfo=CST)
+        analysis = {"mode": "full", "status": "ok", "ts": "2026-07-29 12:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _create_trade_db(root / "demo_trades.db")
+            _write_trade_cycle(root / "demo_trades.db", cycle, "hold", 0)
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertFalse(fired, (fired, out))
 
     def test_unknown_analysis_status_never_dispatches_downstream(self) -> None:
         fired: list[tuple] = []

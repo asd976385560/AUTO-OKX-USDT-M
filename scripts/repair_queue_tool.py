@@ -25,17 +25,22 @@ CST = timezone(timedelta(hours=8))
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "account.db"
 
 
-def _conn(rw: bool, db_path: Path = DB_PATH) -> sqlite3.Connection:
-    """Open exactly ``db_path``; callers using an isolated db-root must pass it."""
-    db_path = db_path.resolve()
-    con = (sqlite3.connect(str(db_path), timeout=15) if rw
-           else sqlite3.connect(db_path.as_uri() + "?mode=ro",
+def _conn(rw: bool, db_path: Path | None = None) -> sqlite3.Connection:
+    """Open exactly ``db_path``.
+
+    Deterministic callers running against an isolated ``--db-root`` must pass
+    that root's ``account.db`` explicitly.  Resolving the default at call time
+    also keeps tests that patch ``DB_PATH`` isolated.
+    """
+    target = Path(db_path or DB_PATH).resolve()
+    con = (sqlite3.connect(str(target), timeout=15) if rw
+           else sqlite3.connect(target.as_uri() + "?mode=ro",
                                 uri=True, timeout=15))
     con.row_factory = sqlite3.Row
     return con
 
 
-def do_list(status_filter: str, db_path: Path = DB_PATH) -> int:
+def do_list(status_filter: str, db_path: Path | None = None) -> int:
     con = _conn(rw=False, db_path=db_path)
     q = "SELECT id, ts, check_name, status, substr(issue,1,60) issue FROM repair_queue"
     args: list = []
@@ -56,7 +61,7 @@ def do_list(status_filter: str, db_path: Path = DB_PATH) -> int:
 
 def do_close(ids: list[int] | None, bulk_pushformat: bool, resolution: str,
              apply: bool, closed_by: str = "repair_queue_tool:manual",
-             db_path: Path = DB_PATH, quiet: bool = False) -> int:
+             db_path: Path | None = None, quiet: bool = False) -> int:
     """关单唯一入口。`closed_by` 供确定性调用方（如 ledger_autoheal）标注来源，
     人工 CLI 路径保持默认 `repair_queue_tool:manual` 不变。"""
     def emit(*args, **kwargs) -> None:

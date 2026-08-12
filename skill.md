@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-04
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Sync portfolio IMR, Demo max-size, profile leases, point-in-time semantics, alert routing and guarded ledger autoheal contracts.
+change-summary: Sync the live-only runtime, consolidated collection, exact multitimeframe evidence, finite risk gates and read-only public recovery boundary.
 -->
 
 # OKX 自主交易系统 V2.0 · 事实源
@@ -23,7 +23,7 @@ change-summary: Sync portfolio IMR, Demo max-size, profile leases, point-in-time
 
 ## 2. 系统定位与流程
 
-系统面向 OKX USDT 永续合约，支持 live 与 demo 双盘。两盘共用确定性执行、止损和成交确认路径；Live 组合 IMR 与 Demo 实时 max-size 分别治理容量。
+系统面向 OKX USDT 永续合约，当前只支持 live。统一实盘 Agent 完成分析与交易判断；多周期证据、账户事实、风控、下单、成交确认和记账均由确定性代码验证。
 
 ```text
 fast/slow/news/account collectors
@@ -36,25 +36,23 @@ fast/slow/news/account collectors
               │
   stage_dispatch + profile lease
               │
-     ┌────────┴────────┐
-     v                 v
-unified live       demo trader
-analysis+trade      demo trade
-     └────────┬────────┘
+              v
+       unified live trader
+       analysis + live trade
               v
      scripts/push_pipeline.py
 ```
 
 主链：
 
-1. fast collector 采集即时行情并同步账户；
-2. slow collector 采集合约规格和低频宏观数据；
+1. `collect_cycle.py --tier hourly` 运行 fast → news → slow，`--tier quarter` 运行 fast → news；每一步独立记录、失败隔离；
+2. fast collector 采集即时行情并同步账户，slow collector 采集合约规格和低频宏观数据；
 3. registry 新闻源经 `news_writer` 落库，news-scout 作为非必需旁路；
 4. dispatcher 在采集齐全且新鲜时抢 `stage_dispatch(live)`；
-5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，经过风控和订单执行层；Live 使用预计组合 IMR，Demo 使用实时方向性 max-size；
-6. analysis 就绪后 dispatcher 派 demo；
-7. `stage_runner.py` 以 profile lease 串行同盘任务，等待子进程终态并回读真实业务产物；`rc=0` 但缺业务行仍判失败；
-8. 双盘 trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
+5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，并绑定同 cycle 的 exact 已收盘 15m/1H/4H 证据；
+6. writer 和 executor 分别重验多周期证据、actor attestation、账仓一致、有限数值和硬风控后才允许订单 I/O；
+7. `stage_runner.py` 以 profile lease 串行 live 任务，等待子进程终态并回读真实业务产物；`rc=0` 但缺业务行仍判失败；
+8. live trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
 9. 日频维护完成对账、账单和质量文件后发布带 SHA-256 的 ready 清单，reviewer 校验后再生成报告。
 
 `cycle_id` 使用 UTC+8 的 `YYYY-MM-DDTHH:MM` 槽位。过窗周期只告警，不自动补单或恢复。
@@ -65,11 +63,10 @@ analysis+trade      demo trade
 
 | 工作 | 类型 | 表达式或触发 |
 |---|---|---|
-| fast collect | command | `0,15,30,45 * * * *` |
-| slow collect | command | `2 * * * *` |
+| hourly collection | command | `0 * * * *`，fast → news → slow |
+| quarter collection | command | `15,30,45 * * * *`，fast → news |
 | dispatcher | command | `*/2 * * * *`，writer 成功后可额外 nudge |
-| registry news | command | `3,18,33,48 * * * *` |
-| news-scout | agent | `5,20,35,50 * * * *`，非必需 |
+| news-scout | agent | `10,25,40,55 * * * *`，非必需 |
 | daily maintenance | command | 每日一次 |
 | reviewer | agent | 每日一次 |
 
@@ -83,7 +80,6 @@ analysis+trade      demo trade
 | dispatcher | 读取就绪状态、抢阶段锁、起下一棒 | ledger.stage_dispatch |
 | analyst | 仅人工回滚时使用的分析角色 | analysis.db |
 | unified live trader | 分析、实盘判断、风控和执行 | analysis.db + live_trades.db |
-| demo trader | 使用同一分析和同一硬风控完成模拟执行 | demo_trades.db |
 | reviewer | 日/周/月复盘和经验摘要 | account.db reports |
 | news-scout | X/无 API 新闻取数和结构化，不做方向判断 | news.db + ledger |
 | push pipeline | 从数据库组装、渲染、校验、归档和可选发送 | reports + system_state |
@@ -114,7 +110,7 @@ Agent 不得直接写表，不得绕过 writer，不得手拼 OKX 下单命令�
 - 允许采集器从本地 `config.md` 读取受控 fallback；
 - `config.md` 从 `config.example.md` 复制后填写，永远不得提交；
 - 业务推送与告警目标只由 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 提供，公开代码无默认目标且不接受 CLI 目标覆盖；
-- Live 账本 autoheal 永久只读；两个写开关仅授权 Demo。Demo 自动写 close 必须显式 `OKX_LEDGER_AUTOHEAL_APPLY=1`，自动补 UNRECORDED open 还需额外 `OKX_LEDGER_AUTOHEAL_UNRECORDED=1`、匹配 intent/ordId，并先确认同侧足量的交易所保护止损；
+- 公开账本 autoheal 永久只读；写参数或历史写开关只会返回非零结构化阻断，不修改交易库或 repair queue；
 - OKX API credential 由仓库外的 CLI profile 或部署环境管理；
 - 代理由 `OKX_PROXY_URL` 或当前启用的系统代理提供，代码不带私网地址或端口默认值。
 
@@ -127,7 +123,6 @@ Agent 不得直接写表，不得绕过 writer，不得手拼 OKX 下单命令�
 | news.db | news_items, coin_sentiment, news_events_index | `collectors/news_writer.py` |
 | analysis.db | analysis_runs, analysis_signals | `collectors/analyst_writer.py` |
 | live_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile live` |
-| demo_trades.db | trade_cycles, trades | `collectors/trades_writer.py --profile demo` |
 | account.db | snapshots, trade_experiences, bills, reports, playbook, system_state | 对应表或键域 writer |
 | ledger.db | collection_runs, stage_dispatch, stage_profile_leases, execution_intents | `collectors/ledger.py` / dispatcher / `core/execution_intent.py` |
 | lessons.db | error_patterns, missed_opportunities, signal_perf | reviewer |
@@ -166,6 +161,8 @@ live 开仓唯一路径是 `core/order_executor.open_position()`；该函数内�
 |---|---:|---|
 | Live 预计组合 IMR 比例 | `MAX_PORTFOLIO_IMR_RATIO = 0.666` | 超限整笔 reject，不 clamp |
 | 可用 USDT 保证金使用比例 | `AVAILABLE_MARGIN_USE_PCT = 0.98` | clamp / 不可行时 reject |
+| 单笔增量 IMR 比例 | `MAX_SINGLE_ORDER_IMR_RATIO = 0.15` | clamp / 不可行时 reject |
+| 单笔止损风险占权益 | `MAX_SINGLE_ORDER_RISK_PCT_EQUITY = 0.05` | clamp / 不可行时 reject |
 | 最大杠杆 | `MAX_LEVERAGE = 10.0` | reject |
 | 最小名义价值占权益 | `MIN_NOTIONAL_PCT = 0.01` | clamp |
 | 最大止损偏离 | `MAX_SL_DEVIATION = 0.30` | reject |
@@ -181,13 +178,13 @@ notional = mark_px * size * ct_val
 
 - 非 dry-run 交易在任何交易所 I/O 前必须验证同 cycle 的完整 `receipt_context`；
 - Live OPEN/ADD 只认同次账户回包中的 `account.imr/totalEq` 加本单增量 IMR，缺失或超过 66.6% 时整笔拒绝；`mgnRatio`、gross、net 不得替代该口径；
-- Demo OPEN 在设置目标杠杆后查询方向性 `account max-size`，规格或查询失败即拒绝，不回退 Live 余额公式；
+- 任何非 `live` profile 在交易路径入口硬拒，不能静默映射为 live；
 - 每个 profile 只要存在 pending/submitted/uncertain 等未决意图，所有标的的新交易都 fail-closed；已完成同参重放只返回缓存回执；
 - 交易前将 OKX 全量现仓与本 profile 已确认交易账本做全集合核对，不一致、坏行或账本不可读时在取 mark/下单前拒绝；
 - `ctVal` 和 `lotSz` 来自 instruments cache，缺失时现拉，仍缺则 reject；
 - 当前持仓来自 OKX API，不能由 position snapshot 聚合推断；
 - 可用 USDT 保证金字段缺失时 fail-safe reject；
-- live/demo 开仓都必须提供止损；
+- live 开仓必须提供止损；
 - 附挂止损必须按本次保护单身份回读；独立保护单还必须精确匹配新 `algoId`，仍失败则立即平掉裸仓并报告 P0；
 - 成交只接受 fills、订单状态或订单历史等权威端点；`fill_sz/fill_px/fill_ts/ts_source` 不完整时不得伪造成交；
 - 成交回执必须在执行交易的同一确定性进程内提交 writer；同 cycle 只允许完整重发或完全不相交的增量，部分重叠拒写；
@@ -197,14 +194,12 @@ notional = mark_px * size * ct_val
 账本自愈的公共安全边界：Live 无条件只读；API/CLI 的 Live 写参数只会留下结构化阻断
 证据并返回非零，不得修改交易库或 repair_queue。Live 人工修复必须唯一命中一个交易所
 `ordId`，先创建并验证 SQLite 备份，逐笔 apply，写后重新拉取现仓并复跑 reconciliation
-与 ledger invariants。两个环境写开关仅作用于 Demo；Demo GHOST-EXACT 只补 close，
-UNRECORDED open 只有在 fills 精确、订单归属一致、交易所已有同侧足量保护止损且显式
-启用第二级开关时才可写入。FUZZY、OVER_CLOSED、归属存疑或超过单轮上限都只报告。
-自愈只补账，绝不下单或重放订单。
+与 ledger invariants。公开代码不提供自动写账入口；FUZZY、OVER_CLOSED、归属存疑或
+超过单轮上限都只报告。自愈不下单、不重放订单，也不修改运行数据库。
 
 ## 9. 交易经验
 
-live/demo 成交写入后，由 `trades_writer.write_experiences` 调用 `trade_experience_writer` 更新 `account.db.trade_experiences`。交易库与经验库使用独立事务；经验写入失败不得回滚已经确认的交易行。
+live 成交写入后，由 `trades_writer.write_experiences` 调用 `trade_experience_writer` 更新 `account.db.trade_experiences`。交易库与经验库使用独立事务；经验写入失败不得回滚已经确认的交易行。
 
 经验状态为 `open|closed|expired`。只有已确认且可计算的 PnL 才能进入经验统计；`pnl_approx=True` 或成交未确认的关闭事件不得污染经验。
 
@@ -249,9 +244,10 @@ provisional 报告，但不得标成最终事实。
 
 ## 12. 当前实装状态
 
-- dispatcher 使用 unified live → demo → push 完成触发，并用 profile lease 防同盘跨 cycle 重叠；
-- Live 使用预计组合 IMR 66.6% 硬闸，Demo 使用实时方向性 max-size；
-- Live 账本 autoheal 永久只读，Demo close/open 写入分别使用两级显式 opt-in；
+- dispatcher 使用 unified live → push 完成触发，并用 profile lease 防 live 跨 cycle 重叠；
+- Live 使用预计组合 IMR 66.6%、单笔增量 IMR 15% 与单笔止损风险 5% 硬闸；
+- OPEN/ADD 使用 exact 已收盘 15m/1H/4H 证据、actor attestation 与有限数值检查；
+- 公开账本 autoheal 永久只读；
 - analysis、trade、news、report 和 system state 都有明确 writer；
 - 新闻采集由 registry 驱动，news-scout 是解耦旁路；
 - push 固定为纯脚本管道；

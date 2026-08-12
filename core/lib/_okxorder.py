@@ -9,7 +9,8 @@
   - place: okx swap place --instId <id> --side <buy|sell> --ordType <market|limit> --sz <n>
            [--posSide long|short] [--tdMode cross|isolated] [--tgtCcy base_ccy|quote_ccy|margin]
            [--reduceOnly] [--slTriggerPx <px>] [--slOrdPx <px|-1>] [--slTriggerPxType last|index|mark]
-           （**支持开仓即附挂 SL**，原子无裸仓窗口）
+           [--tpTriggerPx <px>] [--tpOrdPx <px|-1>] [--tpTriggerPxType last|index|mark]
+           （支持开仓附挂 TP/SL；两者同时提供时走交易所 attached OCO 语义）
   - algo place: okx swap algo place --instId --side --sz --ordType conditional
            --slTriggerPx <px> --slOrdPx -1 --slTriggerPxType mark [--posSide] [--tdMode] [--reduceOnly]
   - close: okx swap close --instId <id> --mgnMode <cross|isolated> [--posSide net|long|short]
@@ -26,25 +27,14 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[2]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import math
+
 import os
 import sys
 from typing import Any, Optional
 
 # 复用 scripts/_okxcli（CLI 调用 + 节流 + 崩溃重试）
-_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", _project_path('scripts'))
+_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", r"./scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
@@ -237,13 +227,16 @@ def set_leverage(inst_id: str, lever: float, mgn_mode: str, profile: str,
 def place_market_open(inst_id: str, pos_side: str, sz: float, profile: str,
                       mgn_mode: str = "cross", tgt_ccy: str = "base_ccy",
                       sl_trigger_px: Optional[float] = None,
-                      sl_trigger_px_type: str = "mark") -> dict[str, Any]:
-    """市价开仓（long→buy / short→sell），可附挂 SL（原子，无裸仓窗口）。"""
+                      sl_trigger_px_type: str = "mark",
+                      tp_trigger_px: Optional[float] = None,
+                      tp_trigger_px_type: str = "mark") -> dict[str, Any]:
+    """市价开仓（long→buy / short→sell），可附挂 TP/SL。"""
     side = "buy" if pos_side == "long" else "sell"
     if is_dryrun():
         return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
                 "data": [{"ordId": "DRYRUN-OPEN", "sCode": "0"}], "dryrun": True,
-                "sl_attached": sl_trigger_px is not None}
+                "sl_attached": sl_trigger_px is not None,
+                "tp_attached": tp_trigger_px is not None}
     # 注：SWAP 不支持 --tgtCcy（sCode 59110，2026-07-02 修）——tgtCcy(base/quote_ccy 计量)
     # 是现货/杠杆概念，永续 sz 恒为合约张数。tgt_ccy 形参保留兼容签名但不再下发。
     args = ["swap", "place", "--instId", inst_id, "--side", side,
@@ -255,8 +248,12 @@ def place_market_open(inst_id: str, pos_side: str, sz: float, profile: str,
         # → 带 SL 的 live/demo 下单一直失败（被 HOLD 掩盖）。等号形式才正确传值。
         args += ["--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",
                  "--slTriggerPxType", sl_trigger_px_type]
+    if tp_trigger_px is not None:
+        args += ["--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",
+                 "--tpTriggerPxType", tp_trigger_px_type]
     r = _call(*args, profile=profile)
     r["sl_attached"] = (sl_trigger_px is not None) and r.get("ok", False)
+    r["tp_attached"] = (tp_trigger_px is not None) and r.get("ok", False)
     return r
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""Manage <PROJECT_ROOT> scratch lifecycle safely.  (v2 — 2026-06-27)
+r"""Manage . scratch lifecycle safely.  (v2 — 2026-06-27)
 
 在原版基础上新增两项(根治 tmp 只进不出、GB 级膨胀):
   1. --hard-delete-tmp-days N : tmp/ 根下超过 N 天的文件【直接删除】, 而非搬进 archive
@@ -14,18 +14,6 @@ in-flight;仅 --apply 后写 account.db.tmp_cleanup_runs 审计。两个新开�
 opt-in】, 不传则行为同原版。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -42,7 +30,7 @@ if hasattr(sys.stdout, "reconfigure"):
 SKIP_DIR_NAMES = {"archive", "pycache", "__pycache__"}
 SKIP_DIR_PREFIXES = ("deploy-tests-",)
 
-# The ONLY files allowed to live in <PROJECT_ROOT> root; never touched by the root sweep.
+# The ONLY files allowed to live in . root; never touched by the root sweep.
 ROOT_KEEP = {"config.md", "README.md", "skill.md", "focus.md"}
 
 # archive/ 子目录名包含这些子串 => 命名的迁移/库/配置备份 = 回滚点, --purge-archive 永不删。
@@ -53,6 +41,10 @@ ARCHIVE_KEEP_SUBSTR = (
     "pre-init", "oneoff-removed", "cleanup-manifest",
     "migrated-sidecar",  # 2026-07-17：OpenClaw 7.1 迁移修复锚冷归档（214MB zip，回滚点）
     "ledger-repair", "vanished-repair",  # 生产账本/仓位修复回滚点，禁止通用归档轮转删除
+    # 2026-08-06 demo 全量下线：被删的角色文件/脚本/测试的唯一副本在
+    # tmp/archive/20260806-demo-removal/。它是回滚点，不是日常草稿——名字里
+    # 没有上面任何一个既有子串，不加这条就会在 30 天后被当普通归档轮转掉。
+    "demo-removal",
 )
 
 
@@ -72,6 +64,35 @@ class CleanupStats:
     archive_purged: int = 0
     archive_kept_protected: int = 0
     archive_kept_recent: int = 0
+    # 2026-08-06 新增：tmp 根下遮蔽标准库的 .py（与 age 无关，--apply 即删）
+    stdlib_shadow_found: int = 0
+    stdlib_shadow_removed: int = 0
+
+
+def find_stdlib_shadows(tmp_root: Path) -> list[Path]:
+    """tmp 根下与标准库同名的 .py —— 会让**任何在 tmp 里执行的脚本**炸在 import。
+
+    成因：两个 trader 的契约都规定当轮临时执行脚本只能写 `./tmp/`，而 Python
+    会把脚本自身目录放进 `sys.path[0]`。tmp 里一旦落下 `bisect.py` / `inspect.py`
+    这类调试残留，`order_executor` 的 `import tempfile` → `random` → `bisect` 就会
+    解析到残留文件，**下一笔 OPEN/CLOSE 直接 ImportError**。
+
+    2026-08-06 实证：13:34 落下的 bisect.py 埋了 6.4h 未引爆——期间双盘全是 HOLD，
+    而 HOLD 回执走 `collectors/trades_writer.py`（sys.path[0] 是 collectors/），绕开
+    了这条路径；直到手动平 demo 仓时才炸出来。性质同「部署漂移」：测试全绿、日志
+    正常，只在真要下单那一刻失败。
+
+    只扫 tmp **根目录**：sys.path[0] 只会是脚本自己所在的目录，archive/ 子目录里的
+    同名文件不参与解析，不必误报。
+    """
+    if not tmp_root.is_dir():
+        return []
+    std = set(sys.stdlib_module_names)
+    hits = []
+    for path in sorted(tmp_root.glob("*.py")):
+        if path.is_file() and path.stem in std:
+            hits.append(path)
+    return hits
 
 
 def utc_now() -> datetime:
@@ -249,8 +270,8 @@ def record_run(db_root: Path, stats: CleanupStats, archive_dir: Path | None, dry
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Safe scratch lifecycle manager for <PROJECT_ROOT> (v2)")
-    parser.add_argument("--okx-root", default=_project_path())
+    parser = argparse.ArgumentParser(description="Safe scratch lifecycle manager for . (v2)")
+    parser.add_argument("--okx-root", default=".")
     parser.add_argument("--keep-days", type=float, default=3.0, help="Keep tmp/ files newer than this many days")
     parser.add_argument("--archive-days", type=float, default=3.0, help="Archive tmp/ files older than this many days")
     parser.add_argument("--scratch-keep-hours", type=float, default=6.0,
@@ -338,6 +359,28 @@ def main() -> int:
     if args.purge_archive:
         purge_archive(tmp_root, now_ts, args.archive_keep_days * 86400, dry_run, stats, moves)
 
+    # --- 标准库遮蔽（与 age 无关）---
+    # tmp 里没有任何合法文件该叫标准库的名字，所以这一类不走 keep-days 保护：
+    # dry-run 一律外显，--apply 一律删。留着它比留一个超期草稿危险得多——
+    # 它会让下一笔 OPEN/CLOSE 炸在 import（详见 find_stdlib_shadows docstring）。
+    shadows = find_stdlib_shadows(tmp_root)
+    shadow_removed: list[str] = []
+    for path in shadows:
+        if dry_run:
+            continue
+        try:
+            path.unlink()
+            shadow_removed.append(path.name)
+            stats.stdlib_shadow_removed += 1
+        except OSError as exc:
+            print(f"[WARN] 遮蔽文件删除失败 {path}: {exc}")
+    stats.stdlib_shadow_found = len(shadows)
+    if shadows:
+        print(f"[P1] tmp 根下有 {len(shadows)} 个文件遮蔽标准库："
+              f"{', '.join(p.name for p in shadows)}"
+              f"——{'已删除' if not dry_run else '下一笔 OPEN/CLOSE 会炸在 import；'
+                 '加 --apply 删除，或手工移走'}")
+
     report = {
         "okx_root": str(okx_root),
         "tmp_root": str(tmp_root),
@@ -346,6 +389,8 @@ def main() -> int:
         "purge_archive": args.purge_archive,
         "archive_keep_days": args.archive_keep_days if args.purge_archive else None,
         "archive_dir": str(archive_dir) if archive_dir else None,
+        "stdlib_shadow_found": [p.name for p in shadows],
+        "stdlib_shadow_removed": shadow_removed,
         "stats": asdict(stats),
         "moves_sample": moves[:100],
     }

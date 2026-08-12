@@ -15,18 +15,6 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import sys
 import time
@@ -35,7 +23,7 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-LOG_ROOT = Path(_project_path('logs'))
+LOG_ROOT = Path(r"./logs")
 # 轮转目标：per-cycle 高频落盘的调试日志目录。审计类 jsonl（qq_push_dedupe/pipeline_runs/
 # monitor audit）不在此删——它们是排障权威、体量小、单独按需管。
 # standalone 默认保持 trigger/push；daily_maintenance 显式追加 stage-status。

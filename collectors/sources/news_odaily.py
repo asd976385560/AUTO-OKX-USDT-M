@@ -28,12 +28,13 @@ import html as _html
 import json
 import re
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
@@ -187,15 +188,14 @@ def _event_time(publish_ms) -> str | None:
 def _parse(payload: dict, max_age_hours: int) -> list[dict]:
     out: list[dict] = []
     if not isinstance(payload, dict):
-        return out
+        raise ValueError("odaily payload is not an object")
     if payload.get("code") != 200:
-        print(f"[WARN] odaily code={payload.get('code')} msg={payload.get('msg')}",
-              file=sys.stderr)
-        return out
+        raise ValueError(
+            f"odaily code={payload.get('code')} msg={payload.get('msg')}")
     data = payload.get("data") or {}
     items = data.get("list") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        return out
+        raise ValueError("odaily payload missing data.list")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     for it in items:
         if not isinstance(it, dict):
@@ -240,34 +240,50 @@ def _parse(payload: dict, max_age_hours: int) -> list[dict]:
 
 
 def fetch_items(page_size: int = 16, max_age_hours: int = 24,
-                errors: list[str] | None = None) -> list[dict]:
+                errors: list[str] | None = None,
+                retry_timeout: int = 6,
+                retry_stats: dict | None = None) -> list[dict]:
     """errors（2026-07-07 可观测性）：调用方传入 list 时，fetch 失败的简短原因
     （HTTP 码/超时等，截 150 字）append 进去——供 collect() 把 err 带回
     news_collect → ledger.collection_runs.err（degraded 行也必须带明细，
     无法区分限流/网络）。不传则行为同旧版（只打 stderr）。"""
-    try:
-        payload = _fetch(page=1, page_size=page_size)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        print(f"[WARN] odaily fetch failed: {e}", file=sys.stderr)
-        if errors is not None:
-            errors.append(f"fetch: {e}"[:150])
-        return []
-    except Exception as e:  # noqa: BLE001
-        print(f"[ERR] odaily: {e}", file=sys.stderr)
-        if errors is not None:
-            errors.append(f"{type(e).__name__}: {e}"[:150])
-        return []
-    return _parse(payload, max_age_hours)
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        if attempt == 2:
+            time.sleep(0.5)
+        try:
+            payload = _fetch(
+                page=1, page_size=page_size,
+                timeout=(15 if attempt == 1 else retry_timeout),
+            )
+            parsed = _parse(payload, max_age_hours)
+            if retry_stats is not None:
+                retry_stats.update({
+                    "attempts": attempt,
+                    "recovered_after_retry": attempt == 2,
+                })
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    message = f"{type(last_error).__name__}: {last_error}"[:150]
+    print(f"[WARN] odaily fetch failed after retry: {message}", file=sys.stderr)
+    if errors is not None:
+        errors.append(f"fetch: {message}"[:150])
+    if retry_stats is not None:
+        retry_stats.update({"attempts": 2, "final_failed": True})
+    return []
 
 
 def collect(db_path: str, page_size: int = 16, max_age_hours: int = 24,
             apply: bool = False) -> dict:
     fetch_errs: list[str] = []
+    retry_stats: dict = {}
     items = fetch_items(page_size=page_size, max_age_hours=max_age_hours,
-                        errors=fetch_errs)
+                        errors=fetch_errs, retry_stats=retry_stats)
     err_txt = "; ".join(fetch_errs)[:150] if fetch_errs else None
     if not apply:
         out = {"ok": True, "dry_run": True, "fetched": len(items),
+               "retry_stats": retry_stats,
                "sample": [{"t": it["title"][:70], "et": it["event_time"],
                            "sym": it["symbols"], "sev": it["severity"],
                            "tags": it["tags"]}
@@ -277,6 +293,7 @@ def collect(db_path: str, page_size: int = 16, max_age_hours: int = 24,
         return out
     res = news_writer.write_news(items, db_path)
     res["fetched"] = len(items)
+    res["retry_stats"] = retry_stats
     if err_txt and not res.get("err"):
         res["err"] = err_txt
     return res

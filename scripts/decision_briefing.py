@@ -5,24 +5,12 @@
 任何子段失败只标注 N/A，不中断（决策不能因简报缺段而停）。
 
 用法:
-  pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 <PROJECT_ROOT>\\scripts\\decision_briefing.py [--db-root <PROJECT_ROOT>\\db] [--top 5] [--out-file <PROJECT_ROOT>\\tmp\\briefing_<stage>.md]
+  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ./scripts//decision_briefing.py [--db-root ./db] [--top 5] [--out-file ./tmp//briefing_<stage>.md]
 
 --out-file（2026-07-15）：stdout 照常输出（契约不变），同时把全文写入 UTF-8 文件。
 agent exec 环境是 cp936 pwsh——对本脚本输出接管道/捕获（`| tail`/`| Select-Object`/`2>&1 |`）
 会被按 GBK 解码坏成 `鍐崇瓥...`；需复读/截断一律 --out-file + read，禁再接管道。
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import json
 import re
@@ -33,16 +21,29 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from core.risk_validator import MAX_PORTFOLIO_IMR_RATIO  # noqa: E402
+from core.multitimeframe_gate import (  # noqa: E402
+    MINIMUM_BARS_FOR_FULL_INDICATORS,
+    validate_kline_row,
+)
+
 CST = timezone(timedelta(hours=8))
 MIN_QUOTE_VOL_USD = 5_000_000  # 流动性下限：过滤微盘噪音
 MIN_OI_USD = 5_000_000         # 可交易候选 OI 下限：过滤成交额虚高但盘口承载不足
 TRADEABLE_CANDIDATE_COUNT = 8
+DECISION_TIMEFRAMES = ("15m", "1H", "4H")
+TIMEFRAME_SECONDS = {"15m": 15 * 60, "1H": 60 * 60, "4H": 4 * 60 * 60}
 DXY_OBSERVATION_WINDOW = 20    # DTWEXBGS 是周频；按 source_as_of 取真实观测，不取 carry-forward 日历行
 DXY_MIN_OBSERVATIONS = 3       # 仅保证可描述离散度；样本量会原样展示给 Agent 自主权衡
 DXY_CARRY_STALE_DAYS = 3       # 本地连续 carry-forward 达该天数后不再输出 zone 档位
 PLAYBOOK_HYPOTHESIS_TTL_DAYS = 14
 PLAYBOOK_OTHER_TTL_DAYS = 30
 REGIME_TOKENS = ("trend_up", "trend_down", "range")
+_CALIBRATION_USAGE_ORDER = ("adopt", "partial", "ignore", "none", "unknown")
+_CALIBRATION_HOLD_ORDER = ("<4h", "4-24h", "24-48h", ">=48h", "unknown")
 
 
 def connect(db_root, name):
@@ -69,6 +70,96 @@ def fmt_age(ts):
     return f"{a:.0f}m" if a is not None else "?"
 
 
+def closed_bar_cutoff(evaluation_ts_utc: str, timeframe: str) -> str:
+    """Latest candle open time guaranteed closed at evaluation_ts_utc."""
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError(f"unsupported decision timeframe: {timeframe}")
+    value = datetime.fromisoformat(str(evaluation_ts_utc).replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    seconds = TIMEFRAME_SECONDS[timeframe]
+    epoch = int(value.astimezone(timezone.utc).timestamp())
+    closed_start_epoch = (epoch // seconds) * seconds - seconds
+    return datetime.fromtimestamp(
+        closed_start_epoch, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def latest_closed_kline(
+    con: sqlite3.Connection,
+    symbol: str,
+    timeframe: str,
+    evaluation_ts_utc: str,
+) -> sqlite3.Row | None:
+    """Read the exact latest candle that had closed at the decision snapshot."""
+    return con.execute(
+        "SELECT * FROM kline_cache "
+        "WHERE symbol=? AND tf=? AND ts=? LIMIT 1",
+        (symbol, timeframe, closed_bar_cutoff(evaluation_ts_utc, timeframe)),
+    ).fetchone()
+
+
+def closed_kline_readiness(
+    con: sqlite3.Connection,
+    symbol: str,
+    timeframe: str,
+    evaluation_ts_utc: str,
+) -> tuple[sqlite3.Row | None, bool]:
+    """Use the same exact-bar and warm-up contract as the execution gate."""
+    cutoff = closed_bar_cutoff(evaluation_ts_utc, timeframe)
+    row = latest_closed_kline(con, symbol, timeframe, evaluation_ts_utc)
+    validation = validate_kline_row(row)
+    bars_seen = int(
+        con.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM kline_cache "
+            "WHERE symbol=? AND tf=? AND ts<=? LIMIT ?)",
+            (
+                symbol,
+                timeframe,
+                cutoff,
+                MINIMUM_BARS_FOR_FULL_INDICATORS,
+            ),
+        ).fetchone()[0]
+    )
+    return (
+        row,
+        bool(
+            validation["ready"]
+            and bars_seen >= MINIMUM_BARS_FOR_FULL_INDICATORS
+        ),
+    )
+
+
+def quote_volume_usd(last, contracts_24h, contract_value) -> float | None:
+    """OKX linear-swap quote turnover: price * contracts * ctVal."""
+    try:
+        values = (float(last), float(contracts_24h), float(contract_value))
+    except (TypeError, ValueError):
+        return None
+    if any(value <= 0 for value in values):
+        return None
+    return values[0] * values[1] * values[2]
+
+
+def catalyst_freshness(event_day, now: datetime | None = None) -> tuple[str, str]:
+    """Event-date freshness; observation time is deliberately not an input."""
+    if not event_day:
+        return "unknown", "事件年龄未知"
+    try:
+        day = datetime.strptime(str(event_day)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return "unknown", "事件年龄未知"
+    today = (now or datetime.now(CST)).astimezone(CST).date()
+    age_days = (today - day).days
+    if age_days < 0:
+        return "scheduled", f"距已排期事件 {-age_days} 天"
+    if age_days == 0:
+        return "fresh", "事件日=今天"
+    if age_days <= 2:
+        return "recent", f"事件已发生 {age_days} 天"
+    return "stale", f"事件已发生 {age_days} 天"
+
+
 def section(title):
     print(f"\n## {title}")
 
@@ -86,6 +177,144 @@ def _row_get(row, key, default=None):
     except (KeyError, IndexError, TypeError):
         value = default
     return default if value is None else value
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _calibration_group_stats(items, field, preferred_order=()):
+    grouped = {}
+    for item in items:
+        grouped.setdefault(item[field], []).append(item)
+    labels = [label for label in preferred_order if label in grouped]
+    labels.extend(sorted(label for label in grouped if label not in labels))
+    result = {}
+    for label in labels:
+        group_items = grouped[label]
+        values = [item["pnl_pct"] for item in group_items]
+        realized = [
+            item["realized_pnl"] for item in group_items
+            if item["realized_pnl"] is not None
+        ]
+        wins = sum(value > 0 for value in values)
+        result[label] = {
+            "n": len(values),
+            "wins": wins,
+            "losses": len(values) - wins,
+            "win_rate_pct": wins / len(values) * 100,
+            "avg_pnl_pct": sum(values) / len(values),
+            "pnl_sum_pct": sum(values),
+            "realized_pnl_n": len(realized),
+            "realized_pnl_sum_usdt": sum(realized) if realized else None,
+        }
+    return result
+
+
+def experience_calibration(rows, asset_classes=None, analysis_usage=None):
+    """Build deterministic self-calibration facts from closed experiences.
+
+    Historical narrative is never parsed for counts or decision type.  Usage is
+    read only from the structured decision-card field; asset class prefers the
+    frozen v2 experience vector and falls back to the current instrument map.
+    """
+    asset_classes = asset_classes or {}
+    analysis_usage = analysis_usage or {}
+    items = []
+    asset_fallback = 0
+    usage_source_counts = {
+        "analysis_signal": 0,
+        "trade_receipt": 0,
+        "unknown": 0,
+    }
+    for row in rows:
+        try:
+            pnl = float(_row_get(row, "pnl_pct"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            realized_pnl = float(_row_get(row, "realized_pnl"))
+        except (TypeError, ValueError):
+            realized_pnl = None
+        raw = _json_object(_row_get(row, "raw"))
+        card = raw.get("decision_card")
+        card = card if isinstance(card, dict) else {}
+        history = card.get("historical_experience")
+        history = history if isinstance(history, dict) else {}
+        usage_key = (
+            str(_row_get(row, "cycle_id", "")),
+            str(_row_get(row, "symbol", "")).upper(),
+        )
+        usage = str(analysis_usage.get(usage_key) or "").strip().lower()
+        if usage in _CALIBRATION_USAGE_ORDER[:-1]:
+            usage_source_counts["analysis_signal"] += 1
+        else:
+            usage = str(history.get("usage") or "").strip().lower()
+            if usage in _CALIBRATION_USAGE_ORDER[:-1]:
+                usage_source_counts["trade_receipt"] += 1
+            else:
+                usage = "unknown"
+                usage_source_counts["unknown"] += 1
+        if usage not in _CALIBRATION_USAGE_ORDER:
+            usage = "unknown"
+
+        hold = _row_get(row, "hold_hours")
+        try:
+            hold_value = float(hold)
+        except (TypeError, ValueError):
+            hold_value = None
+        if hold_value is None or hold_value < 0:
+            hold_bucket = "unknown"
+        elif hold_value < 4:
+            hold_bucket = "<4h"
+        elif hold_value < 24:
+            hold_bucket = "4-24h"
+        elif hold_value < 48:
+            hold_bucket = "24-48h"
+        else:
+            hold_bucket = ">=48h"
+
+        vector = _json_object(_row_get(row, "experience_vector"))
+        features = vector.get("features")
+        features = features if isinstance(features, dict) else {}
+        asset_class = str(features.get("asset_class") or "").strip()
+        if not asset_class:
+            asset_class = str(asset_classes.get(
+                str(_row_get(row, "symbol", "")), "unknown") or "unknown")
+            asset_fallback += 1
+        items.append({
+            "pnl_pct": pnl,
+            "realized_pnl": realized_pnl,
+            "usage": usage,
+            "regime_side": (
+                f"{_row_get(row, 'regime', 'unknown')}/"
+                f"{_row_get(row, 'side', 'unknown')}"
+            ),
+            "hold_bucket": hold_bucket,
+            "asset_class": asset_class,
+        })
+
+    return {
+        "sample_n": len(items),
+        "history_usage": _calibration_group_stats(
+            items, "usage", _CALIBRATION_USAGE_ORDER),
+        "regime_side": _calibration_group_stats(items, "regime_side"),
+        "hold_bucket": _calibration_group_stats(
+            items, "hold_bucket", _CALIBRATION_HOLD_ORDER),
+        "asset_class": _calibration_group_stats(items, "asset_class"),
+        "asset_class_current_map_fallback_n": asset_fallback,
+        "history_usage_source_counts": usage_source_counts,
+        "decision_driver_available": False,
+        "actor_cohort_available": False,
+    }
 
 
 def _dxy_observation_rows(reg, limit: int = DXY_OBSERVATION_WINDOW):
@@ -218,7 +447,7 @@ def _playbook_context(mkt: sqlite3.Connection, acc: sqlite3.Connection,
     }
     context = {"BTC", "ETH", "SOL"} & known
 
-    for profile in ("live", "demo"):
+    for profile in ("live",):
         latest = acc.execute(
             "SELECT ts FROM position_snapshots WHERE profile=? "
             "ORDER BY ts DESC,rowid DESC LIMIT 1",
@@ -470,14 +699,18 @@ def _render(root, top):
     section("技术面（BTC/ETH 多周期）")
 
     def s_tech():
+        evaluation_ts = mkt.execute(
+            "SELECT MAX(ts) FROM tick_snapshots"
+        ).fetchone()[0]
+        if not evaluation_ts:
+            print("  暂无行情快照")
+            return
         for sym in ("BTC-USDT-SWAP", "ETH-USDT-SWAP"):
             parts = []
-            for tf in ("1H", "4H", "1D"):
-                k = mkt.execute(
-                    "SELECT c, ma20, rsi14, macd_hist FROM kline_cache "
-                    "WHERE symbol=? AND tf=? ORDER BY ts DESC LIMIT 1", (sym, tf)
-                ).fetchone()
-                if not k or k["c"] is None:
+            for tf in DECISION_TIMEFRAMES:
+                k, ready = closed_kline_readiness(
+                    mkt, sym, tf, evaluation_ts)
+                if not ready:
                     parts.append(f"{tf}:N/A")
                     continue
                 trend = "↑MA" if (k["ma20"] and k["c"] > k["ma20"]) else "↓MA"
@@ -518,28 +751,33 @@ def _render(root, top):
             }
 
         rows = mkt.execute(
-            "SELECT t.symbol,t.last,t.chg24h,t.vol24h,d.oi_usd,d.funding_rate "
+            "SELECT t.symbol,t.last,t.chg24h,t.vol24h,i.ctVal,d.oi_usd,d.funding_rate "
             "FROM tick_snapshots t JOIN derivatives d ON d.symbol=t.symbol "
+            "JOIN instruments_cache i ON i.instId=t.symbol "
             "WHERE t.ts=? AND d.ts=? AND t.chg24h IS NOT NULL "
-            "AND t.last*t.vol24h>=? AND d.oi_usd>=?",
-            (tick_ts, deriv_ts, MIN_QUOTE_VOL_USD, MIN_OI_USD),
+            "AND i.ctVal IS NOT NULL AND i.ctVal>0",
+            (tick_ts, deriv_ts),
         ).fetchall()
 
         ranked = []
         for r in rows:
+            quote_vol = quote_volume_usd(r["last"], r["vol24h"], r["ctVal"])
+            if (
+                quote_vol is None
+                or quote_vol < MIN_QUOTE_VOL_USD
+                or (r["oi_usd"] or 0) < MIN_OI_USD
+            ):
+                continue
             if r["symbol"] in held:
                 continue
-            parts, trend_vote, observed = [], 0, 0
-            for tf in ("1H", "4H", "1D"):
-                k = mkt.execute(
-                    "SELECT c,ma20,rsi14,macd_hist FROM kline_cache "
-                    "WHERE symbol=? AND tf=? ORDER BY ts DESC LIMIT 1",
-                    (r["symbol"], tf),
-                ).fetchone()
-                if not k or k["c"] is None:
+            parts, trend_vote, all_ready = [], 0, True
+            for tf in DECISION_TIMEFRAMES:
+                k, ready = closed_kline_readiness(
+                    mkt, r["symbol"], tf, tick_ts)
+                if not ready:
                     parts.append(f"{tf}:N/A")
+                    all_ready = False
                     continue
-                observed += 1
                 above = k["ma20"] is not None and k["c"] > k["ma20"]
                 macd_up = k["macd_hist"] is not None and k["macd_hist"] > 0
                 trend_vote += (1 if above else -1) + (1 if macd_up else -1)
@@ -547,10 +785,9 @@ def _render(root, top):
                 rsi = f"R{k['rsi14']:.0f}" if k["rsi14"] is not None else "R?"
                 macd = "M+" if macd_up else "M-"
                 parts.append(f"{tf}{trend}/{rsi}/{macd}")
-            if observed < 2:
+            if not all_ready:
                 continue
             bias = "偏多" if trend_vote >= 2 else ("偏空" if trend_vote <= -2 else "混合")
-            quote_vol = (r["last"] or 0) * (r["vol24h"] or 0)
             # 先看多周期一致性，再看实际波动；成交额/OI 仅用于同分时稳定排序。
             rank_key = (
                 abs(trend_vote),
@@ -662,8 +899,8 @@ def _render(root, top):
         print(f"  @ {fmt_age(ts)} 前；逐笔流为最近最多500笔样本，样本跨度随成交活跃度变化")
     safe(s_micro)
 
-    # ── 3c. OKX CLI 多空账户比（影子软证据） ──────────
-    section("多空账户比（OKX CLI 1H，软证据）")
+    # ── 3c. OKX 官方REST多空账户比（影子软证据） ─────
+    section("多空账户比（OKX官方REST全宇宙1H，软证据）")
 
     def s_positioning():
         latest = mkt.execute(
@@ -724,24 +961,61 @@ def _render(root, top):
         # ts 混 UTC-Z/CST（同 s_senti 口径）：归一 naive-UTC 再比；年龄直接 SQL 算，
         # 不走 fmt_age（其解析不认 Z 格式）。
         _tsn = "CASE WHEN ts LIKE '%Z' THEN datetime(ts) ELSE datetime(ts,'-8 hours') END"
-        rows = news.execute(
-            f"SELECT id, severity, symbol, title, event_time, "
-            f"CAST((julianday('now') - julianday({_tsn})) * 1440 AS INTEGER) AS age_m "
-            f"FROM news_items WHERE severity IN ('critical','high') "
-            f"AND {_tsn} >= datetime('now','-6 hours') "
-            f"ORDER BY (severity='critical') DESC, id DESC LIMIT 8").fetchall()
+        news_cols = {str(r[1]) for r in news.execute(
+            "PRAGMA table_info(news_items)").fetchall()}
+        has_layers = "first_seen_at" in news_cols
+        if has_layers:
+            # first_seen_at 只表示观察首见（重复采集不刷新）；催化新鲜度只由
+            # event_occurred_at 决定，禁止把“刚观察到旧闻”写成“刚发生”。
+            _fsn = ("CASE WHEN first_seen_at LIKE '%Z' THEN datetime(first_seen_at) "
+                    "ELSE datetime(COALESCE(first_seen_at, ts),'-8 hours') END")
+            rows = news.execute(
+                f"SELECT id, severity, symbol, title, event_occurred_at, "
+                f"event_time_confidence, source_grade, primary_source_url, "
+                f"CAST((julianday('now') - julianday({_fsn})) * 1440 AS INTEGER) AS first_seen_age_m "
+                f"FROM news_items WHERE severity IN ('critical','high') "
+                f"AND {_tsn} >= datetime('now','-6 hours') "
+                f"ORDER BY (severity='critical') DESC, id DESC LIMIT 8").fetchall()
+        else:
+            rows = news.execute(
+                f"SELECT id, severity, symbol, title, event_time, "
+                f"CAST((julianday('now') - julianday({_tsn})) * 1440 AS INTEGER) AS age_m "
+                f"FROM news_items WHERE severity IN ('critical','high') "
+                f"AND {_tsn} >= datetime('now','-6 hours') "
+                f"ORDER BY (severity='critical') DESC, id DESC LIMIT 8").fetchall()
         if not rows:
             print("  （近 6h 无 critical/high 新闻——本节为空即代表已查过，无需再查 news.db）")
             news.close()
             return
+        if has_layers:
+            print("  （观察首见=系统首次看到该事件，绝不等于事件新鲜度；"
+                  "催化时效只看事件日；事件日未知不得写成 fresh；"
+                  "grade≠primary 表示未经一级源核实）")
         for r in rows:
             syms = [x[0] for x in news.execute(
                 "SELECT DISTINCT symbol FROM news_events_index WHERE news_id=? LIMIT 6",
                 (r["id"],))]
             sym_s = ("[" + ",".join(syms) + "] ") if syms else \
                 (f"[{r['symbol']}] " if r["symbol"] else "")
-            evt = f" 事件时刻:{r['event_time']}" if r["event_time"] else ""
-            print(f"  [{r['severity']}] {sym_s}{str(r['title'])[:70]}{evt} @ {r['age_m']}m前")
+            if has_layers:
+                occurred = r["event_occurred_at"]
+                conf = r["event_time_confidence"] or "unknown"
+                evt = (f" 事件日:{occurred}" if occurred
+                       else f" 事件日:未知({conf})")
+                freshness, age_text = catalyst_freshness(occurred)
+                grade = r["source_grade"] or "secondary"
+                grade_s = f" 源级:{grade}"
+                if r["primary_source_url"]:
+                    grade_s += "(已附一级源)"
+                elif grade != "primary":
+                    grade_s += "(未经一级源核实)"
+                print(f"  [news_id:{r['id']} {r['severity']}] "
+                      f"{sym_s}{str(r['title'])[:70]}{evt} "
+                      f"催化:{freshness}({age_text}){grade_s} "
+                      f"观察首见:{r['first_seen_age_m']}m前")
+            else:
+                evt = f" 事件时刻:{r['event_time']}" if r["event_time"] else ""
+                print(f"  [{r['severity']}] {sym_s}{str(r['title'])[:70]}{evt} @ {r['age_m']}m前")
         news.close()
     safe(s_critnews)
 
@@ -804,7 +1078,7 @@ def _render(root, top):
     section("持仓 / 账户")
 
     def s_pos():
-        def _portfolio_line(tag, rows, eq):
+        def _portfolio_line(tag, rows, eq, basis="净值"):
             notionals = []
             margins = []
             sides = {"long": 0.0, "short": 0.0}
@@ -827,11 +1101,11 @@ def _render(root, top):
             if not rows:
                 print(f"    {tag} 组合观察: 0 仓 | gross=0 | 保证金≈0")
                 return
-            gross_x = f"{gross / eq:.2f}x净值" if eq else "净值N/A"
+            gross_x = f"{gross / eq:.2f}x{basis}" if eq else f"{basis}N/A"
             margin = sum(margins)
-            margin_pct = f"{margin / eq:.1%}净值" if eq else "净值N/A"
+            margin_pct = f"{margin / eq:.1%}{basis}" if eq else f"{basis}N/A"
             net = sides["long"] - sides["short"]
-            net_x = f"{net / eq:+.2f}x净值" if eq else f"${net:+.2f}"
+            net_x = f"{net / eq:+.2f}x{basis}" if eq else f"${net:+.2f}"
             same = max(sides.values()) / gross if gross else 0.0
             largest = max(notionals, default=0.0) / gross if gross else 0.0
             warns = []
@@ -850,11 +1124,12 @@ def _render(root, top):
             if tag == "live":
                 print(
                     "      Live OPEN/ADD硬闸以执行时同次OKX "
-                    "account.balance.imr/totalEq加本单增量计算预计值，须≤66.6%；"
+                    "account.balance.imr/totalEq加本单增量计算预计值，"
+                    f"须≤{MAX_PORTFOLIO_IMR_RATIO:.1%}；"
                     "本段逐仓估算、mgnRatio、gross、net均不得替代。"
                 )
 
-        def _fmt_pos(tag, r, eq):
+        def _fmt_pos(tag, r, eq, basis="净值"):
             # 2026-07-15 主人要求：持仓行补「多/空 + 保证金 USD + 占净值%」（原只有张数难判风险）。
             # 保证金≈sz×ctVal×avgPx÷lev（与 risk_validator 同口径，ctVal 取 market.db.instruments_cache）。
             side_cn = {"long": "多", "short": "空"}.get(str(r["side"] or "").lower(), r["side"] or "?")
@@ -864,7 +1139,7 @@ def _render(root, top):
                                  (r["symbol"],)).fetchone()
                 if iv and iv["ctVal"] and r["sz"] and r["avgPx"] and r["lev"]:
                     margin = r["sz"] * iv["ctVal"] * r["avgPx"] / r["lev"]
-                    pct = f"/{margin / eq * 100:.1f}%净值" if eq else ""
+                    pct = f"/{margin / eq * 100:.1f}%{basis}" if eq else ""
                     m = f" 保证金≈${margin:.2f}{pct}"
             except Exception:
                 pass
@@ -902,91 +1177,14 @@ def _render(root, top):
             live_fresh if (age_min(pts) or 999) < 45 else [],
             a["totalEq"] if a else None,
         )
-        d_eq = acc.execute(
-            "SELECT totalEq, availBal, upl, ts FROM account_snapshots "
-            "WHERE profile='demo' ORDER BY ts DESC,rowid DESC LIMIT 1"
-        ).fetchone()
-        # 2026-07-12：demo 持仓改读 position_snapshots（与 live 同源、同 __FLAT__ 哨兵语义）。
-        # 旧源 drill.db.drill_trades 06-19 停更且 V2.0 不再写——open 恒 0 行，demo 真开仓时
-        # 本段仍显示 0 仓（主动误导），对抗核查 2026-07-12 定性后换源。
-        d_pts_row = acc.execute(
-            "SELECT ts FROM position_snapshots WHERE profile='demo' "
-            "ORDER BY ts DESC,rowid DESC LIMIT 1"
-        ).fetchone()
-        d_pts = d_pts_row["ts"] if d_pts_row else None
-        op = acc.execute(
-            "SELECT symbol,side,sz,avgPx,lev,upl FROM position_snapshots "
-            "WHERE ts=? AND profile='demo' AND symbol != '__FLAT__'", (d_pts,)
-        ).fetchall() if d_pts else []
-        if d_eq:
-            d_avail = f"${d_eq['availBal']:.2f}" if d_eq["availBal"] is not None else "N/A"
-            print(f"  🟡 demo 资产/绩效展示 ${d_eq['totalEq']:.2f} | "
-                  f"snapshot availBal {d_avail}（仅展示，非开仓容量）| "
-                  f"snapshot 落库 @ {fmt_age(d_eq['ts'])} 前 | "
-                  f"upl {d_eq['upl'] or 0:+.2f} | {len(op)} 仓:")
-            print("    Demo OPEN 容量只认 order_executor 按目标 "
-                  "symbol/side/tdMode/有效杠杆实时查询的 OKX Demo max-size；"
-                  "禁用 totalEq/availBal、Live 组合 IMR 闸或人工百分比公式推导。")
-        else:
-            print(f"  🟡 demo {len(op)} 仓（⚠️ 无 demo 权益快照——先跑 demo_account_check）:")
-        # N1 (2026-06-14): 连续无成交计数——防变相 IDLE/僵持持有。
-        # 连续无成交轮数以 live_trades.db.trade_cycles 的 n_orders 统计。
-        # cycle_id 是规范化 ISO 槽位，按 MAX(cycle_id) 找最近成交，再计数其后的零成交轮；
-        # 历史补账 rowid 乱序不影响。
-        try:
-            _lt = connect(root, "live_trades.db")
-            last_traded = _lt.execute(
-                "SELECT MAX(cycle_id) FROM trade_cycles WHERE COALESCE(n_orders,0)>0"
-            ).fetchone()[0]
-            if last_traded:
-                adj_streak = _lt.execute(
-                    "SELECT COUNT(*) FROM trade_cycles "
-                    "WHERE cycle_id>? AND COALESCE(n_orders,0)=0",
-                    (last_traded,),
-                ).fetchone()[0]
-            else:
-                adj_streak = _lt.execute(
-                    "SELECT COUNT(*) FROM trade_cycles WHERE COALESCE(n_orders,0)=0"
-                ).fetchone()[0]
-        except Exception:
-            adj_streak = 0
-        if adj_streak >= 8:
-            print(f"  🔴 已连续 {adj_streak} 轮 ADJUST 无成交——必须复核：微盈仓是否止盈/集中仓是否分散/"
-                  f"浮亏仓是否止损；勿惯性续持，决策依据须显式说明为何不动")
-        for r in op:
-            # SL 详情 position_snapshots 不含——需要时用 `okx --profile demo swap algo orders` 核验。
-            _fmt_pos("demo", r, d_eq["totalEq"] if d_eq else None)
-        _portfolio_line("demo", op, d_eq["totalEq"] if d_eq else None)
-        # K1c (2026-06-13 主人指示保留消失仓查证): 列出已平但 pnl 仍 NULL 的行——
-        # demo 交易事实源为 demo_trades.db.trades；不得读取 drill.db 归档行。
-        try:
-            _dt = connect(root, "demo_trades.db")
-            nullpnl = _dt.execute(
-                "SELECT symbol, COUNT(*) c FROM trades WHERE pnl IS NULL "
-                "AND ts >= datetime('now','-30 days') GROUP BY symbol"
-            ).fetchall()
-        except Exception:
-            nullpnl = []
-        if nullpnl:
-            tail = " ".join(f"{r['symbol'].split('-')[0]}×{r['c']}" for r in nullpnl)
-            print(f"  ⚠️ 待回填 pnl 的 demo 行(30d): {tail}（demo_account_check 已代查 fills；"
-                  f"仍 NULL 者可 swap fills/--archive 复核，确认无记录则属可接受终态）")
-        # L4 (2026-06-14): demo 同向集中度——极端同向=单边敞口观察；
-        # Demo 仓位容量按交易所实时 max-size，不套 Live 组合 IMR 或人工百分比仓位闸。
-        if len(op) >= 2:
-            long_n = sum(1 for r in op if str(r["side"]).lower() in ("buy", "long"))
-            dom = max(long_n, len(op) - long_n)
-            if dom / len(op) >= 0.8:
-                dw = "多" if long_n * 2 >= len(op) else "空"
-                print(f"  ⚠️ demo 同向集中 {dom}/{len(op)} 做{dw}（{dom/len(op):.0%}）"
-                      f"——单边敞口，regime 反转时齐损，考虑对冲/分散")
+        # demo 账户/持仓/同向集中度/待回填 pnl 四段随 2026-08-06 demo 全量下线移除。
         try:
             costs = acc.execute(
                 "SELECT profile,COUNT(*) n,COALESCE(SUM(fee),0) fee,"
                 "COALESCE(SUM(CASE WHEN type='8' THEN pnl ELSE 0 END),0) funding_cashflow,"
                 "COALESCE(SUM(bal_change),0) net_change "
                 "FROM account_bills WHERE datetime(ts)>=datetime('now','+8 hours','-1 day') "
-                "GROUP BY profile ORDER BY profile"
+                "AND profile='live' GROUP BY profile ORDER BY profile"
             ).fetchall()
             for c in costs:
                 print(f"  {c['profile']} 交易所账单24h: n={c['n']} fee={c['fee']:+.4f} "
@@ -1076,12 +1274,31 @@ def _render(root, top):
     section("历史交易经验（正反样本+错失机会；仅参考，不设自动闸）")
 
     def s_experience():
+        exp_cols = {str(r[1]) for r in acc.execute(
+            "PRAGMA table_info(trade_experiences)").fetchall()}
+        version_sql = (
+            "experience_summary_version"
+            if "experience_summary_version" in exp_cols
+            else "NULL AS experience_summary_version"
+        )
         rows = acc.execute(
             "SELECT cycle_id,ts,profile,symbol,side,regime,pnl_pct,hold_hours,"
-            "experience_summary FROM trade_experiences "
+            f"experience_summary,{version_sql} FROM trade_experiences "
             "WHERE status='closed' AND pnl_pct IS NOT NULL "
             "ORDER BY ts DESC,id DESC LIMIT 80"
         ).fetchall()
+
+        def safe_lesson(row):
+            summary = str(row["experience_summary"] or "").strip()
+            version = row["experience_summary_version"]
+            if (version == 2 and summary
+                    and not re.search(r"(?i)\bhit[_ ]?1r\b", summary)):
+                return summary[:70]
+            regime = row["regime"] or "?"
+            side = row["side"] or "?"
+            hold = row["hold_hours"]
+            hold_s = f" hold{float(hold):.1f}h" if hold is not None else ""
+            return f"{regime}/{side} pnl{float(row['pnl_pct']):+.2f}%{hold_s}"
         wins = sorted(
             (r for r in rows if r["pnl_pct"] > 0),
             key=lambda r: r["pnl_pct"],
@@ -1096,14 +1313,14 @@ def _render(root, top):
               f"{sum(r['pnl_pct'] <= 0 for r in rows)}")
         print("  盈利样本预览（拟交易标的仍须按 symbol/side/regime 匹配）:")
         for r in wins:
-            lesson = str(r["experience_summary"] or "暂无定性摘要")[:70]
+            lesson = safe_lesson(r)
             print(f"    + {r['symbol']} {r['side']} {r['regime'] or '-'} "
                   f"{r['pnl_pct']:+.2f}% 持{r['hold_hours'] or '-'}h | {lesson}")
         if not wins:
             print("    无")
         print("  亏损样本预览（必须与盈利样本同等查看）:")
         for r in losses:
-            lesson = str(r["experience_summary"] or "暂无定性摘要")[:70]
+            lesson = safe_lesson(r)
             print(f"    - {r['symbol']} {r['side']} {r['regime'] or '-'} "
                   f"{r['pnl_pct']:+.2f}% 持{r['hold_hours'] or '-'}h | {lesson}")
         if not losses:
@@ -1111,42 +1328,132 @@ def _render(root, top):
 
         les = connect(root, "lessons.db")
         missed = les.execute(
-            "SELECT ts,symbol,regime,direction_hint,actual_4h_pct,would_hit_1R,notes "
+            "SELECT ts,symbol,regime,direction_hint,actual_4h_pct,"
+            "would_hit_1r_fixed2pct,notes "
             "FROM missed_opportunities WHERE ts LIKE '202%' "
             "ORDER BY ts DESC,id DESC LIMIT 5"
         ).fetchall()
         les.close()
-        print("  错失机会样本:")
+        print("  错失机会样本（fixed2pct 为固定±2%代理口径，非真实计划止损）:")
         for r in missed:
             print(f"    · {r['symbol']} {r['direction_hint'] or '-'} "
                   f"4h={r['actual_4h_pct'] if r['actual_4h_pct'] is not None else '-'}% "
-                  f"hit1R={r['would_hit_1R']} | {str(r['notes'] or '')[:60]}")
+                  f"would_hit_fixed2pct={r['would_hit_1r_fixed2pct']} "
+                  f"| {str(r['notes'] or '')[:60]}")
         if not missed:
             print("    无")
-        print("  ➤ 对每个拟执行标的调用 find_similar_experience.py；把 matched_wins/"
-              "matched_losses/missed_opportunities 写入决策卡，并自主注明 "
-              "usage=adopt|partial|ignore|none 与理由。历史结果永不自动批准或否决。")
+        print(
+            "  ➤ 本段只是全局预览，严禁据此声称某标的直接 N胜/N负。"
+            "每个拟执行标的必须以完整 instId + side + regime + action=open + "
+            "profile=live + 固定 cycle --as-of 调 find_similar_experience.py；"
+            "把 evidence_contract 原样写入决策卡。数字只认 exact_setup/"
+            "same_symbol_similar/cross_symbol_similar 具名 summary；matched_* 与 "
+            "cross_symbol_* 是截断样例，禁止数数组或混栏。另自主注明 "
+            "usage=adopt|partial|ignore|none 与理由。历史结果永不自动批准或否决。"
+        )
     safe(s_experience)
 
     # ── 7. 历史表现基线（不映射评分/置信度档位） ───────
     section("历史表现基线（30 天真实成交；仅参考）")
 
     def s_calib():
+        exp_cols = {str(r[1]) for r in acc.execute(
+            "PRAGMA table_info(trade_experiences)").fetchall()}
+        close_clock = "COALESCE(closed_at,ts)" if "closed_at" in exp_cols else "ts"
+        vector_sql = (
+            "experience_vector" if "experience_vector" in exp_cols
+            else "NULL AS experience_vector"
+        )
+        cutoff = (datetime.now(CST) - timedelta(days=30)).strftime(
+            "%Y-%m-%d %H:%M:%S")
         rows = acc.execute(
-            "SELECT COALESCE(side,'-') AS side, COALESCE(regime,'-') AS regime,"
-            " COUNT(*) AS n, ROUND(AVG(pnl_pct),2) AS avg_pnl,"
-            " ROUND(SUM(CASE WHEN pnl_pct>0 THEN 1.0 ELSE 0 END)/COUNT(*),2) AS wr "
-            "FROM trade_experiences "
+            "SELECT cycle_id,symbol,side,regime,pnl_pct,realized_pnl,"
+            "hold_hours,raw,"
+            f"{vector_sql} FROM trade_experiences "
             "WHERE status='closed' AND pnl_pct IS NOT NULL "
-            "AND ts>=datetime('now','-30 days') "
-            "GROUP BY side,regime ORDER BY n DESC LIMIT 8"
+            f"AND datetime({close_clock})>=datetime(?) "
+            f"ORDER BY datetime({close_clock}),id",
+            (cutoff,),
         ).fetchall()
-        if not rows:
+        try:
+            asset_classes = {
+                str(r["symbol"]): str(r["asset_class"])
+                for r in mkt.execute(
+                    "SELECT symbol,asset_class FROM instrument_class"
+                ).fetchall()
+            }
+        except sqlite3.Error:
+            asset_classes = {}
+        analysis_usage = {}
+        ana = None
+        try:
+            ana = connect(root, "analysis.db")
+            for signal in ana.execute(
+                "SELECT cycle_id,symbol,decision_card FROM analysis_signals "
+                "WHERE cycle_id>=? AND lower(action) IN "
+                "('open','open_long','open_short','long','short','sell')",
+                (cutoff.replace(" ", "T"),),
+            ).fetchall():
+                card = _json_object(signal["decision_card"])
+                history = card.get("historical_experience")
+                history = history if isinstance(history, dict) else {}
+                usage = str(history.get("usage") or "").strip().lower()
+                if usage in _CALIBRATION_USAGE_ORDER[:-1]:
+                    analysis_usage[(
+                        str(signal["cycle_id"]),
+                        str(signal["symbol"]).upper(),
+                    )] = usage
+        except sqlite3.Error:
+            analysis_usage = {}
+        finally:
+            if ana is not None:
+                ana.close()
+        calibration = experience_calibration(
+            rows, asset_classes, analysis_usage)
+        if not calibration["sample_n"]:
             print("  近 30 天无已平仓真实成交样本")
-        for r in rows:
-            small = "（样本小仅参考）" if r["n"] < 10 else ""
-            print(f"  {r['side']}/{r['regime']}: n={r['n']} 胜率{r['wr']:.0%} "
-                  f"均收益{r['avg_pnl']:+.2f}%{small}")
+
+        def show(title, groups):
+            print(f"  {title}:")
+            if not groups:
+                print("    无可用样本")
+                return
+            for label, item in groups.items():
+                small = "（样本小仅参考）" if item["n"] < 10 else ""
+                print(
+                    f"    {label}: n={item['n']} "
+                    f"{item['wins']}胜/{item['losses']}负 "
+                    f"胜率{item['win_rate_pct']:.1f}% "
+                    f"均收益{item['avg_pnl_pct']:+.2f}% "
+                    + (
+                        f"实盈亏Σ{item['realized_pnl_sum_usdt']:+.2f} USDT"
+                        if item["realized_pnl_n"] == item["n"]
+                        else "实盈亏Σ N/A（旧样本缺字段）"
+                    )
+                    + small
+                )
+
+        print(f"  确定性样本窗: 最近30天按 closed_at；n={calibration['sample_n']}")
+        show("历史经验采纳方式", calibration["history_usage"])
+        usage_sources = calibration["history_usage_source_counts"]
+        print(
+            "  采纳口径来源: "
+            f"开仓决策卡 {usage_sources['analysis_signal']} / "
+            f"成交回执 {usage_sources['trade_receipt']} / "
+            f"旧版不可判定 {usage_sources['unknown']}；"
+            "不可判定样本不冒充 none。"
+        )
+        show("regime×方向", calibration["regime_side"])
+        show("已平仓持有时长", calibration["hold_bucket"])
+        show("资产类别", calibration["asset_class"])
+        if calibration["asset_class_current_map_fallback_n"]:
+            print(
+                "  注：资产类别优先使用交易时冻结的 experience_vector；"
+                f"{calibration['asset_class_current_map_fallback_n']} 条旧样本回退当前"
+                " instrument_class 映射。"
+            )
+        print("  决策主因分层: N/A（历史卡未冻结 event/technical 结构字段，禁从自然语言倒推）")
+        print("  actor cohort 分层: N/A（历史闭仓回执无可比较的不透明 cohort，禁猜测身份）")
         print("  ➤ 统计只描述过去，不能形成开仓门槛、仓位档位或否决规则。"
               "仓位由 Agent 结合六项卡自主决定，再由确定性安全闸校验。")
     safe(s_calib)
@@ -1169,11 +1476,13 @@ def _render(root, top):
             print(f"  错误模式[{r['hit_count']}次] {r['pattern_name']}: {str(r['trigger_condition'])[:48]}")
         # ts LIKE '202%' 只读取 ISO 日期行，排除非日期标识。
         mo = les.execute(
-            "SELECT COUNT(*) AS c, ROUND(AVG(actual_4h_pct),2) AS avg4h, SUM(CASE WHEN would_hit_1R=1 THEN 1 ELSE 0 END) AS hit1r "
+            "SELECT COUNT(*) AS c, ROUND(AVG(actual_4h_pct),2) AS avg4h, "
+            "SUM(CASE WHEN would_hit_1r_fixed2pct=1 THEN 1 ELSE 0 END) AS hit1r "
             "FROM missed_opportunities WHERE ts LIKE '202%' AND ts>=datetime('now','-7 days')"
         ).fetchone()
         if mo and mo["c"]:
-            print(f"  错过机会 7天: {mo['c']} 笔，均 4h 走幅 {mo['avg4h']}%，其中 {mo['hit1r']} 笔本可达 1R")
+            print(f"  错过机会 7天: {mo['c']} 笔，均 4h 走幅 {mo['avg4h']}%，"
+                  f"其中 {mo['hit1r']} 笔按固定±2%代理口径本可达 1R（非真实计划止损）")
         les.close()
     safe(s_lessons)
 
@@ -1187,7 +1496,7 @@ def _render(root, top):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--top", type=int, default=5)
     # 2026-07-15：exec(cp936 pwsh) 对 stdout 接管道会把中文 GBK 坏码——agent 需复读/截断时
     # 用 --out-file 落 UTF-8 文件后 read（文件通道绕开 shell 解码）。stdout 行为不变（纯加法）。

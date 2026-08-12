@@ -13,8 +13,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+for _p in (SCRIPTS,):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import build_push_payload  # noqa: E402
 import daily_report_writer  # noqa: E402
@@ -344,14 +345,6 @@ class WeeklyArtifactTests(unittest.TestCase):
                 (out_dir / "weekly-2026-07-27.md").exists())
 
 
-class WeeklyMigrationBoundaryTests(unittest.TestCase):
-    def test_one_off_weekly_migration_is_not_published(self):
-        script = ROOT / "scripts" / "migrate_weekly_win_rate_pct.py"
-        self.assertFalse(script.exists())
-        gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-        self.assertIn("/scripts/migrate_weekly_win_rate_pct.py", gitignore)
-
-
 class DailyValidatorTests(unittest.TestCase):
     def test_validator_checks_report_time_facts_and_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -397,7 +390,6 @@ class DailyValidatorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(daily_report_writer, "LIVE_TRADES_DB", live),
-                mock.patch.object(daily_report_writer, "DEMO_TRADES_DB", demo),
                 mock.patch.object(daily_report_writer, "LEDGER_DB", ledger),
             ):
                 prepared = daily_report_writer.prepare_daily_payload({
@@ -410,7 +402,8 @@ class DailyValidatorTests(unittest.TestCase):
                 })
             con = sqlite3.connect(account)
             try:
-                for index, profile in enumerate(("live", "demo"), start=1):
+                # 2026-08-06 demo 全量下线：日报只落 live 一行
+                for index, profile in enumerate(("live",), start=1):
                     fields = daily_report_writer._daily_fields(
                         prepared, profile)
                     con.execute(
@@ -436,21 +429,14 @@ class DailyValidatorTests(unittest.TestCase):
 > report_revision: 1 | revision_kind: initial | resend_review_required: false | auto_resend: false
 ## 💰 资产
 ### 🟢 实盘
-### 🟡 模拟盘
 ## 📈 持仓
 ### 🟢 实盘
-### 🟡 模拟盘
 ## 🎯 交易
 ### 🟢 实盘
 - 本复盘周期成交开仓: 1 笔
 - 本复盘周期成交平仓: 1 笔
 - 开仓尝试被风控拒绝: 0 笔
 - 净 PnL: $1.00
-### 🟡 模拟盘
-- 本复盘周期成交开仓: 0 笔
-- 本复盘周期成交平仓: 0 笔
-- 开仓尝试被风控拒绝: 1 笔
-- 净 PnL: $0.00
 ## ⚠️ 异常 / 🛠 自修
 无
 ## 🌍 市场
@@ -463,7 +449,7 @@ ok
                 encoding="utf-8",
             )
             result = validate_daily_report.validate_report(
-                report, account, live, demo, ledger)
+                report, account, live, ledger)
             self.assertTrue(result["ok"], result["errors"])
             self.assertIn("risk_reject", result["checks"])
             self.assertIn("revision", result["checks"])
@@ -493,6 +479,76 @@ class PushMacroSummaryTests(unittest.TestCase):
             build_push_payload._map_decision("degraded"), "DEGRADED")
         self.assertEqual(
             build_push_payload._map_decision("unexpected"), "UNKNOWN")
+
+
+CYCLE_SCHEMA = """
+CREATE TABLE trade_cycles(
+  cycle_id TEXT PRIMARY KEY, ts TEXT, mode TEXT, decision TEXT,
+  n_orders INTEGER, equity REAL, note TEXT, raw TEXT
+);
+"""
+
+
+class PushSingleBookPayloadTests(unittest.TestCase):
+    """2026-08-06 demo 全量下线后 push payload 只组 live 一本账。
+
+    原 `PushDemoDecoupleTests` 锁的是「demo 缺行必须标 PENDING 而非 UNKNOWN」；
+    demo 整体移除后，该契约的有效残余是 **live 缺行 vs live decision 不可解释**
+    两种情况必须区分——前者是异常但可渲染，后者必须被 UNKNOWN 拦住整条推送。"""
+
+    CYCLE = "2026-08-06T12:00"
+
+    def _db_root(self, tmp: str, live_row: bool) -> Path:
+        root = Path(tmp)
+        con = sqlite3.connect(root / "live_trades.db")
+        try:
+            con.executescript(CYCLE_SCHEMA + TRADE_SCHEMA)
+            if live_row:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:01:00", "full", "hold",
+                     0, None, "", "{}"))
+            con.commit()
+        finally:
+            con.close()
+        return root
+
+    def test_single_live_book_renders_as_live_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = build_push_payload.build(
+                self._db_root(tmp, live_row=True), self.CYCLE)
+        self.assertEqual(payload["action_taken"], "HOLD")
+        self.assertIn("实盘", payload["summary"])
+        self.assertNotIn("双盘", payload["summary"])
+        self.assertNotIn("demo", payload["trades"])
+        self.assertNotIn("demo", payload["assets"])
+        self.assertEqual(payload["channel"], "live")
+        self.assertNotIn("db_rows_demo", payload["execution"])
+
+    def test_missing_live_cycle_is_flagged_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = build_push_payload.build(
+                self._db_root(tmp, live_row=False), self.CYCLE)
+        self.assertIn(
+            {"name": "live_trader", "status": "pending",
+             "detail": "本轮 trade_cycles 未落库——push 闸要求 live 落库，"
+                       "出现即为异常"},
+            payload["exceptions"])
+
+    def test_present_row_with_unknown_decision_stays_unknown(self):
+        """行在但动作不可解释仍须被拦——这条不因 demo 下线而放开。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=True)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "UPDATE trade_cycles SET decision='weird' WHERE cycle_id=?",
+                    (self.CYCLE,))
+                con.commit()
+            finally:
+                con.close()
+            payload = build_push_payload.build(root, self.CYCLE)
+        self.assertEqual(payload["action_taken"], "UNKNOWN")
 
 
 if __name__ == "__main__":

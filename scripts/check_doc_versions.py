@@ -3,8 +3,8 @@
 
 两层职责严格分开：
 1. ``COVERAGE_DOCS``：只读校验当前文档、模板与角色手册均有版本头；
-2. ``DB_TRACKED_DOCS``：公开版本只比对可发布的 ``skill.md``；本地
-   ``config.md`` 不属于仓库，扩大的静态覆盖不会要求生产库新增记录。
+2. ``DB_TRACKED_DOCS``：公开版本只比对可发布的 ``skill.md``；私有
+   ``config.md`` 不属于仓库，扩大的静态覆盖不会要求数据库新增记录。
 
 默认全程只读。``--apply`` 仅在显式提供 ``--backup-dir`` 后 UPSERT 既有登记
 子集；绝不删除、重排或接管其它 doc_versions 行。
@@ -43,7 +43,6 @@ COVERAGE_DOCS = (
     "templates/daily_template.md",
     "agents/analyst.md",
     "agents/live_trader.md",
-    "agents/demo_trader.md",
     "agents/reviewer.md",
     "agents/news_scout.md",
 )
@@ -91,14 +90,44 @@ def parse_doc_header(path: Path | str) -> dict[str, str]:
 
 
 def online_backup(source: Path, target: Path) -> None:
+    """只导出 doc_versions 一张表，**不再克隆整个 account.db**。
+
+    2026-08-06 修：原实现是 `src.backup(dst)`，把整库（38 MB）复制一份，只为
+    保护一次两行 UPSERT——`backups/doc-versions/` 因此攒了 4 份共 152 MB 的
+    account.db 副本。而 `_sync_tracked` 的写入面**只有 doc_versions**，回滚要
+    的也只有这张表，整库副本里其余 99.99% 是纯噪音（还让人误以为那是一份可用
+    的账户库备份——它只是某次文档登记前的随机时点快照，不该被当账本备份使用）。
+
+    导出目标仍是独立 SQLite 文件：同一套工具可校验、可直接 ATTACH 回滚，
+    体积从 38 MB 降到几 KB。
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        target.unlink()
     src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
     dst = sqlite3.connect(target, timeout=10)
     try:
-        src.backup(dst)
+        ddl = src.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='doc_versions'").fetchone()
+        if not ddl or not ddl[0]:
+            raise RuntimeError("源库无 doc_versions 表，拒绝在无备份的情况下写入")
+        cursor = src.execute("SELECT * FROM doc_versions")
+        columns = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+        with dst:
+            dst.execute(ddl[0])
+            if rows:
+                dst.executemany(
+                    "INSERT INTO doc_versions VALUES "
+                    f"({','.join('?' * len(columns))})", rows)
         integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"backup integrity_check={integrity}")
+        # 回读校验：备份行数必须与源一致，否则这份备份不可信，宁可不写库
+        n_dst = dst.execute("SELECT COUNT(*) FROM doc_versions").fetchone()[0]
+        if n_dst != len(rows):
+            raise RuntimeError(f"backup 行数不符 src={len(rows)} dst={n_dst}")
     finally:
         dst.close()
         src.close()
@@ -196,7 +225,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.apply:
         stamp = datetime.now(CST).strftime("%Y%m%d-%H%M%S")
-        backup = Path(args.backup_dir) / f"account-pre-doc-versions-{stamp}.db"
+        # 文件名改叫 doc_versions-*：旧名 account-pre-doc-versions-* 会让人
+        # 以为那是一份 account.db 备份（它确实是整库，但只是文档登记前的随机
+        # 时点快照，不可当账本备份用）。现在内容名副其实——就只有这张表。
+        backup = Path(args.backup_dir) / f"doc_versions-pre-{stamp}.db"
         online_backup(db_path, backup)
         _sync_tracked(db_path, parsed)
         print(f"[backup] {backup}")

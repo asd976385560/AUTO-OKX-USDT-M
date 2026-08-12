@@ -4,9 +4,8 @@
 | 库            | 唯一 writer   | 读者          | 本脚本动作                         |
 |:--------------|:--------------|:--------------|:-----------------------------------|
 | regime.db     | 慢采脚本      | 分析员        | 建 cross_market（schema 同现 market.db）|
-| analysis.db   | 分析员        | 双 trader     | 建 analysis_runs + analysis_signals |
+| analysis.db   | 分析员        | live trader   | 建 analysis_runs + analysis_signals |
 | live_trades.db| 实盘 trader   | 复盘          | 建 trades + trade_cycles            |
-| demo_trades.db| 模拟 trader   | 复盘          | 建 trades + trade_cycles（同构）    |
 | ledger.db     | 各采集器      | 全体          | 委托 ledger.init_ledger             |
 
 幂等（CREATE IF NOT EXISTS）。WAL/busy_timeout 复用 ledger.connect（单一来源）。
@@ -15,28 +14,16 @@
 确认的生产步（见 docs/团队架构 切换清单），不在本脚本内做，避免误碰生产。
 
 用法：
-    python init_v20_dbs.py --root <PROJECT_ROOT>\\db          # 生产（建空库，不动现有库）
+    python init_v20_dbs.py --root ./db          # 生产（建空库，不动现有库）
     python init_v20_dbs.py --root <tmp> --verify       # tmp 验证 schema + journal_mode
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, r"./collectors")
 import ledger  # noqa: E402  复用 connect()/init_ledger()（WAL 单一来源）
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -123,7 +110,7 @@ CREATE TABLE IF NOT EXISTS analysis_signals (
 CREATE INDEX IF NOT EXISTS idx_analysis_signals_cycle ON analysis_signals(cycle_id);
 """
 
-# live_trades.db / demo_trades.db：同构。每个 trader 是自己库的唯一 writer。
+# live_trades.db：live trader 是交易表的唯一 writer。
 DDL_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts);
 CREATE TABLE IF NOT EXISTS trade_cycles (
     cycle_id     TEXT PRIMARY KEY,
     ts           TEXT NOT NULL,
-    mode         TEXT,               -- live|demo（由 trades_writer 按 profile 写入）
+    mode         TEXT,               -- live（由 trades_writer 按 profile 写入）
     decision     TEXT,               -- traded|hold|skip|degraded
     n_orders     INTEGER DEFAULT 0,
     equity       REAL,
@@ -160,11 +147,14 @@ CREATE TABLE IF NOT EXISTS trade_cycles (
 );
 """
 
+# 2026-08-06 demo 全量下线：demo_trades.db 从初始化目标里移除。
+# **这条尤其要紧**——本脚本是幂等建库器，留着它就意味着任何人跑一次
+# init_v20_dbs.py 就把刚删掉的 demo_trades.db 重新变出来（空表、有 schema），
+# 后续 schema_drift_check 又会认为它该在，来回打架。
 TARGETS = [
     ("regime.db", DDL_REGIME),
     ("analysis.db", DDL_ANALYSIS),
     ("live_trades.db", DDL_TRADES),
-    ("demo_trades.db", DDL_TRADES),
 ]
 
 
@@ -198,7 +188,7 @@ def journal_mode(path: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 数据库初始化（只建表不搬数据）")
-    ap.add_argument("--root", default=_project_path('db'))
+    ap.add_argument("--root", default=r"./db")
     ap.add_argument("--verify", action="store_true", help="建完打印 schema + journal_mode")
     args = ap.parse_args()
     root = Path(args.root)

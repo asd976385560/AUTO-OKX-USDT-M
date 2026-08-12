@@ -5,7 +5,7 @@
 fire()）；本模块集中管理 agent-id / 分级 timeout / --message-file 主路径，自身不做幂等
 （幂等真值 = ledger.stage_dispatch）。
 
-Agent stage（analyst/live/demo）与纯脚本 push stage 均由 core/dispatcher.py 确定性起棒。
+Agent stage（analyst/live）与纯脚本 push stage 均由 core/dispatcher.py 确定性起棒。
 
 三条设计红线
 ------------
@@ -15,7 +15,7 @@ Agent stage（analyst/live/demo）与纯脚本 push stage 均由 core/dispatcher
    单轮跑完即弃。根治持久会话 context overflow（OKXV7 2026-06-18 13:01 事故）。
    所有跨轮状态在 DB（analysis.db / *_trades.db），不靠会话记忆。
 3. **detached 异步启动**：闩锁赢家立即返回，不阻塞等 agent turn 跑完——采集脚本有
-   硬超时（快采 ≤240s），analyst turn 可能数分钟。Gateway 服务端跑 turn，CLI 客户端
+   硬超时（快采 ≤360s），analyst turn 可能数分钟。Gateway 服务端跑 turn，CLI 客户端
    detached 退出不影响。
 
 用法
@@ -26,29 +26,16 @@ Agent stage（analyst/live/demo）与纯脚本 push stage 均由 core/dispatcher
 
 作为 CLI（人工排障/补起单棒用）：
     python trigger_agent.py --stage live --cycle 2026-06-18T14:00
-    python trigger_agent.py --stage demo --cycle 2026-06-18T14:00
     python trigger_agent.py --stage push --cycle 2026-06-18T14:00  # 永久走 push_pipeline.py
 
 环境变量（覆盖默认 agent-id / 二进制 / dry-run）：
-    OKX_ANALYST_AGENT  OKX_LIVE_AGENT  OKX_DEMO_AGENT
+    OKX_ANALYST_AGENT  OKX_LIVE_AGENT
     OKX_OPENCLAW_BIN（默认 'openclaw'）
     OKX_LAUNCH_PROBE_S（默认 3 秒；检测子进程启动后立即非零退出）
     OKX_STAGE_RUNNER / OKX_STAGE_STATUS_DIR（终态监督脚本 / 状态目录）
     OKX_TRIGGER_DRYRUN=1（不真起 agent，只把命令写日志，用于 tmp 验证 plumbing）
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import hashlib
@@ -57,17 +44,32 @@ import os
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+
+
+def _project_path(*parts: str) -> str:
+    return str(_PROJECT_ROOT.joinpath(*parts))
+
+
 if _project_path() not in sys.path:
     sys.path.insert(0, _project_path())
+from core.decision_card import compact_text  # noqa: E402
+from core.risk_validator import (  # noqa: E402
+    MAX_PORTFOLIO_IMR_RATIO,
+    MAX_SINGLE_ORDER_IMR_RATIO,
+    SINGLE_ORDER_SIZING_HEADROOM_PCT,
+)
 from collectors.cycle_contract import (  # noqa: E402
     cycle_session_token,
     cycle_status_token,
     validate_cycle_id,
 )
-from core.decision_card import compact_text  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -81,16 +83,14 @@ CST = timezone(timedelta(hours=8))
 STAGE_AGENTS = {
     "analyst": os.environ.get("OKX_ANALYST_AGENT", "okx-analyst"),
     "live": os.environ.get("OKX_LIVE_AGENT", "okx-live-trader"),
-    "demo": os.environ.get("OKX_DEMO_AGENT", "okx-demo-trader"),
 }
 
-# 显式 agent turn 超时（秒）：人工回滚 analyst 900；full live/demo 720；
+# 显式 agent turn 超时（秒）：人工回滚 analyst 900；full live 720；
 # push 纯脚本不使用 Agent timeout。
 # 勿盲目加大：超时=挂死会话占据 gateway lane 的上限（拥塞治理约束）。
 STAGE_TIMEOUTS = {
     "analyst": int(os.environ.get("OKX_ANALYST_TIMEOUT_S", "900")),
     "live": int(os.environ.get("OKX_TRADER_TIMEOUT_S", "720")),
-    "demo": int(os.environ.get("OKX_TRADER_TIMEOUT_S", "720")),
 }
 # 合并轮同时做 gate、分析落库、实盘执行和交易落库，独立给 1500s；
 # 人工回滚后的 full live 沿用上面的 720s。
@@ -104,7 +104,8 @@ UNIFIED_LIVE_TIMEOUT = int(os.environ.get("OKX_UNIFIED_LIVE_TIMEOUT_S", "1500"))
 _NODE_BIN = os.environ.get("OKX_NODE_BIN", r"C:\Program Files\nodejs\node.exe")
 _OPENCLAW_MJS = os.environ.get(
     "OKX_OPENCLAW_MJS",
-    str(_ProjectPath.home().joinpath('AppData', 'Roaming', 'npm', 'node_modules', 'openclaw', 'openclaw.mjs')),
+    str(Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" /
+        "openclaw" / "openclaw.mjs"),
 )
 # 兼容：设了 OKX_OPENCLAW_BIN 则仍用单一 bin（自定义 wrapper）；否则走 node+mjs。
 OPENCLAW_BIN = os.environ.get("OKX_OPENCLAW_BIN", "")
@@ -113,49 +114,56 @@ OPENCLAW_BIN = os.environ.get("OKX_OPENCLAW_BIN", "")
 # 起法用 **python.exe 直起**（原生 exe，同 node 路径可 DETACHED 存活）——不经 pwsh wrapper：
 #   pwsh 跑 .ps1 在 DETACHED_PROCESS 下可能静默不执行。
 #   push_pipeline 自身只读库 + 内部各步仍走 wrapper（拿 UTF-8/PYTHONPATH/MX_APIKEY），故裸 python 起足够。
-_PUSH_PIPELINE = os.environ.get("OKX_PUSH_PIPELINE", _project_path('scripts', 'push_pipeline.py'))
-_PYTHON_EXE = os.environ.get("OKX_PYTHON_BIN", sys.executable)
+_PUSH_PIPELINE = os.environ.get(
+    "OKX_PUSH_PIPELINE", _project_path("scripts", "push_pipeline.py")
+)
+_PYTHON_EXE = os.environ.get(
+    "OKX_PYTHON_BIN",
+    sys.executable)
 _STAGE_RUNNER = os.environ.get(
-    "OKX_STAGE_RUNNER", _project_path('scripts', 'stage_runner.py'))
+    "OKX_STAGE_RUNNER", _project_path("scripts", "stage_runner.py"))
 _STAGE_STATUS_DIR = Path(os.environ.get(
-    "OKX_STAGE_STATUS_DIR", _project_path('logs', 'stage-status')))
-_OKX_DB_ROOT = os.environ.get("OKX_DB_ROOT", _project_path('db'))
-_CANONICAL_DB_ROOT = Path(_project_path('db')).resolve()
+    "OKX_STAGE_STATUS_DIR", _project_path("logs", "stage-status")))
+_OKX_DB_ROOT = os.environ.get("OKX_DB_ROOT", _project_path("db"))
+_CANONICAL_DB_ROOT = Path(_project_path("db")).resolve()
 
 
 def _root_namespace(db_root: str | os.PathLike | None = None) -> str:
-    """Stable artifact/session namespace; the canonical root keeps legacy names."""
+    """Return a stable suffix for artifacts bound to an isolated DB root."""
     resolved = Path(db_root or _OKX_DB_ROOT).resolve()
-    if resolved == _CANONICAL_DB_ROOT:
+    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
+        os.fspath(_CANONICAL_DB_ROOT)
+    ):
         return ""
     return "r" + hashlib.sha256(
         os.path.normcase(os.fspath(resolved)).encode("utf-8")
     ).hexdigest()[:10]
 
 
-def _stage_status_path(stage: str, cycle_id: str,
-                       db_root: str | os.PathLike | None = None) -> Path:
-    safe_cycle = cycle_status_token(cycle_id)
-    suffix = _root_namespace(db_root)
-    tail = f"-{suffix}" if suffix else ""
-    return _STAGE_STATUS_DIR / f"{stage}-{safe_cycle}{tail}.json"
-
-
 def _launcher() -> list[str]:
     """起棒命令前缀：优先 node + openclaw.mjs；env 覆盖或 mjs 缺失时兜底。"""
     if OPENCLAW_BIN:
         return [OPENCLAW_BIN]
-    if Path(_OPENCLAW_MJS).exists() and Path(_NODE_BIN).exists():
+    try:
+        bundled_launcher_available = (
+            Path(_OPENCLAW_MJS).is_file() and Path(_NODE_BIN).is_file()
+        )
+    except OSError:
+        # Sandboxed/public environments may not be allowed to stat the host's
+        # user-owned OpenClaw installation.  Treat it as unavailable instead
+        # of crashing command construction.
+        bundled_launcher_available = False
+    if bundled_launcher_available:
         # --stack-size=8192：node 一开始就带大栈，OpenClaw entry.js 的 hasStackSizeConfigured()
         # 检测到即**不 re-spawn worker**——worker re-spawn 没设 windowsHide、Windows 下 detached 被强制
         # false，会自建控制台被 Windows Terminal DefTerm 弹「openclaw-agent」窗。绕过 respawn = 单进程
         # （配合 fire() 的 DETACHED 无控制台）= 不弹窗。见 entry.js:86-90 spawn + :290 hasStackSizeConfigured。
         return [_NODE_BIN, "--stack-size=8192", _OPENCLAW_MJS]
     # 兜底（弹窗/坏码风险）：仅当 node/mjs 缺失
-    return [str(_ProjectPath.home().joinpath('AppData', 'Roaming', 'npm', 'openclaw.cmd'))]
+    return [str(Path.home() / "AppData" / "Roaming" / "npm" / "openclaw.cmd")]
 
 
-LOG_DIR = Path(_project_path('logs', 'trigger'))
+LOG_DIR = Path(_project_path("logs", "trigger"))
 
 # Windows detached 启动标志：子进程脱离父，父退出不带走它。
 _DETACHED_PROCESS = 0x00000008
@@ -170,8 +178,13 @@ def _launch_probe_seconds() -> float:
         return 3.0
 
 
-def _probe_launch(proc: subprocess.Popen, stage: str, cycle_id: str, fh,
-                  db_root: str | os.PathLike | None = None) -> None:
+def _probe_launch(
+    proc: subprocess.Popen,
+    stage: str,
+    cycle_id: str,
+    fh,
+    db_root: str | os.PathLike | None = None,
+) -> None:
     """短暂观察 detached 子进程；启动期非零退出必须冒泡给 dispatcher 释放闩锁。
 
     超过探针窗口仍在运行即视为已正常进入主流程，后续完成仍由 DB 生命周期记录判定，
@@ -203,14 +216,16 @@ def _probe_launch(proc: subprocess.Popen, stage: str, cycle_id: str, fh,
         )
 
 
-def _supervised_cmd(stage: str, cycle_id: str, mode: str,
-                    command: list[str], db_root: str | os.PathLike | None = None
-                    ) -> list[str]:
+def _supervised_cmd(
+    stage: str,
+    cycle_id: str,
+    mode: str,
+    command: list[str],
+    db_root: str | os.PathLike | None = None,
+) -> list[str]:
     """独立 runner 等待 detached 真子进程并持久化终态；不负责释放闩锁或重试。"""
     cycle_id = validate_cycle_id(cycle_id)
-    resolved_db_root = os.fspath(
-        Path(db_root or _OKX_DB_ROOT).resolve()
-    )
+    resolved_db_root = os.fspath(Path(db_root or _OKX_DB_ROOT).resolve())
     return [
         _PYTHON_EXE, _STAGE_RUNNER,
         "--stage", stage, "--cycle", cycle_id, "--mode", mode,
@@ -228,26 +243,132 @@ def _safe_cycle(cycle_id: str) -> str:
     return cycle_session_token(cycle_id)
 
 
-def session_key(stage: str, cycle_id: str,
-                db_root: str | os.PathLike | None = None) -> str:
+def session_key(
+    stage: str,
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> str:
     """bare key（不带 agent: 前缀）；交给 openclaw --agent 拼成 agent:<id>:<key>。
 
     （MEMORY 教训：自己拼前缀会变 4 段双前缀 → setup timeout。）
     """
-    safe_cycle = _safe_cycle(cycle_id)
     suffix = _root_namespace(db_root)
     tail = f"-{suffix}" if suffix else ""
-    return f"{stage}-{safe_cycle}{tail}"
+    return f"{stage}-{_safe_cycle(cycle_id)}{tail}"
+
+
+def _stage_status_path(
+    stage: str,
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> Path:
+    suffix = _root_namespace(db_root)
+    tail = f"-{suffix}" if suffix else ""
+    return _STAGE_STATUS_DIR / f"{stage}-{cycle_status_token(cycle_id)}{tail}.json"
 
 
 # 操作手册＝各 agent 的 workspace AGENTS.md（OpenClaw 每轮自动加载）；fire 消息只指 AGENTS.md。
 
 
-_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _project_path('db')))
+_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _project_path("db")))
+_AUTOHEAL_CONTRACT_VERSION = 1
 
 
 def _resolve_db_root(db_root: str | os.PathLike | None = None) -> Path:
     return Path(db_root or _DB_ROOT).resolve()
+
+
+def _autoheal_client_result(profile: str | None, cycle_id: str,
+                            request_id: str, *, status: str, rc: int,
+                            reason: str, db_root: Path | None = None,
+                            finding_kind: str | None =
+                            "AUTOHEAL-CONTRACT-INVALID") -> dict:
+    """Build a caller-side result when no trustworthy producer result exists."""
+    root = Path(db_root or _DB_ROOT).resolve()
+    finding = ({"kind": finding_kind, "sev": "P1", "reason": reason}
+               if finding_kind else None)
+    return {
+        "contract_version": _AUTOHEAL_CONTRACT_VERSION,
+        "request_id": request_id,
+        "profile": profile,
+        "cycle": cycle_id,
+        "db_root": str(root),
+        "status": status,
+        "applied": False,
+        "p0": False,
+        "blocking": rc != 0,
+        "reason": reason,
+        "findings": [finding] if finding else [],
+        "healed": [],
+        "needs_human": [finding] if finding else [],
+        "rc": rc,
+    }
+
+
+def _read_autoheal_contract(path: Path, *, request_id: str, profile: str,
+                            cycle_id: str, db_root: Path,
+                            returncode: int) -> dict:
+    """Read and strictly bind a v1 result to this exact subprocess request."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > 2_000_000:
+            raise ValueError("json-out exceeds 2 MB")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("json-out root is not an object")
+        checks = {
+            "contract_version": data.get("contract_version") == _AUTOHEAL_CONTRACT_VERSION,
+            "request_id": data.get("request_id") == request_id,
+            "profile": data.get("profile") == profile,
+            "cycle": data.get("cycle") == cycle_id,
+            "db_root": Path(str(data.get("db_root") or "")).resolve()
+                       == db_root.resolve(),
+            "status": data.get("status") in {
+                "ok", "applied", "needs_human", "error", "skipped",
+                "p0_blocked",
+            },
+            "applied": type(data.get("applied")) is bool,
+            "p0": type(data.get("p0")) is bool,
+            "blocking": type(data.get("blocking")) is bool,
+            "findings": isinstance(data.get("findings"), list),
+            "healed": isinstance(data.get("healed"), list),
+            "needs_human": isinstance(data.get("needs_human"), list),
+            "rc": type(data.get("rc")) is int
+                  and data.get("rc") in (0, 1, 2, 3, 4),
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed:
+            raise ValueError("contract fields invalid: " + ",".join(failed))
+        if data["blocking"] != (data["rc"] != 0):
+            raise ValueError("blocking/rc mismatch")
+        if data["p0"] != (data["rc"] == 4):
+            raise ValueError("p0/rc mismatch")
+        status_by_rc = {
+            0: {"ok", "applied"}, 1: {"needs_human"}, 2: {"error"},
+            3: {"skipped"}, 4: {"p0_blocked"},
+        }
+        if data["status"] not in status_by_rc[data["rc"]]:
+            raise ValueError("status/rc mismatch")
+        healed_applied = any(
+            isinstance(item, dict) and item.get("applied") is True
+            for item in data["healed"])
+        if data["applied"] != healed_applied:
+            raise ValueError("applied/healed mismatch")
+        findings_p0 = any(
+            isinstance(item, dict)
+            and str(item.get("sev") or "").upper() == "P0"
+            for item in data["findings"])
+        if data["p0"] != findings_p0:
+            raise ValueError("p0/findings mismatch")
+        if int(returncode) != data["rc"]:
+            raise ValueError(
+                f"process rc={returncode} differs from contract rc={data['rc']}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        return _autoheal_client_result(
+            profile, cycle_id, request_id, status="contract_invalid", rc=2,
+            reason=f"{type(exc).__name__}: {exc}", db_root=db_root,
+        )
 
 
 def _run_briefing(db_root: str | os.PathLike | None = None) -> str:
@@ -265,41 +386,116 @@ def _run_briefing(db_root: str | os.PathLike | None = None) -> str:
         return ""
 
 
-def _send_autoheal_p0_alert(profile: str, cycle_id: str,
-                            findings: list[dict],
-                            db_root: str | os.PathLike | None = None) -> bool:
-    """Best-effort private alert for a blocking autoheal P0.
+def _unified_live_message(cycle_id: str, brief: str) -> str:
+    """Build the unified-route prompt with the writer contract in-band.
 
-    The alert intentionally excludes order ids and raw exchange payloads.  A
-    deterministic dedupe key makes dispatcher retries safe.  Delivery failure
-    never clears the trading block.
+    ``unified`` is a dispatcher routing mode, while analysis_runs.mode has
+    always been ``full``.  Keeping that distinction only in a long workspace
+    manual proved too easy to lose next to a large briefing, so the money-path
+    handoff states the minimal receipt shape explicitly.
     """
+    safe_cycle = cycle_id.replace(":", "-")
+    brief_block = (
+        "\n【本轮统一决策简报（分析前预读，直接据此完成分析+实盘）】\n"
+        f"--- decision_briefing ---\n{brief}\n--- end ---\n"
+    ) if brief else "\n【本轮统一决策简报缺块：按 AGENTS.md 自行补跑 decision_briefing】\n"
+    analysis_receipt_contract = (
+        "【analysis writer 契约】dispatch_mode=unified 仅表示同一 Agent 承担分析+实盘；"
+        "写给 analyst_writer 的 JSON 顶层 mode 必须固定为 full，并包含 "
+        "cycle_id/ts/status=ok/decision_protocol=decision_card_v1/regime/"
+        "regime_stale/market_summary/missing_sources/signals/raw。"
+        "market_summary 必须直接包含 macro/news/tech/sentiment/quant 五个 dict。"
+        "每个 signals[].decision_card 必须直接包含 direction_evidence(list)、"
+        "opposing_evidence(list)、execution_conditions、invalidation_point、"
+        "risk_reward、portfolio_impact、historical_experience(dict，内含 "
+        "matched_wins/matched_losses/missed_opportunities 三个 list 及 usage/reason)、"
+        "agent_judgement、reference_overrides(list)。这些字段不得放在 signal 顶层，"
+        "也不得改名为 rationale/final_judgement/overrides；HOLD/WAIT 同样必须给完整卡。"
+        "每个 open_long/open_short 候选还必须先运行只读工具 "
+        "multitimeframe_decision_evidence.py，以本轮固定 cycle 和完整 instId 生成证据文件；"
+        "15m/1H/4H 任一 exact 已收盘 K 线、指标或至少 34 根历史不足即不得产出 open。"
+        "把工具返回的完整 evidence_contract 原样放进 "
+        "decision_card.multitimeframe_analysis.evidence_contract，并对 15m/1H/4H "
+        "分别填写 direction/evidence/relative_rank；三个 rank 必须恰为 1/2/3，"
+        "selected_timeframe 指向 rank=1 且方向与开仓 side 一致。selection_method 固定为 "
+        "relative_rank_1_among_15m_1H_4H_not_calibrated，"
+        "calibrated_confidence=null、confidence_claim_allowed=false；"
+        "在独立前瞻验证达到 90% 前不得写 90% 可信度。"
+    )
+    trade_receipt_contract = (
+        "【trade writer 契约】交易阶段的 cycle 顶层 decision_card 不是摘要容器，"
+        "必须直接包含同一组固定键：direction_evidence(list)、opposing_evidence(list)、"
+        "execution_conditions、invalidation_point、risk_reward、portfolio_impact、"
+        "historical_experience(dict)、agent_judgement、reference_overrides(list)。"
+        "HOLD/ADJUST 也必须完整填写，禁止改成 summary/open_candidates/hold_positions。"
+        "OPEN/ADD 必须原样保留 analysis 的 multitimeframe_analysis；executor 会在任何"
+        "交易所账户/订单 I/O 前按同 cycle 重读 market.db，并逐字段比对 evidence_contract，"
+        "数据未就绪或契约不一致均 clean reject。"
+        "调用 trades_writer.py --facts-file 时，回执应省略 live_facts 让 writer 原样注入；"
+        "若携带则必须与 facts 文件整份完全相同，禁止摘要或重算。"
+    )
+    terminal_contract = (
+        "【交易阶段终止契约】live facts 文件读完后，writer 命令、回执字段与流程已由本消息"
+        "和 AGENTS.md 完整给出；禁止再读取 trades_writer.py 源码、探查 schema、回看无关手册"
+        "或继续研究实现。必须立即形成最终交易判断：若不 OPEN/ADD/CLOSE/REDUCE 就生成完整"
+        "HOLD/ADJUST 回执；随后调用 trades_writer，并只读核验本 cycle 的 trade_cycles 已存在。"
+        "在 trade_cycles 成功终态存在前，禁止发送最终答复、禁止无内容 stop、禁止以‘下一步将’"
+        "结束。即使零成交，HOLD 也必须先落库；writer 失败则按手册保留文件并报告 terminal failure，"
+        "不得把未落库当作正常结束。"
+    )
+    return (
+        f"OKX 本轮工作：stage=live cycle={cycle_id} dispatch_mode=unified；"
+        "analysis_receipt_mode=full。"
+        f"你是本轮唯一分析+实盘决策 Agent：先以 cycle={cycle_id} 执行采集 gate，"
+        f"生成并经 analyst_writer 落 analysis.db；仅 status=ok 且 writer 成功后，"
+        f"再直查 OKX live 现仓/余额，完成实盘决策、executor 调用和 trades_writer 落库。"
+        f"{analysis_receipt_contract}{trade_receipt_contract}{terminal_contract}"
+        "多周期证据命令格式：pwsh -NoProfile -File "
+        "<PROJECT_ROOT>/scripts/run_okx_python.ps1 "
+        "<PROJECT_ROOT>/scripts/multitimeframe_decision_evidence.py "
+        "--db-root <PROJECT_ROOT>/db "
+        f"--symbol <完整instId> --cycle-id {cycle_id} "
+        f"--out-file ./tmp/mtf_{safe_cycle}_<symbol>.json；只读取该文件，禁止手算/hash。"
+        "analysis 回执必须一次完整写文件，先 validate-only 后正式 writer，禁止 edit/局部补丁循环；"
+        "校验失败最多整文件重写一次，第二次失败即停止，禁止跳过 writer。"
+        "禁止调用 sqlite3 CLI 临时探查 schema 或业务库；schema 只读 db/schema.sql，"
+        "业务查询只用已批准的 query_db.py/事实脚本。"
+        "gate/两个 writer/executor 的 cycle_id 均固定为上述派单 cycle，禁墙钟重解析。"
+        "不得等待或调用 push；dispatcher 会在 analysis/live 落库后接力。"
+        f"按你的 AGENTS.md（操作手册）执行。{brief_block}"
+    )
+
+
+def _send_autoheal_p0_alert(
+    profile: str,
+    cycle_id: str,
+    findings: list[dict],
+    db_root: str | os.PathLike | None = None,
+) -> bool:
+    """Best-effort private P0 alert; delivery failure never clears the block."""
     kinds = sorted({str(item.get("kind") or "UNKNOWN") for item in findings})
     locations = sorted({
         f"{item.get('symbol')}/{item.get('side')}"
         for item in findings if item.get("symbol") and item.get("side")
     })
-    summary = ", ".join(kinds[:5])
-    where = ", ".join(locations[:5]) or "未提供标的"
     message = compact_text(
         f"[P0] {profile} 账本自愈阻断交易起棒；cycle={cycle_id}；"
-        f"问题={summary}；位置={where}。请人工核验交易所保护单与账本，系统未下单。",
+        f"问题={','.join(kinds[:5])}；"
+        f"位置={','.join(locations[:5]) or '未提供标的'}。"
+        "请人工核验交易所保护单与账本，系统未下单。",
         480,
     )
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {"profile": profile, "cycle": cycle_id,
-             "kinds": kinds, "locations": locations},
-            ensure_ascii=False, sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()[:16]
+    fingerprint = hashlib.sha256(json.dumps(
+        {"profile": profile, "cycle": cycle_id,
+         "kinds": kinds, "locations": locations},
+        ensure_ascii=False, sort_keys=True,
+    ).encode("utf-8")).hexdigest()[:16]
     push_py = Path(__file__).parent.parent / "scripts" / "qq_push.py"
-    resolved_db_root = _resolve_db_root(db_root)
     try:
         proc = subprocess.run(
             [sys.executable, str(push_py), "--alert", "--message", message,
              "--dedupe-key", f"autoheal-p0:{profile}:{cycle_id}:{fingerprint}",
-             "--db-root", str(resolved_db_root)],
+             "--db-root", str(_resolve_db_root(db_root))],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=30, creationflags=_CREATE_NO_WINDOW,
         )
@@ -308,121 +504,162 @@ def _send_autoheal_p0_alert(profile: str, cycle_id: str,
         return False
 
 
-def _autoheal_ledger(stage: str, cycle_id: str,
-                     db_root: str | os.PathLike | None = None) -> dict:
-    """插入点 A：起棒前检查并按显式授权自愈账本（2026-08-04）。
+def _check_tmp_stdlib_shadow(stage: str, cycle_id: str) -> list[str]:
+    """插入点 A0：起棒前查 tmp 有没有文件遮蔽标准库（2026-08-06）。
+
+    trader 的当轮执行脚本按契约只能写 `./tmp/`，Python 会把该目录放进
+    `sys.path[0]`；tmp 里一旦有 `bisect.py` 之类调试残留，`order_executor` 的
+    `import tempfile` 会直接 ImportError，**下一笔 OPEN/CLOSE 必炸**。
+
+    **只告警不阻断**（同 2026-08-05 autoheal 拍板的边界）：HOLD 轮的回执走
+    `collectors/trades_writer.py`（sys.path[0] 是 collectors/），不受影响；
+    在派发层阻断会把本来能正常完成的 HOLD 轮一起杀掉，比问题本身更糟。
+    """
+    try:
+        if r"./scripts" not in sys.path:
+            sys.path.insert(0, r"./scripts")
+        from tmp_cleanup import find_stdlib_shadows
+
+        names = [p.name for p in find_stdlib_shadows(Path(r"./tmp"))]
+    except Exception as exc:            # 探测本身绝不拖垮起棒
+        print(f"[trigger] WARN tmp 遮蔽探测失败（忽略）: {exc}", file=sys.stderr)
+        return []
+    if not names:
+        return []
+    print(f"[trigger] WARN tmp 下有文件遮蔽标准库 stage={stage} "
+          f"cycle={cycle_id} files={','.join(names)}"
+          "——本轮若产生成交，执行脚本会炸在 import；不阻断起棒",
+          file=sys.stderr)
+    _send_tmp_shadow_alert(stage, cycle_id, names)
+    return names
+
+
+def _send_tmp_shadow_alert(stage: str, cycle_id: str, names: list[str]) -> bool:
+    """按遮蔽文件名集合去重的 P1 告警——同一批残留只吵一次，不是每轮一条。"""
+    message = compact_text(
+        f"[P1] ./tmp 下有 {len(names)} 个文件遮蔽标准库："
+        f"{','.join(sorted(names)[:5])}；stage={stage} cycle={cycle_id}。"
+        "trader 当轮执行脚本写在 tmp、sys.path[0] 即该目录，下一笔 OPEN/CLOSE "
+        "会 ImportError（HOLD 轮不受影响）。处理：删除或改名这些文件，"
+        "或跑 tmp_cleanup.py --apply。",
+        480,
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(sorted(names), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    push_py = Path(__file__).parent.parent / "scripts" / "qq_push.py"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(push_py), "--alert", "--message", message,
+             "--dedupe-key", f"tmp-stdlib-shadow:{fingerprint}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, creationflags=_CREATE_NO_WINDOW,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _autoheal_ledger(
+    stage: str,
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> dict:
+    """插入点 A：起棒前只读检查账本（公开版永久不自动补账）。
 
     必须跑在 `_run_briefing()` **之前**——简报里的持仓视图喂给 Agent 决策，
-    幽灵仓会让 Agent 基于不存在的持仓做判断，同时也早于 `order_executor` 的
-    pretrade 闸。Live 永久只读；两级环境开关只允许 Demo close/open 补账。
+    幽灵仓会让 Agent 基于「不存在的持仓」做判断（2026-08-04 SKHY 事故即如此），
+    同时也早于 `order_executor` 的 pretrade 闸，顺带消除拒单冻结。
 
-    确定性子进程、零 LLM。超时、异常或普通非零 rc 保持 fail-safe，由 pretrade
-    闸 fail-closed 兜底；但结构化结果里的 P0 会立即告警并阻断本次交易起棒，避免
-    Agent 在已知裸仓等最高级异常上继续工作。
+    确定性子进程、零 LLM。只有 v1 契约 rc=0（干净或安全写入完成）
+    才能继续起棒；未解决、错误、跳过、P0 以及缺失/损坏/过期契约均阻断。
     `--self-cycle` 让本 stage 自己的 running runner 不被当成互斥冲突。
     """
-    cycle_id = validate_cycle_id(cycle_id)
-    profile = stage if stage in ("live", "demo") else None
-    if not profile or os.environ.get("OKX_DISABLE_LEDGER_AUTOHEAL") == "1":
-        return {"blocking": False, "skipped": "not_applicable"}
+    profile = stage if stage == "live" else None
+    if not profile:
+        return _autoheal_client_result(
+            None, cycle_id, "not-applicable", status="not_applicable", rc=0,
+            reason="stage does not use a trading ledger",
+            finding_kind=None,
+        )
+    request_id = uuid.uuid4().hex
+    resolved_db_root = _resolve_db_root(db_root)
+    if os.environ.get("OKX_DISABLE_LEDGER_AUTOHEAL") == "1":
+        return _autoheal_client_result(
+            profile, cycle_id, request_id, status="disabled", rc=0,
+            reason="OKX_DISABLE_LEDGER_AUTOHEAL=1", db_root=resolved_db_root,
+            finding_kind=None,
+        )
     try:
         heal_py = Path(__file__).parent.parent / "scripts" / "ledger_autoheal.py"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        resolved_db_root = _resolve_db_root(db_root)
-        root_suffix = hashlib.sha256(
-            str(resolved_db_root).encode("utf-8")
-        ).hexdigest()[:10]
         out_json = LOG_DIR / (
-            f"autoheal-{profile}-{_safe_cycle(cycle_id)}-{root_suffix}.json"
-        )
-        # Public Live autoheal is permanently read-only. Environment variables
-        # can authorize Demo bookkeeping only; they must never widen Live.
-        apply_enabled = (
-            profile == "demo"
-            and os.environ.get("OKX_LEDGER_AUTOHEAL_APPLY") == "1"
-        )
-        unrecorded_enabled = (
-            apply_enabled
-            and os.environ.get("OKX_LEDGER_AUTOHEAL_UNRECORDED") == "1"
-        )
+            f"autoheal-{profile}-{_safe_cycle(cycle_id)}-{request_id}.json")
+        out_json.unlink(missing_ok=True)
         cmd = [sys.executable, str(heal_py), "--profile", profile,
-               "--db-root", str(resolved_db_root), "--self-cycle", cycle_id,
+               "--db-root", str(resolved_db_root),
+               "--self-cycle", cycle_id, "--request-id", request_id,
                "--json-out", str(out_json)]
-        if apply_enabled:
-            cmd.append("--apply")
-        if unrecorded_enabled:
-            cmd.append("--enable-unrecorded")
+        # Public-release boundary: never append --apply or
+        # --enable-unrecorded, regardless of inherited environment values.
         proc = subprocess.run(
             cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=180, creationflags=_CREATE_NO_WINDOW,
         )
-        result = None
-        if isinstance(proc.stdout, str) and proc.stdout.strip():
-            try:
-                candidate = json.loads(proc.stdout)
-                if isinstance(candidate, dict):
-                    result = candidate
-            except json.JSONDecodeError:
-                pass
-        if result is None:
-            return {"blocking": False, "returncode": proc.returncode,
-                    "result": "unparseable"}
-
-        findings = [
-            item for item in result.get("needs_human", [])
+        result = _read_autoheal_contract(
+            out_json, request_id=request_id, profile=profile,
+            cycle_id=cycle_id, db_root=resolved_db_root,
+            returncode=proc.returncode,
+        )
+    except Exception as exc:
+        result = _autoheal_client_result(
+            profile, cycle_id, request_id, status="client_error", rc=2,
+            reason=f"{type(exc).__name__}: {exc}", db_root=resolved_db_root,
+        )
+    if result.get("p0"):
+        p0_findings = [
+            item for item in result.get("findings", [])
             if isinstance(item, dict)
             and str(item.get("sev") or "").upper() == "P0"
         ]
-        if findings:
-            alerted = _send_autoheal_p0_alert(
-                profile, cycle_id, findings, resolved_db_root
-            )
-            return {
-                "blocking": True,
-                "alerted": alerted,
-                "p0_count": len(findings),
-                "p0_kinds": sorted({
-                    str(item.get("kind") or "UNKNOWN") for item in findings
-                }),
-                "returncode": proc.returncode,
-            }
-        return {"blocking": False, "returncode": proc.returncode}
-    except Exception:
-        return {"blocking": False, "result": "exception"}
+        result["alerted"] = _send_autoheal_p0_alert(
+            profile, cycle_id, p0_findings, resolved_db_root)
+        result["p0_kinds"] = sorted({
+            str(item.get("kind") or "UNKNOWN") for item in p0_findings
+        })
+    result["json_out"] = str(out_json) if "out_json" in locals() else None
+    return result
 
 
-def _analyst_briefing(cycle_id: str,
-                      db_root: str | os.PathLike | None = None) -> str:
+def _analyst_briefing(
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> str:
     """为 analyst 预读 decision_briefing 塞进 fire 消息，省去 analyst 临场摸库（降时延）。"""
     return _run_briefing(db_root)
 
 
-def _briefing_for_traders(cycle_id: str,
-                          db_root: str | os.PathLike | None = None) -> str:
-    """trader 预载简报——每 cycle 只真跑一次，live/demo 共享文件缓存（同 tick 顺序起两棒，
+def _briefing_for_traders(
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> str:
+    """trader 预载简报——每 cycle 只真跑一次，走文件缓存（
     第二棒直接读缓存，避免 2×60s 最坏）。
 
     与 analyst 预载**刻意不共缓存**：analyst 简报生成于分析之前（无本轮 signals）；
     trader 派发时本轮 analysis 已落库，预载决策卡与历史正反样本，减少重复摸库
     。缓存 logs/trigger/briefing-<cycle>-trader.txt，
     随 log_rotate 每日轮转回收。全程 fail-safe：缓存读写失败照常直跑/直用。"""
-    resolved_db_root = _resolve_db_root(db_root)
-    default_db_root = _resolve_db_root()
-    root_suffix = ""
-    if resolved_db_root != default_db_root:
-        root_suffix = "-" + hashlib.sha256(
-            str(resolved_db_root).encode("utf-8")
-        ).hexdigest()[:10]
-    cache = LOG_DIR / (
-        f"briefing-{_safe_cycle(cycle_id)}{root_suffix}-trader.txt"
-    )
+    suffix = _root_namespace(db_root)
+    tail = f"-{suffix}" if suffix else ""
+    cache = LOG_DIR / f"briefing-{_safe_cycle(cycle_id)}-trader{tail}.txt"
     try:
         if cache.exists() and cache.stat().st_size > 0:
             return cache.read_text(encoding="utf-8")
     except OSError:
         pass
-    brief = _run_briefing(resolved_db_root)
+    brief = _run_briefing(db_root)
     if brief:
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -432,8 +669,10 @@ def _briefing_for_traders(cycle_id: str,
     return brief
 
 
-def _ro_db(name: str,
-           db_root: str | os.PathLike | None = None) -> sqlite3.Connection | None:
+def _ro_db(
+    name: str,
+    db_root: str | os.PathLike | None = None,
+) -> sqlite3.Connection | None:
     p = _resolve_db_root(db_root) / name
     if not p.exists():
         return None
@@ -442,9 +681,18 @@ def _ro_db(name: str,
     return con
 
 
-def _trader_preload(cycle_id: str, stage: str,
-                    db_root: str | os.PathLike | None = None) -> str:
-    """live/demo 触发消息预载块。
+
+
+# `_demo_swap_pool()` 随 2026-08-06 demo 全量下线移除：它整池取 Demo 环境 SWAP
+# 合约供预载标注「池内有无」，只服务已删除的 ③.5 合约可用性块。
+
+
+def _trader_preload(
+    cycle_id: str,
+    stage: str,
+    db_root: str | os.PathLike | None = None,
+) -> str:
+    """live 触发消息预载块。
 
     dispatcher 起 trader 前已核过 analysis 就绪/新鲜/status=ok——把已证事实与分析内容
     直接塞进触发消息，消 trader 冷启动逐库自查（demo 失败调用 2.6x 于 live 的主源=
@@ -506,37 +754,27 @@ def _trader_preload(cycle_id: str, stage: str,
             + ("\n".join(lines) if lines else "  （空=本轮无信号，全 hold）")
             + (f"\nmarket_summary: {ms}" if ms else ""))
     except Exception:
-        parts.append("【分析预读缺块——按 AGENTS.md §2 自查 analysis.db】")
-    # ③ 账户参考（live=system_state 4 键 / demo=account_snapshots 最新行）。
-    # demo 快照只供资产/绩效展示；OPEN 容量由 executor 按目标合约实时查 Demo max-size。
+        parts.append("【分析预读缺块——按 AGENTS.md 的 DB_ACCESS 自查 analysis.db】")
+    # ③ 账户参考（system_state 4 键）。
+    # demo 分支（读 account_snapshots(profile='demo') 作资产/绩效展示）随
+    # 2026-08-06 全量下线移除。
     try:
         con = _ro_db("account.db", db_root)
-        if stage == "live":
-            rows = con.execute(
-                "SELECT key, value, updated_utc FROM system_state WHERE key IN "
-                "('live_totalEq','live_availBal','live_position_count',"
-                "'last_live_account_check')").fetchall()
-            con.close()
-            if not rows:
-                raise LookupError("no system_state keys")
-            kv = "; ".join(f"{r['key']}={r['value']}(@{r['updated_utc']})" for r in rows)
-            parts.append(f"【账户参考（system_state，仅参考——现仓/余额以 OKX API 为准）】\n  {kv}")
-        else:
-            r = con.execute(
-                "SELECT ts, totalEq, availBal, upl FROM account_snapshots "
-                "WHERE profile='demo' ORDER BY ts DESC,rowid DESC LIMIT 1"
-            ).fetchone()
-            con.close()
-            if r is None:
-                raise LookupError("no demo snapshot")
-            parts.append(
-                "【账户参考（demo account_snapshots，仅资产/绩效展示，非开仓容量）】\n"
-                f"  ts={r['ts']} totalEq={r['totalEq']} availBal={r['availBal']} upl={r['upl']}\n"
-                "  Demo OPEN 禁据此快照或 live 公式估算容量；"
-                "order_executor 将按 symbol/side/tdMode/杠杆实时查询 OKX Demo max-size。")
+        rows = con.execute(
+            "SELECT key, value, updated_utc FROM system_state WHERE key IN "
+            "('live_totalEq','live_availBal','live_position_count',"
+            "'last_live_account_check')").fetchall()
+        con.close()
+        if not rows:
+            raise LookupError("no system_state keys")
+        kv = "; ".join(f"{r['key']}={r['value']}(@{r['updated_utc']})" for r in rows)
+        parts.append(f"【账户参考（system_state，仅参考——现仓/余额以 OKX API 为准）】\n  {kv}")
     except Exception:
-        parts.append("【账户参考缺块——按 AGENTS.md §2 自查 account.db】")
-    # ④ 决策简报（含历史正反样本与错失机会；live/demo 共享每 cycle 一次）
+        parts.append("【账户参考缺块——按 AGENTS.md 的 DB_ACCESS 自查 account.db】")
+    # ③.5 Demo 合约可用性预载块随 2026-08-06 全量下线移除。它当年解决的是
+    # 「analysis 按 live 行情选标的、Demo 池远小（实测 169 vs 400+）」导致 agent
+    # 逐个试 API 烧预算的问题（2026-08-05T10:15 那轮烧光 720s 一条回执没写）。
+    # ④ 决策简报（含历史正反样本与错失机会；每 cycle 一次）
     brief = _briefing_for_traders(cycle_id, db_root)
     if brief:
         parts.append("【决策简报（已预读，历史盈利/亏损/错失机会均为参考）】\n"
@@ -544,35 +782,57 @@ def _trader_preload(cycle_id: str, stage: str,
     else:
         parts.append("【决策简报缺块——按 AGENTS.md 自跑 decision_briefing.py 兜底】")
     # ⑤ 必须自取项（防预载诱导偷懒）
-    profile = "live" if stage == "live" else "demo"
-    safe_cycle = cycle_status_token(cycle_id)
-    positions_file = _project_path('tmp', f'okx_{profile}_{safe_cycle}_positions.json')
-    balance_file = _project_path('tmp', f'okx_{profile}_{safe_cycle}_balance.json')
-    wrapper = "'" + _project_path(
-        "scripts", "run_okx_python.ps1").replace("'", "''") + "'"
-    cli = "'" + _project_path(
-        "scripts", "_okxcli.py").replace("'", "''") + "'"
+    profile = "live"
+    safe_cycle = cycle_id.replace(":", "-")
+    facts_file = f"<PROJECT_ROOT>/tmp/live_facts_{safe_cycle}.json"
+    # demo 的 role_policy（max-size 容量口径）随 2026-08-06 全量下线移除。
+    role_policy = (
+        "Live OPEN/ADD 的组合保证金闸只认执行时同次 "
+        "account.balance.imr/totalEq 与本单 incremental_order_imr，"
+        f"预计成交后须≤{MAX_PORTFOLIO_IMR_RATIO:.1%}，超限整笔拒绝；"
+        "mgnRatio/gross/net 不得替代，"
+        "CLOSE/REDUCE 不受该闸影响。另有单笔增量保证金硬上限 "
+        f"MAX_SINGLE_ORDER_IMR_RATIO={MAX_SINGLE_ORDER_IMR_RATIO:g}"
+        f"（≤{MAX_SINGLE_ORDER_IMR_RATIO:.0%} 净值，定仓预算 "
+        f"{MAX_SINGLE_ORDER_IMR_RATIO * SINGLE_ORDER_SIZING_HEADROOM_PCT:.1%} "
+        "含滑点余量，"
+        "2026-08-08 起）：validator 超限自动按 lotSz 缩量或整笔拒绝，提案前以 "
+        "facts 的 balance.single_order_margin_budget_usdt 为准核对仓位，"
+        "该预算作用域是下一笔 OPEN/ADD 增量，既有仓位不扣减它；组合总量另看 "
+        "balance.portfolio_margin_state/portfolio_margin_label_cn 与 66.6% 闸，"
+        "禁写‘既有仓 X% 接近单笔15%’、禁算 15%-X%、禁用 gross/net 判断保证金紧张，"
+        "禁心算每张保证金、禁缩量后改参重试逼近上限。"
+        "每个 OPEN/ADD 候选必须先运行 multitimeframe_decision_evidence.py，固定 "
+        f"--cycle-id {cycle_id}，输出到 ./tmp/mtf_{safe_cycle}_<symbol>.json；"
+        "15m/1H/4H 必须全部 exact-ready，完整 evidence_contract 原样进入 "
+        "decision_card.multitimeframe_analysis。三个周期分别给方向证据和唯一 rank 1/2/3，"
+        "选择 rank=1；calibrated_confidence=null、confidence_claim_allowed=false。"
+        "executor 会在账户/订单 I/O 前独立重读 market.db 并比对契约，禁止编辑、摘录或重算。"
+        "任何 open_* 历史数字只认 find_similar_experience 以固定 cycle --as-of "
+        "输出的 evidence_contract：原样写进 decision_card；只引用 exact_setup/"
+        "same_symbol_similar/cross_symbol_similar 具名 summary，截断样例数组禁止计数或混栏。"
+        "已取消的旧同侧/集中度硬规则不得恢复，回执不得复述其旧阈值，"
+        "任何旧 MEMORY 或旧回执里的该规则无效；0.0666 也是错误阈值。"
+    )
     parts.append(
         "【你仍需自取（唯一权威，禁用预载替代）】\n"
-        "  OKX API 现仓：pwsh -NoProfile -File "
-        f"{wrapper} {cli} "
-        f"--profile {profile} --compact --out-file {positions_file} "
-        "account positions --instType SWAP；随后 read "
-        f"{positions_file}\n"
-        "  OKX API 余额：pwsh -NoProfile -File "
-        f"{wrapper} {cli} "
-        f"--profile {profile} --compact --out-file {balance_file} "
-        "account balance；随后 read "
-        f"{balance_file}\n"
-        "  两条命令均须原样直跑；stdout 仅为写入回执，完整 JSON 在 out-file。"
-        "禁止改成 scripts/okx.py、裸 okx、管道或重定向；"
-        "现仓真值喂 order_executor，预载里没有它，别猜。"
-        "Live OPEN/ADD 的组合保证金闸只认执行时同次 account.balance.imr/totalEq"
-        "与本单 incremental_order_imr，预计成交后须≤66.6%，超限整笔拒绝；"
-        "mgnRatio/gross/net 不得替代，CLOSE/REDUCE 不受该闸影响。"
-        "Demo 的 balance/totalEq/availBal 只作账户观察，不是开仓容量；"
-        "每次 Demo OPEN 必须由 order_executor 对目标 symbol/side/tdMode/有效杠杆"
-        "实时查询 account max-size，失败即关闭，禁止回退 Live 组合 IMR 或人工百分比公式。"
+        "  一次性只读事实包：pwsh -NoProfile -File "
+        "<PROJECT_ROOT>/scripts/run_okx_python.ps1 "
+        "<PROJECT_ROOT>/scripts/live_decision_facts.py "
+        f"--profile {profile} --cycle-id {cycle_id} --out-file {facts_file}；"
+        f"随后 read {facts_file}\n"
+        "  命令须原样直跑；该文件一次读取 OKX 现仓、余额、ctVal 和活动 SL，"
+        "并确定性给出 position_age_hours、止损损失和 IMR 比例。禁止编辑该文件，"
+        "禁止自行换算这些字段。status=blocking 时禁止 OPEN/ADD；只有 "
+        "action_policy.allowed_executor_actions 明确包含 close/reduce 且原始现仓已核验，"
+        "才保留去风险出口，否则不调用 executor，并写 terminal error 回执后停止。"
+        "status=ok 时 exchange.positions/balance 才可用于新增风险判断。"
+        "HOLD/ADJUST 调 trades_writer 必须同时传 --facts-file；成交回执则在同一进程"
+        "把完整 live_facts 原样挂入 receipt 后 commit_receipt。"
+        "facts 文件读完后禁止再读 trades_writer.py 源码、探查 schema 或研究实现；"
+        "立即决定并生成完整回执，调用 writer 后只读核验本 cycle trade_cycles。"
+        "trade_cycles 成功终态存在前禁止最终答复或无内容 stop；零成交 HOLD 也必须先落库。"
+        f"{role_policy}"
     )
     return "\n\n" + "\n\n".join(parts) + "\n"
 
@@ -597,19 +857,47 @@ def _write_message_file(key: str, msg: str) -> Path | None:
         return None
 
 
-def build_cmd(stage: str, cycle_id: str, mode: str,
-              db_root: str | os.PathLike | None = None) -> list[str]:
-    cycle_id = validate_cycle_id(cycle_id)
+def build_cmd(
+    stage: str,
+    cycle_id: str,
+    mode: str,
+    db_root: str | os.PathLike | None = None,
+) -> list[str]:
     agent = STAGE_AGENTS[stage]
+    # 插入点 A0：tmp 遮蔽标准库探测（纯只读，只告警）。放在最前面：它与账本无关，
+    # 失败也不该影响自愈/简报，而一旦命中就说明本轮任何成交都写不进去。
+    _check_tmp_stdlib_shadow(stage, cycle_id)
     # 插入点 A：先自愈账本，再生成简报——顺序不可颠倒（简报要反映修好后的持仓）。
     # dry-run 走不到这里（fire 在 build_cmd 前就已返回），故干跑不会写库。
     autoheal = _autoheal_ledger(stage, cycle_id, db_root)
     if autoheal.get("blocking"):
-        kinds = ",".join(autoheal.get("p0_kinds") or ["UNKNOWN"])
-        alert_state = "alerted" if autoheal.get("alerted") else "alert_failed"
-        raise RuntimeError(
-            f"ledger_autoheal P0 blocked {stage} stage ({kinds}; {alert_state})"
+        kinds = sorted({
+            str(item.get("kind") or "UNKNOWN")
+            for item in autoheal.get("findings", [])
+            if isinstance(item, dict)
+        })
+        alert_state = (
+            "alerted" if autoheal.get("alerted") is True
+            else "alert_failed" if autoheal.get("p0") else "not_p0"
         )
+        # **fail-safe：只告警不阻断**（主人 2026-08-05 拍板，事故后回退）。
+        #
+        # 曾经这里 raise 掉整个 stage。后果：demo 出现一个自愈范围内的幽灵仓 →
+        # 每 2 分钟派发、每 2 分钟被挡、无人真正修 → demo 与依赖它的 **push 一起死锁
+        # 2h14m**（2026-08-05 17:25→19:39）。症状（收不到推送）离根因（demo 账本幽灵仓）
+        # 隔三层，且 60+ 次重试零告警。
+        #
+        # 为什么不该在派发层挡：真正的防线是 `order_executor` 的 pretrade 闸——它紧贴下单、
+        # 用当场 API 现仓、只挡这一单。派发层阻断则连 push 一起杀，而 **push 是纯汇报、
+        # 一分钱不碰**。对照：前一日 live 被 pretrade 闸冻结 9h 期间推送始终正常，
+        # 系统保持可观测；本次派发层阻断直接让系统变哑。
+        #
+        # 所以：自愈尽力而为，修不成就让流程照常走，由 pretrade 闸 fail-closed 兜底。
+        print(f"[trigger] WARN ledger_autoheal 未清干净但不阻断 "
+              f"stage={stage} cycle={cycle_id} status={autoheal.get('status')} "
+              f"rc={autoheal.get('rc')} findings={','.join(kinds) or 'UNKNOWN'} "
+              f"alert={alert_state}（pretrade 闸仍会 fail-closed 兜底）",
+              file=sys.stderr)
     # 触发消息只写"本轮工作"（stage/cycle/mode + analyst 的数据简报）；
     # 流程/红线/注意事项全在各 agent 的 AGENTS.md（OpenClaw 每轮自动加载），不再塞触发消息。
     if stage == "analyst":
@@ -628,20 +916,8 @@ def build_cmd(stage: str, cycle_id: str, mode: str,
         # 统一 live 在 analysis 尚未产出时起棒：预载采集后的全量 briefing，
         # 同一会话先 analyst_writer，成功后再走 OKX API + executor + trades_writer。
         brief = _analyst_briefing(cycle_id, db_root)
-        brief_block = (
-            "\n【本轮统一决策简报（分析前预读，直接据此完成分析+实盘）】\n"
-            f"--- decision_briefing ---\n{brief}\n--- end ---\n"
-        ) if brief else "\n【本轮统一决策简报缺块：按 AGENTS.md 自行补跑 decision_briefing】\n"
-        msg = (
-            f"OKX 本轮工作：stage=live cycle={cycle_id} mode=unified。"
-            f"你是本轮唯一分析+实盘决策 Agent：先以 cycle={cycle_id} 执行采集 gate，"
-            f"生成并经 analyst_writer 落 analysis.db；仅 status=ok 且 writer 成功后，"
-            f"再直查 OKX live 现仓/余额，完成实盘决策、executor 调用和 trades_writer 落库。"
-            f"gate/两个 writer/executor 的 cycle_id 均固定为上述派单 cycle，禁墙钟重解析。"
-            f"不得等待或调用 demo/push；dispatcher 会在 analysis/live 落库后接力。"
-            f"按你的 AGENTS.md（操作手册）执行。{brief_block}"
-        )
-    elif stage in ("live", "demo"):
+        msg = _unified_live_message(cycle_id, brief)
+    elif stage == "live":
         # trader 预载减少冷启动逐库自查；各块独立 fail-safe，缺块留标记回退自查。
         preload = _trader_preload(cycle_id, stage, db_root)
         msg = (
@@ -672,8 +948,10 @@ def build_cmd(stage: str, cycle_id: str, mode: str,
     ]
 
 
-def _fire_push_script(cycle_id: str,
-                      db_root: str | os.PathLike | None = None) -> str:
+def _fire_push_script(
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> str:
     """push stage 纯脚本路径：detached 起 push_pipeline.py
     （build→render→validate→qq_push→archive→system_state）。
     返回 session-key 作 card_id（与 agent 路径同签名，dispatcher._fire_stage 语义不变）。
@@ -682,15 +960,14 @@ def _fire_push_script(cycle_id: str,
     管道内部各步自走 wrapper 拿 UTF-8/MX_APIKEY）。
     起棒失败抛异常由 _fire_stage 释放闩锁重试。"""
     cycle_id = validate_cycle_id(cycle_id)
+    resolved_db_root = _resolve_db_root(db_root)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    resolved_db_root = os.fspath(
-        Path(db_root or _OKX_DB_ROOT).resolve()
-    )
     key = session_key("push", cycle_id, resolved_db_root)
     inner_cmd = [_PYTHON_EXE, _PUSH_PIPELINE, "--cycle", cycle_id,
-                 "--db-root", resolved_db_root]
+                 "--db-root", str(resolved_db_root)]
     cmd = _supervised_cmd(
-        "push", cycle_id, "script", inner_cmd, db_root=resolved_db_root)
+        "push", cycle_id, "script", inner_cmd, db_root=resolved_db_root
+    )
     logf = LOG_DIR / f"{key}.log"
     dry = os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
     with open(logf, "a", encoding="utf-8") as fh:
@@ -704,13 +981,17 @@ def _fire_push_script(cycle_id: str,
         flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
-            creationflags=flags, cwd=str(Path(_project_path())), close_fds=True)
+            creationflags=flags, cwd=_project_path(), close_fds=True)
         _probe_launch(proc, "push", cycle_id, fh, resolved_db_root)
     return key
 
 
-def fire(stage: str, cycle_id: str, mode: str = "full",
-         db_root: str | os.PathLike | None = None) -> str:
+def fire(
+    stage: str,
+    cycle_id: str,
+    mode: str = "full",
+    db_root: str | os.PathLike | None = None,
+) -> str:
     """detached 拉起 Agent stage，或对 push 无条件起纯脚本管道。
 
     返回 session-key（作 card_id 用）。
@@ -726,18 +1007,19 @@ def fire(stage: str, cycle_id: str, mode: str = "full",
         raise ValueError(f"unknown stage: {stage}")
     resolved_db_root = _resolve_db_root(db_root)
     dry = os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
-    # Reject an isolated real Agent before creating even the local trigger log
-    # directory. Gateway tool processes cannot prove propagation of this local
-    # root; dry-run and the deterministic push script remain supported.
-    if not dry and resolved_db_root != _CANONICAL_DB_ROOT:
+    # Gateway tool processes cannot prove propagation of an arbitrary local
+    # root.  Reject before creating trigger artifacts or subprocess commands.
+    if not dry and os.path.normcase(os.fspath(resolved_db_root)) != os.path.normcase(
+        os.fspath(_CANONICAL_DB_ROOT)
+    ):
         raise RuntimeError(
             "non-default db_root is supported for Agent stages only with "
             "OKX_TRIGGER_DRYRUN=1; Gateway tool DB-root propagation is not guaranteed"
         )
-
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     key = session_key(stage, cycle_id, resolved_db_root)
     logf = LOG_DIR / f"{key}.log"
+
     if dry:
         # dry 判定必须在 build_cmd 之前，避免启动 decision_briefing 子进程或写
         # msg/briefing 文件。dry 只验 plumbing：落意图日志即返回，
@@ -747,8 +1029,10 @@ def fire(stage: str, cycle_id: str, mode: str = "full",
                      f"agent={STAGE_AGENTS[stage]} dry=True\n")
             fh.write("  (dry-run: 未组消息/未真起 agent)\n")
         return key
-    inner_cmd = build_cmd(stage, cycle_id, mode, db_root=db_root)
-    cmd = _supervised_cmd(stage, cycle_id, mode, inner_cmd, db_root=db_root)
+    inner_cmd = build_cmd(stage, cycle_id, mode, db_root=resolved_db_root)
+    cmd = _supervised_cmd(
+        stage, cycle_id, mode, inner_cmd, db_root=resolved_db_root
+    )
     with open(logf, "a", encoding="utf-8") as fh:
         fh.write(f"\n[{now_cst()}] stage={stage} cycle={cycle_id} mode={mode} "
                  f"agent={STAGE_AGENTS[stage]} dry={dry}\n")
@@ -764,7 +1048,7 @@ def fire(stage: str, cycle_id: str, mode: str = "full",
             stdout=fh,
             stderr=subprocess.STDOUT,
             creationflags=flags,
-            cwd=str(Path(_project_path())),
+            cwd=_project_path(),
             close_fds=True,
         )
         _probe_launch(proc, stage, cycle_id, fh, resolved_db_root)
@@ -774,13 +1058,13 @@ def fire(stage: str, cycle_id: str, mode: str = "full",
 def main() -> int:
     ap = argparse.ArgumentParser(description="agent 起棒适配层（唯一 caller=core/dispatcher.py；人工排障可 CLI 调）")
     ap.add_argument("--stage", required=True, choices=sorted((*STAGE_AGENTS, "push")))
-    ap.add_argument("--cycle", required=True, type=validate_cycle_id,
-                    help="cycle_id 如 2026-06-18T14:00")
+    ap.add_argument("--cycle", required=True, help="cycle_id 如 2026-06-18T14:00")
     ap.add_argument("--mode", default="full", choices=["full", "unified"])
+    ap.add_argument("--db-root", default=_project_path("db"))
     args = ap.parse_args()
     if args.mode == "unified" and args.stage != "live":
         ap.error("mode=unified 仅适用于 stage=live")
-    key = fire(args.stage, args.cycle, args.mode)
+    key = fire(args.stage, args.cycle, args.mode, db_root=args.db_root)
     print(f"fired stage={args.stage} cycle={args.cycle} -> session-key={key}")
     return 0
 

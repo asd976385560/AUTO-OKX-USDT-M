@@ -8,21 +8,9 @@ r"""V2.0 §6 —— 源时效审计（registry-aware staleness，根治稀疏源
 **只读**（不写任何库），供主人触发的 on-demand 维护会话审源健康 / 决定是否灰度改
 registry.json。
 
-用法：run_okx_python.ps1 scripts/source_freshness.py --db-root <PROJECT_ROOT>/db
+用法：run_okx_python.ps1 scripts/source_freshness.py --db-root ./db
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -32,8 +20,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, _project_path('collectors', 'sources'))
-sys.path.insert(0, _project_path('scripts'))
+sys.path.insert(0, r"./collectors/sources")
+sys.path.insert(0, r"./scripts")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -151,6 +139,16 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
             mkt, "SELECT MAX(ts) FROM market_trade_flow"))
         ls["okx_top_long_short"] = _to_cst_str(_max_ts(
             mkt, "SELECT MAX(collected_ts) FROM market_positioning"))
+        # 合约统计可能包含受限的 previous-batch carry-forward；源新鲜度必须
+        # 取原始 observation ``ts``，绝不能用每轮重写的 collected_ts 掩盖老化。
+        contract_statistics_source_ts = _to_cst_str(_max_ts(
+            mkt,
+            "SELECT MAX(ts) FROM market_contract_statistics "
+            "WHERE source='okx_rest_contract_oi_taker_15m'",
+        ))
+        ls["okx_contract_open_interest_history"] = (
+            contract_statistics_source_ts)
+        ls["okx_contract_taker_volume"] = contract_statistics_source_ts
         ls["okx_instruments"] = ls["okx_klines"]  # instruments_cache 无 ts，借慢采节奏代理
         # macro 源共享 cross_market 行（regime.db 优先）
         macro_ts = _to_cst_str(_max_ts(reg, "SELECT MAX(ts) FROM cross_market")) or \
@@ -206,7 +204,7 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="registry-aware 源时效审计（只读）")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--registry", default=None)
     args = ap.parse_args()
     reg = _registry.load_registry(args.registry) if args.registry else _registry.load_registry()

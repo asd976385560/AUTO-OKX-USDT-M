@@ -3,7 +3,7 @@
 
 输入：stdin JSON: {"content" 或 "content_file"(优先，UTF-8 文件交接), "ts": "2026-06-05 21:46:00", "title": "可选标题"}
 - ts 必填，决定归档文件名（V2.0 管道传 push_pipeline 的运行时刻 now_ts()）
-- 输出：<PROJECT_ROOT>\\reports\\agents\\v2-push-{YYYYMMDD-HHMMSS}.md，
+- 输出：./reports//agents//v2-push-{YYYYMMDD-HHMMSS}.md，
   并以同内容覆盖 v2-push-latest.md。
 
 调用方（V2.0 现役）：scripts/push_pipeline.py 在 qq_push 之前完成归档与内容硬校验；
@@ -14,18 +14,6 @@
 退出码：0=成功；2=已归档但内容缺渲染模板指纹（<300 字符 / 缺『第N轮』/ 缺📊 段——T4 存证闸，
         pipeline 将其视为硬校验失败并禁止外发）；其余非0=归档失败
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse, json, os, re, sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -65,7 +53,7 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:
-        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 <PROJECT_ROOT>\\tmp\\*.json 再用 --json-file")
+        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 ./tmp//*.json 再用 --json-file")
 
 def parse_stamp(ts: str) -> str:
     # ts 格式: "2026-06-05 21:46:00" → 文件名 20260605-214600
@@ -96,7 +84,7 @@ def extract_cycle(content: str):
 
 def main():
     p = argparse.ArgumentParser(description="推送归档")
-    p.add_argument("--reports-dir", default=_project_path('reports', 'agents'))
+    p.add_argument("--reports-dir", default=r"./reports/agents")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--stdin", action="store_true")
     g.add_argument("--json-file")

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-r"""experience_hygiene.py — trade_experiences 一次性卫生迁移（rank6 2026-07-16）。
+r"""experience_hygiene.py — trade_experiences 人工按需卫生工具。
 
-背景（架构审查 + 07-16 复核实测，87 行表）：写侧此前裸 INSERT 零幂等 + close 只配最新
+历史背景（2026-07-16 当时的 87 行表）：写侧此前裸 INSERT 零幂等 + close 只配最新
 open → ①15 组精确重复（同 profile+symbol+side+action+cycle_id）36 行=21 行冗余，closed
 重复直接放大 find_similar 的 n/win_rate；②~18 条陈旧悬挂 open（永远等不到 close，还会
 偷走未来无新 open 时的 close 匹配）；③毒行 id80（错配 open 得 pnl_pct=+38.1%，恒入引用
@@ -10,28 +10,18 @@ open → ①15 组精确重复（同 profile+symbol+side+action+cycle_id）36 �
 
 处置：
   ①重复组：留最优一行（closed 有 outcome > pnl_pct 非空 > score 非空 > id 最小），余删；
-  ②毒行（--poison-ids，默认 80）：pnl_pct=NULL、hit_1R=0——行保留但退出引用样本
-    （find_similar 过滤 pnl_pct IS NOT NULL）；
-  ③陈旧悬挂 open（status='open' 且 ts < --stale-cutoff，默认 2026-07-16 00:00:00）：
-    status='expired'——对全部消费方隐身（closed 正向过滤 / open 匹配都不再命中），
-    行体保留可审计。当前真实持仓的 open 行（07-16 的 87/88/89/90）在 cutoff 之后不受影响。
+  ②经人工证据确认的毒行（--poison-ids，默认空）：pnl_pct=NULL、is_gross_profit_close=NULL
+    ——行保留但退出引用样本（find_similar 过滤 pnl_pct IS NOT NULL）。2026-08-10 起
+    毛利标记随 pnl 一并置 NULL：pnl 未知时写 0 是用"确证亏损"冒充"未知"；
+  ③经人工给定 --stale-cutoff 后，处理该时间前仍悬挂的 open；默认不启用：
+    status='expired' 仅退出 closed 引用样本 / find_similar；持仓生命周期消费方仍可能按
+    status IN ('open','expired') 读取。若要作废幻影 open 必须使用 orphaned，不能把 expired
+    当作全域隐身。行体保留可审计；执行前必须用当前主账和 OKX 现仓证明目标确属悬挂。
 
 默认 dry-run 全量打印处置计划；--apply 先备份 account.db 到 tmp/archive/ 再执行。
 幂等：重复执行第二遍应零变更。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -45,8 +35,8 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ACCOUNT_DB = Path(os.environ.get("OKX_ACCOUNT_DB", _project_path('db', 'account.db')))
-ARCHIVE_ROOT = Path(_project_path('tmp', 'archive'))
+ACCOUNT_DB = Path(os.environ.get("OKX_ACCOUNT_DB", r"./db/account.db"))
+ARCHIVE_ROOT = Path(r"./tmp/archive")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -93,7 +83,8 @@ def plan_poison(con, ids: list[int]) -> list[dict]:
             continue  # 已处理过（幂等）
         plan.append({"id": r["id"], "symbol": r["symbol"], "profile": r["profile"],
                      "old_pnl_pct": r["pnl_pct"], "hold_hours": r["hold_hours"],
-                     "action": "pnl_pct=NULL, hit_1R=0（错配 open 的产物，退出引用样本）"})
+                     "action": "pnl_pct=NULL, is_gross_profit_close=NULL"
+                               "（错配 open 的产物，退出引用样本）"})
     return plan
 
 
@@ -107,12 +98,12 @@ def plan_stale_opens(con, cutoff: str, drop_ids: set[int]) -> list[dict]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="trade_experiences 卫生迁移（rank6）")
+    ap = argparse.ArgumentParser(description="trade_experiences 人工卫生工具")
     ap.add_argument("--apply", action="store_true", help="真执行（默认 dry-run 只打印计划）")
-    ap.add_argument("--poison-ids", default="80",
-                    help="毒行 id 列表（逗号分隔，默认 80；空串跳过该步）")
-    ap.add_argument("--stale-cutoff", default="2026-07-16 00:00:00",
-                    help="悬挂 open 陈旧判定线（ts 早于此且仍 open → expired）")
+    ap.add_argument("--poison-ids", default="",
+                    help="已由人工证据确认的毒行 id（逗号分隔；默认空）")
+    ap.add_argument("--stale-cutoff",
+                    help="人工确认的悬挂 open 判定线；默认不处理任何 open")
     args = ap.parse_args()
 
     if not ACCOUNT_DB.exists():
@@ -126,7 +117,10 @@ def main() -> int:
         dupes = plan_dupes(con)
         drop_ids = {i for d in dupes for i in d["drop_ids"]}
         poison = plan_poison(con, [i for i in poison_ids if i not in drop_ids])
-        stale = plan_stale_opens(con, args.stale_cutoff, drop_ids)
+        stale = (
+            plan_stale_opens(con, args.stale_cutoff, drop_ids)
+            if args.stale_cutoff else []
+        )
 
         report = {
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -152,8 +146,8 @@ def main() -> int:
         for i in sorted(drop_ids):
             cur.execute("DELETE FROM trade_experiences WHERE id=?", (i,))
         for p in poison:
-            cur.execute("UPDATE trade_experiences SET pnl_pct=NULL, hit_1R=0 "
-                        "WHERE id=?", (p["id"],))
+            cur.execute("UPDATE trade_experiences SET pnl_pct=NULL, "
+                        "is_gross_profit_close=NULL WHERE id=?", (p["id"],))
         for s in stale:
             cur.execute("UPDATE trade_experiences SET status='expired' WHERE id=?",
                         (s["id"],))

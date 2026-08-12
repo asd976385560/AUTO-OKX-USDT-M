@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""V2.0 §8.5 —— 交易经验写入（由 trades_writer 挂钩，live+demo 同写 account.db）。
+"""V2.0 §8.5 —— 交易经验写入（由 live trades_writer 挂钩并写 account.db）。
 
 每笔交易完成写结构化经验入 account.db.trade_experiences（LLM 长期记忆）。开仓写 open 行
-（含决策背景 + experience_vector），平仓 UPDATE 该行为 closed（补 pnl_pct/hold_hours/hit_1R）。
+（含决策背景 + experience_vector），平仓 UPDATE 该行为 closed（补 pnl_pct/hold_hours/is_gross_profit_close）。
 caller 提供 account.db 连接并负责 commit；交易账与经验跨库，经验失败不阻塞交易记账。
 
 `experience_vector` 由 `_simutil.experience_vector` 编码（与 find_similar_experience 同空间）。
@@ -15,18 +15,6 @@ caller 提供 account.db 连接并负责 commit；交易账与经验跨库，经
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import json
 import re
 import sqlite3
@@ -34,8 +22,129 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-sys.path.insert(0, _project_path('scripts'))
+sys.path.insert(0, r"./scripts")
 import _simutil  # noqa: E402
+
+import os
+from pathlib import Path
+
+_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", r"./db"))
+
+
+def _v2_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
+    """v2 特征载荷（Wave2 序9；与 experience_features_v2 回填同构）。
+
+    市场态派生失败 → 字段 None 如实留空（覆盖惩罚在 similarity_v2 内），
+    绝不因特征派生失败阻断记账。legacy_v1=None：v2 起新行无旧向量。
+    """
+    stop_distance = None
+    try:
+        fill_px = float(trade.get("fill_px") or trade.get("px") or 0)
+        sl = float(trade.get("sl_trigger_px") or 0)
+        if fill_px > 0 and sl > 0:
+            stop_distance = round(abs(fill_px - sl) / fill_px, 6)
+    except (TypeError, ValueError):
+        pass
+    base = {
+        "asset_class": None, "side": side, "action": action, "regime": regime,
+        "stop_distance_pct": stop_distance, "planned_rr": None,
+        "funding_rate": None, "vol_24h_pct": None,
+        "trend_1h": None, "trend_4h": None,
+    }
+    try:
+        import experience_features_v2 as efv2
+        try:
+            from core.asset_class import asset_class_of
+        except ImportError:
+            if r"." not in sys.path:
+                sys.path.insert(0, r".")
+            from core.asset_class import asset_class_of
+        base["asset_class"] = asset_class_of(symbol, _DB_ROOT)
+        card = trade.get("decision_card")
+        base["planned_rr"] = efv2._planned_rr_from_card(card)
+        market_db = _DB_ROOT / "market.db"
+        if market_db.exists():
+            mcon = sqlite3.connect(
+                f"file:{market_db}?mode=ro", uri=True, timeout=5)
+            try:
+                base.update(efv2.derive_market_features(
+                    mcon, symbol, now_ts))
+            finally:
+                mcon.close()
+    except Exception as exc:  # noqa: BLE001  特征派生永不阻断记账
+        print(f"[trade_experience_writer][WARN] v2 特征派生失败 "
+              f"{symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return {"v": 2, "features": _simutil.experience_features_v2(base),
+            "legacy_v1": None}
+
+
+def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
+                       close_ts, realized_pnl, close_trade) -> None:
+    """Wave2 序10：closed 行的 MFE/MAE/realized_r/出口类别（失败静默告警）。"""
+    try:
+        cols = {str(r[1]) for r in conn.execute(
+            "PRAGMA table_info(trade_experiences)")}
+        if "path_coverage" not in cols:
+            return  # 迁移未跑：跳过（apply_path_metrics_schema 后自动启用）
+        import apply_path_metrics_schema as pms
+        from exit_taxonomy_report import classify as classify_exit
+        entry = float(open_raw.get("fill_px") or open_raw.get("px") or 0)
+        sl = float(open_raw.get("sl_trigger_px") or 0)
+        notional = 0.0
+        try:
+            notional = float(open_raw.get("notional") or 0)
+        except (TypeError, ValueError):
+            pass
+        if entry <= 0 or sl <= 0 or notional <= 0:
+            if "path_metric_version" in cols:
+                conn.execute(
+                    "UPDATE trade_experiences SET path_coverage='none', "
+                    "path_metric_version=? WHERE id=?",
+                    (2, exp_id),)
+            else:
+                conn.execute(
+                    "UPDATE trade_experiences SET path_coverage='none' "
+                    "WHERE id=?", (exp_id,))
+            return
+        market_db = _DB_ROOT / "market.db"
+        if not market_db.exists():
+            return
+        mcon = sqlite3.connect(
+            f"file:{market_db}?mode=ro", uri=True, timeout=5)
+        try:
+            metrics = pms.compute_path_metrics(
+                mcon, symbol, side, entry, sl, notional,
+                open_ts, close_ts, realized_pnl)
+        finally:
+            mcon.close()
+        reason = str((close_trade or {}).get("reason")
+                     or (close_trade or {}).get("reasoning") or "")
+        exit_cat = classify_exit(
+            reason, close_trade if isinstance(close_trade, dict) else {},
+            sl, None)
+        if "path_metric_version" in cols:
+            conn.execute(
+                "UPDATE trade_experiences SET initial_risk_usdt=?, mfe_r=?, "
+                "mae_r=?, realized_r_net=?, close_at_1r=?, ever_hit_1r=?, "
+                "exit_category=?, path_coverage=?, path_metric_version=? "
+                "WHERE id=?",
+                (metrics["initial_risk_usdt"], metrics["mfe_r"],
+                 metrics["mae_r"], metrics["realized_r_net"],
+                 metrics["close_at_1r"], metrics["ever_hit_1r"], exit_cat,
+                 metrics["path_coverage"], 2, exp_id))
+        else:
+            conn.execute(
+                "UPDATE trade_experiences SET initial_risk_usdt=?, mfe_r=?, "
+                "mae_r=?, realized_r_net=?, close_at_1r=?, ever_hit_1r=?, "
+                "exit_category=?, path_coverage=? WHERE id=?",
+                (metrics["initial_risk_usdt"], metrics["mfe_r"],
+                 metrics["mae_r"], metrics["realized_r_net"],
+                 metrics["close_at_1r"], metrics["ever_hit_1r"], exit_cat,
+                 metrics["path_coverage"], exp_id))
+    except Exception as exc:  # noqa: BLE001  埋点永不阻断记账
+        print(f"[trade_experience_writer][WARN] 路径埋点失败 {symbol}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
 
 CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -287,11 +396,8 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                            _trade_ordid(t)):
                 deduped += 1
                 continue
-            vec = _simutil.experience_vector({
-                "regime": regime, "side": side, "action": "open",
-                "score_total": score, "regime_stale": regime_stale,
-                "symbol": symbol,
-            })
+            vec = _v2_vector_payload(
+                symbol, side, "open", regime, now_ts, t)
             open_sz = _positive(t.get("sz"))
             conn.execute(
                 "INSERT INTO trade_experiences (cycle_id, ts, profile, symbol, "
@@ -376,7 +482,9 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                 notional = _entry_notional(rawd, open_sz)
                 if fully_closed and all_pnl_known and notional:
                     pnl_pct = round(new_realized / notional * 100.0, 4)
-                hit_1r = (
+                # 毛利方向标记（2026-08-10 由 hit_1R 更名）：只表示 pnl_pct 正负，
+                # 不含任何"达 1R"语义；1R 触达属 ever_hit_1r，需价格路径证据，本写方不填。
+                is_gross_profit = (
                     1 if pnl_pct is not None and pnl_pct > 0
                     else (0 if fully_closed and pnl_pct is not None else None)
                 )
@@ -388,13 +496,19 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                 conn.execute(
                     "UPDATE trade_experiences SET status=?,open_sz=?,"
                     "remaining_sz=?,realized_pnl=?,close_count=?,pnl_pct=?,"
-                    "hold_hours=?,hit_1R=?,closed_at=?,raw=? WHERE id=?",
+                    "hold_hours=?,is_gross_profit_close=?,closed_at=?,raw=? "
+                    "WHERE id=?",
                     (new_status, open_sz, new_remaining, new_realized,
-                     int(row[7] or 0) + 1, pnl_pct, hold, hit_1r,
+                     int(row[7] or 0) + 1, pnl_pct, hold, is_gross_profit,
                      now_ts if fully_closed else None,
                      json.dumps(rawd, ensure_ascii=False), row[0]))
                 if fully_closed:
                     closed += 1
+                    # Wave2 序10：平仓即懒计算路径/退出埋点（K 线不全或派生
+                    # 失败 → 字段留 NULL/coverage 如实，绝不阻断记账）。
+                    _fill_path_metrics(
+                        conn, row[0], symbol, side, rawd, row[1], now_ts,
+                        new_realized, t)
                 if remaining_close is not None:
                     remaining_close = max(0.0, remaining_close - consume)
                 else:
@@ -408,10 +522,8 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                 unmatched_pnl = None
                 if pnl_value is not None and close_sz and unmatched_sz is not None:
                     unmatched_pnl = pnl_value * unmatched_sz / close_sz
-                vec = _simutil.experience_vector({
-                    "regime": regime, "side": side, "action": "close",
-                    "score_total": score, "regime_stale": regime_stale,
-                    "symbol": symbol})
+                vec = _v2_vector_payload(
+                    symbol, side, "close", regime, now_ts, t)
                 fallback_raw = dict(t)
                 fallback_raw["unmatched_sz"] = unmatched_sz
                 fallback_raw["close_cycle_id"] = cycle_id
@@ -419,7 +531,7 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                     "INSERT INTO trade_experiences (cycle_id, ts, profile, symbol, "
                     "side, action, regime, regime_stale, score_total, confidence, "
                     "playbook_ref, hypothesis_id, market_snapshot, "
-                    "experience_vector,pnl_pct,hit_1R,status,open_sz,"
+                    "experience_vector,pnl_pct,is_gross_profit_close,status,open_sz,"
                     "remaining_sz,realized_pnl,close_count,closed_at,raw) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (cycle_id, now_ts, profile, symbol, side, "close", regime,

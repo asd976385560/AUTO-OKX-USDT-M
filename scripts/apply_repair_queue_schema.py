@@ -7,8 +7,8 @@ r"""apply_repair_queue_schema.py — v7.0e.5 治本：补 account.db.repair_queu
 同时往 doc_versions 表写一条变更记录。
 
 调用：
-  pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 \
-    <PROJECT_ROOT>\scripts\apply_repair_queue_schema.py --db-root <DB_ROOT>
+  pwsh -NoProfile -File ./scripts/run_okx_python.ps1 \
+    ./scripts/apply_repair_queue_schema.py --db-root <DB_ROOT>
   # 真写必须显式授权并先在线备份：
   ... apply_repair_queue_schema.py --db-root <DB_ROOT> --apply \
     --backup-dir <BACKUP_DIR>

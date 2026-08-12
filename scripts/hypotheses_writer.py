@@ -5,7 +5,7 @@
 .py 脚本（hypo2185.py、hypo2201.py…）ad-hoc 写入——还出现过写错库
 （lessons.db 旁路表，P7 update_playbook_stats 读不到，已于 2026-06-11
 迁移回 account.db 并把旁路表改名 hypotheses_migrated_20260611）。
-本脚本是公开版本唯一合法的 hypotheses 写入口。
+本脚本与 phase5_writer.py 同级：唯一合法的 hypotheses 写入口。
 
 权威表：**account.db.hypotheses**（不是 lessons.db！）
 schema: id, cycle_id TEXT, ts TEXT, hypothesis_id TEXT, hypothesis TEXT,
@@ -61,7 +61,7 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:  # noqa: BLE001
-        fail(f"输入 JSON 解析失败: {e}；含中文时建议先写 <PROJECT_ROOT>\\tmp\\*.json 再 --json-file")
+        fail(f"输入 JSON 解析失败: {e}；含中文时建议先写 ./tmp//*.json 再 --json-file")
 
 
 def main():

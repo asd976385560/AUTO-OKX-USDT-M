@@ -1,46 +1,34 @@
 # -*- coding: utf-8 -*-
 r"""reconcile_daily.py — 日频交易所侧确定性对账编排。
 
-reconcile_exchange_closes.py 本体不动（比对/分类/--apply 全复用），本脚本只做分级编排
-（主人 2026-07-16 拍板）：
-  demo → dry 检；rc=1（GHOST-EXACT 可修）→ --apply 自动补账 → dry 复检验证归零；
-         rc=3（FUZZY/含糊）→ P1 人工。
-  live → **所有路径永久只 dry**；rc∈{1,3} → P1 告警附人工命令，本脚本和
-         scripts/ledger_autoheal.py 均绝不自动 --apply。GHOST-EXACT 也只能按唯一 ordId、
-         已验证备份和逐笔写后复核流程人工修复；FUZZY / OVER_CLOSED / UNRECORDED 同样
-         保持只读分类并转人工。
-  rc=2（API/账本错误）→ 两盘均 P1。
+reconcile_exchange_closes.py 本体不动（比对/分类/--apply 全复用），本脚本只做编排。
+
+2026-08-06 demo 全量下线后只剩 live 一盘；原「demo 自动 --apply 自愈 / live 只 dry」
+的分级（主人 2026-07-16 拍板）退化为单盘：
+  live → **本脚本永远只 dry**；rc∈{1,3} → P1 告警附人工命令，本脚本绝不自动 --apply。
+         （2026-08-04 口径变更：live 的 GHOST-EXACT 幽灵仓已由 scripts/ledger_autoheal.py
+          在交易环节自动补账——起棒前 + pretrade 拒单前各一次。所以日维护跑到这里时
+          GHOST-EXACT 通常已归零；本脚本的 live 人工告警实际只覆盖
+          FUZZY / OVER_CLOSED / UNRECORDED 三类。本脚本自身行为未变。）
+  rc=2（API/账本错误）→ P1。
 推送经 scripts/qq_push.py，--dedupe-key reconcile:{YYYYMMDD}（显式身份键契约；
 当日重跑同键去重、送达失败可重试）。
-exit：0=全清（含 demo 自愈） 1=有告警已推 2=编排自身错误。
+exit：0=全清 1=有告警已推 2=编排自身错误。
 
 用法：
-  reconcile_daily.py               # 真跑（demo 可自动 --apply、告警真推 QQ）
-  reconcile_daily.py --dry-run     # 两盘只 dry 检，不 apply 不推送，只打报告
+  reconcile_daily.py               # 真跑（告警真推 QQ）
+  reconcile_daily.py --dry-run     # 只 dry 检，不推送，只打报告
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
 import os
-import re
-import sqlite3
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import _proc  # 子进程超时整树杀（详见模块 docstring）
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -49,14 +37,13 @@ if hasattr(sys.stderr, "reconfigure"):
 
 CST = timezone(timedelta(hours=8))
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
-WRAP = _project_path('scripts', 'run_okx_python.ps1')
-RECON = _project_path('scripts', 'reconcile_exchange_closes.py')
-QQ_PUSH = _project_path('scripts', 'qq_push.py')
-LOG_DIR = Path(_project_path('logs', 'reconcile'))
+WRAP = r"./scripts/run_okx_python.ps1"
+RECON = r"./scripts/reconcile_exchange_closes.py"
+QQ_PUSH = r"./scripts/qq_push.py"
+LOG_DIR = Path(r"./logs/reconcile")
 _CREATE_NO_WINDOW = 0x08000000
 _MARK_WORDS = ("[GHOST", "[OVER_CLOSED", "[UNRECORDED", "[LEFTOVER")
-LEDGER_DB = Path(_project_path('db', 'ledger.db'))
-_APPLIED_CYCLE_RE = re.compile(r"\[APPLIED\].*?\bcycle=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})")
+# LEDGER_DB / _APPLIED_CYCLE_RE 随 demo 自动 --apply 自愈路径一并移除（2026-08-06）。
 
 
 def now_cst() -> datetime:
@@ -73,10 +60,11 @@ def run_recon(profile: str, apply: bool = False) -> tuple[int, str]:
     if apply:
         cmd.append("--apply")
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=180,
-                           creationflags=_CREATE_NO_WINDOW)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        # 超时走整树杀：只杀 pwsh 会留下 reconcile_exchange_closes 持有管道，
+        # 回收阶段二次阻塞，180s 超时形同虚设（详见 _proc 模块）。
+        rc, out, err, _to = _proc.run_guarded(
+            cmd, timeout=180, creationflags=_CREATE_NO_WINDOW)
+        return rc, out + err
     except Exception as e:
         return 99, f"__RUN_ERR__ {type(e).__name__}: {e}"
 
@@ -119,42 +107,23 @@ def _live_classification(rc: int, out: str) -> str:
     return " + ".join(parts)
 
 
-def _applied_cycles(out: str) -> list[str]:
-    return sorted(set(_APPLIED_CYCLE_RE.findall(out or "")))
-
-
-def _cycles_without_push(cycles: list[str]) -> list[str]:
-    """补账只修账，不补历史 push；只读 ledger 给运维通知精确标记缺失轮。"""
-    if not cycles or not LEDGER_DB.exists():
-        return []
-    try:
-        con = sqlite3.connect(f"file:{LEDGER_DB.as_posix()}?mode=ro",
-                              uri=True, timeout=8)
-        try:
-            rows = con.execute(
-                "SELECT cycle_id FROM stage_dispatch WHERE stage='push' "
-                f"AND cycle_id IN ({','.join('?' for _ in cycles)})",
-                cycles,
-            ).fetchall()
-        finally:
-            con.close()
-    except (sqlite3.Error, OSError):
-        return []
-    pushed = {str(r[0]) for r in rows}
-    return [c for c in cycles if c not in pushed]
+# `_applied_cycles` / `_cycles_without_push` 随 2026-08-06 demo 全量下线移除：
+# 二者只服务 demo 的自动 --apply 自愈路径（补账后标记哪些轮没推过历史消息），
+# live 侧永远只 dry，不存在自动补账，因此没有调用方。
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="日频交易所侧对账分级编排")
     ap.add_argument("--dry-run", action="store_true",
-                    help="两盘只 dry 检，不 apply 不推送")
+                    help="只 dry 检，不推送")
     args = ap.parse_args()
 
     alerts: list[str] = []
-    notices: list[str] = []
     report: dict = {"ts": f"{now_cst():%Y-%m-%d %H:%M:%S}", "dry_run": args.dry_run}
 
-    for profile in ("demo", "live"):
+    # 2026-08-06 demo 全量下线：原先 demo 先跑并可自动 --apply 自愈，live 只 dry。
+    # demo 分级整段移除后只剩 live，分级编排退化为「永远只 dry + P1 人工」。
+    for profile in ("live",):
         rc, out = run_recon(profile)
         entry: dict = {"rc": rc, "findings": _findings(out)}
         report[profile] = entry
@@ -174,71 +143,40 @@ def main() -> int:
         if rc in (99, 2) or rc not in (1, 3):
             alerts.append(f"[P1] {profile} 对账执行错误 rc={rc}: {entry['findings']}")
             continue
-        if profile == "live":
-            # 主人拍板：live 永远只 dry+P1 人工，绝不自动 --apply
-            classification = _live_classification(rc, out)
-            apply_hint = (
-                "｜人工: reconcile_exchange_closes.py --profile live "
-                "--apply --ordid <已核实的精确ordId>"
-                "（逐笔；只补 GHOST-EXACT，OVER_CLOSED/UNRECORDED/LEFTOVER 不会补）"
-                if "[GHOST-EXACT]" in out
-                else "｜人工逐笔核实（含糊项禁止 --apply）"
-            )
-            alerts.append(
-                f"[P1] live 账实差异 rc={rc}({classification}): "
-                f"{entry['findings']}{apply_hint}")
-            continue
-        # demo 分级
-        if rc == 3:
-            alerts.append(f"[P1] demo 对账含糊(FUZZY/UNRECORDED)需人工: {entry['findings']}")
-            continue
-        # rc == 1：GHOST-EXACT 可修
-        if args.dry_run:
-            entry["would_apply"] = True
-            log(f"[dry-run] demo rc=1，将自动 --apply（未执行）")
-            continue
-        rc_apply, out_apply = run_recon("demo", apply=True)
-        rc_check, out_check = run_recon("demo")
-        entry.update({"rc_apply": rc_apply, "rc_recheck": rc_check})
-        if rc_apply == 0 and rc_check == 0:
-            entry["self_healed"] = True
-            applied_cycles = _applied_cycles(out_apply)
-            missing_push = _cycles_without_push(applied_cycles)
-            entry["applied_cycles"] = applied_cycles
-            entry["missing_historical_push"] = missing_push
-            suffix = (f"；原轮未推送={missing_push}，按策略不补发历史交易消息"
-                      if missing_push else "")
-            notices.append(
-                f"[P2] demo 对账已自动补账并复检归零，cycles={applied_cycles or ['unknown']}"
-                f"{suffix}")
-            log(f"demo GHOST-EXACT 已自动补账并复检归零{suffix}")
-        else:
-            alerts.append(
-                f"[P1] demo 对账 --apply 后未归零 rc_apply={rc_apply} "
-                f"rc_recheck={rc_check}: {_findings(out_apply + out_check)}")
+        # 主人拍板：live 永远只 dry+P1 人工，绝不自动 --apply
+        classification = _live_classification(rc, out)
+        apply_hint = (
+            "｜人工: reconcile_exchange_closes.py --profile live "
+            "--apply --ordid <已核实的精确ordId>"
+            "（逐笔；只补 GHOST-EXACT，OVER_CLOSED/UNRECORDED/LEFTOVER 不会补）"
+            if "[GHOST-EXACT]" in out
+            else "｜人工逐笔核实（含糊项禁止 --apply）"
+        )
+        alerts.append(
+            f"[P1] live 账实差异 rc={rc}({classification}): "
+            f"{entry['findings']}{apply_hint}")
 
     report["alerts"] = alerts
-    report["notices"] = notices
-    messages = alerts + notices
+    messages = alerts
     if messages and not args.dry_run:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = f"{now_cst():%Y%m%d}"
-        level = "P1" if alerts else "P2"
-        dedupe = f"reconcile:{stamp}" if alerts else f"reconcile-selfheal:{stamp}"
+        # notices/P2 自愈通知随 demo 自动 --apply 一并移除，只剩 live 的 P1 告警。
+        level = "P1"
+        dedupe = f"reconcile:{stamp}"
         text = (f"⚠️ 日频对账告警 [{level}] [{f'{now_cst():%Y-%m-%d %H:%M}'}] (统一QQ告警)\n"
                 + "\n".join(f"· {a}" for a in messages)
-                + "\n（reconcile_daily 分级编排：demo 自动/live 人工，2026-07-16 拍板）")
+                + "\n（reconcile_daily：live 只 dry + P1 人工，绝不自动 --apply）")
         f = LOG_DIR / f"alert_{stamp}.txt"
         f.write_text(text, encoding="utf-8")
         cmd = [PWSH, "-NoProfile", "-File", WRAP, QQ_PUSH,
                "--content-file", str(f), "--alert",  # 告警走 C2C 私聊（2026-08-04）
                "--dedupe-key", dedupe]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=60,
-                               creationflags=_CREATE_NO_WINDOW)
-            report["alert_sent"] = {"rc": p.returncode}
-            log(f"告警已推 rc={p.returncode}: {len(messages)} 项")
+            rc, _out, _err, _to = _proc.run_guarded(
+                cmd, timeout=60, creationflags=_CREATE_NO_WINDOW)
+            report["alert_sent"] = {"rc": rc}
+            log(f"告警已推 rc={rc}: {len(messages)} 项")
         except Exception as e:
             report["alert_sent"] = {"error": str(e)}
     elif messages:

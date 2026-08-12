@@ -8,18 +8,6 @@ changes a report, or sends a message.
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import re
@@ -38,12 +26,15 @@ REQUIRED_MARKERS = (
     "## 📈 持仓",
     "## 🎯 交易",
     "### 🟢 实盘",
-    "### 🟡 模拟盘",
+    # "### 🟡 模拟盘" 随 2026-08-06 demo 全量下线移除
     "## ⚠️ 异常 / 🛠 自修",
     "## 🌍 市场",
     "## 🧠 教训",
     "## 详细 summary",
 )
+# "demo" 项**刻意保留**：demo 下线前生成的 54 份历史日报仍带 "### 🟡 模拟盘"
+# 段，重新校验旧报告时要按标签定位截断（见 _section 的截断注释）。它只是个
+# 解析用的标签表，不代表 demo 还在跑。
 PROFILE_LABELS = {"live": "🟢 实盘", "demo": "🟡 模拟盘"}
 FINAL_RECONCILE = {"clean", "ok", "cleared", "final"}
 
@@ -132,6 +123,8 @@ def _trading_profile_block(content: str, profile: str) -> str | None:
     if marker not in trading:
         return None
     block = trading.split(marker, 1)[1]
+    # 历史日报仍可能带 "### 🟡 模拟盘" 段（demo 下线前生成）；截断保证旧报告
+    # 的 live 段解析结果不被后面的 demo 数字污染。
     if profile == "live" and "### 🟡 模拟盘" in block:
         block = block.split("### 🟡 模拟盘", 1)[0]
     return block
@@ -169,7 +162,6 @@ def validate_report(
     report_path: Path,
     account_db: Path,
     live_trades_db: Path,
-    demo_trades_db: Path,
     ledger_db: Path,
 ) -> dict:
     errors: list[str] = []
@@ -201,10 +193,11 @@ def validate_report(
     if revision_line is None:
         errors.append("revision: missing machine-readable revision line")
 
+    # 2026-08-06 demo 全量下线：日报只剩 live 一段，双盘断言全部降为单盘。
     markdown_metrics = {
         profile: _parse_profile_metrics(
             _trading_profile_block(content, profile))
-        for profile in ("live", "demo")
+        for profile in ("live",)
     }
     for profile, metrics in markdown_metrics.items():
         if metrics is None:
@@ -226,12 +219,15 @@ def validate_report(
     finally:
         con.close()
     by_profile = {str(row["profile"]): row for row in rows}
-    if set(by_profile) != {"live", "demo"} or len(rows) != 2:
-        errors.append("database: report ts must have exactly live+demo rows")
+    # 2026-08-06 demo 全量下线：只要求 live 行存在，多余 profile 一律忽略。
+    # 刻意不写成 `set(by_profile) == {"live"}`——那在过渡期是**收紧**：demo 行清除
+    # 之前生成的历史日报（54 份）都会当场校验失败。放宽后新旧两种形态都通过。
+    if "live" not in by_profile:
+        errors.append("database: report ts must have a live row")
         return {"ok": False, "errors": errors, "checks": checks}
+    by_profile = {"live": by_profile["live"]}
 
     audit_by_profile: dict[str, dict] = {}
-    revision_by_profile: dict[str, dict] = {}
     for profile, row in by_profile.items():
         raw = _json_object(row["raw"])
         audit = raw.get("report_audit")
@@ -251,7 +247,6 @@ def validate_report(
         if not isinstance(revision, dict):
             errors.append(f"revision: {profile} revision missing")
         else:
-            revision_by_profile[profile] = revision
             required_revision = {
                 "number", "kind", "corrected", "resend_review_required",
                 "resend_status", "auto_resend",
@@ -275,12 +270,9 @@ def validate_report(
                 errors.append(
                     f"revision: {profile} markdown/audit state differs")
 
-    if len(revision_by_profile) == 2 and (
-        revision_by_profile["live"] != revision_by_profile["demo"]
-    ):
-        errors.append("revision: live/demo revision state differs")
+    # live↔demo 的 revision 一致性比对随 demo 下线移除（只剩一盘，无从比对）。
 
-    if len(audit_by_profile) == 2:
+    if len(audit_by_profile) == 1:
         checks.append("report_audit")
         reference_state = audit_by_profile["live"].get("report_state") or {}
         status = str(reference_state.get("status") or "").lower()
@@ -304,9 +296,7 @@ def validate_report(
         if is_provisional and "临时报告" not in content:
             errors.append(
                 "reconciliation: provisional audit lacks provisional banner")
-        other_state = audit_by_profile["demo"].get("report_state") or {}
-        if other_state != reference_state:
-            errors.append("reconciliation: live/demo report_state differs")
+        # live↔demo 的 report_state 一致性比对同上，随 demo 下线移除。
         if not any(error.startswith("reconciliation:") for error in errors):
             checks.append("reconciliation")
 
@@ -324,9 +314,7 @@ def validate_report(
             checks.append("daily_window_continuity")
 
     authoritative = {}
-    for profile, trade_db in (
-        ("live", live_trades_db), ("demo", demo_trades_db)
-    ):
+    for profile, trade_db in (("live", live_trades_db),):
         authoritative[profile] = trade_report_stats.profile_statistics(
             profile,
             trade_db,
@@ -336,7 +324,7 @@ def validate_report(
             end_exclusive=True,
         )
 
-    for profile in ("live", "demo"):
+    for profile in ("live",):
         row = by_profile[profile]
         audit = audit_by_profile.get(profile) or {}
         metrics_all = audit.get("trade_metrics") or {}
@@ -376,6 +364,52 @@ def validate_report(
                 errors.append(
                     f"risk_reject: {profile} markdown count differs")
 
+    # 2026-08-10 Wave0-2：方向计数与错失机会的独立复核（刻意不复用 writer 的
+    # lint 实现）。仅对含新格式确定性事实行的报告启用——历史报告不回溯拒绝。
+    live_facts = authoritative["live"]
+    sides = live_facts.get("close_side_breakdown") or {}
+    side_line = re.search(r"平仓方向:\s*多\s*(\d+)\s*/\s*空\s*(\d+)", content)
+    if side_line:
+        expect_long = (sides.get("long") or {}).get("close_count")
+        expect_short = (sides.get("short") or {}).get("close_count")
+        if (int(side_line.group(1)) != expect_long
+                or int(side_line.group(2)) != expect_short):
+            errors.append(
+                "side_counts: markdown 平仓方向与 live_trades.db 不符 "
+                f"(markdown 多{side_line.group(1)}/空{side_line.group(2)}, "
+                f"账本 多{expect_long}/空{expect_short})")
+        else:
+            checks.append("side_counts")
+    missed_line = re.search(r"本窗口错失机会记录:\s*(\d+)\s*条", content)
+    if missed_line:
+        lessons_db = Path(account_db).parent / "lessons.db"
+        actual_missed = None
+        if lessons_db.exists():
+            lcon = _open_readonly(lessons_db)
+            try:
+                if lcon.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name='missed_opportunities'").fetchone():
+                    actual_missed = int(lcon.execute(
+                        "SELECT COUNT(*) FROM missed_opportunities "
+                        "WHERE ts LIKE '202%' AND datetime(ts)>=datetime(?) "
+                        "AND datetime(ts)<datetime(?)",
+                        (start_ts, end_ts)).fetchone()[0])
+            finally:
+                lcon.close()
+        if actual_missed is not None:
+            if int(missed_line.group(1)) != actual_missed:
+                errors.append(
+                    "missed_opps: markdown 错失机会计数与 lessons.db 不符 "
+                    f"(markdown {missed_line.group(1)}, 库 {actual_missed})")
+            elif actual_missed > 0 and re.search(
+                    r"无错失机会|错失机会\s*[:：]?\s*0\s*(?:条|笔|个)?", content):
+                errors.append(
+                    "missed_opps: 文字段声称无错失机会，"
+                    f"lessons.db 本窗口实有 {actual_missed} 条")
+            else:
+                checks.append("missed_opps")
+
     if not any(error.startswith("risk_reject:") for error in errors):
         checks.append("risk_reject")
     if not any(error.startswith("revision:") for error in errors):
@@ -387,7 +421,7 @@ def validate_report(
         "report_ts": report_ts,
         "errors": errors,
         "checks": sorted(set(checks)),
-        "profiles_checked": 2,
+        "profiles_checked": len(by_profile),
         "auto_send": False,
     }
 
@@ -396,10 +430,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="read-only reviewer daily report validator")
     parser.add_argument("--file", required=True)
-    parser.add_argument("--db-root", default=_project_path('db'))
+    parser.add_argument("--db-root", default=r"./db")
     parser.add_argument("--account-db")
     parser.add_argument("--live-trades-db")
-    parser.add_argument("--demo-trades-db")
+    # `--demo-trades-db` 随 2026-08-06 demo 全量下线删除：函数体早已不读它，
+    # 只是签名和 CLI 里还挂着一个指向已删库的路径。
     parser.add_argument("--ledger-db")
     args = parser.parse_args()
     root = Path(args.db_root)
@@ -409,9 +444,6 @@ def main() -> int:
         "live_trades_db": (
             Path(args.live_trades_db)
             if args.live_trades_db else root / "live_trades.db"),
-        "demo_trades_db": (
-            Path(args.demo_trades_db)
-            if args.demo_trades_db else root / "demo_trades.db"),
         "ledger_db": (
             Path(args.ledger_db)
             if args.ledger_db else root / "ledger.db"),

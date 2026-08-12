@@ -9,8 +9,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+for _p in (SCRIPTS,):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import decision_briefing  # noqa: E402
 from collectors import trades_writer  # noqa: E402
@@ -35,7 +36,7 @@ CREATE TABLE trade_experiences (
     experience_vector TEXT,
     pnl_pct REAL,
     hold_hours REAL,
-    hit_1R INTEGER,
+    is_gross_profit_close INTEGER,
     status TEXT DEFAULT 'open',
     raw TEXT,
     experience_summary TEXT,
@@ -119,6 +120,38 @@ class DxyObservationSemanticsTests(unittest.TestCase):
         self.assertEqual(result["reason"], "observation_sample_insufficient")
 
 
+class DecisionMarketDataSemanticsTests(unittest.TestCase):
+    def test_requested_timeframes_and_closed_candle_only(self):
+        self.assertEqual(decision_briefing.DECISION_TIMEFRAMES, ("15m", "1H", "4H"))
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        con.execute(
+            "CREATE TABLE kline_cache(ts TEXT,symbol TEXT,tf TEXT,c REAL,ma5 REAL,"
+            "ma20 REAL,rsi14 REAL,macd_hist REAL)"
+        )
+        con.executemany(
+            "INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?)",
+            [
+                ("2026-08-11T14:00:00Z", "BTC-USDT-SWAP", "15m", 1, 1, 2, 40, -1),
+                # This bar is still open at evaluation 14:16 and must not be read.
+                ("2026-08-11T14:15:00Z", "BTC-USDT-SWAP", "15m", 3, 3, 2, 70, 1),
+            ],
+        )
+        row = decision_briefing.latest_closed_kline(
+            con, "BTC-USDT-SWAP", "15m", "2026-08-11T14:16:00Z"
+        )
+        con.close()
+        self.assertEqual(row["ts"], "2026-08-11T14:00:00Z")
+        self.assertEqual(row["macd_hist"], -1)
+
+    def test_quote_volume_uses_okx_contract_value(self):
+        self.assertEqual(
+            decision_briefing.quote_volume_usd(2, 300_000, 10),
+            6_000_000,
+        )
+        self.assertIsNone(decision_briefing.quote_volume_usd(2, 300_000, None))
+
+
 class ExperienceRegimePointInTimeTests(unittest.TestCase):
     @staticmethod
     def _make_regime_db(root: Path):
@@ -176,7 +209,11 @@ class ExperienceRegimePointInTimeTests(unittest.TestCase):
             finally:
                 con.close()
             self.assertEqual(row[0], "range")
-            self.assertEqual(json.loads(row[1])[2:5], [0.0, 1.0, 0.0])
+            # Wave2 序9：writer 落 v2 特征载荷；regime 语义直接看 features.regime
+            stored_vec = json.loads(row[1])
+            self.assertEqual(stored_vec.get("v"), 2)
+            self.assertEqual(stored_vec["features"]["regime"], "range")
+            self.assertEqual(stored_vec["features"]["side"], "long")
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,7 @@ def load_doc_checker():
 class DocumentHeaderTests(unittest.TestCase):
     def test_current_document_surface_has_version_headers(self):
         checker = load_doc_checker()
-        self.assertEqual(len(checker.COVERAGE_DOCS), 18)
+        self.assertEqual(len(checker.COVERAGE_DOCS), 17)
         for relative in checker.COVERAGE_DOCS:
             with self.subTest(relative=relative):
                 info = checker.parse_doc_header(ROOT / relative)
@@ -110,8 +110,8 @@ class CrossDocumentFactTests(unittest.TestCase):
 
     def test_push_pipeline_archive_precedes_send(self):
         source = read("scripts/push_pipeline.py")
-        archive_call = source.index("'push_archive.py'")
-        send_call = source.index("'qq_push.py'")
+        archive_call = source.index('_run(r"./scripts/push_archive.py"')
+        send_call = source.index('_run(\n                r"./scripts/qq_push.py"')
         self.assertLess(archive_call, send_call)
 
 

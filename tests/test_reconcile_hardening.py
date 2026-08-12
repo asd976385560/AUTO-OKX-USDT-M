@@ -154,7 +154,7 @@ class HistoricalReplayTests(unittest.TestCase):
                     "symbol": "WLD-USDT-SWAP", "action": "close",
                     "side": "short", "sz": 400, "fill_px": 0.3506,
                     "lev": 10, "pnl": -2.28,
-                    "raw": {"ordId": "test-order-001"},
+                    "raw": {"ordId": "3777879978121388032"},
                 }],
                 "_profile": "live",
             }
@@ -182,9 +182,9 @@ class HistoricalReplayTests(unittest.TestCase):
 class TraderDocContractTests(unittest.TestCase):
     def test_live_forced_flow_requires_same_process_commit(self):
         text = """
-## 7. 强制流程（每轮）
-5. **交易回执喂 writer**：回执写 tmp 后 trades_writer.py --json-file <tmp 回执文件>
-## 8. 失败 / 降级
+## RUN_OUTPUT
+交易回执喂 writer：回执写 tmp 后 trades_writer.py --json-file <tmp 回执文件>
+## STOP
 """
         problems = check_trader_docs_sync.live_money_path_problems(text)
         self.assertTrue(any("缺同进程" in item for item in problems))
@@ -192,47 +192,15 @@ class TraderDocContractTests(unittest.TestCase):
 
     def test_live_forced_flow_accepts_same_process_commit(self):
         text = """
-## 7. 强制流程（每轮）
-5. 成交轮同进程调用 commit_receipt(receipt, "live")；HOLD 才可分步使用 writer。
-## 8. 失败 / 降级
+## RUN_OUTPUT
+成交轮必须在同一个临时 Python 进程内调用 commit_receipt(receipt, "live")；HOLD 才可分步使用 writer。
+## STOP
 """
         self.assertEqual(
             check_trader_docs_sync.live_money_path_problems(text), [])
 
 
 class StageBusinessOutputTests(unittest.TestCase):
-    def test_runner_cli_uses_custom_db_root_for_verify_and_lease_release(self):
-        cycle = "2026-07-27T02:45"
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            argv = [
-                "stage_runner.py", "--stage", "live", "--cycle", cycle,
-                "--mode", "full", "--db-root", str(root), "--", "child",
-            ]
-            with mock.patch.object(stage_runner.sys, "argv", argv), \
-                 mock.patch.object(stage_runner.subprocess, "run",
-                                   return_value=mock.Mock(returncode=0)) as run, \
-                 mock.patch.object(stage_runner, "_status_path",
-                                   return_value=root / "status.json"), \
-                 mock.patch.object(stage_runner, "_write_status"), \
-                 mock.patch.object(stage_runner, "verify_business_output",
-                                   return_value={"ok": True}) as verify, \
-                 mock.patch.object(stage_runner.ledger,
-                                   "release_profile_lease",
-                                   return_value=True) as release:
-                rc = stage_runner.main()
-
-            self.assertEqual(rc, 0)
-            verify.assert_called_once_with(
-                "live", cycle, "full", db_root=root
-            )
-            release.assert_called_once_with(
-                root / "ledger.db", "live", cycle
-            )
-            self.assertEqual(
-                run.call_args.kwargs["env"]["OKX_DB_ROOT"], str(root)
-            )
-
     def test_length_terminal_is_classified_without_model_chain_metadata(self):
         cycle = "2026-07-28T16:45"
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +252,107 @@ class StageBusinessOutputTests(unittest.TestCase):
         self.assertNotIn("model", serialized.replace("model_output_length", ""))
         self.assertNotIn("provider", serialized)
 
+    def test_empty_terminal_is_classified_without_model_chain_metadata(self):
+        cycle = "2026-08-12T20:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_dir = (
+                root / "agents" / "okx-live-trader" / "sessions"
+            )
+            session_dir.mkdir(parents=True)
+            session_id = "empty-output-session"
+            (session_dir / "sessions.json").write_text(
+                json.dumps({
+                    "agent:okx-live-trader:live-20260812-2000": {
+                        "sessionId": session_id,
+                        "model": "must-not-be-emitted",
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (session_dir / f"{session_id}.trajectory.jsonl").write_text(
+                json.dumps({"type": "session.ended"}) + "\n",
+                encoding="utf-8",
+            )
+            records = [
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "working"}],
+                        "provider": "must-not-be-emitted",
+                        "model": "must-not-be-emitted",
+                        "usage": {"output": 4, "totalTokens": 10},
+                        "stopReason": "toolUse",
+                    },
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "provider": "must-not-be-emitted",
+                        "model": "must-not-be-emitted",
+                        "usage": {"output": 0, "totalTokens": 0},
+                        "stopReason": "stop",
+                    },
+                },
+            ]
+            (session_dir / f"{session_id}.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            result = stage_runner.detect_agent_terminal_failure(
+                "live", cycle, root)
+
+        self.assertEqual(result, {
+            "failure_kind": "model_empty_output",
+            "stop_reason": "stop",
+            "content_blocks": 0,
+            "output_tokens": 0,
+        })
+        serialized = json.dumps(result).lower()
+        self.assertNotIn("provider", serialized)
+        self.assertNotIn("must-not-be-emitted", serialized)
+
+    def test_nonempty_normal_stop_is_not_empty_terminal(self):
+        cycle = "2026-08-12T20:15"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_dir = (
+                root / "agents" / "okx-live-trader" / "sessions"
+            )
+            session_dir.mkdir(parents=True)
+            session_id = "normal-session"
+            (session_dir / "sessions.json").write_text(
+                json.dumps({
+                    "agent:okx-live-trader:live-20260812-2015": {
+                        "sessionId": session_id,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (session_dir / f"{session_id}.trajectory.jsonl").write_text(
+                json.dumps({"type": "session.ended"}) + "\n",
+                encoding="utf-8",
+            )
+            (session_dir / f"{session_id}.jsonl").write_text(
+                json.dumps({
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {"output": 1},
+                        "stopReason": "stop",
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            result = stage_runner.detect_agent_terminal_failure(
+                "live", cycle, root)
+
+        self.assertIsNone(result)
+
     def test_unified_live_requires_trade_cycle_after_ok_analysis(self):
         cycle = "2026-07-27T02:45"
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,11 +389,12 @@ class StageBusinessOutputTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["terminal"], "analysis_stale")
 
-    def test_demo_requires_trade_cycle(self):
+    def test_live_requires_trade_cycle(self):
+        # 原用 demo stage 驱动；2026-08-06 demo 下线后改打 live（机制不变）。
         with tempfile.TemporaryDirectory() as tmp:
-            _create_trade_db(Path(tmp) / "demo_trades.db")
+            _create_trade_db(Path(tmp) / "live_trades.db")
             result = stage_runner.verify_business_output(
-                "demo", "2026-07-27T02:45", "full", Path(tmp))
+                "live", "2026-07-27T02:45", "full", Path(tmp))
         self.assertFalse(result["ok"])
         self.assertEqual(
             result["failure_kind"], "business_output_missing")
@@ -335,19 +405,19 @@ class StageBusinessOutputTests(unittest.TestCase):
             with self.subTest(decision=decision, n_orders=n_orders):
                 with tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
-                    _create_trade_db(root / "demo_trades.db")
-                    con = sqlite3.connect(root / "demo_trades.db")
+                    _create_trade_db(root / "live_trades.db")
+                    con = sqlite3.connect(root / "live_trades.db")
                     try:
                         con.execute(
                             "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
-                            (cycle, "2026-07-27 04:01:00", "demo",
+                            (cycle, "2026-07-27 04:01:00", "live",
                              decision, n_orders, None, "", "{}"),
                         )
                         con.commit()
                     finally:
                         con.close()
                     result = stage_runner.verify_business_output(
-                        "demo", cycle, "full", root)
+                        "live", cycle, "full", root)
                 self.assertFalse(result["ok"], result)
                 self.assertEqual(
                     result["failure_kind"], "business_verification_error")
@@ -356,8 +426,8 @@ class StageBusinessOutputTests(unittest.TestCase):
         cycle = "2026-07-27T04:15"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            _create_trade_db(root / "demo_trades.db")
-            con = sqlite3.connect(root / "demo_trades.db")
+            _create_trade_db(root / "live_trades.db")
+            con = sqlite3.connect(root / "live_trades.db")
             try:
                 con.execute(
                     "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
@@ -368,47 +438,11 @@ class StageBusinessOutputTests(unittest.TestCase):
             finally:
                 con.close()
             result = stage_runner.verify_business_output(
-                "demo", cycle, "full", root)
+                "live", cycle, "full", root)
         self.assertTrue(result["ok"], result)
 
 
 class MonitoringAndAlertTests(unittest.TestCase):
-    def test_post_push_reconcile_receives_custom_db_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            fake = mock.Mock(returncode=0, stdout="ok", stderr="")
-            with mock.patch.object(
-                live_reconcile_monitor.subprocess, "run", return_value=fake
-            ) as run:
-                rc, _ = live_reconcile_monitor.run_reconcile("demo", root)
-            self.assertEqual(rc, 0)
-            argv = run.call_args.args[0]
-            self.assertIn("--db-root", argv)
-            self.assertEqual(argv[argv.index("--db-root") + 1], str(root))
-
-    def test_post_push_alert_uses_same_custom_db_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            fake = mock.Mock(returncode=0, stdout="sent", stderr="")
-            argv = [
-                "live_reconcile_monitor.py", "--profile", "demo",
-                "--cycle", "2026-08-04T12:00", "--db-root", str(root),
-            ]
-            with mock.patch.object(sys, "argv", argv), \
-                 mock.patch.object(live_reconcile_monitor, "active_runner",
-                                   return_value=None), \
-                 mock.patch.object(live_reconcile_monitor, "run_reconcile",
-                                   return_value=(1, "[GHOST-EXACT] synthetic")), \
-                 mock.patch.object(live_reconcile_monitor, "LOG_DIR", root / "logs"), \
-                 mock.patch.object(live_reconcile_monitor.subprocess, "run",
-                                   return_value=fake) as run:
-                self.assertEqual(live_reconcile_monitor.main(), 1)
-            push_argv = run.call_args.args[0]
-            self.assertEqual(
-                push_argv[push_argv.index("--db-root") + 1], str(root)
-            )
-            self.assertIn(":r", push_argv[push_argv.index("--dedupe-key") + 1])
-
     def test_post_push_monitor_detects_rc0_over_closed(self):
         out = "[OVER_CLOSED] 1 组:\n  LTC-USDT-SWAP long net=-2.8\n"
         result = live_reconcile_monitor.evaluate(0, out)
@@ -438,55 +472,6 @@ class MonitoringAndAlertTests(unittest.TestCase):
                 result = live_reconcile_monitor.active_live_runner()
         self.assertEqual(result["cycle_id"], "2026-07-27T10:30")
 
-    def test_post_push_monitor_supports_demo_profile(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            status_dir = Path(tmp)
-            (status_dir / "demo-2026-07-27T10-45.json").write_text(
-                json.dumps({
-                    "status": "running",
-                    "cycle_id": "2026-07-27T10:45",
-                    "started_at": live_reconcile_monitor.now_cst().strftime(
-                        "%Y-%m-%d %H:%M:%S"),
-                }),
-                encoding="utf-8",
-            )
-            with mock.patch.object(
-                    live_reconcile_monitor, "STAGE_STATUS_DIR", status_dir):
-                result = live_reconcile_monitor.active_runner("demo")
-        self.assertEqual(result["cycle_id"], "2026-07-27T10:45")
-
-    def test_post_push_monitor_filters_active_status_by_db_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            status_dir = Path(tmp) / "status"
-            status_dir.mkdir()
-            custom_root = Path(tmp) / "db"
-            custom_root.mkdir()
-            started = live_reconcile_monitor.now_cst().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            default_file = status_dir / "live-2026-08-04T11-45.json"
-            custom_ns = live_reconcile_monitor._root_namespace(custom_root)
-            custom_file = status_dir / f"live-2026-08-04T12-00-{custom_ns}.json"
-            default_file.write_text(json.dumps({
-                "status": "running", "cycle_id": "default",
-                "started_at": started,
-            }), encoding="utf-8")
-            custom_file.write_text(json.dumps({
-                "status": "running", "cycle_id": "custom",
-                "started_at": started,
-            }), encoding="utf-8")
-            with mock.patch.object(
-                live_reconcile_monitor, "STAGE_STATUS_DIR", status_dir
-            ):
-                custom = live_reconcile_monitor.active_runner(
-                    "live", custom_root
-                )
-                default = live_reconcile_monitor.active_runner(
-                    "live", live_reconcile_monitor.ROOT / "db"
-                )
-        self.assertEqual(custom["cycle_id"], "custom")
-        self.assertEqual(default["cycle_id"], "default")
-
     def test_business_missing_runner_maps_to_run_ok_no_db_row(self):
         with tempfile.TemporaryDirectory() as tmp:
             status_dir = Path(tmp)
@@ -502,6 +487,22 @@ class MonitoringAndAlertTests(unittest.TestCase):
                 result = collection_monitor._audit_attribution(
                     "live", "2026-07-27T02:45")
         self.assertEqual(result, "run-ok-no-db-row")
+
+    def test_empty_output_runner_maps_to_run_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp)
+            path = status_dir / "live-2026-08-12T20-00.json"
+            path.write_text(json.dumps({
+                "status": "failed",
+                "failure_kind": "model_empty_output",
+                "child_returncode": 0,
+                "returncode": 86,
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    collection_monitor, "STAGE_STATUS_DIR", status_dir):
+                result = collection_monitor._audit_attribution(
+                    "live", "2026-08-12T20:00")
+        self.assertEqual(result, "run-failed")
 
     def test_findings_keeps_over_closed_symbol_but_not_ghost_diagnostics(self):
         out = """
@@ -639,8 +640,6 @@ class TradeReportFactTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     daily_report_writer, "LIVE_TRADES_DB", live_db),
-                mock.patch.object(
-                    daily_report_writer, "DEMO_TRADES_DB", demo_db),
                 mock.patch.object(
                     daily_report_writer, "LEDGER_DB", ledger_db),
             ):
@@ -801,7 +800,7 @@ class TradeReportFactTests(unittest.TestCase):
                 con.execute(
                     "INSERT INTO execution_intents VALUES("
                     "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    ("demo", "d-reject", "UNI-USDT-SWAP", "open",
+                    ("live", "d-reject", "UNI-USDT-SWAP", "open",
                      "long", "f", "{}", "failed_clean",
                      "2026-07-27 03:00:00", "2026-07-27 03:00:01",
                      None, None, None, None,
@@ -815,9 +814,6 @@ class TradeReportFactTests(unittest.TestCase):
                 "live_open_count": 9,
                 "live_close_count": 0,
                 "live_total_pnl": 0,
-                "demo_open_count": 3,
-                "demo_close_count": 0,
-                "demo_total_pnl": 0,
                 "live_reconcile_status": "pending",
                 "live_reconcile_issue_count": 2,
                 "raw": "{\"origin\":\"test\"}",
@@ -826,15 +822,14 @@ class TradeReportFactTests(unittest.TestCase):
                 mock.patch.object(
                     daily_report_writer, "LIVE_TRADES_DB", live_db),
                 mock.patch.object(
-                    daily_report_writer, "DEMO_TRADES_DB", demo_db),
-                mock.patch.object(
                     daily_report_writer, "LEDGER_DB", ledger_db),
             ):
                 prepared = daily_report_writer.prepare_daily_payload(payload)
 
         self.assertEqual(prepared["live_open_count"], 1)
-        self.assertEqual(prepared["demo_open_count"], 1)
-        self.assertEqual(prepared["demo_risk_rejected_open_count"], 1)
+        self.assertEqual(prepared["live_risk_rejected_open_count"], 1)
+        # demo_* 断言随 2026-08-06 demo 全量下线移除（prepare 只再统计 live）。
+        self.assertNotIn("demo_open_count", prepared)
         self.assertEqual(prepared["report_status"], "provisional")
         self.assertIn("成交统计已按有效 fill 自动校正",
                       prepared["anomalies"])
@@ -850,7 +845,8 @@ class TradeReportFactTests(unittest.TestCase):
             _create_trade_db(live_db)
             _create_trade_db(demo_db)
             _create_ledger_db(ledger_db)
-            con = sqlite3.connect(demo_db)
+            # 原夹具把成交写在 demo 库；2026-08-06 demo 下线后统计只看 live。
+            con = sqlite3.connect(live_db)
             try:
                 for cycle, ts in (
                     ("before", "2026-07-20 07:59:59"),
@@ -872,20 +868,17 @@ class TradeReportFactTests(unittest.TestCase):
                 mock.patch.object(
                     daily_report_writer, "LIVE_TRADES_DB", live_db),
                 mock.patch.object(
-                    daily_report_writer, "DEMO_TRADES_DB", demo_db),
-                mock.patch.object(
                     daily_report_writer, "LEDGER_DB", ledger_db),
             ):
                 prepared = daily_report_writer.prepare_weekly_payload({
                     "week_start_ts": "2026-07-27 00:00:00",
-                    "demo_open_count": 0,
                 })
 
         self.assertEqual(prepared["period_start_ts"],
                          "2026-07-20 08:00:00")
         self.assertEqual(prepared["period_end_ts"],
                          "2026-07-27 08:00:00")
-        self.assertEqual(prepared["demo_open_count"], 2)
+        self.assertEqual(prepared["live_open_count"], 2)
 
     def test_weekly_window_is_tiled_by_seven_daily_windows(self):
         """七份日报必须恰好平铺周报窗，否则日/周口径无法互相对账。"""

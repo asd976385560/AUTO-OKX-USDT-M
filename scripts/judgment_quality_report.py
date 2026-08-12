@@ -1,28 +1,15 @@
 # -*- coding: utf-8 -*-
 """周度判断质量报告（T11，2026-06-12）——P7 weekly 固定段落数据源。
 
-输出 markdown 到 stdout，由周报 agent 原样嵌入业务报告，并经不带
-`--alert` 的 `qq_push.py` 推送至 `OKX_QQ_TARGET`。四段:
+输出 markdown 到 stdout，由周报 agent 原样嵌入推送（统一 QQ target）。四段:
   1. 六项决策卡完整率与历史经验取舍结果
   2. regime 判定 vs BTC 实际走势（近 7 天逐日复盘）
   3. 轮次可靠性（cron 运行成功率 / 丢轮 / provider 分布，读 openclaw.sqlite 只读）
   4. 推送健康（归档数量 / 劣化计数）
 
-用法: pwsh ... run_okx_python.ps1 scripts/judgment_quality_report.py [--db-root <PROJECT_ROOT>\\db] [--days 7]
+用法: pwsh ... run_okx_python.ps1 scripts/judgment_quality_report.py [--db-root ./db] [--days 7]
 任何子段失败标 N/A 不中断。退出码恒 0（报告性质）。
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import json
 import os
@@ -35,11 +22,12 @@ import trade_report_stats
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-OPENCLAW_DB = str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite'))
+OPENCLAW_DB = str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite")
 # trader 统一由 dispatcher 按业务产物就绪条件派发，无独立 cron。
 # 轮次可靠性/效率改聚合核心周期 cron。job_id 是 UUID、随 cron 重建会变——按 name 动态解析。
-CYCLE_CRON_NAMES = ("okx-fast-collect", "okx-slow-collect", "okx-analyst-cron", "okx-dispatcher")
-REPORTS_DIR = _project_path('reports', 'agents')
+# 2026-08-08 采集整并：fast/slow/news-rss 三条 cron 合为 quarter/hourly 两条聚合。
+CYCLE_CRON_NAMES = ("okx-collect-quarter", "okx-collect-hourly", "okx-analyst-cron", "okx-dispatcher")
+REPORTS_DIR = r"./reports/agents"
 REQUIRED_DECISION_CARD_FIELDS = frozenset({
     "direction_evidence",
     "opposing_evidence",
@@ -126,7 +114,7 @@ def _format_pct(value) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument(
         "--as-of",
@@ -324,13 +312,19 @@ def main():
 
     safe(f"效率·token（{days} 天）", s_efficiency)
 
-    # 6) demo 周转率：当前 demo_trades.db 有效 fill + ledger 风控拒绝；
+    # 6) 周转率：live_trades.db 有效 fill + ledger 风控拒绝；
     # drill.db 是只读归档，不再参与当前复盘事实。
+    #
+    # 2026-08-06 demo 全量下线：本节原本量的是 demo。改指 live 而不是删掉——
+    # 「周转停滞 = 学习闭环停滞」是真信号，唯一的盘换成 live 后它依然成立。
+    # 但**原来的 ➤ 判语一并去掉**：`日均开<1 且持有>24h` 这个阈值是按 demo 的
+    # 成交频率标定的，live 天然开得少得多，照搬会让周报每周都盖一个
+    # 「学习闭环停滞」的戳——那是拿失准阈值替判断，不是事实。只报数，判给人。
     def s_turnover():
         start, end = trade_report_stats.rolling_window(as_of, days)
         stats = trade_report_stats.profile_statistics(
-            "demo",
-            Path(root) / "demo_trades.db",
+            "live",
+            Path(root) / "live_trades.db",
             Path(root) / "ledger.db",
             start,
             end,
@@ -346,7 +340,7 @@ def main():
             for reason, count in rejected["reasons"].items()
         ) or "无"
         print(
-            f"demo 近 {days}×24h（{start}~{end}）："
+            f"live 近 {days}×24h（{start}~{end}）："
             f"成交开仓 {opened} / 成交平仓 {closed} 笔"
             f"（日均开 {opened/days:.1f}）| 当前 open 平均持有 {ah}")
         print(
@@ -361,14 +355,8 @@ def main():
             print(
                 f"成交表另排除 rejected/不完整非 fill 行 {excluded} 条，"
                 "不计入开平仓。")
-        if opened / days < 1 and avg_hold is not None and avg_hold > 24:
-            print(
-                "➤ 周转过低（日均开<1 且持有>24h）= "
-                "ADJUST 僵持/学习闭环停滞。")
-        else:
-            print("➤ 周转存在有效成交，学习闭环未停滞。")
 
-    safe(f"demo 周转率（{days} 天）", s_turnover)
+    safe(f"周转率（{days} 天）", s_turnover)
 
     print("\n（judgment_quality_report.py 生成，P7 weekly 原样嵌入周报）")
 

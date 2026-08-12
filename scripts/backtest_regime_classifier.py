@@ -6,18 +6,6 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import bisect
 import itertools
@@ -136,7 +124,7 @@ def _objective(summary: dict) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="BTC 4H regime 历史回测（只读）")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--json-out")
     args = ap.parse_args()
     rows = _rows(Path(args.db_root))

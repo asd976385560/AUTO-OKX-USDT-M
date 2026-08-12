@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for writer ownership and fast-collection status."""
+"""Regression tests for writer ownership and controlled drill maintenance."""
 from __future__ import annotations
 
 import io
@@ -13,12 +13,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 COLLECTORS = ROOT / "collectors"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
-if str(COLLECTORS) not in sys.path:
-    sys.path.insert(0, str(COLLECTORS))
+for _p in (SCRIPTS, COLLECTORS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import fast_collect  # noqa: E402
+
 
 class WriterOwnershipTests(unittest.TestCase):
     def test_fast_path_has_one_snapshot_writer(self) -> None:
@@ -26,19 +26,22 @@ class WriterOwnershipTests(unittest.TestCase):
         collect_data = (ROOT / "scripts" / "collect_data.py").read_text(
             encoding="utf-8"
         )
-        demo_check = (ROOT / "scripts" / "demo_account_check.py").read_text(
-            encoding="utf-8"
-        )
         self_review = (ROOT / "scripts" / "self_review.py").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn('"demo_position_check"', fast)
-        self.assertIn('"--profile", "demo"', fast)
-        self.assertLess(
-            fast.index("steps.append(demo_pos_step)"),
-            fast.index("status = _collection_status(steps)"),
-        )
+        # 唯一快照 writer 契约（live）：只有 jobb_live_account_check 写
+        # account_snapshots / position_snapshots，collect_data 不得旁路写入。
+        self.assertIn('"live_account_check"', fast)
+        self.assertIn("jobb_live_account_check.py", fast)
+        self.assertIn('"contract_statistics"', fast)
+        self.assertIn('"--contract-stats-only"', fast)
+        # 2026-08-06 demo 全量下线：快采不得再**调用**任何 demo 步骤。
+        # 断言针对调用形态而非文件名字样——注释里提历史沿革是允许的。
+        self.assertNotIn('run_step("demo_position_check"', fast)
+        self.assertNotIn('run_step("demo_account_check"', fast)
+        self.assertNotIn('SCRIPTS / "demo_account_check.py"', fast)
+        self.assertNotIn('"--profile", "demo"', fast)
         self.assertNotIn("--legacy-account-writes", fast)
         self.assertNotIn("--legacy-account-writes", collect_data)
         self.assertNotIn("account_con = open_db", collect_data)
@@ -50,9 +53,7 @@ class WriterOwnershipTests(unittest.TestCase):
             "cross_snapshot, account_snapshot",
             collect_data,
         )
-        self.assertNotIn("INSERT INTO account_snapshots", demo_check)
-        self.assertNotIn("UPDATE drill_trades", demo_check)
-        self.assertNotIn("INSERT INTO drill_trades", demo_check)
+        # demo_account_check.py 的三条「不得写库」断言随该脚本一并下线（Phase 2 删除）。
         self.assertNotIn("INSERT OR REPLACE INTO daily_reports", self_review)
         self.assertNotIn("INSERT INTO missed_opportunities", self_review)
 
@@ -63,6 +64,7 @@ class FastCollectionStatusTests(unittest.TestCase):
         defaults = {
             "collect_data": True,
             "market_features": True,
+            "contract_statistics": True,
             "live_account_check": True,
             "demo_account_check": True,
             "demo_position_check": True,
@@ -80,10 +82,15 @@ class FastCollectionStatusTests(unittest.TestCase):
                 self._steps(live_account_check=False)
             ),
         )
+
+    def test_demo_snapshot_is_no_longer_a_gate_source(self) -> None:
+        """2026-08-06 demo 全量下线：demo 快照曾是采集 gate 必需源，一旦停写会让
+        `_collection_ready()` 永久 False、unified live 再也不派发。解除后 demo
+        侧任何状态都不得再影响 live 派发。"""
         self.assertEqual(
-            "error",
+            "ok",
             fast_collect._collection_status(
-                self._steps(demo_position_check=False)
+                self._steps(demo_position_check=False, demo_account_check=False)
             ),
         )
 
@@ -95,15 +102,51 @@ class FastCollectionStatusTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            "degraded",
+            fast_collect._collection_status(
+                self._steps(contract_statistics=False)
+            ),
+        )
+        self.assertEqual(
             "ok",
             fast_collect._collection_status(
                 self._steps(demo_account_check=False)
             ),
         )
 
-    def test_main_records_error_when_demo_snapshot_writer_fails(self) -> None:
+    def test_collect_data_partial_payload_is_visible_as_degraded(self) -> None:
+        steps = self._steps()
+        for step in steps:
+            if step["name"] == "collect_data":
+                step["payload"] = {
+                    "degraded": True,
+                    "quality": {"candle_coverage": 0.91},
+                }
+        self.assertEqual("degraded", fast_collect._collection_status(steps))
+
+    def test_contract_statistics_warning_does_not_override_passed_99_gate(self) -> None:
+        steps = self._steps()
+        for step in steps:
+            if step["name"] == "contract_statistics":
+                step["payload"] = {
+                    "degraded": False,
+                    "direct_coverage_rate": 427 / 429,
+                    "coverage_rate": 427 / 429,
+                    "warnings": [
+                        "contract statistics carry-forward unresolved=2"
+                    ],
+                }
+        self.assertEqual("ok", fast_collect._collection_status(steps))
+        contract_step = next(
+            step for step in steps if step["name"] == "contract_statistics")
+        warning = fast_collect._step_degraded_warning(contract_step)
+        self.assertIn("unresolved=2", warning)
+
+    def test_main_records_error_when_live_snapshot_writer_fails(self) -> None:
+        # 原用 demo_position_check 打这条链；2026-08-06 demo 下线后它不再是必需源，
+        # 改打 live_account_check——fail-closed 机制本身不变，仍须覆盖。
         def fake_run(name, _script, _args, _timeout):
-            ok = name != "demo_position_check"
+            ok = name != "live_account_check"
             return {
                 "name": name,
                 "ok": ok,

@@ -7,18 +7,6 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import hashlib
 import json
@@ -33,22 +21,24 @@ from pathlib import Path
 
 
 CST = timezone(timedelta(hours=8))
-ROOT = Path(_project_path())
+ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
 COLLECTORS = ROOT / "collectors"
 if str(COLLECTORS) not in sys.path:
     sys.path.insert(0, str(COLLECTORS))
-from cycle_contract import (  # noqa: E402
+import ledger  # noqa: E402
+from collectors.cycle_contract import (  # noqa: E402
     cycle_session_token,
     cycle_status_token,
     validate_cycle_id,
 )
-import ledger  # noqa: E402
 
 STATUS_DIR = Path(os.environ.get("OKX_STAGE_STATUS_DIR")
-                  or _project_path('logs', 'stage-status'))
+                  or (ROOT / "logs" / "stage-status"))
 QQ_PUSH = ROOT / "scripts" / "qq_push.py"
 LIVE_RECON_MONITOR = ROOT / "scripts" / "live_reconcile_monitor.py"
-DB_ROOT = Path(os.environ.get("OKX_DB_ROOT") or _project_path('db'))
+DB_ROOT = Path(os.environ.get("OKX_DB_ROOT") or (ROOT / "db"))
 CANONICAL_DB_ROOT = (ROOT / "db").resolve()
 OPENCLAW_STATE_ROOT = Path(
     os.environ.get("OKX_OPENCLAW_STATE_ROOT")
@@ -60,7 +50,6 @@ _BUSINESS_FAILURE_RC = 86
 _STAGE_AGENTS = {
     "analyst": "okx-analyst",
     "live": "okx-live-trader",
-    "demo": "okx-demo-trader",
 }
 
 
@@ -74,19 +63,23 @@ def _safe(value: str) -> str:
 
 def _root_namespace(db_root: Path | str | None = None) -> str:
     resolved = Path(db_root or DB_ROOT).resolve()
-    if resolved == CANONICAL_DB_ROOT:
+    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
+        os.fspath(CANONICAL_DB_ROOT)
+    ):
         return ""
     return "r" + hashlib.sha256(
         os.path.normcase(os.fspath(resolved)).encode("utf-8")
     ).hexdigest()[:10]
 
 
-def _stage_session_key(stage: str, cycle: str,
-                       db_root: Path | str | None = None) -> str:
-    safe_cycle = cycle_session_token(cycle)
+def _stage_session_key(
+    stage: str,
+    cycle: str,
+    db_root: Path | str | None = None,
+) -> str:
     suffix = _root_namespace(db_root)
     tail = f"-{suffix}" if suffix else ""
-    return f"{stage}-{safe_cycle}{tail}"
+    return f"{stage}-{cycle_session_token(cycle)}{tail}"
 
 
 def _walk_dicts(value):
@@ -107,8 +100,15 @@ def detect_agent_terminal_failure(
     state_root: Path | None = None,
     db_root: Path | str | None = None,
 ) -> dict | None:
-    """Read only the matching terminal reason; never persist model-chain data."""
-    cycle = validate_cycle_id(cycle)
+    """Read only the matching terminal reason; never persist model-chain data.
+
+    Besides explicit output-length exhaustion, OpenClaw can occasionally end a
+    session with a normal ``stop`` whose final assistant message has no content
+    and zero output tokens.  When the deterministic business post-check also
+    failed, that is an agent terminal failure rather than an unexplained writer
+    miss.  Only the minimal terminal shape is returned; provider/model/message
+    contents are deliberately excluded.
+    """
     agent = _STAGE_AGENTS.get(stage)
     if not agent:
         return None
@@ -117,54 +117,97 @@ def detect_agent_terminal_failure(
     index_path = session_dir / "sessions.json"
     try:
         index = json.loads(index_path.read_text(encoding="utf-8"))
-        lookup_key = f"agent:{agent}:{_stage_session_key(stage, cycle, db_root)}"
+        lookup_key = (
+            f"agent:{agent}:{_stage_session_key(stage, cycle, db_root)}"
+        )
         entry = index.get(lookup_key)
         if not isinstance(entry, dict) or not entry.get("sessionId"):
             return None
-        trajectory = session_dir / f"{entry['sessionId']}.trajectory.jsonl"
+        session_id = str(entry["sessionId"])
+        trajectory = session_dir / f"{session_id}.trajectory.jsonl"
         stop_reason = None
         terminal_error = None
         total_tokens = None
-        with trajectory.open("r", encoding="utf-8", errors="replace") as handle:
+        try:
+            handle = trajectory.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            handle = None
+        if handle is not None:
+            with handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if record.get("type") == "trace.artifacts":
+                        data = record.get("data")
+                        if isinstance(data, dict) and data.get("terminalError"):
+                            terminal_error = str(data["terminalError"])[:160]
+                    for item in _walk_dicts(record.get("data")):
+                        if str(item.get("stopReason") or "").lower() == "length":
+                            stop_reason = "length"
+                            usage = item.get("usage")
+                            if isinstance(usage, dict):
+                                try:
+                                    total_tokens = int(usage.get("totalTokens"))
+                                except (TypeError, ValueError):
+                                    pass
+        if stop_reason == "length":
+            result = {
+                "failure_kind": "model_output_length",
+                "stop_reason": stop_reason,
+            }
+            if terminal_error:
+                result["terminal_error"] = terminal_error
+            if total_tokens is not None:
+                result["total_tokens"] = total_tokens
+            return result
+
+        transcript = session_dir / f"{session_id}.jsonl"
+        last_assistant = None
+        with transcript.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
                     record = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if record.get("type") == "trace.artifacts":
-                    data = record.get("data")
-                    if isinstance(data, dict) and data.get("terminalError"):
-                        terminal_error = str(data["terminalError"])[:160]
-                for item in _walk_dicts(record.get("data")):
-                    if str(item.get("stopReason") or "").lower() == "length":
-                        stop_reason = "length"
-                        usage = item.get("usage")
-                        if isinstance(usage, dict):
-                            try:
-                                total_tokens = int(usage.get("totalTokens"))
-                            except (TypeError, ValueError):
-                                pass
-        if stop_reason != "length":
+                message = record.get("message")
+                if (isinstance(message, dict)
+                        and str(message.get("role") or "").lower() == "assistant"):
+                    last_assistant = message
+        if not isinstance(last_assistant, dict):
             return None
-        result = {
-            "failure_kind": "model_output_length",
-            "stop_reason": stop_reason,
-        }
-        if terminal_error:
-            result["terminal_error"] = terminal_error
-        if total_tokens is not None:
-            result["total_tokens"] = total_tokens
-        return result
+        content = last_assistant.get("content")
+        usage = last_assistant.get("usage")
+        output_tokens = None
+        if isinstance(usage, dict):
+            raw_output = usage.get("output", usage.get("outputTokens"))
+            try:
+                output_tokens = int(raw_output)
+            except (TypeError, ValueError):
+                pass
+        if (str(last_assistant.get("stopReason") or "").lower() == "stop"
+                and isinstance(content, list) and len(content) == 0
+                and output_tokens == 0):
+            return {
+                "failure_kind": "model_empty_output",
+                "stop_reason": "stop",
+                "content_blocks": 0,
+                "output_tokens": 0,
+            }
+        return None
     except (OSError, ValueError, TypeError):
         return None
 
 
-def _status_path(stage: str, cycle: str,
-                 db_root: Path | str | None = None) -> Path:
-    safe_cycle = cycle_status_token(cycle)
+def _status_path(
+    stage: str,
+    cycle: str,
+    db_root: Path | str | None = None,
+) -> Path:
     suffix = _root_namespace(db_root)
     tail = f"-{suffix}" if suffix else ""
-    return STATUS_DIR / f"{_safe(stage)}-{safe_cycle}{tail}.json"
+    return STATUS_DIR / f"{_safe(stage)}-{cycle_status_token(cycle)}{tail}.json"
 
 
 def _write_status(path: Path, payload: dict) -> None:
@@ -200,9 +243,9 @@ def _send_failure_alert(stage: str, cycle: str, rc: int,
     try:
         p = subprocess.run(
             [sys.executable, str(QQ_PUSH), "--content-file", str(alert_file),
-              "--alert",  # 告警走 C2C 私聊，不混进业务播报群（2026-08-04）
-              "--dedupe-key", f"stage-failed:{status_path.stem}",
-              "--db-root", str(Path(db_root or DB_ROOT).resolve())],
+             "--alert",  # 告警走 C2C 私聊，不混进业务播报群（2026-08-04）
+             "--dedupe-key", f"stage-failed:{status_path.stem}",
+             "--db-root", str(Path(db_root or DB_ROOT).resolve())],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60,
             creationflags=_CREATE_NO_WINDOW,
@@ -247,7 +290,6 @@ def verify_business_output(stage: str, cycle: str, mode: str,
     本校验绝不释放 stage_dispatch、补派或重试；异常按 fail-closed 返回。
     unified gate 主动写 skipped/stale 时按合法无交易终态处理。
     """
-    cycle = validate_cycle_id(cycle)
     root = Path(db_root or DB_ROOT)
     checks: list[dict] = []
 
@@ -302,8 +344,6 @@ def verify_business_output(stage: str, cycle: str, mode: str,
             require_trade_terminal("live_trades.db")
         elif stage == "live":
             require_trade_terminal("live_trades.db")
-        elif stage == "demo":
-            require_trade_terminal("demo_trades.db")
         elif stage == "analyst":
             require_analysis_terminal()
         else:
@@ -325,20 +365,22 @@ def verify_business_output(stage: str, cycle: str, mode: str,
         }
 
 
-def _run_post_push_monitor(cycle: str, profile: str,
-                           db_root: Path | None = None) -> dict:
+def _run_post_push_monitor(
+    cycle: str,
+    profile: str,
+    db_root: Path | str | None = None,
+) -> dict:
     """push 后运行指定 profile dry reconciliation；告警由 monitor 自己去重。
 
     该检查永远不改变 push stage 的成功/失败，也不 apply/replay。
     """
-    cycle = validate_cycle_id(cycle)
     if os.environ.get("OKX_POST_PUSH_RECONCILE", "1") == "0":
         return {"skipped": "OKX_POST_PUSH_RECONCILE=0"}
     try:
         proc = subprocess.run(
             [sys.executable, str(LIVE_RECON_MONITOR),
              "--cycle", cycle, "--profile", profile,
-             "--db-root", str(Path(db_root or DB_ROOT))],
+             "--db-root", str(Path(db_root or DB_ROOT).resolve())],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=240, creationflags=_CREATE_NO_WINDOW)
         return {
@@ -429,17 +471,15 @@ def main() -> int:
     if terminal_evidence:
         status["agent_terminal_evidence"] = terminal_evidence
     if rc == 0 and args.stage == "push":
+        # demo 的 post-push dry 对账随 2026-08-06 全量下线移除。
         status["post_live_reconcile"] = _run_post_push_monitor(
             args.cycle, "live", runtime_db_root)
-        status["post_demo_reconcile"] = _run_post_push_monitor(
-            args.cycle, "demo", runtime_db_root)
     _write_status(path, status)
     if rc != 0:
         status["alert"] = _send_failure_alert(
-            args.stage, args.cycle, rc, path, business_check,
-            db_root=runtime_db_root)
+            args.stage, args.cycle, rc, path, business_check, runtime_db_root)
         _write_status(path, status)
-    if args.stage in {"live", "demo"}:
+    if args.stage == "live":
         try:
             status["profile_lease_released"] = ledger.release_profile_lease(
                 runtime_db_root / "ledger.db", args.stage, args.cycle)

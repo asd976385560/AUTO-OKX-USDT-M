@@ -13,16 +13,16 @@ query_state.py — V2.0 数据校验聚合查询
   sqlite3 CLI 路径（C:\\ProgramData\\chocolatey\\bin\\sqlite3.exe）仅留作 ad-hoc 排查。
 
 调用：
-  pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
-      <PROJECT_ROOT>\\scripts\\query_state.py --check all --db-root <PROJECT_ROOT>\\db
-  pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
-      <PROJECT_ROOT>\\scripts\\query_state.py --check regime --db-root <PROJECT_ROOT>\\db --json
+  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ^
+      ./scripts//query_state.py --check all --db-root ./db
+  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ^
+      ./scripts//query_state.py --check regime --db-root ./db --json
 
 参数：
   --check {all|tickers|regime|analysis_macro|news|account|kline|volume_anomaly|degraded|cycle_fresh|playbook|lost_cycles|collection_failures}
          all = 跑全部可用检查
          analysis_macro = 交易侧 regime/DXY 权威（analysis.db.analysis_runs，非 system_state.live_*）
-  --db-root <PROJECT_ROOT>\\db   (硬编码默认)
+  --db-root ./db   (硬编码默认)
   --stale-min 15          (新鲜度阈值分钟；FRESH<10 / STALE 10-15 / STALE+ >15)
   --hh01-only             (regime HH:01 必检；非 HH:01 复制 cross_market 最新行视为合规)
   --json                  (输出 JSON 而非 text，给脚本/parse 用)
@@ -789,7 +789,7 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
     2026-07-23 起 unified live）；
     form②：fast 采集已完成、槽位已过 30 分钟但 stage_dispatch 从未出现 analyst/live。
     两者都会令该 cycle 分析+交易+推送全丢。本检测供 reviewer/巡检
-    FAIL 告警（经 `qq_push.py --alert` 推送至 `OKX_QQ_ALERT_TARGET`）；**不自动 release/refire**（禁 watchdog 红线；V2.0 无任何
+    FAIL 告警（推统一 QQ target）；**不自动 release/refire**（禁 watchdog 红线；V2.0 无任何
     自动兜底派发，过窗槽 dispatcher 仅打 "collection window expired" alert-only WARN，
     永不补派）。dispatched_at 是 UTC+8 空格格式；datetime('now','+8 hours')=CST now。
     回看窗 2026-07-06 由 6h 放宽到 24h：13:30 型静默丢槽在晚间巡检时已出 6h 窗而漏检；

@@ -16,18 +16,6 @@ self_review.py —— Job C 自省与学习脚本（每日一次，独立于 Job
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import re
@@ -122,11 +110,11 @@ def utc_now_iso() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run daily self-review and update lessons.db.")
     parser.add_argument("--date", dest="review_date", help="UTC+8 review date in YYYY-MM-DD, default=yesterday in Asia/Shanghai")
-    parser.add_argument("--db-root", default=_project_path('db'), help=r"DB root, default <PROJECT_ROOT>\db")
+    parser.add_argument("--db-root", default=r"./db", help=r"DB root, default ./db")
     parser.add_argument(
         "--okx-root",
         default=str(Path.home() / ".openclaw" / "workspace" / ".okx"),
-        help=r"Runtime root, default %%USERPROFILE%%\.openclaw\workspace\.okx",
+        help=r"Runtime root, default ~/.openclaw/workspace/.okx",
     )
     return parser.parse_args()
 
@@ -724,7 +712,7 @@ def scan_openclaw_runtime_logs(okx_root: Path, issues: list[dict[str, str]]) -> 
         return
     scan_started_ts = datetime.now().timestamp()
     since = scan_started_ts - 24 * 3600
-    include_markers = ("OKX-JobA", "OKX-JobB", "OKX-JobC", "OKX-JobE", _project_path(), _project_path())
+    include_markers = ("OKX-JobA", "OKX-JobB", "OKX-JobC", "OKX-JobE", r".", r".")
     error_markers = (
         "edit failed", "oldtext must match", "could not find edits", "could not find the exact text",
         "file not found", "no such file", "permission denied", "command not found", "can't open file",
@@ -1093,7 +1081,7 @@ def run_review(review_day: date, db_root: Path, okx_root: Path) -> dict[str, obj
             "source": "decision_card_v1",
             "scanned": 0,
             "written": 0,
-            "would_hit_1R": 0,
+            "would_hit_1r_fixed2pct": 0,
         },
         "weekly": None,
         "buckets": {"retired": True},

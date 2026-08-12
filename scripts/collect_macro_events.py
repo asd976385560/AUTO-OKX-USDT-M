@@ -2,25 +2,13 @@
 """采集未来7天高重要度经济日历，写 regime.db.macro_events。"""
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, r"./collectors")
 import ledger  # noqa: E402
 
 from _okxcli import okx_json
@@ -37,7 +25,7 @@ def fmt_ms(value) -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="未来高重要度经济日历采集")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--importance", type=int, default=3)
     args = ap.parse_args()
