@@ -45,6 +45,9 @@ All notable public-release changes are recorded here. Public versions follow
 - Release validation preserves the authoritative remote annotated tag in an
   isolated Git ref, and an explicit retry path can republish an existing
   immutable tag without creating, moving, or deleting it.
+- Declared the NumPy and pandas dependencies required by the published
+  multitimeframe diagnostics, and isolated the persistent-dispatch latch test
+  from CI's global trigger dry-run guard.
 
 ### Security
 

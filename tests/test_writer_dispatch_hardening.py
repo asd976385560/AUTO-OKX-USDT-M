@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -923,7 +924,12 @@ class DispatcherHardeningTests(unittest.TestCase):
         # analysis 已过 max_age：trader 不会被追起，只剩 push 闸可评估
         now = datetime(2026, 7, 29, 12, 40, tzinfo=CST)
         analysis = {"mode": "full", "status": "ok", "ts": "2026-07-29 12:01:00"}
-        with tempfile.TemporaryDirectory() as tmp:
+        # CI keeps trigger dry-run enabled globally for safety.  This test
+        # specifically verifies the persistent stage latch, so exercise the
+        # non-dry-run dispatcher with an injected fire function and temp DBs.
+        with mock.patch.dict(
+                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
+                tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ledger_path = root / "ledger.db"
             dispatcher.ledger.init_ledger(ledger_path)
