@@ -112,35 +112,45 @@ class LivePortfolioMarginCapTests(unittest.TestCase):
         kwargs.update(overrides)
         return rv.validate(**kwargs)
 
-    def test_incremental_order_imr_above_20pct_is_allowed_below_portfolio_cap(self):
+    def test_incremental_order_imr_above_15pct_is_clamped_below_portfolio_cap(self):
+        # 2026-08-08 契约反转：本测试原名 *_above_20pct_is_allowed_*，断言
+        # 「单笔 >20% 只要组合 ≤66.6% 就放行」——SNDK 单笔 60% 净值事故后，
+        # 单笔增量保证金 >15% 改为按 lotSz 缩量（定仓预算 14.7%）。
         result = self._live_validate(
             intended_sz=25.0,
             account_imr=100.0,
         )
 
         self.assertTrue(result["approved"])
-        self.assertEqual(result["approved_sz"], 25.0)
-        self.assertFalse(result["clamped"])
+        self.assertEqual(result["approved_sz"], 7.0)
+        self.assertTrue(result["clamped"])
+        self.assertTrue(
+            any("单笔保证金上限" in a for a in result["adjustments"]))
         math_box = result["math"]
-        self.assertEqual(math_box["incremental_order_imr"], 500.0)
-        self.assertGreater(
-            math_box["incremental_order_imr"] / math_box["equity"], 0.20)
-        self.assertEqual(math_box["projected_account_imr"], 600.0)
+        self.assertEqual(math_box["max_sz_single_order"], 7.0)
+        self.assertEqual(math_box["incremental_order_imr"], 140.0)
+        self.assertLessEqual(
+            math_box["single_order_imr_ratio"],
+            rv.MAX_SINGLE_ORDER_IMR_RATIO)
+        self.assertEqual(math_box["projected_account_imr"], 240.0)
         self.assertAlmostEqual(
-            math_box["projected_portfolio_imr_ratio"], 0.60)
+            math_box["projected_portfolio_imr_ratio"], 0.24)
         self.assertEqual(
             math_box["max_portfolio_imr_ratio"],
             rv.MAX_PORTFOLIO_IMR_RATIO,
         )
 
     def test_exactly_66_6pct_is_allowed(self):
+        # 2026-08-08 构造调整：改用 7 张（增量 140 = 单笔预算内）+ 更高存量 IMR
+        # 逼出精确 66.6% 边界；原 10 张构造会先撞单笔闸，测不到组合边界语义。
         result = self._live_validate(
-            intended_sz=10.0,
-            account_imr=466.0,
+            intended_sz=7.0,
+            account_imr=526.0,
         )
 
         self.assertTrue(result["approved"])
-        self.assertEqual(result["approved_sz"], 10.0)
+        self.assertEqual(result["approved_sz"], 7.0)
+        self.assertFalse(result["clamped"])
         self.assertEqual(result["math"]["projected_account_imr"], 666.0)
         self.assertAlmostEqual(
             result["math"]["projected_portfolio_imr_ratio"], 0.666)
@@ -150,9 +160,10 @@ class LivePortfolioMarginCapTests(unittest.TestCase):
             result["math"]["portfolio_imr_source"], "account.balance.imr")
 
     def test_above_66_6pct_rejects_the_whole_order_without_clamp(self):
+        # 2026-08-08 构造调整：同上改 7 张 + 存量 526.1，保持越界 0.6661 不变。
         result = self._live_validate(
-            intended_sz=10.0,
-            account_imr=466.1,
+            intended_sz=7.0,
+            account_imr=526.1,
         )
 
         self.assertFalse(result["approved"])
@@ -160,7 +171,7 @@ class LivePortfolioMarginCapTests(unittest.TestCase):
         self.assertFalse(result["clamped"])
         self.assertEqual(
             result["reject_reason"], "portfolio_margin_cap_exceeded")
-        self.assertEqual(result["math"]["incremental_order_imr"], 200.0)
+        self.assertEqual(result["math"]["incremental_order_imr"], 140.0)
         self.assertAlmostEqual(
             result["math"]["projected_portfolio_imr_ratio"], 0.6661)
         self.assertEqual(result["adjustments"], [])
@@ -210,34 +221,9 @@ class LivePortfolioMarginCapTests(unittest.TestCase):
                 self.assertEqual(result["reject_reason"], expected_reason)
                 self.assertIsNone(result["approved_sz"])
 
-    def test_demo_ignores_imr_and_keeps_exchange_max_size_policy(self):
-        result = rv.validate(
-            symbol="BTC-USDT-SWAP",
-            side="long",
-            intended_sz=20.0,
-            lev=5.0,
-            mark_px=100.0,
-            ct_val=1.0,
-            lot_sz=0.1,
-            equity=1.0,
-            available_margin=-1.0,
-            account_imr=math.inf,
-            open_positions=[],
-            sl_trigger_px=95.0,
-            profile="demo",
-            exchange_max_size=12.34,
-            min_order_size=0.1,
-        )
-
-        self.assertTrue(result["approved"])
-        self.assertTrue(result["clamped"])
-        self.assertEqual(result["approved_sz"], 12.3)
-        self.assertEqual(
-            result["math"]["sizing_policy"], "okx_demo_max_size_only")
-        self.assertEqual(result["math"]["max_sz_exchange"], 12.3)
-        self.assertEqual(
-            result["math"]["account_imr_observation_only"], math.inf)
-        self.assertIsNone(result["math"]["account_imr"])
+    # `test_demo_ignores_imr_and_keeps_exchange_max_size_policy` 随 2026-08-06
+    # demo 全量下线删除：它断言的 `sizing_policy=okx_demo_max_size_only` 分支
+    # （绕过 IMR 闸、只按交易所 max-size 收敛）在 risk_validator 中已整块移除。
 
     def test_add_uses_existing_leverage_for_incremental_imr(self):
         result = self._live_validate(

@@ -11,22 +11,10 @@
 发现漂移只报告，修复一律经人工确认后重新导出；本脚本零写入。
 
 用法：
-  run_okx_python.ps1 scripts/schema_drift_check.py [--db-root <PROJECT_ROOT>/db] [--schema <PROJECT_ROOT>/db/schema.sql]
+  run_okx_python.ps1 scripts/schema_drift_check.py [--db-root ./db] [--schema ./db/schema.sql]
 退出码：0=一致；1=有漂移；2=输入或 schema 解析错误。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import re
@@ -47,7 +35,6 @@ DBS = (
     "regime.db",
     "analysis.db",
     "live_trades.db",
-    "demo_trades.db",
     "ledger.db",
     "qq_push_dedupe.db",
 )
@@ -248,8 +235,8 @@ def collect_drifts(declared: SchemaMap, live: SchemaMap) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="schema drift check (read-only)")
-    ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--schema", default=_project_path('db', 'schema.sql'))
+    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--schema", default=r"./db/schema.sql")
     args = ap.parse_args(argv)
     schema_path = Path(args.schema)
     db_root = Path(args.db_root)

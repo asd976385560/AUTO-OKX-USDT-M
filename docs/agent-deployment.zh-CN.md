@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-agent-deployment
-last-updated: 2026-07-29
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Align public Agent deployment with the latest stage supervision and dry-run contracts.
+change-summary: Align public deployment with the live-only runtime and consolidated collection runner.
 -->
 
 # Agent 与 OpenClaw 部署指南
@@ -18,7 +18,7 @@ change-summary: Align public Agent deployment with the latest stage supervision 
 
 公开仓库提供：
 
-- 5 个 Agent 的角色规则；
+- 4 个 Agent 的角色规则；
 - 每个 Agent 的 `IDENTITY.md` 与 `SOUL.md`；
 - 公开调度表达式；
 - dry-run 和隔离验证方法；
@@ -39,7 +39,6 @@ change-summary: Align public Agent deployment with the latest stage supervision 
 |---|---|---|---|
 | `okx-analyst` | `agents/analyst.md` | `agents/personas/analyst/` | 手工回滚 |
 | `okx-live-trader` | `agents/live_trader.md` | `agents/personas/live_trader/` | dispatcher |
-| `okx-demo-trader` | `agents/demo_trader.md` | `agents/personas/demo_trader/` | dispatcher |
 | `okx-news-scout` | `agents/news_scout.md` | `agents/personas/news_scout/` | 独立 cron，可选 |
 | `okx-reviewer` | `agents/reviewer.md` | `agents/personas/reviewer/` | 日频 cron |
 
@@ -69,7 +68,6 @@ $openclawRoot = Join-Path $HOME '.openclaw'
 $workspaces = @{
   'okx-analyst'     = Join-Path $openclawRoot 'workspace-okx-analyst'
   'okx-live-trader' = Join-Path $openclawRoot 'workspace-okx-live-trader'
-  'okx-demo-trader' = Join-Path $openclawRoot 'workspace-okx-demo-trader'
   'okx-news-scout'  = Join-Path $openclawRoot 'workspace-okx-news-scout'
   'okx-reviewer'    = Join-Path $openclawRoot 'workspace-okx-reviewer'
 }
@@ -81,7 +79,7 @@ foreach ($entry in $workspaces.GetEnumerator()) {
 openclaw agents list --bindings
 ```
 
-不要让多个交易 Agent 共用同一个 workspace。角色规则、记忆和工具边界必须隔离。
+不要让不同 Agent 共用同一个 workspace。角色规则、记忆和工具边界必须隔离。
 
 ## 5. 安装角色文件
 
@@ -91,7 +89,6 @@ openclaw agents list --bindings
 $roles = @{
   'okx-analyst'     = 'analyst'
   'okx-live-trader' = 'live_trader'
-  'okx-demo-trader' = 'demo_trader'
   'okx-news-scout'  = 'news_scout'
   'okx-reviewer'    = 'reviewer'
 }
@@ -125,7 +122,6 @@ foreach ($agentId in $roles.Keys) {
 |---|---|
 | analyst | 只读数据库、报告写入适配器 |
 | live trader | 只读证据、决策卡、受控 order executor/writer |
-| demo trader | 只读证据、demo executor/writer |
 | news scout | 配置的新闻检索、`news_writer` |
 | reviewer | 只读报告、复盘 writer；默认禁止交易执行 |
 
@@ -149,22 +145,22 @@ python scripts/check_trader_docs_sync.py
 以下命令使用占位符，必须逐一替换。`--no-dispatch` 只是源码保留的无副作用兼容参数，因此示例不依赖它；隔离由 `--dry-collect`、`OKX_TRIGGER_DRYRUN=1` 和独立数据库共同保证。
 
 ```powershell
-openclaw cron create '0,15,30,45 * * * *' `
-  --name 'okx-fast-collect' `
-  --command-argv '["<PYTHON_BIN>","<PROJECT_ROOT>/collectors/fast_collect.py","--db-root","<ISOLATED_DB_ROOT>","--dry-collect"]' `
+openclaw cron create '0 * * * *' `
+  --name 'okx-collect-hourly' `
+  --command-argv '["<PYTHON_BIN>","<PROJECT_ROOT>/collectors/collect_cycle.py","--tier","hourly","--db-root","<ISOLATED_DB_ROOT>","--dry-collect"]' `
   --command-env 'OKX_ROOT=<PROJECT_ROOT>' `
   --command-env 'OKX_DB_ROOT=<ISOLATED_DB_ROOT>' `
   --command-env 'OKX_TRIGGER_DRYRUN=1' `
-  --timeout-seconds 240 `
+  --timeout-seconds 1200 `
   --no-deliver
 
-openclaw cron create '2 * * * *' `
-  --name 'okx-slow-collect' `
-  --command-argv '["<PYTHON_BIN>","<PROJECT_ROOT>/collectors/slow_collect.py","--db-root","<ISOLATED_DB_ROOT>","--dry-collect"]' `
+openclaw cron create '15,30,45 * * * *' `
+  --name 'okx-collect-quarter' `
+  --command-argv '["<PYTHON_BIN>","<PROJECT_ROOT>/collectors/collect_cycle.py","--tier","quarter","--db-root","<ISOLATED_DB_ROOT>","--dry-collect"]' `
   --command-env 'OKX_ROOT=<PROJECT_ROOT>' `
   --command-env 'OKX_DB_ROOT=<ISOLATED_DB_ROOT>' `
   --command-env 'OKX_TRIGGER_DRYRUN=1' `
-  --timeout-seconds 600 `
+  --timeout-seconds 900 `
   --no-deliver
 
 openclaw cron create '*/2 * * * *' `
@@ -177,15 +173,9 @@ openclaw cron create '*/2 * * * *' `
   --no-deliver
 ```
 
-`news_collect.py` 在不带 `--apply` 时不会写运行数据库，但仍会向启用的数据源发起网络请求。因此，下面的 registry news job 只应在出站网络已单独获批后创建：
-
-```powershell
-openclaw cron create '3,18,33,48 * * * *' `
-  --name 'okx-registry-news' `
-  --command-argv '["<PYTHON_BIN>","<PROJECT_ROOT>/collectors/sources/news_collect.py","--db-root","<ISOLATED_DB_ROOT>"]' `
-  --timeout-seconds 180 `
-  --no-deliver
-```
+`collect_cycle.py --dry-collect` 会跳过没有 dry-run 模式的 registry news 步骤；真实
+news 网络采集包含在 hourly/quarter 聚合 runner 中，只有在出站网络和数据库写入分别
+获批后才能移除 `--dry-collect`。
 
 创建命令默认会返回 job ID。不要把 ID 写回仓库。
 
@@ -194,7 +184,7 @@ openclaw cron create '3,18,33,48 * * * *' `
 只有在 Agent 模型、工具白名单和 workspace 完成核验后，才能创建：
 
 ```powershell
-openclaw cron create '5,20,35,50 * * * *' `
+openclaw cron create '10,25,40,55 * * * *' `
   'Run one news-scout collection cycle. Follow AGENTS.md and keep structured output only.' `
   --name 'okx-news-scout' `
   --session isolated `
@@ -212,7 +202,7 @@ openclaw cron create '5 8 * * *' `
   --no-deliver
 ```
 
-live trader 和 demo trader 由 dispatcher 根据 `stage_dispatch` 状态起棒，不应再创建独立固定周期 cron。analyst 仅用于人工回滚。
+live trader 由 dispatcher 根据 `stage_dispatch` 状态起棒，不应再创建独立固定周期 cron。analyst 仅用于人工回滚。
 
 `scripts/daily_maintenance.py` 包含会写运行数据或访问外部服务的步骤，不提供一键启用示例。它必须在隔离验证完成后，经维护者单独批准再创建。
 
@@ -241,7 +231,7 @@ openclaw cron runs --id <CRON_JOB_ID> --limit 10
 1. 独立安全审查通过；
 2. 隔离数据库验证通过；
 3. Agent 工具白名单已核对；
-4. OKX demo 环境验证完成；
+4. 隔离数据库的非交易 dry-run 验证完成；
 5. 维护者明确批准外部调用；
 6. 生产凭证仍位于仓库外；
 7. 每个 cron 都有已记录的禁用和回滚方式。

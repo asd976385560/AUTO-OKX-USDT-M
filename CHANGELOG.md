@@ -5,11 +5,58 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-12
+
+### Added
+
+- Synchronized the sanitized public tree with the current live-only runtime,
+  including consolidated hourly and quarter-hour collection runners, per-step
+  collection evidence, and the unified Live-to-Push dispatch chain.
+- Added exact closed-bar 15m/1H/4H decision evidence, independent writer and
+  executor revalidation, actor attestation, asset-class and instrument context,
+  EV calculations, news time layers, and versioned experience contracts.
+- Added source-health, report-completeness, positioning, multitimeframe,
+  contract-statistics, and model-shadow audit tools, plus a 17-item Push report
+  contract and hardened periodic-report validation.
+
+### Changed
+
+- Retired Demo execution, its Agent role, database initialization target, and
+  automatic dispatch path. Trading entry points now accept only `profile=live`
+  and fail closed for every other profile.
+- Consolidated the former independent fast, slow, and registry-news schedules
+  into deterministic aggregate runners while preserving source-level failure
+  isolation and read-only dry-run support.
+- Updated all public role manuals, deployment guides, templates, lifecycle
+  metadata, schema exports, and bilingual system documentation to match the
+  current runtime and portable project-root contract.
+
 ### Fixed
 
-- Release validation now preserves the authoritative remote annotated tag in an
-  isolated Git ref, and an explicit retry path can republish an existing immutable
-  tag without creating, moving or deleting that tag.
+- Added a 15% equity cap for incremental order IMR, a 5% equity cap for
+  stop-loss risk, finite-number validation, and post-fill audits so NaN, infinity,
+  oversized orders, or inconsistent risk evidence cannot reach exchange I/O.
+- Namespaced session, status, deduplication, journal, and Push artifacts by the
+  selected database root; invalid cycle identifiers and real Agent launches
+  against non-default roots now fail before creating runtime artifacts.
+- Bound analyst, trade, collection-monitor, reconciliation, and Push reads to
+  the explicitly selected root, preventing isolated validation from falling
+  back to canonical runtime databases.
+- Release validation preserves the authoritative remote annotated tag in an
+  isolated Git ref, and an explicit retry path can republish an existing
+  immutable tag without creating, moving, or deleting it.
+
+### Security
+
+- Public ledger autoheal is permanently report-only. Direct write flags and
+  legacy write environment settings return a structured non-zero refusal and
+  never modify a trade ledger, repair queue, or exchange order.
+- Published migrations default to read-only inspection and require explicit
+  apply authorization plus a verified SQLite online backup before any target
+  write; failed preflight leaves every target unchanged.
+- Removed host-specific paths, credentials, routing identifiers, runtime data,
+  private exchange-auth helpers, real-order microtests, account-history tools,
+  OpenClaw host baselines, and incident-repair utilities from the public tree.
 
 ## [1.0.0] - 2026-08-04
 
@@ -44,5 +91,6 @@ All notable public-release changes are recorded here. Public versions follow
 - CI now scans the complete candidate tree for concrete delivery routes, private
   host paths and runtime artifacts without echoing matched values.
 
-[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.0
 [1.0.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.0.0

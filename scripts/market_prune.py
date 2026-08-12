@@ -22,25 +22,13 @@ VACUUM（主人停 fast_collect → VACUUM → 拉起）可回收初值 ~150MB�
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sqlite3
 import sys
 from pathlib import Path
 
-sys.path.insert(0, _project_path('scripts'))
+sys.path.insert(0, r"./scripts")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -121,7 +109,7 @@ def incremental_reclaim(con: sqlite3.Connection,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="market.db 保留裁剪（CLI 只 dry-run，守单 writer）")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()

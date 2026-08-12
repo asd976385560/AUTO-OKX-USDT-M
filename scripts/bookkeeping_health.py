@@ -17,18 +17,6 @@
 
 退出码：0=健康；1=断链/异常告警。
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import os
 import sys
@@ -129,7 +117,7 @@ def main():
     # 不在本检查器内自动重置会话或重跑外发。
     try:
         import os as _os
-        rep_dir = _project_path('reports', 'agents')
+        rep_dir = r"./reports/agents"
         files = sorted(
             (f for f in _os.listdir(rep_dir)
              if f.startswith("v2-push-2") and f.endswith(".md")),

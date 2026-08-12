@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-public-example
-last-updated: 2026-08-04
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Add separate alert routing and explicit ledger-autoheal write opt-ins while keeping all defaults inert.
+change-summary: Document separated delivery routes and the permanently read-only public ledger-autoheal boundary.
 -->
 
 # V2.0 本地配置示例
@@ -91,13 +91,7 @@ $env:OKX_TRIGGER_DRYRUN = '1'
 非默认 `OKX_DB_ROOT` 只用于确定性脚本与上述 dry-run。公开触发器会拒绝在非默认
 root 上真实启动 Gateway Agent，避免远端工具进程回落到 `<PROJECT_ROOT>/db`。
 
-Live 账本 autoheal 永久只读；下列开关只允许 Demo 写入。只有在隔离 Demo 数据库完成
-dry-run 和备份验证后，才分别启用：
-
-```powershell
-$env:OKX_LEDGER_AUTOHEAL_APPLY = '1'          # 仅 Demo：允许精确 GHOST close 补账
-$env:OKX_LEDGER_AUTOHEAL_UNRECORDED = '1'     # 仅 Demo：允许 intent+ordId 一致且已确认同侧足量止损的精确 UNRECORDED open 补账
-```
-
-第二个开关单独设置不生效。Live 修复只能走 unique ordId、写前已验证备份、逐笔 apply
-和写后现仓/reconciliation/invariants 复核的人工流程。自愈只写账本，不下单或重放订单。
+公开版账本 autoheal 永久只读。不要设置历史写开关；即使传入 `--apply` 或旧环境变量，
+入口也只会完成只读分类、返回非零结构化阻断，并保持交易库与 repair queue 不变。
+人工修复必须另行审查，并使用 unique ordId、写前验证备份、逐笔 apply 和写后
+现仓/reconciliation/invariants 复核。任何恢复流程都不得下单或重放订单。

@@ -12,18 +12,6 @@ okx_news、mx_search、geo_political 均在本链通过各自 adapter 经 news_w
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[2]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import importlib
 import json
@@ -44,6 +32,22 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 SKIP_ADAPTERS = {"EXTERNAL_SCOUT"}
+
+
+def _source_result_status(res: dict, fetched: int) -> str:
+    """Classify a source without hiding partial adapter failures.
+
+    A successful request with zero natural events is ``ok``: no-event is a
+    valid news state, while freshness is checked separately.  An adapter-level
+    ``err``/``error`` makes a partially successful multi-feed result
+    ``degraded`` instead of ``ok``.  Child RSS outcomes retain their own
+    ok/failed ledger rows.
+    """
+    if not res.get("ok"):
+        return "failed"
+    if res.get("err") or res.get("error"):
+        return "degraded"
+    return "ok"
 
 
 def _load_adapter(name: str):
@@ -106,8 +110,7 @@ def collect_all(db_root: str, apply: bool = False,
             inserted = res.get("inserted") if apply else None
             total_fetched += fetched
             total_inserted += int(inserted or 0)
-            status = "ok" if (res.get("ok") and fetched > 0) else (
-                "degraded" if res.get("ok") else "failed")
+            status = _source_result_status(res, fetched)
             # 可观测性（2026-07-06）：adapter 返回的失败简因（HTTP 码/超时，见
             # news_panews.collect 的 err 键；news_writer 失败的 error 键）随账本
             # err 列必须落库，便于区分限流、网络和解析失败。
@@ -123,6 +126,21 @@ def collect_all(db_root: str, apply: bool = False,
                     ledger_db, cycle_id, sid, status,
                     rows=(inserted if inserted is not None else fetched),
                     latency_ms=dur_ms, err=err_txt)
+                # Multi-feed adapters expose child outcomes so a healthy peer
+                # can no longer conceal one failing publisher.  These rows are
+                # observability only; they do not alter freshness gates.
+                for child in res.get("subsources") or []:
+                    child_id = str(child.get("id") or "").strip()
+                    child_status = str(child.get("status") or "failed")
+                    if not child_id or child_id == sid:
+                        continue
+                    child_err = child.get("err")
+                    ledger.record_collection(
+                        ledger_db, cycle_id, child_id, child_status,
+                        rows=int(child.get("fetched") or 0),
+                        latency_ms=dur_ms,
+                        err=(str(child_err)[:150] if child_err else None),
+                    )
         except Exception as e:  # noqa: BLE001 —— 失败隔离
             dur_ms = int((time.time() - t0) * 1000)
             results.append({"id": sid, "adapter": adapter, "status": "failed",
@@ -141,7 +159,7 @@ def collect_all(db_root: str, apply: bool = False,
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="V2.0 registry 驱动新闻采集（迭代 enabled type=news 源）")
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--apply", action="store_true", help="真写（默认 dry-run）")
     ap.add_argument("--registry", default=None)
     args = ap.parse_args()

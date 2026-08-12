@@ -143,7 +143,7 @@ def nudge_from_collector(origin: str, db_root, statuses, dry_collect: bool = Fal
 
     在 nudge() 四道守护闸之外加三道采集侧门（缺一即误拍）：
       a. dry_collect 假 ok 行不发（--dry-collect 只验 plumbing，账本行不代表真采集）；
-      b. 仅生产 db-root 发——nudge spawn 的 dispatcher 硬编码打 <PROJECT_ROOT>\\db，隔离/tmp
+      b. 仅生产 db-root 发——nudge spawn 的 dispatcher 硬编码打 ./db，隔离/tmp
          db-root 的采集落账若外拍会对生产库跑真 tick（幂等无害但破坏隔离语义）；
       c. 至少一个源 status ∈ ok|degraded 才发（error/timeout 轮 gate 必拒，白拍）。
     与 nudge() 同约：永不 raise、永不写 stdout、不改调用方退出码。

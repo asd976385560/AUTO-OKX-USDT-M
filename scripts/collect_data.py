@@ -84,18 +84,6 @@ collect_data.py —— Job A 数据采集（每 15 分钟由 cron 调用）。
 
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 
 
 
@@ -118,6 +106,8 @@ import sqlite3
 
 
 import sys
+
+import time
 
 
 
@@ -157,6 +147,7 @@ from _okx_http import (
     fetch_open_interest_all_sync,
 
 )
+from asset_class_sync import sync_asset_classes
 
 
 
@@ -186,7 +177,7 @@ from _okx_http import (
 
 
 
-def _fetch_all_swap_symbols(cli_global_args: list[str]) -> list[str]:
+def _fetch_all_swap_instruments(cli_global_args: list[str]) -> list[dict]:
 
 
 
@@ -202,39 +193,22 @@ def _fetch_all_swap_symbols(cli_global_args: list[str]) -> list[str]:
 
 
 
-    symbols = [
-
-
-
-        inst["instId"]
-
-
-
-        for inst in all_instruments
-
-
-
+    return [
+        inst for inst in all_instruments
         if inst.get("instType") == "SWAP"
-
-
-
         and inst.get("settleCcy") == "USDT"
-
-
-
         and inst.get("ctType") == "linear"
-
-
-
         and inst.get("state") == "live"
-
-
-
+        and inst.get("instId")
     ]
 
 
-
-    return symbols
+def _fetch_all_swap_symbols(cli_global_args: list[str]) -> list[str]:
+    """Compatibility wrapper for callers that only need instrument IDs."""
+    return [
+        str(inst["instId"])
+        for inst in _fetch_all_swap_instruments(cli_global_args)
+    ]
 
 
 
@@ -260,7 +234,7 @@ COIN_TO_SYMBOL: dict[str, str] = {}
 
 
 
-DEFAULT_DB_ROOT = Path(_project_path('db'))
+DEFAULT_DB_ROOT = Path(r"./db")
 
 
 
@@ -398,58 +372,6 @@ def state_symbol_key(symbol: str) -> str:
 
 
     return symbol.lower().replace("-swap", "").replace("-", "_")
-
-
-
-
-
-
-
-
-
-
-
-def build_cli_global_args(profile: str, demo: bool) -> list[str]:
-
-
-
-    flags: list[str] = []
-
-
-
-    if profile:
-
-
-
-        flags.extend(["--profile", profile])
-
-
-
-    if demo:
-
-
-
-        flags.append("--demo")
-
-
-
-    return flags
-
-
-
-
-
-
-
-
-
-
-
-def build_public_cli_global_args(demo: bool) -> list[str]:
-
-
-
-    return ["--live"] if demo else []
 
 
 
@@ -805,13 +727,22 @@ def compute_indicators(candles: list[dict]) -> list[dict]:
 
 
 
-def collect_tickers(market_con: sqlite3.Connection, ts: str) -> tuple[int, dict[str, dict]]:
+def collect_tickers(
+    market_con: sqlite3.Connection,
+    ts: str,
+    batch_timeout_s: float = 135.0,
+) -> tuple[int, dict[str, dict], dict[str, int | float]]:
 
 
 
     # ── Batch HTTP (fast): tickers + funding rates ──────────────────────────
 
-    all_tickers_raw = fetch_tickers_all_sync()
+    deadline = time.monotonic() + max(1.0, float(batch_timeout_s))
+
+    def remaining() -> float:
+        return max(0.1, deadline - time.monotonic())
+
+    all_tickers_raw = fetch_tickers_all_sync(remaining())
 
 
 
@@ -823,11 +754,18 @@ def collect_tickers(market_con: sqlite3.Connection, ts: str) -> tuple[int, dict[
 
     # Funding rates: HTTP batch concurrent (was 292 CLI subprocess calls)
 
-    funding_map: dict[str, dict] = fetch_funding_rates_batch_sync(SYMBOLS)
+    funding_map: dict[str, dict] = fetch_funding_rates_batch_sync(
+        SYMBOLS,
+        batch_timeout_s=remaining(),
+    )
 
     # OI：公共端点支持 instType=SWAP 一次取全量，供分析观察 OI 24h 变化。
+    official_instruments: list[dict] = []
     try:
-        oi_map: dict[str, dict] = fetch_open_interest_all_sync("SWAP")
+        oi_map: dict[str, dict] = fetch_open_interest_all_sync(
+            "SWAP",
+            request_timeout_s=remaining(),
+        )
     except Exception as oi_exc:  # 单项失败不阻断 tick/funding 主采集
         oi_map = {}
         print(f"[collect_data] OI degraded: {oi_exc}", file=sys.stderr)
@@ -859,57 +797,38 @@ def collect_tickers(market_con: sqlite3.Connection, ts: str) -> tuple[int, dict[
 
             chg24h = (last_px - open_24h) / open_24h * 100.0
 
-        tick_rows.append(
-
-            (
-
-                ts,
-
-                symbol,
-
-                last_px,
-
-                to_float(ticker.get("bidPx")),
-
-                to_float(ticker.get("askPx")),
-
-                to_float(ticker.get("vol24h")),
-
-                to_float(funding.get("fundingRate")),
-
-                to_float(oi_row.get("oi")),
-
-                chg24h,
-
+        funding_rate = to_float(funding.get("fundingRate"))
+        oi_value = to_float(oi_row.get("oi"))
+        if last_px is not None and last_px > 0:
+            tick_rows.append(
+                (
+                    ts,
+                    symbol,
+                    last_px,
+                    to_float(ticker.get("bidPx")),
+                    to_float(ticker.get("askPx")),
+                    to_float(ticker.get("vol24h")),
+                    funding_rate,
+                    oi_value,
+                    chg24h,
+                )
             )
-
-        )
-
-        derivative_rows.append(
-
-            (
-
-                ts,
-
-                symbol,
-
-                to_float(funding.get("fundingRate")),
-
-                ms_to_iso(funding.get("fundingTime")),
-
-                ms_to_iso(funding.get("nextFundingTime")),
-
-                to_float(funding.get("premium")),
-
-                to_float(oi_row.get("oi")),
-
-                to_float(oi_row.get("oiCcy")),
-
-                to_float(oi_row.get("oiUsd")),
-
+        # 不把全空占位行写成“本轮新衍生品快照”；否则一次批次超时会把
+        # 最新值整体顶成 NULL，后续分析难以区分“真实 0”与“未采到”。
+        if funding_rate is not None or oi_value is not None:
+            derivative_rows.append(
+                (
+                    ts,
+                    symbol,
+                    funding_rate,
+                    ms_to_iso(funding.get("fundingTime")),
+                    ms_to_iso(funding.get("nextFundingTime")),
+                    to_float(funding.get("premium")),
+                    oi_value,
+                    to_float(oi_row.get("oiCcy")),
+                    to_float(oi_row.get("oiUsd")),
+                )
             )
-
-        )
 
         snapshot[symbol] = {
 
@@ -955,7 +874,20 @@ def collect_tickers(market_con: sqlite3.Connection, ts: str) -> tuple[int, dict[
 
     market_con.commit()
 
-    return len(tick_rows), snapshot
+    expected = len(SYMBOLS)
+    quality = {
+        "expected": expected,
+        "tickers": len(tick_rows),
+        "funding": sum(
+            1 for value in snapshot.values()
+            if value.get("fundingRate") is not None
+        ),
+        "open_interest": sum(
+            1 for value in snapshot.values()
+            if value.get("oiUsd") is not None
+        ),
+    }
+    return len(tick_rows), snapshot, quality
 
 
 
@@ -1304,7 +1236,7 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
         from _regime_read import latest_cross_market as _lcm
         _main = next((r[2] for r in market_con.execute("PRAGMA database_list").fetchall()
                       if r[1] == "main"), None)
-        _db_root = _os.path.dirname(_main) if _main else _project_path('db')
+        _db_root = _os.path.dirname(_main) if _main else r"./db"
         row = _lcm(_db_root)
     except Exception:
         row = None
@@ -1482,13 +1414,30 @@ def main() -> int:
 
 
 
-    parser.add_argument("--demo", action="store_true", help="通过 OKX CLI 的全局 demo 参数采集账户与市场数据")
+    # 兼容解析后硬拒绝，给旧 cron/人工命令明确错误；绝不把 --demo 映射成 --live。
+    parser.add_argument("--demo", action="store_true", help=argparse.SUPPRESS)
 
 
 
     parser.add_argument("--skip-news", action="store_true", help=argparse.SUPPRESS)
 
+    parser.add_argument(
+        "--http-batch-timeout",
+        type=float,
+        default=135.0,
+        help=(
+            "快采公共行情批次内部截止秒数；默认 135，须早于 fast_collect "
+            "外层 175 秒超时"
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.demo:
+        parser.error(
+            "--demo 已于 2026-08-06 下线；collect_data 只采公共市场事实，"
+            "禁止以 demo 标签写入生产 market.db"
+        )
 
 
 
@@ -1508,7 +1457,7 @@ def main() -> int:
 
 
 
-    public_cli_global_args = build_public_cli_global_args(args.demo)
+    public_cli_global_args: list[str] = []
 
 
 
@@ -1532,11 +1481,12 @@ def main() -> int:
 
 
 
-        fetched = _fetch_all_swap_symbols(public_cli_global_args)
+        official_instruments = _fetch_all_swap_instruments(
+            public_cli_global_args)
 
 
 
-        SYMBOLS = sorted(fetched)
+        SYMBOLS = sorted(str(inst["instId"]) for inst in official_instruments)
 
 
 
@@ -1572,7 +1522,12 @@ def main() -> int:
 
 
 
-    summary = {"profile": args.profile, "demo": args.demo, "ts_start": ts_start, "symbols_count": len(SYMBOLS), "wrote": {}}
+    summary = {
+        "profile": args.profile,
+        "ts_start": ts_start,
+        "symbols_count": len(SYMBOLS),
+        "wrote": {},
+    }
 
 
 
@@ -1599,6 +1554,45 @@ def main() -> int:
 
         market_con = open_db(db_root, "market.db")
 
+        # OKX official ``instCategory`` is the authority for broad asset type.
+        # The existing market writer only fills/corrects non-manual rows; manual
+        # decisions remain immutable.  This closes new-listing gaps without a
+        # second database writer or an out-of-band repair job.
+        try:
+            asset_sync = sync_asset_classes(
+                market_con, official_instruments, apply=True)
+            summary["asset_class_sync"] = {
+                key: asset_sync[key]
+                for key in (
+                    "official_instruments",
+                    "insert_count",
+                    "update_count",
+                    "unchanged_count",
+                    "manual_conflict_count",
+                    "unsupported_count",
+                    "applied",
+                )
+            }
+            if asset_sync["manual_conflict_count"]:
+                warnings.append(
+                    "asset_class_manual_conflicts="
+                    f"{asset_sync['manual_conflict_count']}"
+                )
+            if asset_sync["unsupported_count"]:
+                warnings.append(
+                    "asset_class_unsupported_official_categories="
+                    f"{asset_sync['unsupported_count']}"
+                )
+        except (sqlite3.Error, ValueError) as asset_exc:
+            summary["asset_class_sync"] = {
+                "applied": False,
+                "error": f"{type(asset_exc).__name__}: {asset_exc}",
+            }
+            warnings.append(
+                "asset_class_sync_failed: "
+                f"{type(asset_exc).__name__}: {asset_exc}"
+            )
+
 
 
         # V2.0 的账户/持仓快照唯一权威写入方是
@@ -1614,13 +1608,89 @@ def main() -> int:
         # _okx_http 已按端点分桶限速、两端点互不阻塞；candles 后台跑，collect_tickers
         # 同时抓 tickers+funding 并写库（market_con 只此主线程写），wall≈max 而非串行相加。
         with ThreadPoolExecutor(max_workers=1) as _cand_ex:
-            _cand_fut = _cand_ex.submit(fetch_candles_batch_sync, SYMBOLS, "15m", 60)
-            tick_count, ticker_snapshot = collect_tickers(market_con, ts_start)
+            _cand_fut = _cand_ex.submit(
+                fetch_candles_batch_sync,
+                SYMBOLS,
+                "15m",
+                60,
+                args.http_batch_timeout,
+            )
+            tick_count, ticker_snapshot, ticker_quality = collect_tickers(
+                market_con,
+                ts_start,
+                batch_timeout_s=args.http_batch_timeout,
+            )
             summary["wrote"]["tickers"] = tick_count
             _cand_data = _cand_fut.result()
 
         # Job A: ALL symbols get 15m K-lines (full coverage for accuracy)
         summary["wrote"]["klines"] = collect_klines(market_con, SYMBOLS, prefetched=_cand_data)
+
+        expected = len(SYMBOLS)
+        candle_symbols = sum(1 for rows in _cand_data.values() if rows)
+        quality = {
+            **ticker_quality,
+            "candles": candle_symbols,
+            "ticker_coverage": round(
+                ticker_quality["tickers"] / expected, 4
+            ) if expected else 0.0,
+            "funding_coverage": round(
+                ticker_quality["funding"] / expected, 4
+            ) if expected else 0.0,
+            "candle_coverage": round(
+                candle_symbols / expected, 4
+            ) if expected else 0.0,
+            "batch_timeout_s": args.http_batch_timeout,
+        }
+        summary["quality"] = quality
+
+        core_symbols = {
+            "BTC-USDT-SWAP",
+            "ETH-USDT-SWAP",
+            "SOL-USDT-SWAP",
+        }
+        missing_core_tickers = sorted(
+            symbol for symbol in core_symbols
+            if symbol not in ticker_snapshot
+            or ticker_snapshot[symbol].get("last") is None
+        )
+        missing_core_candles = sorted(
+            symbol for symbol in core_symbols if not _cand_data.get(symbol)
+        )
+        quality_errors: list[str] = []
+        if quality["ticker_coverage"] < 0.95:
+            quality_errors.append(
+                f"ticker_coverage={quality['ticker_coverage']:.1%}<95%"
+            )
+        if quality["candle_coverage"] < 0.80:
+            quality_errors.append(
+                f"candle_coverage={quality['candle_coverage']:.1%}<80%"
+            )
+        if missing_core_tickers:
+            quality_errors.append(
+                "core_ticker_missing=" + ",".join(missing_core_tickers)
+            )
+        if missing_core_candles:
+            quality_errors.append(
+                "core_candle_missing=" + ",".join(missing_core_candles)
+            )
+        if quality_errors and error is None:
+            error = "market_quality_fail_closed: " + "; ".join(quality_errors)
+
+        degraded_reasons: list[str] = []
+        if quality["candle_coverage"] < 0.95:
+            degraded_reasons.append(
+                f"candle_coverage={quality['candle_coverage']:.1%}<95%"
+            )
+        if quality["funding_coverage"] < 0.80:
+            degraded_reasons.append(
+                f"funding_coverage={quality['funding_coverage']:.1%}<80%"
+            )
+        if degraded_reasons:
+            summary["degraded"] = True
+            warnings.append("market_partial: " + "; ".join(degraded_reasons))
+        else:
+            summary["degraded"] = False
 
 
 
@@ -1681,8 +1751,8 @@ def main() -> int:
         try:
             _pnow = datetime.now(timezone(timedelta(hours=8)))
             if (market_con is not None and _pnow.hour == 4 and 30 <= _pnow.minute < 45):
-                if _project_path('scripts') not in sys.path:
-                    sys.path.insert(0, _project_path('scripts'))
+                if r"./scripts" not in sys.path:
+                    sys.path.insert(0, r"./scripts")
                 import market_prune
                 _pstat = market_prune.prune(market_con, retention_days=45, apply=True)
                 print(f"[collect_data] market.db prune: {_pstat}", file=sys.stderr)

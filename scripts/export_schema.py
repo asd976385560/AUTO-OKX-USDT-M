@@ -2,18 +2,6 @@
 """导出 V2.0 业务数据库 schema 到 db/schema.sql。"""
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import re
 from datetime import datetime, timedelta, timezone
@@ -23,9 +11,10 @@ from typing import Iterable
 from _db_ro import connect_ro
 
 SCHEMA_VERSION = "V2.0"
-DEFAULT_DB_ROOT = Path(_project_path('db'))
-# V2.0 规范库；drill.db 永久保留为业务只读历史归档。
-# 公开版本不提供该归档库的自动写维护入口。
+DEFAULT_DB_ROOT = Path(r"./db")
+# V2.0 规范库；drill.db 永久保留为业务只读历史归档，唯一授权维护写入口
+# 为 scripts/archive/drill/drill_reconcile.py --apply（2026-08-06 归档）。
+# schema 导出不得暗示删除该库或维护入口。
 DBS = (
     "market.db",
     "news.db",
@@ -35,7 +24,6 @@ DBS = (
     "regime.db",
     "analysis.db",
     "live_trades.db",
-    "demo_trades.db",
     "ledger.db",
     "qq_push_dedupe.db",
 )
@@ -46,10 +34,10 @@ CST = timezone(timedelta(hours=8))
 
 def normalize_schema_comments(db_name: str, table_name: str, sql: str) -> str:
     """清理旧 DDL 内嵌注释；只改注释，不改表、列、约束或索引。"""
-    if db_name in {"live_trades.db", "demo_trades.db"} and table_name == "trade_cycles":
+    if db_name == "live_trades.db" and table_name == "trade_cycles":
         return re.sub(
             r"(?m)^(\s*mode\s+TEXT,\s+--\s*).*$",
-            r"\1live|demo（由 trades_writer 按 profile 写入）",
+            r"\1live（由 trades_writer 按 profile 写入）",
             sql,
         )
     return sql

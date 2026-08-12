@@ -11,18 +11,6 @@ zip 落 reports/archive/<组>-<YYYYMM>.zip（按文件 mtime 月分桶；不放 
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sys
@@ -34,7 +22,7 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-REPORTS = Path(_project_path('reports'))
+REPORTS = Path(r"./reports")
 TARGETS = [
     ("agents", REPORTS / "agents", "*.md"),
     ("push", REPORTS / "push", "*.json"),

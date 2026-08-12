@@ -3,36 +3,48 @@ r"""daily_maintenance.py — 日频运维合并入口（2026-07-17 cron 治理�
 okx-reconcile + okx-log-rotate + okx-audit-snapshot 三条日频 cron 合为一条
 okx-daily-maintenance，07:55 起跑）。
 
-顺序跑：① reconcile_daily.py（交易所侧对账分级：demo 自动 --apply / live dry+P1）
+顺序跑：① reconcile_daily.py（交易所侧对账：live dry+P1；demo 已于 2026-08-06 下线）
         ② collect_account_bills.py（手续费/资金费/已实现盈亏账单）
         ③ quality_metrics.py（质量指标；完成后立即原子发布 reviewer ready handoff）
-        ④ ledger_invariants.py（只读：近24h重复执行、负净仓、经验数量错配、
+        ④ evaluate_universe_judgments.py（只读：全宇宙一致度影子标签）
+        ⑤ evaluate_multitimeframe_model_shadow.py（只读：冻结模型未来前向校准）
+        ⑥ audit_model_shadow_label_quality.py（只读：独立从冻结工件与原始ticker
+          重建执行价标签，拒绝重复键、时间穿越、价格/收益/汇总不一致及门槛降级）
+        ⑦ audit_analysis_signal_forward_quality.py（只读：以 analysis 完成时刻
+          后首个快照为入场，成熟生产LLM开多/开空的15m/1H/4H标签）
+        ⑧ audit_report_completeness.py（只读：从2026-07-28验收基线至昨日的
+          日报完整率；缺失日期也进入分母）
+        ⑨ audit_push_completeness.py（只读：按完整北京时间自然日的15分钟
+          计划槽重建Push报告与精确送达分母；独立复验生产归档，并要求sent
+          回执哈希与有效归档一致；缺槽、pending和失败均不算完整）
+        ⑩ audit_source_health.py（只读：按15分钟计划槽重建 fast 分母，缺失槽也
+          计失败；同时保留14日滚动窗和修复后前向窗）
+        ⑪ audit_news_source_health.py（只读：按各新闻源真实计划槽重建分母；
+          degraded与缺行不计入严格完整率，英文RSS六个发布方逐源前向验收）
+        ⑫ audit_positioning_coverage.py（只读：官方REST最新1H多空比批次逐币
+          对齐最新USDT线性SWAP宇宙，缺失、额外或比例非法均失败关闭）
+        ⑬ audit_asset_class_coverage.py（只读：逐币对齐OKX官方instCategory，
+          分开审计本地分类有行率与语义兼容率）
+        ⑭ audit_contract_statistics_coverage.py（只读：官方15m合约OI与主动
+          买卖量最新批次严格审计；同时按15分钟计划槽重建修复后分母，
+          缺批次计失败，不足96槽不得通过）
+        ⑮ audit_multitimeframe_coverage.py（只读：按最新交易宇宙逐币核验精确
+          已收盘15m/1H/4H OHLCV与指标就绪率；新区历史不足仍留在分母）
+        ⑯ ledger_invariants.py（只读：近24h重复执行、负净仓、经验数量错配、
           未决/含糊执行意图；有发现 rc=1，使日维护失败外显，不自动补单/改账）
-        ⑤ log_rotate.py --apply --days 7 --dirs trigger,push,stage-status
+        ⑰ log_rotate.py --apply --days 7 --dirs trigger,push,stage-status
           （三类高频调试日志超 7 天轮转）
-        ⑥ audit_snapshot.py（audit_events 增量导出，防滚动窗丢失）
-        ⑦ reports_rotate.py --apply（reports/agents+push 超 30 天月度压包，
+        ⑱ audit_snapshot.py（audit_events 增量导出，防滚动窗丢失）
+        ⑲ reports_rotate.py --apply（reports/agents+push 超 30 天月度压包，
           封顶无界增长——2026-07-17 主人拍板）
-        ⑧ collect_public_macro.py（Alternative.me、ECB复算DXY、ETF权威证据核验）
-        ⑨ collect_macro_events.py（未来7天高重要度经济日历）
+        ⑳ collect_public_macro.py（Alternative.me、ECB复算DXY、ETF权威证据核验）
+        ㉑ collect_macro_events.py（未来7天高重要度经济日历）
 每步独立 fail-safe：一步失败/超时不阻断下一步；任一失败聚合 exit 1（cron 记 error
 可见），全过 exit 0。新增日频运维项往这里加，不再开新 cron。
-注意：本 cron 因含 reconcile（demo 会真动账本）已入 fulltest BUSINESS_CRONS——
+注意：本 cron 含 reconcile（历史上 demo 会真动账本，现已下线）已入 fulltest BUSINESS_CRONS——
 测试窗内随业务 cron 一并停/复。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import hashlib
@@ -49,7 +61,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 SCRIPTS = Path(__file__).resolve().parent
 QUALITY_REPORT_DIR = Path(os.environ.get(
-    "OKX_QUALITY_REPORT_DIR", _project_path('reports', 'quality')))
+    "OKX_QUALITY_REPORT_DIR", r"./reports/quality"))
 REVIEWER_READY_DIR = Path(os.environ.get(
     "OKX_REVIEWER_READY_DIR", str(QUALITY_REPORT_DIR)))
 REVIEWER_CRITICAL_STEPS = (
@@ -59,19 +71,121 @@ REVIEWER_CRITICAL_STEPS = (
 )
 CST = timezone(timedelta(hours=8))
 STEPS = [
-    # (名字, argv, 单步超时秒, 合法退出码)。reconcile 最坏 4 次 OKX API 往返（demo
-    # dry→apply→复检→live dry）；其 rc=1=「有账实差异且告警已推」（脚本工作正常，
-    # 差异经 QQ P1 走人工通道），只有 rc≥2 才算本步失败。
+    # (名字, argv, 单步超时秒, 合法退出码)。reconcile 现只剩 live 一次 OKX API 往返
+    # （2026-08-06 前还有 demo 的 dry→apply→复检三次）；其 rc=1=「有账实差异且告警
+    # 已推」（脚本工作正常，差异经 QQ P1 走人工通道），只有 rc≥2 才算本步失败。
     ("reconcile", [str(SCRIPTS / "reconcile_daily.py")], 1200, (0, 1)),
     ("account_bills", [str(SCRIPTS / "collect_account_bills.py")], 120, (0,)),
     # 质量指标是 reviewer handoff 的第三个关键步骤。成功落完整 JSON 后立即
     # 发布 ready manifest；后续非关键维护继续跑，不阻塞 08:05 reviewer。
     ("quality_metrics", [str(SCRIPTS / "quality_metrics.py")], 120, (0,)),
+    ("universe_judgment_evaluation", [
+        str(SCRIPTS / "evaluate_universe_judgments.py"),
+        "--snapshot-root", str(QUALITY_REPORT_DIR / "universe-shadow"),
+        "--market-db", r"./db/market.db",
+        "--json-out", str(QUALITY_REPORT_DIR / "universe-shadow-evaluation.json"),
+        "--labels-out", str(QUALITY_REPORT_DIR / "universe-shadow-labels.csv"),
+    ], 180, (0,)),
+    ("frozen_model_shadow_evaluation", [
+        str(SCRIPTS / "evaluate_multitimeframe_model_shadow.py"),
+        "--shadow-root", str(QUALITY_REPORT_DIR / "model-shadow" / "forward"),
+        "--market-db", r"./db/market.db",
+        "--json-out", str(QUALITY_REPORT_DIR / "model-shadow-evaluation.json"),
+        "--labels-out", str(QUALITY_REPORT_DIR / "model-shadow-labels.csv"),
+    ], 180, (0,)),
+    ("frozen_model_shadow_label_quality", [
+        str(SCRIPTS / "audit_model_shadow_label_quality.py"),
+        "--evaluation", str(QUALITY_REPORT_DIR / "model-shadow-evaluation.json"),
+        "--labels", str(QUALITY_REPORT_DIR / "model-shadow-labels.csv"),
+        "--shadow-root", str(QUALITY_REPORT_DIR / "model-shadow" / "forward"),
+        "--market-db", r"./db/market.db",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "model-shadow-label-quality-audit.json"),
+    ], 180, (0,)),
+    ("analysis_signal_forward_quality", [
+        str(SCRIPTS / "audit_analysis_signal_forward_quality.py"),
+        "--analysis-db", r"./db/analysis.db",
+        "--market-db", r"./db/market.db",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "analysis-signal-forward-evaluation.json"),
+        "--labels-out", str(
+            QUALITY_REPORT_DIR / "analysis-signal-forward-labels.csv"),
+    ], 180, (0,)),
+    ("daily_report_completeness", [
+        str(SCRIPTS / "audit_report_completeness.py"),
+        "--start", "2026-07-28",
+        "--reports-dir", r"./reports/daily-reports",
+        "--account-db", r"./db/account.db",
+        "--live-trades-db", r"./db/live_trades.db",
+        "--ledger-db", r"./db/ledger.db",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "daily-report-completeness.json"),
+    ], 60, (0,)),
+    ("push_completeness", [
+        str(SCRIPTS / "audit_push_completeness.py"),
+        "--days", "14",
+        "--pipeline-log", r"./logs/push/pipeline_runs.jsonl",
+        "--event-log", r"./logs/push/qq_push_dedupe.jsonl",
+        "--dedupe-db", r"./db/qq_push_dedupe.db",
+        "--reports-dir", r"./reports/agents",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "push-completeness-audit.json"),
+    ], 120, (0,)),
+    ("fast_source_health", [
+        str(SCRIPTS / "audit_source_health.py"),
+        "--ledger-db", r"./db/ledger.db",
+        "--forward-start", "2026-08-12T16:00:00+08:00",
+        "--rolling-days", "14",
+        "--target-rate", "0.99",
+        "--forward-minimum-slots", "96",
+        "--json-out", str(QUALITY_REPORT_DIR / "source-health-audit.json"),
+    ], 180, (0,)),
+    ("news_source_health", [
+        str(SCRIPTS / "audit_news_source_health.py"),
+        "--ledger-db", r"./db/ledger.db",
+        "--registry", r"./collectors/sources/registry.json",
+        "--forward-start", "2026-08-12T16:15:00+08:00",
+        "--rolling-days", "14",
+        "--target-rate", "0.99",
+        "--minimum-window-hours", "24",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "news-source-health-audit.json"),
+    ], 60, (0,)),
+    ("positioning_coverage", [
+        str(SCRIPTS / "audit_positioning_coverage.py"),
+        "--market-db", r"./db/market.db",
+        "--minimum-rate", "0.99",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "positioning-coverage-audit.json"),
+    ], 60, (0,)),
+    ("asset_class_coverage", [
+        str(SCRIPTS / "audit_asset_class_coverage.py"),
+        "--market-db", r"./db/market.db",
+        "--minimum-rate", "0.99",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "asset-class-coverage-audit.json"),
+    ], 60, (0,)),
+    ("contract_statistics_coverage", [
+        str(SCRIPTS / "audit_contract_statistics_coverage.py"),
+        "--db", r"./db/market.db",
+        "--minimum-coverage", "0.99",
+        "--forward-start", "2026-08-12T16:00:00+08:00",
+        "--forward-minimum-slots", "96",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "contract-statistics-coverage-audit.json"),
+    ], 180, (0,)),
+    ("multitimeframe_coverage", [
+        str(SCRIPTS / "audit_multitimeframe_coverage.py"),
+        "--market-db", r"./db/market.db",
+        "--minimum-rate", "0.99",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "multitimeframe-coverage-audit.json"),
+    ], 60, (0,)),
     # 每日只读账本不变量：不启用 collection_monitor cron，不自动重放/补单/改账。
     # compact 保证聚合日志的 tail 能保留完整 findings；rc=1 作为日维护失败外显。
     ("ledger_invariants", [
         str(SCRIPTS / "ledger_invariants.py"),
-        "--profile", "both", "--window-min", "1440", "--compact",
+        "--profile", "live", "--window-min", "1440", "--compact",
     ], 120, (0,)),
     ("log_rotate", [
         str(SCRIPTS / "log_rotate.py"),
@@ -207,7 +321,7 @@ def write_reviewer_manifest(report: dict, state: str) -> dict:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "按固定顺序执行 9 项日频维护；不带参数时才执行，"
+            "按固定顺序执行日频维护步骤；不带参数时才执行，"
             "未知参数会立即退出。"
         )
     )

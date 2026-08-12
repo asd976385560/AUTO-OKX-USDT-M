@@ -7,7 +7,7 @@
 职责：
   - collection_runs 账本（采集器结尾必写）
   - stage_dispatch 闩锁（try_stage/stage_dispatched/release_stage，见 §5 段）——
-    core/dispatcher.py 对 analyst/live/demo/push 四个 stage 全走它，唯一约束 race-safe
+    core/dispatcher.py 对 analyst/live/push 现役 stage 全走它（demo 2026-08-06 下线，历史行保留），唯一约束 race-safe
   - gate_collection_fresh（registry-aware 时效判定，analyst 开场 + dispatcher 派发闸共用）
 
 设计要点：
@@ -21,18 +21,6 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import os
@@ -41,6 +29,10 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -48,7 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 CST = timezone(timedelta(hours=8))
 
 # 生产账本路径；测试传自己的 path 覆盖。
-DEFAULT_LEDGER = Path(_project_path('db', 'ledger.db'))
+DEFAULT_LEDGER = _PROJECT_ROOT / "db" / "ledger.db"
 
 # 每个采集器在一轮里的 source 标签。
 SRC_FAST = "fast"
@@ -130,12 +122,7 @@ def connect(path: str | os.PathLike, readonly: bool = False) -> sqlite3.Connecti
 
 
 def _require_profile_lease_migrated(path: Path) -> None:
-    """Existing databases must receive the lease table through the guarded migration.
-
-    This inspection is deliberately read-only.  It prevents dispatcher startup from
-    turning ``CREATE TABLE IF NOT EXISTS`` into an implicit, unbacked schema change.
-    A brand-new database is still initialized in one pass by :func:`init_ledger`.
-    """
+    """Refuse implicit schema upgrades of an existing ledger database."""
     con = sqlite3.connect(
         path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5
     )
@@ -144,13 +131,9 @@ def _require_profile_lease_migrated(path: Path) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             ("stage_profile_leases",),
         ).fetchone() is not None
-        table_info = (
-            tuple(
-                con.execute("PRAGMA table_info(stage_profile_leases)")
-            )
-            if present
-            else ()
-        )
+        table_info = tuple(
+            con.execute("PRAGMA table_info(stage_profile_leases)")
+        ) if present else ()
         schema = tuple(
             (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
             for row in table_info
@@ -172,10 +155,10 @@ def _require_profile_lease_migrated(path: Path) -> None:
 
 
 def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
-    """Initialize a new ledger or verify an existing ledger before idempotent DDL.
+    """Initialize a new ledger or verify an existing ledger before DDL.
 
-    Existing databases are never upgraded implicitly: the profile-lease table must
-    already have been installed by the backup-guarded migration script.
+    Existing databases are never upgraded implicitly.  The profile-lease table
+    must have been installed through the backup-guarded migration.
     """
     ledger_path = Path(str(path))
     if ledger_path.is_file():
@@ -196,11 +179,13 @@ def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
                 PRIMARY KEY (cycle_id, source)
             );
 
-            -- V2.0 §5：阶段派发闩锁。dispatcher 起 analyst/live/demo/push 前
+            -- V2.0 §5：阶段派发闩锁。dispatcher 起 analyst/live/push 前
             -- INSERT (cycle_id,stage)，唯一约束用于防止双起棒竞态。
             CREATE TABLE IF NOT EXISTS stage_dispatch (
                 cycle_id      TEXT NOT NULL,
-                stage         TEXT NOT NULL,      -- 'analyst'|'live'|'demo'|'push'|'skip_warn'
+                -- 'demo' 于 2026-08-06 下线，但历史行（3613 条）刻意保留：
+                -- 它是运行史留痕，不是报表数据，删了一分钱指标都不改善。
+                stage         TEXT NOT NULL,      -- 'analyst'|'live'|'push'|'skip_warn'（历史另有 'demo'）
                 dispatched_at TEXT NOT NULL,
                 card_id       TEXT,
                 PRIMARY KEY (cycle_id, stage)
@@ -209,7 +194,7 @@ def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
             -- 跨 cycle 的同 profile 串行租约。stage_dispatch 只按 cycle 幂等，
             -- 无法阻止上一轮长任务与下一轮同 profile 重叠。
             CREATE TABLE IF NOT EXISTS stage_profile_leases (
-                profile       TEXT PRIMARY KEY,   -- 'live'|'demo'
+                profile       TEXT PRIMARY KEY,   -- 'live'（2026-08-06 起只此一种）
                 cycle_id      TEXT NOT NULL,
                 acquired_at   TEXT NOT NULL,
                 expires_at    TEXT NOT NULL
@@ -279,7 +264,7 @@ def record_collection(
 def _load_registry_module():
     """惰性导入 collectors/sources/_registry。
 
-    ledger 有两种被 import 的身份：wrapper 路径（<PROJECT_ROOT> 在 PYTHONPATH →
+    ledger 有两种被 import 的身份：wrapper 路径（. 在 PYTHONPATH →
     `collectors.ledger`）和 dispatcher 路径（collectors 目录在 sys.path →
     顶层 `ledger`），两条导入路都试；任何失败返回 None（调用方回退 flat）。
     """
@@ -414,7 +399,7 @@ def gate_collection_fresh(
 
 
 # ---------------------------------------------------------------------------
-# V2.0 §5：阶段派发闩锁（dispatcher 用；analyst/live/demo/push 各 stage 幂等 race-safe）
+# V2.0 §5：阶段派发闩锁（dispatcher 用；analyst/live/push 各现役 stage 幂等 race-safe，历史另有 demo 行）
 # ---------------------------------------------------------------------------
 def try_stage(path: str | os.PathLike, cycle_id: str, stage: str,
               card_id: str | None = None) -> bool:
@@ -477,10 +462,11 @@ def try_profile_lease(
     """原子抢同 profile 跨 cycle 租约；未过期的其他 cycle 一律 defer。
 
     监督 runner 正常结束时显式释放；进程被强杀时由一小时 TTL 兜底，避免永久
-    卡死。TTL 高于 live/demo 现役超时，禁止活任务仍在时被下一轮抢占。
+    卡死。TTL 高于 live 现役超时，禁止活任务仍在时被下一轮抢占。
+    2026-08-06 demo 全量下线后只接受 live（历史 stage_dispatch 行照旧保留）。
     """
-    if profile not in {"live", "demo"}:
-        raise ValueError(f"profile lease only supports live|demo, got {profile!r}")
+    if profile != "live":
+        raise ValueError(f"profile lease only supports live, got {profile!r}")
     if ttl_sec <= 0:
         raise ValueError("ttl_sec must be positive")
     at = now or datetime.now(CST)

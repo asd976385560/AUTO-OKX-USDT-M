@@ -1,31 +1,19 @@
 # -*- coding: utf-8 -*-
-"""双盘账户/持仓快照采集器（live/demo account sanity check）。
+"""账户/持仓快照采集器（live account sanity check）。
 
-V2.0 起由 collectors/fast_collect.py 每轮调用（live 一次 + `--profile demo` 一次，
-2026-07-03 C4b）：查 OKX 账户余额 + SWAP 持仓，写成本轮新鲜快照，防止 account.db
-旧行被当真相。
+V2.0 起由 collectors/fast_collect.py 每轮调用：查 OKX 账户余额 + SWAP 持仓，
+写成本轮新鲜快照，防止 account.db 旧行被当真相。
+2026-08-06 demo 全量下线：原先每轮还会额外跑一次 `--profile demo`（2026-07-03 C4b），
+该调用与 demo 历史数据均已移除；`normalize_profile_label` 现对 demo 硬拒（见其注释）。
 
 写库：account_snapshots / position_snapshots（含 B13 消失仓对账补 trade_events 行；
 F7 2026-07-06：空仓批次写 symbol='__FLAT__' 哨兵行标记"确认空仓"，见 FLAT_SENTINEL）；
-system_state 键按 profile 派生——`{profile}_totalEq` / `{profile}_availBal` /
-`{profile}_position_count` / `last_{profile}_account_check`
-（即 live_totalEq / demo_totalEq / … camelCase 键）。
+system_state 键按 profile 派生——`live_totalEq` / `live_availBal` /
+`live_position_count` / `last_live_account_check`（camelCase 键）。
 
 Read-only against OKX; writes the fresh snapshot to account.db for audit.
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -47,7 +35,7 @@ FLAT_SENTINEL = "__FLAT__"
 def cst_now_str() -> str:
     """C3（2026-07-03）UTC-Z 写方统一：account_snapshots/position_snapshots/trade_events 的 ts
     一律 CST 'YYYY-MM-DD HH:MM:SS'（消 ts 混 Z/CST 测量地雷；历史 Z 行由
-    apply_ts_cst_migration.py 幂等迁移）。"""
+    scripts/archive/migrations/apply_ts_cst_migration.py 幂等迁移，2026-08-06 归档）。"""
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -72,9 +60,22 @@ def normalize_rows(payload: Any) -> list[dict[str, Any]]:
 
 
 def normalize_profile_label(profile: str | None) -> str:
-    if not profile:
-        return "live"
-    return "demo" if "demo" in str(profile).lower() else "live"
+    """2026-08-06 demo 全量下线后只认 live。
+
+    **硬拒而不是静默当 live**：本脚本会写 `trade_events`（reconcile_vanished_positions
+    的自动补记）并按 label 选账本库。`--profile` 没有 choices 限制，若还有调用方
+    传 demo，静默归一到 live 就等于**把一批 demo 标签的行重新灌进刚清空的表**，
+    还会去开已删除的 demo_trades.db。宁可 raise。
+    """
+    value = str(profile or "live").strip().lower()
+    if "demo" in value:
+        raise ValueError(
+            f"normalize_profile_label: 只支持 live，收到 {profile!r}。"
+            "demo 已于 2026-08-06 全量下线（账本库与历史行均已清除）；"
+            "若这是旧脚本请更新调用方，**不要**直接改成 live 重跑——"
+            "先确认它本来要不要动真账。"
+        )
+    return "live"
 
 
 def signed_size(item: dict[str, Any]) -> float:
@@ -93,7 +94,7 @@ def position_side(item: dict[str, Any]) -> str:
 
 
 def _trade_db_path(db_root: Path, profile_label: str) -> Path:
-    return db_root / ("demo_trades.db" if profile_label == "demo" else "live_trades.db")
+    return db_root / "live_trades.db"
 
 
 def _main_ledger_close(db_root: Path, profile_label: str, symbol: str,
@@ -521,7 +522,9 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
                 family_prefix=(
                     f"ledger_invariant:experience_position:{profile_label}:"),
                 findings=experience_findings,
-                ts=ts)
+                ts=ts,
+                closed_by="jobb_live_account_check",
+                resolution="jobb live account check invariant healed")
             experience_audit = {
                 "findings": experience_findings,
                 "repair_queue": experience_queue,
@@ -563,7 +566,7 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobB mandatory live account/position check")
     parser.add_argument("--profile", default="live")
-    parser.add_argument("--db-root", default=_project_path('db'))
+    parser.add_argument("--db-root", default=r"./db")
     parser.add_argument("--repair-auto-vanished", action="store_true",
                         help="dry-run 查找已被 V2 主账本平仓取代的伪 auto-vanished 事件")
     parser.add_argument("--since", default=None,

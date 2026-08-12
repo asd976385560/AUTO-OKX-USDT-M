@@ -1,37 +1,25 @@
 # -*- coding: utf-8 -*-
 """system_state_writer.py — v7.0c 统一交易员每轮 system_state 关键字段更新
 
-写入：<PROJECT_ROOT>\\db\\account.db → system_state (key, value, updated_utc)
+写入：./db//account.db → system_state (key, value, updated_utc)
 输入：stdin JSON: {"updates": {"key1": "value1", "key2": "value2", ...}, "ts": "2026-06-05 21:46:00"}
 - ts 可选；缺省用 UTC ISO 当前时间
 - 每个 key 写一行；INSERT OR REPLACE（key 唯一）
 - 保护键（cum_pnl 冻结基线权威键）默认拒写，需 --force-protected（仅维护用）
 
 调用：
-  echo '{"updates":{...}}' | pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 <PROJECT_ROOT>\\scripts\\system_state_writer.py --stdin
+  echo '{"updates":{...}}' | pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ./scripts//system_state_writer.py --stdin
 
 退出码：0=成功；2=批内含保护键被拒写（其余键正常写入）；非0=失败
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse, json, os, sqlite3, sys
 from datetime import datetime, timedelta, timezone
 
+# 2026-08-06 demo 全量下线：`demo_cum_pnl` / `demo_cum_pnl_reset_ts` 两项随
+# 261 个 demo 键一并从 system_state 清除，保护一个已不存在的键没有意义。
 PROTECTED_KEYS = {
     "live_cum_pnl",
-    "demo_cum_pnl",
     "live_cum_pnl_reset_ts",
-    "demo_cum_pnl_reset_ts",
 }
 
 def utc_now_iso() -> str:
@@ -59,7 +47,7 @@ def load_payload(args) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description="v7.0c system_state 关键字段更新")
-    p.add_argument("--db-root", default=_project_path('db'))
+    p.add_argument("--db-root", default=r"./db")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--stdin", action="store_true")
     g.add_argument("--json-file")
@@ -81,11 +69,16 @@ def main():
     rejected_keys = []
     try:
         # v7.0e.1: 自动给 key 加 profile 命名空间（如果没显式带前缀）
-        # live_xxx / demo_xxx 显式带前缀 → 保持原样
-        # 其他 key → 视为 live（默认）
+        # live_xxx 显式带前缀 → 保持原样；其他 key → 视为 live（默认）
         for k, v in updates.items():
-            # 如果 key 已带 live_/demo_ 前缀，保持；否则默认视为 live
-            if k.startswith("live_") or k.startswith("demo_"):
+            # 2026-08-06 demo 全量下线：`demo_` 前缀曾同样直通。261 个 demo 键
+            # 已清除，再直通就等于让任意调用方把它们一个个写回来。
+            # **跳过而不是整批 fail**（沿用既有 rejected_keys 通道）：批里通常
+            # 还有正当的 live 键，为一个误写的 demo_ 键让整轮状态写丢更糟。
+            if k.startswith("demo_"):
+                rejected_keys.append(k)
+                continue
+            if k.startswith("live_"):
                 final_key = k
             else:
                 final_key = f"live_{k}"

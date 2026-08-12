@@ -17,18 +17,6 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[2]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import re
@@ -37,8 +25,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
-_SCRIPTS = str(Path(_project_path('scripts')))
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
+_SCRIPTS = str(Path(r"./scripts"))
 for _p in (_COLLECTORS, _SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -190,26 +178,53 @@ def _item_to_news(item: dict) -> dict | None:
 def fetch_items(important_limit: int = _DEFAULT_IMPORTANT_LIMIT,
                 latest_limit: int = _DEFAULT_LATEST_LIMIT,
                 timeout_sec: float = _CLI_TIMEOUT,
-                errors: list[str] | None = None) -> list[dict]:
-    """拉 important + latest，按 id 去重，规整为 news_writer 条目。"""
+                errors: list[str] | None = None,
+                retry_stats: dict | None = None) -> list[dict]:
+    """拉 important + latest，失败端点在全部首轮结束后各重试一次。
+
+    两遍式顺序避免 important 的长超时直接吃掉 latest 的机会。默认首轮8秒、
+    重试6秒，两个端点全失败最坏约28秒，仍在 registry 的30秒源预算内。
+    """
     raw_items: list[dict] = []
+    failed: list[tuple[str, int, str]] = []
+    recovered = 0
+    initial_timeout = max(1.0, min(float(timeout_sec), 8.0))
+    retry_timeout = max(1.0, min(float(timeout_sec), 6.0))
     for kind, lim in (("important", important_limit), ("latest", latest_limit)):
-        t0 = time.time()
         try:
             payload = okx_json(
                 "news", kind, "--limit", str(lim),
-                timeout_sec=timeout_sec, retries=1,
+                timeout_sec=initial_timeout, retries=0,
             )
             batch = _normalize_payload(payload)
             raw_items.extend(batch)
         except Exception as e:  # noqa: BLE001
             msg = f"{kind}: {type(e).__name__}: {e}"[:150]
+            print(f"[WARN] okx news initial {msg}; retrying", file=sys.stderr)
+            failed.append((kind, lim, msg))
+
+    for index, (kind, lim, _initial_error) in enumerate(failed):
+        if index == 0:
+            time.sleep(0.5)
+        try:
+            payload = okx_json(
+                "news", kind, "--limit", str(lim),
+                timeout_sec=retry_timeout, retries=0,
+            )
+            raw_items.extend(_normalize_payload(payload))
+            recovered += 1
+        except Exception as e:  # noqa: BLE001
+            msg = f"{kind}: {type(e).__name__}: {e}"[:150]
             print(f"[WARN] okx news {msg}", file=sys.stderr)
             if errors is not None:
                 errors.append(msg)
-        # 单源预算保护
-        if time.time() - t0 > timeout_sec + 2:
-            break
+
+    if retry_stats is not None:
+        retry_stats.update({
+            "initial_failed": len(failed),
+            "recovered_after_retry": recovered,
+            "final_failed": len(failed) - recovered,
+        })
 
     seen_ids: set[str] = set()
     seen_titles: set[str] = set()
@@ -238,11 +253,13 @@ def collect(db_path: str, apply: bool = False,
             latest_limit: int = _DEFAULT_LATEST_LIMIT,
             timeout_sec: float = _CLI_TIMEOUT) -> dict:
     fetch_errs: list[str] = []
+    retry_stats: dict = {}
     items = fetch_items(
         important_limit=important_limit,
         latest_limit=latest_limit,
         timeout_sec=timeout_sec,
         errors=fetch_errs,
+        retry_stats=retry_stats,
     )
     err_txt = "; ".join(fetch_errs)[:150] if fetch_errs else None
     if not apply:
@@ -250,6 +267,7 @@ def collect(db_path: str, apply: bool = False,
             "ok": True,
             "dry_run": True,
             "fetched": len(items),
+            "retry_stats": retry_stats,
             "sample": [
                 {
                     "t": it["title"][:70],
@@ -272,6 +290,7 @@ def collect(db_path: str, apply: bool = False,
 
     res = news_writer.write_news(items, db_path)
     res["fetched"] = len(items)
+    res["retry_stats"] = retry_stats
     if err_txt and not res.get("err"):
         res["err"] = err_txt
     return res

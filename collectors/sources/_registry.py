@@ -12,18 +12,6 @@ collect_slow 内声明（registry 对其仅登记，采集器暂未改读）。
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[2]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -34,7 +22,7 @@ CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 DEFAULT_REGISTRY = Path(os.environ.get(
-    "OKX_REGISTRY_PATH", _project_path('collectors', 'sources', 'registry.json')))
+    "OKX_REGISTRY_PATH", r"./collectors/sources/registry.json"))
 
 VALID_TYPES = {"market", "news", "macro", "social"}
 VALID_CADENCE = {"15m", "hourly", "daily", "weekday", "weekly", "event"}

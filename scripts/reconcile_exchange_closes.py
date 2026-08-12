@@ -33,22 +33,10 @@ r"""交易所侧/执行后平仓漏落账对账（F2，2026-07-06）。
         3=存在模糊幽灵（需人工）；2=API/库/写入错误。
 
 用法：
-  pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 \
-      <PROJECT_ROOT>/scripts/reconcile_exchange_closes.py --profile live [--db-root <PROJECT_ROOT>/db] [--apply]
+  pwsh -NoProfile -File ./scripts/run_okx_python.ps1 \
+      ./scripts/reconcile_exchange_closes.py --profile live [--db-root ./db] [--apply]
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -60,8 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, _project_path('scripts'))
-sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, r"./scripts")
+sys.path.insert(0, r"./collectors")
 from _okxcli import okx_json  # noqa: E402
 import trades_writer  # noqa: E402  （硬化 writer：write_trades / write_experiences / normalize_ts）
 
@@ -119,7 +107,7 @@ def ledger_rows(con):
     """全量 trades 行 → {(symbol, side): [row, ...]}（rowid 序）。"""
     by_key = defaultdict(list)
     for r in con.execute(
-            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl, raw "
+            "SELECT id, cycle_id, ts, symbol, action, side, sz, fill_px, lev, pnl "
             "FROM trades ORDER BY rowid"):
         by_key[(r["symbol"], norm_side(r["side"]))].append(r)
     return by_key
@@ -260,27 +248,8 @@ CLOSE_ACTIONS = ("close", "stop_loss", "reduce")
 OPEN_ACTIONS = ("open", "add")
 
 
-def _recorded_ord_ids(row) -> set[str]:
-    """Extract authoritative exchange order identities from one ledger row."""
-    try:
-        raw_value = row["raw"]
-    except (KeyError, IndexError, TypeError):
-        return set()
-    try:
-        raw = json.loads(raw_value or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return set()
-    if not isinstance(raw, dict):
-        return set()
-    raw_ord_ids = raw.get("ord_ids") or []
-    if not isinstance(raw_ord_ids, (list, tuple, set)):
-        raw_ord_ids = [raw_ord_ids]
-    values = [raw.get("ordId"), *raw_ord_ids]
-    return {str(value) for value in values if value not in (None, "")}
-
-
 def consume_recorded(groups, rows, t0_dt, actions=CLOSE_ACTIONS):
-    """账本已有成交行 → 优先按 ordId、否则按唯一 sz+时间候选销账。
+    """账本已有成交行 → 销账对应 fills 组（sz 相等 + 时间窗内）。
 
     `actions` 默认平仓腿（幽灵仓补 close 用）；P2 补 open 时传 `OPEN_ACTIONS`
     销账已记录的开仓行，逻辑完全对称。
@@ -297,48 +266,20 @@ def consume_recorded(groups, rows, t0_dt, actions=CLOSE_ACTIONS):
         if r_dt is None or (t0_dt is not None and r_dt < t0_dt):
             continue
         r_sz = f(r["sz"], 0.0) or 0.0
-        ord_ids = _recorded_ord_ids(r)
-        if ord_ids:
-            identified = [g for g in remaining if str(g.get("ordId")) in ord_ids]
-            identified_sz = sum(g["sz"] for g in identified)
-            if identified and abs(identified_sz - r_sz) <= SZ_TOL:
-                for group in identified:
-                    remaining.remove(group)
-                notes.append(
-                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
-                    f"ordId={','.join(sorted(ord_ids))} 已按身份销账"
-                )
-            else:
-                notes.append(
-                    f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 的 "
-                    f"ordId 身份与 fills 数量不一致，拒绝弱匹配"
-                )
-            continue
-
-        candidates = []
-        for group in remaining:
-            if abs(group["sz"] - r_sz) > SZ_TOL:
+        best, best_gap = None, None
+        for g in remaining:
+            if abs(g["sz"] - r_sz) > SZ_TOL:
                 continue
-            gap = abs((fill_dt(group["t_last_ms"]) - r_dt).total_seconds())
-            if gap <= CONSUME_WINDOW_MIN * 60:
-                candidates.append((gap, group))
-        if len(candidates) == 1:
-            group = candidates[0][1]
-            remaining.remove(group)
-            notes.append(
-                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
-                f"ordId={group['ordId']} 已按唯一数量/时间候选销账"
-            )
-        elif len(candidates) > 1:
-            notes.append(
-                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 有 "
-                f"{len(candidates)} 个等量时间候选，拒绝弱匹配并转人工"
-            )
+            gap = abs((fill_dt(g["t_last_ms"]) - r_dt).total_seconds())
+            if gap <= CONSUME_WINDOW_MIN * 60 and (best_gap is None or gap < best_gap):
+                best, best_gap = g, gap
+        if best is not None:
+            remaining.remove(best)
+            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) ↔ "
+                         f"ordId={best['ordId']} 已销账")
         else:
-            notes.append(
-                f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
-                f"（可能超 API 窗口，靠合计硬门兜底）"
-            )
+            notes.append(f"账本行 id={r['id']}({act} sz={r_sz} ts={r['ts']}) 无对应 fills 组"
+                         f"（可能超 API 窗口，靠合计硬门兜底）")
     return remaining, notes
 
 
@@ -895,8 +836,8 @@ def classify(profile, by_key, nets, ven):
 
 def main():
     ap = argparse.ArgumentParser(description="交易所侧/执行后平仓漏落账对账")
-    ap.add_argument("--profile", choices=["live", "demo"], required=True)
-    ap.add_argument("--db-root", default=_project_path('db'))
+    ap.add_argument("--profile", choices=["live"], required=True)
+    ap.add_argument("--db-root", default=r"./db")
     ap.add_argument("--apply", action="store_true",
                     help="对精确匹配幽灵经 trades_writer 补 close 行（默认 dry-run 只报告）")
     ap.add_argument("--ordid",

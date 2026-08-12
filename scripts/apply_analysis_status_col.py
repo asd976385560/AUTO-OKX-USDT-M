@@ -11,8 +11,8 @@ Safe & idempotent: ADD COLUMN is non-destructive (existing rows default to 'ok')
 re-running is a no-op once the column exists.
 
 用法:
-    python apply_analysis_status_col.py --root <PROJECT_ROOT>\db
-    python apply_analysis_status_col.py --root <PROJECT_ROOT>\db \
+    python apply_analysis_status_col.py --root ./db
+    python apply_analysis_status_col.py --root ./db \
         --apply --backup-dir <BACKUP_DIR>
 """
 from __future__ import annotations

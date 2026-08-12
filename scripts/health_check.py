@@ -6,7 +6,7 @@ Validates that all external APIs are reachable before starting data collection.
 采集/交易链启动前的外部 API 连通性预检。
 
 Usage:
-    pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 <PROJECT_ROOT>\\scripts\\health_check.py
+    pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ./scripts//health_check.py
 """
 
 from __future__ import annotations

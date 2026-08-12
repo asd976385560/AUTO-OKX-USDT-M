@@ -2,18 +2,6 @@
 """Read-only ledger invariants plus deduplicated repair-queue synchronization."""
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sqlite3
@@ -22,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 CST = timezone(timedelta(hours=8))
-LEDGERS = {"live": "live_trades.db", "demo": "demo_trades.db"}
+LEDGERS = {"live": "live_trades.db"}
 _EPS = 1e-7
 
 
@@ -155,7 +143,7 @@ def execution_intent_findings(
     stale_after = now - timedelta(minutes=max(1, stale_min))
     valid_states = {
         "reserved", "submitting", "submitted", "completed",
-        "uncertain", "failed_clean", "reconciled",
+        "uncertain", "failed_clean",
     }
     findings: list[dict[str, Any]] = []
     for row in rows:
@@ -295,13 +283,40 @@ def sync_repair_queue(
     family_prefix: str,
     findings: list[dict[str, Any]],
     ts: str,
+    closed_by: str = "ledger_invariants",
+    resolution: str = "invariant healed",
 ) -> dict[str, int]:
-    """Upsert active invariant findings and close healed queue entries."""
-    active = {str(f["check_name"]): f for f in findings}
+    """Upsert one explicitly owned repair-queue family.
+
+    ``findings`` must belong to ``family_prefix``.  Rejecting a mixed batch is
+    deliberate: a narrow caller must never insert another owner's finding or
+    close another owner's still-active row.  ``substr`` is used instead of
+    ``LIKE`` because invariant names contain ``_`` (a SQL LIKE wildcard).
+    """
+    family_prefix = str(family_prefix or "")
+    closed_by = str(closed_by or "").strip()
+    resolution = str(resolution or "").strip()
+    if not family_prefix:
+        raise ValueError("family_prefix must be non-empty")
+    if not closed_by:
+        raise ValueError("closed_by must be non-empty")
+    if not resolution:
+        raise ValueError("resolution must be non-empty")
+
+    active: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        check_name = str(finding.get("check_name") or "")
+        if not check_name.startswith(family_prefix):
+            raise ValueError(
+                "repair_queue family mismatch: "
+                f"prefix={family_prefix!r} check_name={check_name!r}"
+            )
+        active[check_name] = finding
     rows = account.execute(
-        "SELECT id,check_name FROM repair_queue WHERE check_name LIKE ? "
+        "SELECT id,check_name FROM repair_queue "
+        "WHERE substr(check_name,1,?)=? "
         "AND status IN ('open','pending')",
-        (f"{family_prefix}%",)).fetchall()
+        (len(family_prefix), family_prefix),).fetchall()
     existing = {str(r[1]): int(r[0]) for r in rows}
     inserted = closed = 0
     for check_name, finding in active.items():
@@ -319,23 +334,32 @@ def sync_repair_queue(
             continue
         account.execute(
             "UPDATE repair_queue SET status='closed',closed_at=?,"
-            "closed_by='ledger_invariants',resolution='invariant healed' "
-            "WHERE id=?", (ts, row_id))
-        closed += 1
+            "closed_by=?,resolution=? "
+            "WHERE id=? AND status IN ('open','pending')",
+            (ts, closed_by, resolution, row_id))
+        if account.execute("SELECT changes()").fetchone()[0]:
+            closed += 1
     return {"inserted": inserted, "closed": closed}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--profile", choices=("live", "demo", "both"), default="both")
+    ap.add_argument("--db-root", default=r"./db")
+    # `both` 是 demo 时代的遗留写法，**刻意继续接受**：daily_maintenance、
+    # reviewer 角色文档和历史运维记录里都写着 `--profile both`，改成拒绝会让
+    # 每日维护当场 rc≠0。这里把它降级为 live 的别名。
+    ap.add_argument("--profile", choices=("live", "both"), default="both")
     ap.add_argument("--window-min", type=int, default=90)
     ap.add_argument("--intent-stale-min", type=int, default=15)
     ap.add_argument("--apply-repair-queue", action="store_true")
     ap.add_argument("--compact", action="store_true")
     args = ap.parse_args()
     db_root = Path(args.db_root)
-    profiles = ("live", "demo") if args.profile == "both" else (args.profile,)
+    # 2026-08-06 demo 全量下线：无论传 live 还是 both，都只扫 live。
+    # 这行原本是 `("live","demo") if both`——Phase 2 只收窄了 choices 没动这里，
+    # 于是 demo_trades.db 一删，daily_maintenance 每日那条 `--profile both`
+    # 就会在 _open_ro 上抛 `unable to open database file`（已实测复现）。
+    profiles = ("live",)
     now = datetime.now(CST)
     since = (now - timedelta(minutes=max(1, args.window_min))).strftime(
         "%Y-%m-%d %H:%M:%S")

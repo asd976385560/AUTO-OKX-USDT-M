@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-05
+last-updated: 2026-08-12
 updated-by: Codex
-change-summary: Deliver generated Stars history from a dedicated data branch without bypassing main protection.
+change-summary: Sync the live-only runtime, consolidated collection, multitimeframe evidence and public safety boundary.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Deliver generated Stars history from a dedicated data branch wit
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。系统同时支持 live 与 demo；两者共用执行意图幂等、账仓一致性、成交确认和止损安全路径，但容量按 profile 分治：Live 使用组合 IMR，Demo 使用实时方向性 max-size。
+V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。当前运行链仅保留 live：统一实盘 Agent 先完成分析，再经确定性多周期证据、账户事实、硬风控、订单执行和 writer 同进程提交交易结果。
 
 > [!WARNING]
 > 本项目包含真实交易执行能力。首次部署必须保持 `OKX_EXECUTOR_DRYRUN=1` 和 `OKX_TRIGGER_DRYRUN=1`，并在隔离数据库中完成验证。本项目不构成投资建议，也不保证盈利。
@@ -69,34 +69,32 @@ GitHub Release 名称统一为 `v<VERSION>`。每次发布的非空说明及版�
 
 ## 本次同步
 
-2026-08-04 的公开同步在 7 月 29 日基线上继续带出以下生产语义，同时保留动态路径、空凭证和显式写入授权：
+2026-08-12 的同步以实际运行代码为来源，并在进入公开项目时重新应用可移植与安全边界：
 
-- Live OPEN/ADD 预计成交后组合 `account.imr/totalEq` 不得超过 66.6%，超限整笔拒绝；Demo 按目标杠杆后的方向性 `account max-size` 定仓；
-- `stage_profile_leases` 防止同一 profile 跨 cycle 重叠，runner 还会核验真实 trade 终态；
-- DXY observation-date 去重与 stale 语义、交易时点 regime、固定 08:00 报告窗口和推送持仓投影；
-- GHOST-EXACT / UNRECORDED 精确证据链检查；Live autoheal 永久只读，Demo close/open 写入分别使用两级显式 opt-in；Demo UNRECORDED 还必须确认 intent、ordId 与现有交易所止损，且永不下单或重放订单；
-- 业务推送与告警目标分离，分别只从 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 读取；
-- 扩展后的隔离回归、生命周期清单及带备份门禁的 profile-lease 迁移。
+- Demo 运行能力、角色和数据库初始化目标已经下线，主链收敛为 unified live → push；
+- `collect_cycle.py` 将整点 fast → news → slow 与每刻钟 fast → news 聚合运行，逐步记录结果并隔离失败；
+- OPEN/ADD 必须绑定同一 cycle 的 exact 已收盘 15m/1H/4H 证据，writer 与 executor 独立重验；新闻时间层、资产类别、经验契约和模型影子评估同步纳入；
+- Live 风控同时执行组合 IMR 66.6%、单笔增量 IMR 15%、单笔止损风险 5%、可用保证金、有限数值、账仓一致和 actor attestation 闸；
+- Push 使用 17 项完整报告契约，并对计划槽、归档和精确送达分别审计；
+- 所有公开路径使用项目根或占位符，迁移默认 dry-run 且写入必须显式授权和验证备份；公开 `ledger_autoheal.py` 永久只读；
+- 业务推送与告警目标分离，只从 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 读取；真实凭证、目标、主机状态、数据库、日志和修复工具均不进入仓库。
 
 ## 架构
 
 ```text
 OpenClaw cron
-  ├─ fast_collect.py ───────────────┐
-  ├─ slow_collect.py ───────────────┼─> ledger.db
-  └─ sources/news_collect.py ───────┘
+  ├─ collect_cycle.py --tier hourly ──> fast → news → slow ─┐
+  └─ collect_cycle.py --tier quarter ─> fast → news ────────┴─> ledger.db
                                       │
                                       v
                               core/dispatcher.py
                                       │
               stage_dispatch 闩锁 + profile lease
                                       │
-                 ┌────────────────────┴───────────────────┐
-                 v                                        v
-       unified live trader                         demo trader
-       analysis + live execution                   demo execution
-                 │                                        │
-                 └───────────────┬────────────────────────┘
+                                 v
+                       unified live trader
+                       analysis + live execution
+                                 │
                                  v
                     stage_runner 终态/业务产物核验
                                  │
@@ -113,7 +111,8 @@ OpenClaw cron
 - 每张表或明确键域只有一个权威 writer，读者使用 SQLite `mode=ro`；
 - live 开仓只经 `core/order_executor.py`，内部强制调用 `core/risk_validator.py`；
 - 下单前必须使 OKX 全量现仓与该 profile 的已确认交易账本一致；
-- live/demo 都要求止损，并共用同一套硬上限；
+- 仅支持 `profile=live`，任何非 live profile 都会在交易路径 fail-closed；
+- live 开仓必须提供止损，并同时通过组合、单笔保证金和单笔止损风险硬上限；
 - 当前持仓以 OKX API 为准，不能由本地快照推断；
 - confirmed fill 必须具备权威 `fill_sz`、`fill_px`、`fill_ts` 和 `ts_source`；
 - push 固定走 `scripts/push_pipeline.py`，不由 Agent 临时拼接执行链。
@@ -124,7 +123,6 @@ OpenClaw cron
 |---|---|---|---|
 | analyst | `agents/analyst.md` | 人工回滚分析，不参与默认主链 | 手工 |
 | unified live trader | `agents/live_trader.md` | 分析、实盘判断、硬风控和执行 | dispatcher |
-| demo trader | `agents/demo_trader.md` | 共用分析与硬风控的模拟执行 | dispatcher |
 | news scout | `agents/news_scout.md` | X/无 API 新闻取数和结构化 | 独立 cron，可选 |
 | reviewer | `agents/reviewer.md` | 日/周/月复盘和经验摘要 | 日频 cron |
 
@@ -175,7 +173,6 @@ $openclawRoot = Join-Path $HOME '.openclaw'
 
 openclaw agents add okx-analyst --workspace (Join-Path $openclawRoot 'workspace-okx-analyst') --non-interactive
 openclaw agents add okx-live-trader --workspace (Join-Path $openclawRoot 'workspace-okx-live-trader') --non-interactive
-openclaw agents add okx-demo-trader --workspace (Join-Path $openclawRoot 'workspace-okx-demo-trader') --non-interactive
 openclaw agents add okx-news-scout --workspace (Join-Path $openclawRoot 'workspace-okx-news-scout') --non-interactive
 openclaw agents add okx-reviewer --workspace (Join-Path $openclawRoot 'workspace-okx-reviewer') --non-interactive
 
@@ -193,11 +190,10 @@ openclaw agents list
 
 | 工作 | 类型 | 调度 |
 |---|---|---|
-| fast collect | command | `0,15,30,45 * * * *` |
-| slow collect | command | `2 * * * *` |
+| hourly collection | command | `0 * * * *`，fast → news → slow |
+| quarter collection | command | `15,30,45 * * * *`，fast → news |
 | dispatcher | command | `*/2 * * * *` |
-| registry news | command | `3,18,33,48 * * * *` |
-| news scout | agent | `5,20,35,50 * * * *`，可选 |
+| news scout | agent | `10,25,40,55 * * * *`，可选 |
 | daily maintenance | command | 每日一次，启用前必须单独授权 |
 | reviewer | agent | 每日一次 |
 
@@ -232,8 +228,6 @@ openclaw cron create '*/2 * * * *' `
 | `OKX_QQ_ALERT_TARGET` | 告警 QQ 目标；无默认值 |
 | `OKX_EXECUTOR_DRYRUN` | `1` 时阻止交易变更命令 |
 | `OKX_TRIGGER_DRYRUN` | `1` 时阻止 Agent/push 起棒 |
-| `OKX_LEDGER_AUTOHEAL_APPLY` | 仅 Demo：`1` 时允许精确 GHOST close 补账；Live 永久只读 |
-| `OKX_LEDGER_AUTOHEAL_UNRECORDED` | 仅 Demo：与上一开关同时为 `1`，且 execution_intent、ordId 与同侧足量保护止损均确认时才允许精确 UNRECORDED open 补账；任一证据缺失永远只报告 |
 
 `OKX_DB_ROOT` 可用于确定性脚本、writer、push 与隔离 dry-run。真实 Agent turn
 在 OpenClaw Gateway 服务端执行，本地子进程环境不能证明会传入远端工具进程；因此公开版对
@@ -274,8 +268,9 @@ python scripts/update_star_stats.py --self-test
 权威值以 `core/risk_validator.py` 为准：
 
 - Live OPEN/ADD 预计成交后组合 IMR 比例不超过 66.6%（`MAX_PORTFOLIO_IMR_RATIO`），超限整笔拒绝；
-- Demo OPEN 只按交易所实时方向性 `account max-size` 和合约 `minSz/lotSz` 定仓，不回退 Live 余额公式；
 - 最多使用当前可用 USDT 保证金的 98%（`AVAILABLE_MARGIN_USE_PCT`）；
+- 每笔 OPEN/ADD 的增量 IMR 不超过净值 15%（定仓预算保留余量为 14.7%）；
+- 每笔 OPEN/ADD 的止损风险不超过净值 5%；
 - 杠杆不超过 10x（`MAX_LEVERAGE`）；
 - 单笔名义价值不低于权益的 1%（`MIN_NOTIONAL_PCT`）；
 - 止损偏离 mark price 不超过 30%（`MAX_SL_DEVIATION`）；
@@ -284,11 +279,10 @@ python scripts/update_star_stats.py --self-test
 - 独立止损必须回读本次 `algoId`，confirmed fill 必须来自权威端点；
 - 合约规格、余额、可用保证金或成交确认缺失时 fail-safe 拒绝。
 
-Live 账本 autoheal 永久只读；即使直接向 API/CLI 传 `--apply` 或设置环境开关，也只会
-完成只读分类并以非零结构化结果指向受控人工流程。Live 修复必须唯一命中一个 `ordId`，
+公开版账本 autoheal 永久只读；即使直接向 API/CLI 传 `--apply` 或设置历史环境开关，也只会
+完成只读分类并以非零结构化结果指向受控人工流程。人工修复必须唯一命中一个 `ordId`，
 写前创建并验证 SQLite 备份，逐笔 apply，随后重拉交易所现仓并复跑 reconciliation 与
-ledger invariants。两个环境开关仅授权 Demo；Demo UNRECORDED open 仍需精确 fills、订单
-归属、同侧足量保护止损、单轮上限和 runner 互斥检查。所有路径只修账，不会下单。
+ledger invariants。公开代码没有自动写账入口；所有 autoheal 路径都不会下单、重放订单或修改数据库。
 
 这些限制没有因公开发布、文档国际化或 Stars 统计而修改。
 

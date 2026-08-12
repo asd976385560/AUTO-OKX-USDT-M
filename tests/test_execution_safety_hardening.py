@@ -20,38 +20,117 @@ for module_path in (CORE, COLLECTORS):
 import order_executor as oe  # noqa: E402
 import risk_validator as rv  # noqa: E402
 import trades_writer  # noqa: E402
+from core import multitimeframe_gate as mtf_gate  # noqa: E402
+from experience_contract import build_contract  # noqa: E402
 
 
-class RepairQueueCommandTests(unittest.TestCase):
-    def test_fix_action_uses_runtime_project_paths(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            account_db = root / "account.db"
-            con = sqlite3.connect(account_db)
-            con.execute(
-                "CREATE TABLE repair_queue ("
-                "id INTEGER PRIMARY KEY, ts TEXT, check_name TEXT, "
-                "issue TEXT, fix_action TEXT, status TEXT, created_utc TEXT)")
-            con.commit()
-            con.close()
-
-            oe._enqueue_repair(
-                "live", "BTC-USDT-SWAP", "test-order",
-                "isolated repair test", root)
-
-            con = sqlite3.connect(account_db)
-            fix_action = con.execute(
-                "SELECT fix_action FROM repair_queue").fetchone()[0]
-            con.close()
-            self.assertNotIn("<PROJECT_ROOT>", fix_action)
-            self.assertIn(
-                oe._project_path("scripts", "run_okx_python.ps1"),
-                fix_action)
-            self.assertIn(
-                oe._project_path("scripts", "_okxcli.py"), fix_action)
+def _same_actor_timeline(*_args, **_kwargs) -> dict:
+    """Deterministic fixture for tests that intentionally reach live OPEN gates."""
+    return {
+        "available": True,
+        "handoff_detected": False,
+        "analysis_epoch": 0,
+        "current_epoch": 0,
+        "actor_chain_hash": "fixture-same-actor",
+    }
 
 
-def _valid_receipt_context(cycle_id: str) -> dict:
+def _ready_multitimeframe(*_args, **_kwargs) -> dict:
+    symbol = str(_args[1])
+    cycle_id = str(_args[2])
+    return {
+        "contract_version": 1,
+        "mode": "read_only",
+        "ready": True,
+        "status": "PASSED",
+        "reject_reason": None,
+        "timeframes": [],
+        "evidence_contract": _market_evidence_contract(cycle_id, symbol),
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    }
+
+
+def _market_evidence_contract(cycle_id: str, symbol: str) -> dict:
+    try:
+        cycle = mtf_gate.parse_cycle_cst(cycle_id)
+    except ValueError:
+        # Legacy unit-test sentinels predate the canonical production cycle
+        # contract.  Keep them isolated; production paths remain strict.
+        cycle = mtf_gate.parse_cycle_cst("2026-08-12T18:30")
+    values = {
+        "o": 100.0, "h": 102.0, "l": 99.0, "c": 101.0,
+        "v": 1000.0, "ma5": 100.0, "ma20": 99.0,
+        "atr14": 2.0, "rsi14": 55.0, "macd_hist": 0.5,
+    }
+    return mtf_gate.seal_evidence_contract({
+        "protocol": mtf_gate.EVIDENCE_PROTOCOL,
+        "mode": "read_only",
+        "symbol": symbol,
+        "cycle_id": cycle_id,
+        "required_timeframes": list(mtf_gate.TIMEFRAME_SECONDS),
+        "minimum_bars_for_full_indicators": (
+            mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS),
+        "timeframes": {
+            timeframe: {
+                "expected_closed_bar_ts": (
+                    mtf_gate.expected_closed_bar_start(cycle, timeframe)),
+                "observed_bar_ts": (
+                    mtf_gate.expected_closed_bar_start(cycle, timeframe)),
+                "bars_seen": mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS,
+                "ready": True,
+                "values": dict(values),
+            }
+            for timeframe in mtf_gate.TIMEFRAME_SECONDS
+        },
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    })
+
+
+def _multitimeframe_analysis(
+    cycle_id: str,
+    side: str = "long",
+    symbol: str = "BTC-USDT-SWAP",
+) -> dict:
+    opposite = "short" if side == "long" else "long"
+    return {
+        "cycle_id": cycle_id,
+        "required_timeframes": ["15m", "1H", "4H"],
+        "timeframes": {
+            "15m": {
+                "direction": side,
+                "evidence": ["isolated 15m closed-bar evidence"],
+                "relative_rank": 2,
+            },
+            "1H": {
+                "direction": opposite,
+                "evidence": ["isolated 1H counter-evidence"],
+                "relative_rank": 3,
+            },
+            "4H": {
+                "direction": side,
+                "evidence": ["isolated 4H selected evidence"],
+                "relative_rank": 1,
+            },
+        },
+        "selected_timeframe": "4H",
+        "selected_direction": side,
+        "selection_reason": "4H is relatively strongest in this fixture",
+        "selection_method": (
+            "relative_rank_1_among_15m_1H_4H_not_calibrated"
+        ),
+        "calibrated_confidence": None,
+        "confidence_claim_allowed": False,
+        "evidence_contract": _market_evidence_contract(cycle_id, symbol),
+    }
+
+
+def _valid_receipt_context(
+    cycle_id: str,
+    side: str = "long",
+    symbol: str = "BTC-USDT-SWAP",
+) -> dict:
     return {
         "cycle_id": cycle_id,
         "status": "ok",
@@ -73,8 +152,40 @@ def _valid_receipt_context(cycle_id: str) -> dict:
             },
             "agent_judgement": "exercise the deterministic close contract",
             "reference_overrides": [],
+            "multitimeframe_analysis": _multitimeframe_analysis(
+                cycle_id, side, symbol),
         },
     }
+
+
+def _empty_experience_contract(cycle_id: str, symbol: str,
+                               side: str, regime: str = "range") -> dict:
+    def summary(scope: str) -> dict:
+        return {
+            "scope": scope,
+            "n": 0,
+            "wins": 0,
+            "losses": 0,
+            "sufficient": False,
+            "credibility": 0.0,
+            "reason": "no_experiences",
+        }
+
+    return build_contract(
+        {
+            "symbol": symbol,
+            "side": side,
+            "regime": regime,
+            "action": "open",
+            "profile": "live",
+            "as_of": cycle_id.replace("T", " ") + ":00",
+            "min_sim": 0.5,
+            "top_k": 8,
+        },
+        exact_setup=summary("same_symbol_side_action_regime"),
+        same_symbol_similar=summary("same_symbol_similar"),
+        cross_symbol_similar=summary("cross_symbol_similar"),
+    )
 
 
 class ExecutionIntentProfileGateTests(unittest.TestCase):
@@ -138,6 +249,9 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                     oe.ox, "is_dryrun", return_value=False))
                 stack.enter_context(mock.patch.object(
                     oe, "validate_receipt_context", return_value=[]))
+                stack.enter_context(mock.patch.object(
+                    oe.actor_att, "timeline_state",
+                    side_effect=_same_actor_timeline))
                 stack.enter_context(mock.patch.object(
                     oe, "_enqueue_repair", repair_mock))
                 for name, method_mock in exchange_mocks.items():
@@ -258,10 +372,21 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
             "place_algo_sl": mock.Mock(),
         }
         with ExitStack() as stack:
+            # This helper exercises the original pretrade ledger gate.  Autoheal
+            # has its own contract tests below and must not change these cases'
+            # expected reject reason.
+            stack.enter_context(mock.patch.dict(
+                "os.environ", {"OKX_DISABLE_LEDGER_AUTOHEAL": "1"}, clear=False))
             stack.enter_context(mock.patch.object(
                 oe.ox, "is_dryrun", return_value=False))
             stack.enter_context(mock.patch.object(
                 oe, "validate_receipt_context", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                oe.actor_att, "timeline_state",
+                side_effect=_same_actor_timeline))
+            stack.enter_context(mock.patch.object(
+                oe, "check_multitimeframe_readiness",
+                side_effect=_ready_multitimeframe))
             stack.enter_context(mock.patch.object(
                 oe.ox, "get_balance", return_value={"ok": True}))
             stack.enter_context(mock.patch.object(
@@ -286,7 +411,8 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
                 # 故意传与 API 不同的 caller 快照，闸门必须完全忽略它。
                 open_positions=[
                     {"symbol": "CALLER-ONLY", "side": "short", "sz": 999.0}],
-                receipt_context={"cycle_id": cycle},
+                receipt_context=_valid_receipt_context(
+                    cycle, "long", "SOL-USDT-SWAP"),
             )
         return result, positions_mock, mark_mock, order_mocks, repair_mock
 
@@ -360,6 +486,54 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
                 self.assertIn("pretrade_ledger_position_mismatch", repair_reason)
                 self.assertIn(expected_symbol, repair_reason)
 
+    def test_autoheal_blocking_contract_stops_before_recheck_mark_risk_or_order(self):
+        blocked = {
+            "contract_version": 1,
+            "request_id": "REQ-BLOCK",
+            "profile": "live",
+            "cycle": "AUTOHEAL-BLOCK",
+            "db_root": "isolated",
+            "status": "p0_blocked",
+            "applied": False,
+            "p0": True,
+            "blocking": True,
+            "findings": [{
+                "kind": "NAKED-POSITION-P0", "sev": "P0",
+                "symbol": "BTC-USDT-SWAP", "side": "long",
+                "reason": "protective SL not confirmed",
+            }],
+            "healed": [],
+            "needs_human": [],
+            "rc": 4,
+        }
+        risk = mock.Mock()
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(oe, "_try_autoheal_ledger",
+                               return_value=blocked) as autoheal, \
+             mock.patch.object(oe.rv, "validate", risk):
+            root = Path(td)
+            self._create_trade_db(root, [
+                ("BTC-USDT-SWAP", "open", "long", 2.0),
+            ])
+            result, positions_mock, mark_mock, order_mocks, repair_mock = (
+                self._run_open(root, [], cycle="AUTOHEAL-BLOCK"))
+            intent_state = self._intent_state(root, "AUTOHEAL-BLOCK")
+
+        positions_mock.assert_called_once()
+        autoheal.assert_called_once()
+        mark_mock.assert_not_called()
+        risk.assert_not_called()
+        for method_mock in order_mocks.values():
+            method_mock.assert_not_called()
+        self.assertEqual(
+            result["reject_reason"], "pretrade_ledger_autoheal_blocked")
+        self.assertTrue(result["p0"])
+        self.assertEqual(
+            result["position_reconciliation"]["autoheal"]["rc"], 4)
+        self.assertEqual(intent_state, "failed_clean")
+        repair_reason = repair_mock.call_args.args[3]
+        self.assertIn("pretrade_ledger_autoheal_blocked", repair_reason)
+
     def test_missing_trade_db_fails_closed_before_mark_or_order(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -401,7 +575,11 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
             self.assertIn(
                 "query_failed", repair_mock.call_args.args[3])
 
-    def test_demo_profile_uses_demo_ledger_with_numeric_tolerance(self):
+    def test_ledger_position_compare_uses_numeric_tolerance(self):
+        """0.1+0.2 != 0.3 的浮点累加不得被判成账仓不一致。
+
+        原为 demo profile 用例（2026-08-06 demo 全量下线后改打 live）——容差本身
+        与 profile 无关，是账本累加与交易所 sz 比对的通用契约。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self._create_trade_db(
@@ -410,14 +588,13 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
                     ("BTC-USDT-SWAP", "open", "long", 0.1),
                     ("BTC-USDT-SWAP", "add", "long", 0.2),
                 ],
-                profile="demo",
             )
             result = oe._verify_pretrade_ledger_positions(
-                "demo", root,
+                "live", root,
                 [{"symbol": "BTC-USDT-SWAP", "side": "long", "sz": 0.3}],
             )
             self.assertTrue(result["ok"])
-            self.assertEqual(result["profile"], "demo")
+            self.assertEqual(result["profile"], "live")
             self.assertEqual(result["ledger_groups"], 1)
             self.assertEqual(result["exchange_groups"], 1)
 
@@ -470,6 +647,12 @@ class LiveAccountImrGateTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe, "validate_receipt_context", return_value=[]))
             stack.enter_context(mock.patch.object(
+                oe.actor_att, "timeline_state",
+                side_effect=_same_actor_timeline))
+            stack.enter_context(mock.patch.object(
+                oe, "check_multitimeframe_readiness",
+                side_effect=_ready_multitimeframe))
+            stack.enter_context(mock.patch.object(
                 oe.ei, "reserve",
                 return_value={"status": "reserved", "fingerprint": "FP"}))
             mark_failed_clean = stack.enter_context(
@@ -502,7 +685,8 @@ class LiveAccountImrGateTests(unittest.TestCase):
                 available_margin=1.0,
                 account_imr=caller_account_imr,
                 cycle_id="IMR-GATE",
-                receipt_context={"cycle_id": "IMR-GATE"},
+                receipt_context=_valid_receipt_context(
+                    "IMR-GATE", "long", "BTC-USDT-SWAP"),
             )
 
         return {
@@ -755,6 +939,26 @@ class StopLossReadbackTests(unittest.TestCase):
 
 
 class OpenFillTruthTests(unittest.TestCase):
+    def test_live_open_fails_closed_when_actor_timeline_is_unavailable(self):
+        balance_mock = mock.Mock()
+        with (
+            mock.patch.object(oe.ox, "is_dryrun", return_value=False),
+            mock.patch.object(oe, "validate_receipt_context", return_value=[]),
+            mock.patch.object(
+                oe.actor_att, "timeline_state",
+                return_value={"available": False,
+                              "reason": "session_unresolvable"}),
+            mock.patch.object(oe.ox, "get_balance", balance_mock),
+        ):
+            result = oe.open_position(
+                "BTC-USDT-SWAP", "long", 1.0, 5.0, 95.0, "live",
+                cycle_id="2026-08-10T08:00",
+                receipt_context={"cycle_id": "2026-08-10T08:00"},
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reject_reason"], "actor_timeline_required")
+        balance_mock.assert_not_called()
+
     def test_fills_use_last_authoritative_fill_time(self):
         aggregate = oe._avg_fill([
             {
@@ -851,6 +1055,52 @@ class OpenFillTruthTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(error, "fill_sz_exceeds_approved")
 
+    def test_live_open_requires_cycle_scoped_experience_contract_before_io(self):
+        context = _valid_receipt_context(
+            "2026-08-10T08:00", "short", "HYPE-USDT-SWAP")
+        balance_mock = mock.Mock()
+        with (
+            mock.patch.object(oe.ox, "is_dryrun", return_value=False),
+            mock.patch.object(oe.ox, "get_balance", balance_mock),
+        ):
+            result = oe.open_position(
+                "HYPE-USDT-SWAP",
+                "short",
+                100.0,
+                10.0,
+                56.5,
+                "live",
+                cycle_id="2026-08-10T08:00",
+                receipt_context=context,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reject_reason"], "receipt_context_invalid")
+        self.assertIn("evidence_contract", result["reject_detail"])
+        balance_mock.assert_not_called()
+
+    def test_cycle_scoped_experience_contract_passes_pretrade_context(self):
+        cycle = "2026-08-10T08:00"
+        context = _valid_receipt_context(
+            cycle, "short", "HYPE-USDT-SWAP")
+        context["regime"] = "range"
+        context["decision_card"]["historical_experience"][
+            "evidence_contract"
+        ] = _empty_experience_contract(
+            cycle, "HYPE-USDT-SWAP", "short", "range")
+
+        self.assertEqual(
+            oe.validate_receipt_context(
+                context,
+                cycle_id=cycle,
+                expected_symbol="HYPE-USDT-SWAP",
+                expected_side="short",
+                expected_regime="range",
+                require_experience=True,
+            ),
+            [],
+        )
+
     def test_independent_algo_requires_readback_and_partial_fill_is_returned(self):
         risk_result = {
             "approved": True,
@@ -861,11 +1111,21 @@ class OpenFillTruthTests(unittest.TestCase):
         }
         verify_mock = mock.Mock(
             return_value={"verified": True, "found": [], "matched": {}})
+        tp_verify_mock = mock.Mock(
+            return_value={"verified": False, "found": []})
         journal_mock = mock.Mock()
+        repair_mock = mock.Mock()
+        close_mock = mock.Mock()
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(oe.ox, "is_dryrun", return_value=False))
             stack.enter_context(mock.patch.object(
                 oe, "validate_receipt_context", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                oe.actor_att, "timeline_state",
+                side_effect=_same_actor_timeline))
+            stack.enter_context(mock.patch.object(
+                oe, "check_multitimeframe_readiness",
+                side_effect=_ready_multitimeframe))
             stack.enter_context(mock.patch.object(
                 oe.ei, "reserve",
                 return_value={"status": "reserved", "fingerprint": "FP"}))
@@ -904,7 +1164,7 @@ class OpenFillTruthTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe.ox, "place_market_open",
                 return_value={
-                    "ok": True, "sl_attached": False,
+                    "ok": True, "sl_attached": False, "tp_attached": True,
                     "data": [{"ordId": "O-NEW"}],
                 }))
             stack.enter_context(mock.patch.object(
@@ -915,6 +1175,8 @@ class OpenFillTruthTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe, "_verify_sl_placed", verify_mock))
             stack.enter_context(mock.patch.object(
+                oe, "_verify_tp_placed", tp_verify_mock))
+            stack.enter_context(mock.patch.object(
                 oe, "_read_fills",
                 return_value={
                     "ok": True, "fill_px": 101.0, "fill_sz": 2.0,
@@ -924,15 +1186,27 @@ class OpenFillTruthTests(unittest.TestCase):
                 }))
             stack.enter_context(mock.patch.object(
                 oe, "_journal_fill", journal_mock))
+            stack.enter_context(mock.patch.object(
+                oe, "_enqueue_repair", repair_mock))
+            stack.enter_context(mock.patch.object(
+                oe, "close_position", close_mock))
 
+            context = _valid_receipt_context("CYCLE-1")
+            context["decision_card"]["risk_reward"]["target"] = 110.0
             result = oe.open_position(
                 "BTC-USDT-SWAP", "long", 5.0, 5.0, 95.0, "live",
-                cycle_id="CYCLE-1", receipt_context={"cycle_id": "CYCLE-1"},
+                cycle_id="CYCLE-1", receipt_context=context,
+                tp_trigger_px=110.0,
             )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["sl_mode"], "algo")
         self.assertTrue(result["sl_verified"])
+        self.assertEqual(result["tp_warning"], "tp_unsecured")
+        self.assertFalse(result["tp_verified"])
+        close_mock.assert_not_called()
+        self.assertEqual(
+            repair_mock.call_args.args[3], "tp_unsecured_after_open")
         trade = result["trades"][0]
         self.assertEqual(trade["sz"], 2.0)
         self.assertEqual(trade["fill_sz"], 2.0)

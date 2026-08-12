@@ -20,8 +20,8 @@ news_events_index PK(symbol,ts,news_id)）：目标 CST 值已存在同键行时
 （conflict——两行是同一时刻的重复快照，保留现状待人工裁决，不自动删数据）。
 
 用法（默认 dry-run，只读打开、逐表计数不写）：
-    pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
-        <PROJECT_ROOT>\\scripts\\apply_ts_cst_migration.py --db-root <PROJECT_ROOT>\\db
+    pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ^
+        ./scripts//apply_ts_cst_migration.py --db-root ./db
     加 --apply --backup-dir <BACKUP_DIR> 才真写；两个目标库会在任何写连接前
     完成 SQLite 在线备份和 integrity_check。
 

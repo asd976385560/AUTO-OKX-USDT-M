@@ -32,38 +32,34 @@ REQUIRED_GROUP_FIELDS = {
 
 
 def tracked_scripts(root: Path = SCRIPTS) -> set[str]:
-    if root.resolve() == SCRIPTS.resolve() and (ROOT / ".git").exists():
-        result = subprocess.run(
-            [
-                "git",
-                "-c",
-                f"safe.directory={ROOT.as_posix()}",
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                "scripts",
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if result.returncode == 0:
-            return {
-                Path(line.strip()).name
-                for line in result.stdout.splitlines()
-                if Path(line.strip()).parent.as_posix() == "scripts"
-                and Path(line.strip()).suffix.lower() in {".py", ".ps1"}
-            }
-    return {
-        path.name
-        for path in root.iterdir()
-        if path.is_file() and path.suffix.lower() in {".py", ".ps1"}
-    }
+    """Return publishable top-level scripts, including intentional new files.
+
+    Ignored host-only utilities may coexist in an operator checkout.  They are
+    not part of the public release and must not force entries into the public
+    lifecycle manifest, so the repository index/ignore rules are authoritative.
+    """
+    root = root.resolve()
+    repo_root = root.parent
+    result = subprocess.run(
+        ["git", "-c", f"safe.directory={repo_root.as_posix()}",
+         "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+         "--", root.name],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("git ls-files failed; lifecycle scope is unknown")
+    names: set[str] = set()
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        relative = Path(raw.decode("utf-8").replace("\\", "/"))
+        if (len(relative.parts) == 2 and relative.parts[0] == root.name
+                and relative.suffix.lower() in {".py", ".ps1"}
+                and (repo_root / relative).is_file()):
+            names.add(relative.name)
+    return names
 
 
 def validate_manifest(

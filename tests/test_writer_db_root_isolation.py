@@ -16,7 +16,7 @@ from collectors import _dispatch_nudge, analyst_writer, trades_writer
 
 class WriterDbRootIsolationTests(unittest.TestCase):
     @staticmethod
-    def _empty_trade_db(db_root: Path, profile: str = "demo") -> Path:
+    def _empty_trade_db(db_root: Path, profile: str = "live") -> Path:
         db_root.mkdir(parents=True, exist_ok=True)
         db = db_root / f"{profile}_trades.db"
         con = sqlite3.connect(db)
@@ -45,9 +45,6 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             self.assertEqual(analyst_writer._runtime_db_root(), root)
             self.assertEqual(
                 trades_writer._trade_db_path("live"), root / "live_trades.db"
-            )
-            self.assertEqual(
-                trades_writer._trade_db_path("demo"), root / "demo_trades.db"
             )
             self.assertEqual(
                 trades_writer._runtime_db_path(
@@ -157,9 +154,9 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             root = Path(tmp)
             db_root = root / "db"
             db = self._empty_trade_db(db_root)
-            journal = root / "exec_demo.jsonl"
+            journal = root / "exec_live.jsonl"
             journal.write_text(json.dumps({
-                "profile": "demo",
+                "profile": "live",
                 "cycle_id": "2026-08-04T12:00",
                 "ts": "2026-08-04 12:01:00",
                 "unwind": True,
@@ -174,7 +171,7 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             before = db.read_bytes()
             args = SimpleNamespace(
-                from_journal=str(journal), profile="demo",
+                from_journal=str(journal), profile="live",
                 db_root=str(db_root), ordid=None, replay_dry_run=True,
             )
             output = io.StringIO()
@@ -195,10 +192,10 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             root = Path(tmp)
             db_root = root / "db"
             self._empty_trade_db(db_root)
-            journal = root / "exec_demo.jsonl"
+            journal = root / "exec_live.jsonl"
             journal.write_text("{}\n", encoding="utf-8")
             args = SimpleNamespace(
-                from_journal=str(journal), profile="demo",
+                from_journal=str(journal), profile="live",
                 db_root=str(db_root), ordid=None, replay_dry_run=False,
             )
             output = io.StringIO()
@@ -218,9 +215,9 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             root = Path(tmp)
             db_root = root / "db"
             self._empty_trade_db(db_root)
-            journal = root / "exec_demo.jsonl"
+            journal = root / "exec_live.jsonl"
             journal.write_text(json.dumps({
-                "profile": "demo",
+                "profile": "live",
                 "cycle_id": "2026-08-04T12:00",
                 "ts": "2026-08-04 12:01:00",
                 "unwind": True,
@@ -233,7 +230,7 @@ class WriterDbRootIsolationTests(unittest.TestCase):
                 },
             }) + "\n", encoding="utf-8")
             args = SimpleNamespace(
-                from_journal=str(journal), profile="demo",
+                from_journal=str(journal), profile="live",
                 db_root=str(db_root), ordid="ORD-UNWIND",
                 replay_dry_run=False,
             )
@@ -256,9 +253,9 @@ class WriterDbRootIsolationTests(unittest.TestCase):
             root = Path(tmp)
             db_root = root / "db"
             self._empty_trade_db(db_root)
-            journal = root / "exec_demo.jsonl"
+            journal = root / "exec_live.jsonl"
             record = {
-                "profile": "demo",
+                "profile": "live",
                 "cycle_id": "2026-08-04T12:00",
                 "ts": "2026-08-04 12:01:00",
                 "trade": {
@@ -274,7 +271,7 @@ class WriterDbRootIsolationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             args = SimpleNamespace(
-                from_journal=str(journal), profile="demo",
+                from_journal=str(journal), profile="live",
                 db_root=str(db_root), ordid="ORD-DUPLICATE",
                 replay_dry_run=False,
             )

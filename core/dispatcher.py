@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""V2.0 §3/§8 —— 硬化派发器（就绪驱动派发 + DB 闩锁幂等）。
 
-unified-live/demo/push 的幂等统一使用
+unified-live/push 的幂等统一使用（demo stage 已于 2026-08-06 下线，历史行保留）
 `ledger.db.stage_dispatch(cycle_id,stage)` 唯一约束闩锁。
 按上游业务产物就绪条件派发，而非把派发闩锁解释成完成证明
 （分析时长不定；阶段终态由 stage_runner/目标业务产物另行核验）。
@@ -9,9 +9,10 @@ unified-live/demo/push 的幂等统一使用
 逻辑（对最近 LOOKBACK_SLOTS+1（当前=5）个 15min 槽，命令型 cron */2min）：
   - stage live（mode=unified）：`analysis_runs[cycle]` 未写且采集必需源齐且新鲜
         → 抢 live 闩锁 → 起 okx-live-trader，一次完成分析+实盘；每 tick 至多派 1 个。
-  - stage demo：analysis 已写且新鲜、demo 未派 → 起 demo。
-        人工回滚 analyst 写入 analysis 后，补派 full live。
-  - stage push：live+demo 的 `trade_cycles[cycle]` 都已写、push 未派 → 抢锁 → fire。
+  - stage demo：**2026-08-06 全量下线**，stage 已从 trigger_agent 的路由表移除，
+        手动也起不了。人工回滚 analyst 写入 analysis 后，仍补派 full live。
+  - stage push：**live** 的 `trade_cycles[cycle]` 已写、push 未派 → 抢锁 → fire。
+        demo 未落库不阻断（2026-08-06 解耦），payload 侧标 PENDING。
   - **过窗处置**：过窗仍无 analysis / 采集未齐 → **不空起、不补派**，仅 WARN（alert-only，交 on-demand collection_monitor / failureAlert 巡检）。
   - push 送达核验：派发 15-40min 窗内 qq_push_dedupe 无送达记录 → WARN
         （alert-only，不补派不重试）。
@@ -20,22 +21,10 @@ unified-live/demo/push 的幂等统一使用
 零模型名（红线 #1）：起棒经 trigger_agent（agent-id 集中在那）。
 
 用法（OpenClaw 命令型 cron */2min）：
-    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\core\dispatcher.py --db-root <PROJECT_ROOT>\db
+    pwsh -NoProfile -File ./scripts/run_okx_python.ps1 ./core/dispatcher.py --db-root ./db
     OKX_TRIGGER_DRYRUN=1 + 上述 wrapper 命令   # 只验逻辑不真起棒
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import hashlib
@@ -47,7 +36,16 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _project_path('collectors'))
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+
+
+def _project_path(*parts: str) -> str:
+    return str(_PROJECT_ROOT.joinpath(*parts))
+
+
+_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _project_path("collectors"))
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 
@@ -65,13 +63,15 @@ COLLECT_MAX_AGE = 900  # 采集齐活后 ≤15min 内仍可起 unified live；ga
 LOOKBACK_SLOTS = 4  # P4b：dispatch_once 回扫最近 N+1 个 15min 槽，给 push 等晚到 stage 多轮补派机会（stage_dispatch 闩锁保幂等）
 PUSH_VERIFY_MIN_SEC = 900   # push 派发后给足 15min 送达，再核验
 PUSH_VERIFY_MAX_SEC = 2400  # 只核验最近 40min 内派发的 push；窗口自然滚动即幂等，无需去重状态
-PUSH_EVENT_LOG = Path(_project_path('logs', 'push', 'qq_push_dedupe.jsonl'))
-CANONICAL_DB_ROOT = Path(_project_path('db')).resolve()
+PUSH_EVENT_LOG = Path(_project_path("logs", "push", "qq_push_dedupe.jsonl"))
+CANONICAL_DB_ROOT = Path(_project_path("db")).resolve()
 
 
 def _root_namespace(db_root: Path | str) -> str:
     resolved = Path(db_root).resolve()
-    if resolved == CANONICAL_DB_ROOT:
+    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
+        os.fspath(CANONICAL_DB_ROOT)
+    ):
         return ""
     return "r" + hashlib.sha256(
         os.path.normcase(os.fspath(resolved)).encode("utf-8")
@@ -140,7 +140,7 @@ def _age_sec(ts_str: str, now: Optional[datetime] = None) -> int:
 
 def _collection_ready(ledger_path, cycle: str, max_age: int = COLLECT_MAX_AGE) -> bool:
     """采集必需源齐且新鲜 → True。任何异常一律视作未就绪——绝不让统一 live 触发
-    的探测拖垮整个派发器（live/demo/push 派发优先存活）。"""
+    的探测拖垮整个派发器（live/push 派发优先存活）。"""
     try:
         g = ledger.gate_collection_fresh(ledger_path, cycle, max_age_sec=max_age)
         return g.get("status") == "ok"
@@ -156,14 +156,12 @@ def _fire_stage(ledger_path, cycle: str, stage: str, mode: str,
                 fire_fn: Callable, result: list) -> None:
     """抢 profile 租约 + cycle 闩锁 → fire；起棒失败释放（下轮重试）。
 
-    ``OKX_TRIGGER_DRYRUN=1`` 只调用 trigger 的干跑分支来记录待执行命令，
-    不获取或写入任何持久闩锁。否则一次干跑会让后续真实派发误以为该 stage
-    已经执行，而 dry-run 又没有监督 runner 可以完成或接管该租约。
+    Dry-run only records the intended launch.  It must not acquire any
+    persistent stage or profile latch.
     """
     cycle = validate_cycle_id(cycle)
     if ledger.stage_dispatched(ledger_path, cycle, stage):
         return
-
     if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
         try:
             key = fire_fn(stage, cycle, mode)
@@ -173,8 +171,7 @@ def _fire_stage(ledger_path, cycle: str, stage: str, mode: str,
             result.append(f"fire_failed {stage} {cycle}: {e}")
             log(f"{cycle}: dry-run fire {stage} FAILED; no latch written: {e}")
         return
-
-    leased = stage in {"live", "demo"}
+    leased = stage == "live"
     if leased and not ledger.try_profile_lease(ledger_path, stage, cycle):
         result.append(f"deferred {stage} {cycle}: profile lease busy")
         log(f"{cycle}: stage={stage} deferred (same-profile task still active)")
@@ -272,11 +269,6 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
                    allow_agent_stages: Optional[bool] = None) -> list:
     cycle = validate_cycle_id(cycle)
     out: list = []
-    # ``dispatch_once`` normally binds the selected root before calling here,
-    # but this function is also a public test/diagnostic seam.  Bind the
-    # canonical trigger here as well so a direct custom-root call cannot put a
-    # latch in the isolated ledger while launching push (or dry-run Agent
-    # artifacts) against the production root.
     default_trigger = fire_fn is trigger_agent.fire
     effective_fire = fire_fn
     if default_trigger:
@@ -287,7 +279,7 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
         allow_agent_stages = (
             not default_trigger
             or os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
-            or Path(db_root).resolve() == CANONICAL_DB_ROOT
+            or _root_namespace(db_root) == ""
         )
     a = analysis_row(db_root, cycle)
     if not a:
@@ -301,7 +293,7 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
                     )
                 else:
                     out.append(
-                        f"blocked live {cycle}: non-default db_root requires dry-run"
+                        f"blocked live/demo {cycle}: non-default db_root requires dry-run"
                     )
                     log(
                         f"{cycle}: live Agent blocked before lease/latch; "
@@ -316,45 +308,50 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
 
     # analysis 只有精确 status=ok + mode=full 才可放行；旧库缺失值、未知值、
     # failed/timeout 或非现役 mode 一律 fail-closed。
-    # live/demo/push 闩锁不写、每 tick 重查；人工重写为 status=ok 后自然放行。
+    # live/push 闩锁不写、每 tick 重查；人工重写为 status=ok 后自然放行。
     # mode 固定为 full；是否允许下游仅由 analysis status 决定。
     # WARN 防刷屏：stage_dispatch 哨兵行 (cycle,'skip_warn') 唯一约束保每 cycle 只打一次。
     if status != "ok" or mode != "full":
         reason = f"status={status or '<missing>'},mode={mode or '<missing>'}"
         if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
             out.append(f"dry_run skip {cycle} analysis {reason}, no latch written")
-            log(f"{cycle}: dry-run WARN analysis {reason} -> skip live/demo/push; "
-                "no skip_warn latch written")
+            log(
+                f"{cycle}: dry-run WARN analysis {reason} -> skip live/push; "
+                "no skip_warn latch written"
+            )
             return out
         if (not ledger.stage_dispatched(ledger_path, cycle, "skip_warn")
                 and ledger.try_stage(ledger_path, cycle, "skip_warn")):
             out.append(f"skip {cycle} analysis {reason}, no trader/push")
-            log(f"{cycle}: WARN analysis {reason} -> skip live/demo/push "
+            log(f"{cycle}: WARN analysis {reason} -> skip live/push "
                 f"(re-check every tick; recovers if analyst rewrites status=ok)")
         return out
 
-    # unified 轮的 live 闩锁已在首棒存在，只会派 demo；人工回滚 analyst 轮若
-    # live 尚未派，则在此补派 full live。同一循环由闩锁区分两种路径。
+    # 人工回滚 analyst 轮若 live 尚未派，在此补派 full live；unified 轮的 live 闩锁
+    # 已在首棒存在，_fire_stage 静默跳过。
+    # **2026-08-06：demo 全量下线。** 起因是三重口径分叉——标的范围（live 36 个 /
+    # demo 17 个，OKX 对 demo 不可交易标的统一返 51001）、仓位授权（max-size vs
+    # 组合 IMR≤0.666）、可用保证金（demo availBal 仅占 totalEq 0.5%，实际可冒险
+    # 资金比 live 还少）。当日先停自动派发，随后决定连运行能力与历史数据一并清除；
+    # order_executor 现以 _require_live_profile() 硬拒任何非 live profile。
     if age <= max_age:
         if allow_agent_stages:
-            for stage in ("live", "demo"):
-                _fire_stage(ledger_path, cycle, stage, mode, effective_fire, out)
+            _fire_stage(ledger_path, cycle, "live", mode, effective_fire, out)
         else:
             out.append(
                 f"blocked live/demo {cycle}: non-default db_root requires dry-run"
-            )
-            log(
-                f"{cycle}: live/demo Agents blocked before lease/latch; "
-                "non-default db_root requires OKX_TRIGGER_DRYRUN=1"
             )
     else:
         if not ledger.stage_dispatched(ledger_path, cycle, "live"):
             out.append(f"stale {cycle} age={age}s>{max_age}s skip trader")
             log(f"{cycle}: analysis 陈旧 age={age}s，不追起 trader (status={status})")
 
-    # stage push：双盘 trade_cycles 都已写 → 抢锁起 push（独立于 analysis 新鲜度）
-    if (trade_written(db_root, "live", cycle)
-            and trade_written(db_root, "demo", cycle)):
+    # stage push：live trade_cycles 已写 → 抢锁起 push（独立于 analysis 新鲜度）。
+    # 2026-08-06 解耦：push 是纯汇报、一分钱不碰，不得被 demo 账本卡住（8-05 一个
+    # 自愈范围内的 demo 幽灵仓曾让 demo+push 死锁 2h14m）——与 trigger_agent 对
+    # autoheal blocking「只告警不停 stage」同一条边界，真正的防线在 executor pretrade。
+    # demo 停自动派发后本就不落库，故不再为此告警；payload 侧仍把该盘标 PENDING。
+    if trade_written(db_root, "live", cycle):
         _fire_stage(ledger_path, cycle, "push", mode, effective_fire, out)
     return out
 
@@ -362,9 +359,9 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
 def _delivered_dedupe_keys(event_log: Path, floor_ts: str) -> set:
     """qq_push_dedupe.jsonl 尾部「已送达」的显式身份键集合（ts>=floor_ts）。
 
-    送达形态两种：mark(status=sent)=真发成功；duplicate_skip 且
-    existing_status=sent=同键已有确认送达。pending duplicate 仍属未知，绝不能
-    冒充送达。按 dedupe_key 归集，避免相邻 push 互相掩盖。
+    送达形态两种：mark(status=sent)=真发成功；duplicate_skip=同键已有 sent、
+    本次派发被合并（skip 不写 dedupe 库，只能从事件流看到）。按 dedupe_key
+    归集，避免相邻 push 互相掩盖。
     """
     if not event_log.exists():
         return set()
@@ -384,8 +381,12 @@ def _delivered_dedupe_keys(event_log: Path, floor_ts: str) -> set:
     return out
 
 
-def verify_push_delivery(db_root: Path, ledger_path, now: Optional[datetime] = None,
-                         event_log: Path | None = None) -> None:
+def verify_push_delivery(
+    db_root: Path,
+    ledger_path,
+    now: Optional[datetime] = None,
+    event_log: Path | None = None,
+) -> None:
     """push 送达核验（alert-only，只告警不补派不重试）。
 
     trigger 起纯脚本 push 后，进程启动成功不代表消息已送达。送达真值 =
@@ -399,7 +400,8 @@ def verify_push_delivery(db_root: Path, ledger_path, now: Optional[datetime] = N
     namespace = _root_namespace(db_root)
     if event_log is None:
         event_log = (
-            PUSH_EVENT_LOG if not namespace
+            PUSH_EVENT_LOG
+            if not namespace
             else PUSH_EVENT_LOG.with_name(
                 f"qq_push_dedupe-{namespace}.jsonl"
             )
@@ -450,7 +452,7 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
     叠加 dispatcher cron 被 gateway 饿（实测 10-28min 间隔），push 往往只剩一次「在窗且双盘
     trade_cycles 齐」的机会即丢→该 cycle 滑出两槽窗后永不补派（实测 ~18% 完成交易的 cycle 无 push）。
     拉宽回扫窗让 push 多轮补派；stage_dispatch UNIQUE(cycle_id,stage) 闩锁保幂等，已派 stage
-    再扫一律静默跳过、绝不重复起棒；live/demo 另有 age<=max_age 新鲜度闸挡住旧轮（不会迟起 trader）。
+    再扫一律静默跳过、绝不重复起棒；live 另有 age<=max_age 新鲜度闸挡住旧轮（不会迟起 trader）。
     """
     if ledger_path is None:
         ledger_path = db_root / "ledger.db"
@@ -463,7 +465,7 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
     allow_agent_stages = (
         not default_trigger
         or os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
-        or Path(db_root).resolve() == CANONICAL_DB_ROOT
+        or _root_namespace(db_root) == ""
     )
     now = now or datetime.now(CST)
     cycles = [
@@ -496,7 +498,7 @@ def main() -> int:
     ap.add_argument("--db-root", required=True)
     ap.add_argument("--max-age", type=int, default=MAX_AGE_SEC)
     args = ap.parse_args()
-    db_root = Path(args.db_root).resolve()
+    db_root = Path(args.db_root)
     ledger.init_ledger(db_root / "ledger.db")  # 幂等保 stage_dispatch 存在
     actions = dispatch_once(db_root, max_age=args.max_age)
     if not actions:

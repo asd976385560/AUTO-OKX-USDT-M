@@ -8,30 +8,18 @@
 4. 绝不执行 DELETE/UPDATE 已有 trade_day_num（只 INSERT）
 5. --rewrite-null-and-renumber 仅用于显式维护：把 #NULL 行重新编号并补缺号
 6. 默认 dry-run 模式（--apply 才真写）
-7. 同时落盘 reports/daily-reports/daily-YYYY-MM-DD.md（markdown 全文）
+7. 同时落盘 daily/weekly/monthly 的 UTF-8 Markdown（原子替换）
 
 调用：
   echo '<json>' | run_okx_python.ps1 scripts/daily_report_writer.py --stdin
-  run_okx_python.ps1 scripts/daily_report_writer.py --json-file path.json [--apply] [--profiles live|demo|both]
+  run_okx_python.ps1 scripts/daily_report_writer.py --json-file path.json [--apply] [--profiles live]
   run_okx_python.ps1 scripts/daily_report_writer.py --rewrite-null-and-renumber [--apply]
   run_okx_python.ps1 scripts/daily_report_writer.py --backfill-daily-revision --report-ts "YYYY-MM-DD HH:MM:SS" [--apply]
 
-说明：默认 --profiles both，一次 payload 同时写 live/demo 双段；成功后不要再单独重复写 demo。
+说明：2026-08-06 demo 全量下线后只写 live 一段。
 
 退出码：0=成功且校验通过；非0=失败（Agent 须视为 P0）
 """
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 import argparse
 import hashlib
 import json
@@ -54,15 +42,16 @@ def sanitize_text(value: str) -> str:
 
 CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
-DB_PATH = Path(os.environ.get('OKX_ACCOUNT_DB', _project_path('db', 'account.db')))
-REPORTS_DIR = Path(os.environ.get('OKX_DAILY_REPORTS_DIR', _project_path('reports', 'daily-reports')))
+DB_PATH = Path(os.environ.get('OKX_ACCOUNT_DB', r'./db/account.db'))
+REPORTS_DIR = Path(os.environ.get('OKX_DAILY_REPORTS_DIR', r'./reports/daily-reports'))
 WEEKLY_REPORTS_DIR = Path(os.environ.get(
-    'OKX_WEEKLY_REPORTS_DIR', _project_path('reports', 'weekly')))
+    'OKX_WEEKLY_REPORTS_DIR', r'./reports/weekly'))
+MONTHLY_REPORTS_DIR = Path(os.environ.get(
+    'OKX_MONTHLY_REPORTS_DIR', r'./reports/monthly'))
 LIVE_TRADES_DB = Path(os.environ.get(
-    'OKX_LIVE_TRADES_DB', _project_path('db', 'live_trades.db')))
-DEMO_TRADES_DB = Path(os.environ.get(
-    'OKX_DEMO_TRADES_DB', _project_path('db', 'demo_trades.db')))
-LEDGER_DB = Path(os.environ.get('OKX_LEDGER_DB', _project_path('db', 'ledger.db')))
+    'OKX_LIVE_TRADES_DB', r'./db/live_trades.db'))
+LEDGER_DB = Path(os.environ.get('OKX_LEDGER_DB', r'./db/ledger.db'))
+LESSONS_DB = Path(os.environ.get('OKX_LESSONS_DB', r'./db/lessons.db'))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -399,7 +388,11 @@ def plan_daily_revision_backfill(
     report_ts: str,
     report_path: Path,
 ) -> dict:
-    """Plan a metadata-only repair for one existing live/demo daily pair."""
+    """Plan a metadata-only repair for one existing daily report row.
+
+    2026-08-06 demo 全量下线：历史 ts 可能是 live+demo 两行（下线前生成）或只有
+    live 一行。刻意放宽为「live 行必须在，多余 profile 忽略」——写死两行会让所有
+    历史日报的 revision 修复当场失效。"""
     canonical_ts = trade_report_stats.fmt_ts(report_ts)
     rows = con.execute(
         "SELECT rowid,ts,profile,trade_day_num,raw "
@@ -407,9 +400,9 @@ def plan_daily_revision_backfill(
         (canonical_ts,),
     ).fetchall()
     profiles = [str(row[2]) for row in rows]
-    if len(rows) != 2 or set(profiles) != {"live", "demo"}:
+    if "live" not in profiles:
         raise RuntimeError(
-            "revision backfill 要求 report_ts 恰有 live/demo 两行")
+            "revision backfill 要求 report_ts 至少有 live 行")
     if not report_path.exists():
         raise FileNotFoundError(f"日报 Markdown 不存在：{report_path}")
 
@@ -446,7 +439,7 @@ def plan_daily_revision_backfill(
     if existing_revisions:
         revision = existing_revisions[0]
         if any(item != revision for item in existing_revisions[1:]):
-            raise RuntimeError("live/demo 已有 revision 不一致，拒绝自动选择")
+            raise RuntimeError("已有 revision 不一致，拒绝自动选择")
     else:
         revision = _initial_daily_revision()
         revision.update({
@@ -651,6 +644,13 @@ def _compact_trade_metrics(stats: dict) -> dict:
         "win_rate_pct": stats["win_rate_pct"],
         "best_trade": stats["best_trade"],
         "worst_trade": stats["worst_trade"],
+        "close_side_breakdown": stats.get("close_side_breakdown"),
+        "closed_position_avg_hold_hours": stats.get(
+            "closed_position_avg_hold_hours"),
+        "closed_position_hold_sample_count": stats.get(
+            "closed_position_hold_sample_count"),
+        "closed_position_hold_unmatched_count": stats.get(
+            "closed_position_hold_unmatched_count"),
         "excluded_rejected_rows": stats["excluded_rejected_rows"],
         "excluded_incomplete_rows": stats["excluded_incomplete_rows"],
         "risk_rejected_open_attempts": {
@@ -685,6 +685,97 @@ def _numeric_diff(left, right, tolerance: float = 1e-9) -> bool:
         return True
 
 
+def _missed_opps_window_count(start_ts: str, end_ts: str) -> int | None:
+    """lessons.db 窗口内错失机会权威计数；库/表缺失返回 None（未知≠0）。"""
+    if not LESSONS_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{LESSONS_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            if not con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='missed_opportunities'").fetchone():
+                return None
+            return int(con.execute(
+                "SELECT COUNT(*) FROM missed_opportunities "
+                "WHERE ts LIKE '202%' AND datetime(ts)>=datetime(?) "
+                "AND datetime(ts)<datetime(?)",
+                (start_ts, end_ts)).fetchone()[0])
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+_SIDE_PAIR_RES = (
+    # "11空/2多"、"11 空、2 多" 及反序
+    (re.compile(r"(\d+)\s*(?:笔)?\s*空\s*[/、]\s*(\d+)\s*(?:笔)?\s*多"),
+     ("short", "long")),
+    (re.compile(r"(\d+)\s*(?:笔)?\s*多\s*[/、]\s*(\d+)\s*(?:笔)?\s*空"),
+     ("long", "short")),
+)
+_SIDE_LABEL_RES = (
+    (re.compile(r"空头(?:方向)?\s*(\d+)\s*笔"), "short"),
+    (re.compile(r"多头(?:方向)?\s*(\d+)\s*笔"), "long"),
+)
+_NO_MISSED_RE = re.compile(r"无错失机会|错失机会\s*[:：]?\s*0\s*(?:条|笔|个)?")
+_NO_REJECT_RE = re.compile(r"无风控拒绝|风控拒绝\s*[:：]?\s*0\s*(?:条|笔)?")
+_LEGACY_1R_RE = re.compile(r"(?i)\bhit[_ ]?1r\b")
+
+
+def _lint_narrative_against_facts(payload: dict, stats: dict,
+                                  missed_count: int | None) -> list[str]:
+    """过渡期叙事 lint（Wave0-2）：只拦已实际烧过的三类事实冲突——
+
+    ① 方向计数（周报曾写 11空/2多，账本 10空/3多）；
+    ② "无错失机会"断言 vs lessons.db 窗口实数；
+    ③ "无风控拒绝"断言 vs execution_intents 实数。
+    只校验 summary/lessons 文字段；数字来源恒为确定性 stats。不做泛化数字
+    审查（价格、百分比等不在射程），完整 fact_id 绑定属后续 wave。
+    """
+    text = f"{payload.get('summary') or ''}\n{payload.get('lessons') or ''}"
+    if not text.strip():
+        return []
+    problems: list[str] = []
+    sides = stats.get("close_side_breakdown") or {}
+    actual = {
+        "long": (sides.get("long") or {}).get("close_count"),
+        "short": (sides.get("short") or {}).get("close_count"),
+    }
+    claimed: dict[str, set[int]] = {"long": set(), "short": set()}
+    for pattern, (first, second) in _SIDE_PAIR_RES:
+        for m in pattern.finditer(text):
+            claimed[first].add(int(m.group(1)))
+            claimed[second].add(int(m.group(2)))
+    for pattern, side in _SIDE_LABEL_RES:
+        for m in pattern.finditer(text):
+            claimed[side].add(int(m.group(1)))
+    for side in ("long", "short"):
+        expected = actual.get(side)
+        if expected is None:
+            continue
+        wrong = {n for n in claimed[side] if n != expected}
+        if wrong:
+            label = "多" if side == "long" else "空"
+            problems.append(
+                f"文字段声称{label}头 {sorted(wrong)} 笔，"
+                f"确定性统计为 {expected} 笔")
+    if missed_count is not None and missed_count > 0 and \
+            _NO_MISSED_RE.search(text):
+        problems.append(
+            f"文字段声称无错失机会，lessons.db 本窗口实有 {missed_count} 条")
+    rejects = (stats.get("risk_rejected_open_attempts") or {}).get("count")
+    if rejects and _NO_REJECT_RE.search(text):
+        problems.append(
+            f"文字段声称无风控拒绝，本窗口实有 {rejects} 笔")
+    if _LEGACY_1R_RE.search(text):
+        problems.append(
+            "文字段含退化 hit_1R/hit1R 旧口径；请改用 "
+            "is_gross_profit_close、ever_hit_1r 或 would_hit_1r_fixed2pct 的明确语义"
+        )
+    return problems
+
+
 def _prepare_trade_payload(
     payload: dict,
     *,
@@ -703,8 +794,8 @@ def _prepare_trade_payload(
     }
     stats_by_profile = {}
     corrections = []
-    paths = {"live": LIVE_TRADES_DB, "demo": DEMO_TRADES_DB}
-    for profile in ("live", "demo"):
+    paths = {"live": LIVE_TRADES_DB}
+    for profile in ("live",):
         stats = trade_report_stats.profile_statistics(
             profile,
             paths[profile],
@@ -727,10 +818,17 @@ def _prepare_trade_payload(
         }
         if include_avg_hold:
             authoritative["avg_hold_hours"] = (
-                stats.get("open_position_avg_hold_hours")
+                stats.get("closed_position_avg_hold_hours")
             )
         if period_kind == "weekly":
             authoritative["win_rate"] = stats["win_rate_pct"]
+
+        sides = stats.get("close_side_breakdown") or {}
+        authoritative["close_side_breakdown"] = sides
+        authoritative["close_long_count"] = (
+            sides.get("long") or {}).get("close_count", 0)
+        authoritative["close_short_count"] = (
+            sides.get("short") or {}).get("close_count", 0)
 
         for key in ("open_count", "close_count", "total_pnl"):
             field = f"{profile}_{key}"
@@ -746,6 +844,20 @@ def _prepare_trade_payload(
         _append_anomaly(
             out,
             "成交统计已按有效 fill 自动校正: " + "；".join(corrections),
+        )
+
+    missed_count = _missed_opps_window_count(
+        out["period_start_ts"], out["period_end_ts"])
+    out["missed_opps_window_count"] = missed_count
+
+    lint_problems: list[str] = []
+    for stats in stats_by_profile.values():
+        lint_problems.extend(
+            _lint_narrative_against_facts(out, stats, missed_count))
+    if lint_problems:
+        fail(
+            "报告文字段与确定性事实冲突，拒写（修正 summary/lessons 后重交）: "
+            + "；".join(lint_problems)
         )
 
     report_state = _report_state(out)
@@ -796,28 +908,55 @@ def prepare_daily_payload(payload: dict) -> dict:
     )
 
 
+def _canonical_period_key(payload: dict, key: str, kind: str) -> str:
+    raw = payload.get(key)
+    if not raw:
+        raise ValueError(f"{kind} 必填 {key}")
+    value = trade_report_stats.parse_cst(str(raw))
+    if any((value.hour, value.minute, value.second, value.microsecond)):
+        raise ValueError(f"{key} 必须是 00:00:00 报告键")
+    if kind == "weekly" and value.weekday() != 0:
+        raise ValueError("week_start_ts 必须是周一 00:00:00")
+    if kind == "monthly" and value.day != 1:
+        raise ValueError("month_start_ts 必须是当月 1 号 00:00:00")
+    return value.strftime(TS_FMT)
+
+
+def _require_expected_period_window(
+    payload: dict,
+    expected_start: str,
+    expected_end: str,
+    kind: str,
+) -> tuple[str, str]:
+    """Reject caller-supplied window drift instead of silently trusting it."""
+    start = trade_report_stats.fmt_ts(
+        payload.get("period_start_ts") or expected_start)
+    end = trade_report_stats.fmt_ts(
+        payload.get("period_end_ts") or expected_end)
+    if (start, end) != (expected_start, expected_end):
+        raise ValueError(
+            f"{kind} 统计窗口必须为 [{expected_start}, {expected_end})，"
+            f"got [{start}, {end})"
+        )
+    if payload.get("period_end_exclusive") is False:
+        raise ValueError(f"{kind} 统计窗口必须使用右开区间 [start,end)")
+    return start, end
+
+
 def prepare_weekly_payload(payload: dict) -> dict:
     """Use the previous complete Monday-to-Monday interval for weekly facts.
 
     事实窗锚在 08:00（`[上周一 08:00, 本周一 08:00)`），与日报同相位，
     使一周七份日报恰好平铺该区间；`week_start_ts` 仍是 本周一 00:00:00 报告键。
     """
-    week_start_raw = payload.get("week_start_ts")
-    if not week_start_raw:
-        raise ValueError(
-            "weekly 必填 week_start_ts（报告键：本周一 00:00:00）")
-    week_start = trade_report_stats.parse_cst(str(week_start_raw))
+    week_start = _canonical_period_key(
+        payload, "week_start_ts", "weekly")
     default_start, default_end = trade_report_stats.weekly_window(week_start)
-    start_ts = payload.get("period_start_ts")
-    if start_ts:
-        start = trade_report_stats.fmt_ts(start_ts)
-    else:
-        start = default_start
-    end = trade_report_stats.fmt_ts(
-        payload.get("period_end_ts") or default_end)
+    start, end = _require_expected_period_window(
+        payload, default_start, default_end, "weekly")
     out = {
         **payload,
-        "week_start_ts": week_start.strftime(TS_FMT),
+        "week_start_ts": week_start,
         "period_start_ts": start,
         "period_end_ts": end,
         "period_end_exclusive": True,
@@ -830,6 +969,83 @@ def prepare_weekly_payload(payload: dict) -> dict:
         include_avg_hold=True,
         period_kind="weekly",
     )
+
+
+def prepare_monthly_payload(payload: dict) -> dict:
+    """Make the previous complete calendar month authoritative.
+
+    The report key is current month day 1 at 00:00.  The fact window is the
+    previous calendar month on the shared 08:00 daily anchor.  PnL, realized
+    PnL drawdown, and approximate Sharpe are recomputed from confirmed live
+    close fills and embedded in ``raw.report_audit``.
+    """
+    month_start = _canonical_period_key(
+        payload, "month_start_ts", "monthly")
+    default_start, default_end = trade_report_stats.monthly_window(month_start)
+    start, end = _require_expected_period_window(
+        payload, default_start, default_end, "monthly")
+    out = {
+        **payload,
+        "month_start_ts": month_start,
+        "period_start_ts": start,
+        "period_end_ts": end,
+        "period_end_exclusive": True,
+    }
+    out = _prepare_trade_payload(
+        out,
+        start_ts=start,
+        end_ts=end,
+        end_exclusive=True,
+        include_avg_hold=False,
+        period_kind="monthly",
+    )
+    performance = trade_report_stats.realized_performance_stats(
+        LIVE_TRADES_DB,
+        start,
+        end,
+        end_exclusive=True,
+    )
+    authoritative = {
+        "max_drawdown": performance["max_drawdown_usdt"],
+        "sharpe_approx": performance["sharpe_approx"],
+    }
+    corrections = []
+    for key, value in authoritative.items():
+        incoming_key = (
+            f"live_{key}" if f"live_{key}" in out
+            else key if key in out else None
+        )
+        if incoming_key is not None:
+            incoming = out[incoming_key]
+            differs = (
+                incoming is not None or value is not None
+            ) and not (
+                incoming is None and value is None
+            ) and _numeric_diff(incoming, value, tolerance=1e-8)
+            if differs:
+                corrections.append(f"live.{key} {incoming}→{value}")
+        out[f"live_{key}"] = value
+    if corrections:
+        _append_anomaly(
+            out,
+            "月报绩效已按确认平仓 PnL 自动校正: " + "；".join(corrections),
+        )
+
+    raw = _raw_object(out.get("raw"))
+    audit = raw.setdefault("report_audit", {})
+    audit["performance_metrics"] = {"live": performance}
+    units = raw.setdefault("metric_units", {})
+    units.update({
+        "monthly_reports.total_pnl": "USDT confirmed close-fill realized PnL",
+        "monthly_reports.max_drawdown": (
+            "USDT peak-to-trough confirmed realized-PnL curve"
+        ),
+        "monthly_reports.sharpe_approx": (
+            "annualized 08:00 daily realized-PnL mean/stdev sqrt(365)"
+        ),
+    })
+    out["raw"] = json.dumps(raw, ensure_ascii=False)
+    return out
 
 
 def _augment_operational_anomalies(payload: dict) -> None:
@@ -874,13 +1090,13 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:
-        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 <PROJECT_ROOT>\\tmp\\*.json 再用 --json-file")
+        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 ./tmp//*.json 再用 --json-file")
 
 
 def next_trade_day_num(con, report_ts: str | None = None) -> int:
     """返回日报 trade_day_num。
 
-    v7.0e.7 修复：live/demo 同一天应共享同一个 trade_day_num，不能每 INSERT 一行就 +1。
+    v7.0e.7 修复：同一天共享同一个 trade_day_num，不能每 INSERT 一行就 +1。
     - 若当天已有非空 trade_day_num：复用当天编号
     - 否则：取所有历史 MAX(trade_day_num)+1
     """
@@ -903,10 +1119,10 @@ def _daily_fields(payload: dict, profile: str) -> dict:
     now = now_cst()
 
     def pf(key, default=0):
-        """按 profile 优先读取 live_/demo_ 前缀字段，兼容旧无前缀字段。"""
+        """按 profile 优先读取 live_ 前缀字段，兼容旧无前缀字段。"""
         return payload.get(f"{profile}_{key}", payload.get(key, default))
 
-    # v7.0e.1/e.7: payload 拆分 live / demo 两套字段
+    # v7.0e.1/e.7: payload 按 profile 前缀拆分字段
     return {
         "ts": payload.get("ts") or now,
         "profile": profile,
@@ -966,7 +1182,7 @@ def write_daily(con, payload: dict, apply: bool) -> dict:
             print(f"  {k:14}= {v_disp}")
         return {"dry_run": True, "fields": fields}
 
-    # 计算 trade_day_num（v7.0e.7：同一天 live/demo 共享编号）
+    # 计算 trade_day_num（同一天共享编号）
     fields["trade_day_num"] = next_trade_day_num(con, fields["ts"])
 
     cols = ", ".join(fields.keys())
@@ -979,7 +1195,7 @@ def write_daily(con, payload: dict, apply: bool) -> dict:
     except sqlite3.IntegrityError as e:
         fail(f"INSERT 失败（IntegrityError）: {e}")
 
-    # read-after-write 校验：用 last_insert_rowid，避免同一天 live/demo 共享 trade_day_num 时回读到另一行
+    # read-after-write 校验：用 last_insert_rowid 精确回读本次插入行
     rowid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
     row = con.execute(
         "SELECT rowid, trade_day_num, ts, profile, open_count, close_count, total_pnl "
@@ -1166,7 +1382,7 @@ def correct_existing_weekly(
 
 
 def _shared_period_num(con, table: str, num_col: str, ts_col: str, ts_val: str) -> int:
-    """同一周期 live/demo 共享编号；无则 MAX+1（禁跳号/回滚）。"""
+    """同一周期共享编号；无则 MAX+1（禁跳号/回滚）。"""
     cur = con.execute(
         f"SELECT MIN({num_col}) FROM {table} WHERE {ts_col}=? AND {num_col} IS NOT NULL",
         (ts_val,),
@@ -1325,9 +1541,9 @@ def write_markdown(payload: dict, apply: bool) -> str:
     if not period_end_exclusive:
         raise ValueError("日报复盘窗口必须使用右开区间 [start,end)")
 
-    # v7.0e.1: live / demo 数据分别读
+    # v7.0e.1: 按 profile 前缀读
     def v(prefix, key, default=0):
-        """读 payload[key]，优先用 live_/demo_ 前缀"""
+        """读 payload[key]，优先用 live_ 前缀"""
         return payload.get(f"{prefix}_{key}", payload.get(key, default))
 
     # writer 自取权威值：避免 reviewer 漏传字段时把顶部默认为 0/空仓，而详细 summary 又写真值。
@@ -1349,45 +1565,21 @@ def write_markdown(payload: dict, apply: bool) -> str:
     live_pos = _live_pos_db if _live_pos_db is not None else v(
         'live', 'positions_summary', payload.get('positions_summary', '持仓数据不可用'))
 
-    # P3b (2026-06-29)：payload 优先；缺失/为 0 回退 demo 自身快照（绝不 fallback 到 live，避免收益混淆）
-    _demo_eq = v('demo', 'equity', None)
-    _demo_eq_db = _snapshot_equity(DB_PATH, 'demo', ts)
-    demo_eq = _demo_eq_db if _demo_eq_db is not None else _demo_eq
-    # v7.1.2：demo 仍缺（payload 与 account.db 快照均无）→ 显式标 0 + 异常
-    if demo_eq is None:
-        demo_eq = 0
-        _append_anomaly(
-            payload,
-            "WARN: demo_equity 缺失（payload 与 account.db 快照均无），"
-            "已禁止 fallback 到 live equity。",
-        )
-    _demo_cum_db = _authoritative_cum_pnl(DB_PATH, 'demo', ts)
-    demo_realized_pnl = _demo_cum_db if _demo_cum_db is not None else v('demo', 'realized_pnl', 0)
-    demo_bill_net = _account_bill_net_for_window(
-        DB_PATH, 'demo', period_start_ts, period_end_ts)
-    try:
-        le, de = float(live_eq), float(demo_eq)
-        lr, dr = float(live_realized_pnl), float(demo_realized_pnl)
-        # P3b (2026-06-29)：仅当两盘 equity 均非 0 且相同（且 realized 也同）才告警；全 0/缺数据不再误触
-        if le != 0 and de != 0 and le == de and lr == dr:
-            _append_anomaly(
-                payload,
-                "WARN: demo/live equity 与 realized_pnl 完全相同，"
-                "疑似口径混淆，请核验 demo 数据源。",
-            )
-    except Exception:
-        pass
-    demo_open = v('demo', 'open_count')
-    demo_close = v('demo', 'close_count')
-    demo_pnl_today = v('demo', 'total_pnl', 0)
-    demo_fees = v('demo', 'total_fees', 0)
-    demo_best = v('demo', 'best_trade', '—') or '—'
-    demo_worst = v('demo', 'worst_trade', '—') or '—'
-    _demo_pos_db = _snapshot_positions_summary(DB_PATH, 'demo', ts)
-    demo_pos = _demo_pos_db if _demo_pos_db is not None else v(
-        'demo', 'positions_summary', '持仓数据不可用')
+    # demo 的资产/交易变量装配（含 live↔demo equity 混淆告警）随 2026-08-06
+    # demo 全量下线整块移除。
     live_rejects = v('live', 'risk_rejected_open_summary', '0 笔')
-    demo_rejects = v('demo', 'risk_rejected_open_summary', '0 笔')
+    live_close_long = v('live', 'close_long_count', None)
+    live_close_short = v('live', 'close_short_count', None)
+    if live_close_long is not None and live_close_short is not None:
+        live_side_line = (
+            f"- 平仓方向: 多 {int(live_close_long)} / 空 {int(live_close_short)}"
+            "（确定性统计）\n")
+    else:
+        live_side_line = ""
+    _missed = payload.get('missed_opps_window_count')
+    missed_line = (
+        f"- 本窗口错失机会记录: {int(_missed)} 条（lessons.db 权威计数）\n"
+        if _missed is not None else "")
     report_state = _report_state(payload)
     if report_state["status"] == "final":
         report_banner = f"最终报告｜{report_state['reason']}"
@@ -1416,22 +1608,18 @@ def write_markdown(payload: dict, apply: bool) -> str:
         f"${live_bill_net['net']:.2f}（账单至 {live_bill_net['last_ts']}）"
         if live_bill_net else "账单未覆盖"
     )
-    demo_bill_line = (
-        f"${demo_bill_net['net']:.2f}（账单至 {demo_bill_net['last_ts']}）"
-        if demo_bill_net else "账单未覆盖"
-    )
 
     md = f"""# 📊 小灵日报 {date_str}（v7.4 固定24h复盘窗口）
 
 > 自动生成 by daily_report_writer.py (P7 复盘写入器) — v7.4 收益口径拆分
-> ts: {ts} | live/demo 同日共享 trade_day_num（见 db）
+> ts: {ts} | trade_day_num 见 db
 > 统计窗口: [{period_start_ts}, {period_end_ts})，UTC+8（固定24小时）
 > **报告状态：{report_banner}**
 > report_revision: {revision_number} | revision_kind: {revision_kind} | resend_review_required: {str(resend_review_required).lower()} | auto_resend: false
 
 ---
 
-## 💰 资产（实盘 / 模拟盘分开）
+## 💰 资产
 
 ### 🟢 实盘（live）
 | 项 | 数值 |
@@ -1440,43 +1628,23 @@ def write_markdown(payload: dict, apply: bool) -> str:
 | 累计交易PnL（未扣手续费/资金费） | ${float(live_realized_pnl):.2f} |
 | 本复盘周期账户账单净变动（含手续费/资金费） | {live_bill_line} |
 
-### 🟡 模拟盘（demo）
-| 项 | 数值 |
-|---|---|
-| 资金总额 | ${float(demo_eq):.2f} |
-| 累计交易PnL（未扣手续费/资金费） | ${float(demo_realized_pnl):.2f} |
-| 本复盘周期账户账单净变动（含手续费/资金费） | {demo_bill_line} |
-
 > 累计交易PnL = 冻结基线 + reset 后 trades.pnl；不含手续费、资金费和浮动盈亏。
 > 本复盘周期账户账单净变动 = OKX account_bills 中 type=2/8 的 bal_change；严格使用上方固定24小时统计窗口，仅代表注明的账单采集覆盖。
 
-> 严禁 live+demo 收益混合 / 用 demo 收益粉饰 live
-
-## 📈 持仓（实盘 / 模拟盘分开）
+## 📈 持仓
 
 ### 🟢 实盘
 {live_pos}
 
-### 🟡 模拟盘
-{demo_pos}
-
-## 🎯 交易（实盘 / 模拟盘分开）
+## 🎯 交易
 
 ### 🟢 实盘
 - 本复盘周期成交开仓: {int(live_open)} 笔
 - 本复盘周期成交平仓: {int(live_close)} 笔
-- 开仓尝试被风控拒绝: {live_rejects}
+{live_side_line}{missed_line}- 开仓尝试被风控拒绝: {live_rejects}
 - 净 PnL: ${float(live_pnl_today):.2f}
 - 手续费: ${float(live_fees):.2f}
 - 最佳: {live_best} | 最差: {live_worst}
-
-### 🟡 模拟盘
-- 本复盘周期成交开仓: {int(demo_open)} 笔
-- 本复盘周期成交平仓: {int(demo_close)} 笔
-- 开仓尝试被风控拒绝: {demo_rejects}
-- 净 PnL: ${float(demo_pnl_today):.2f}
-- 手续费: ${float(demo_fees):.2f}
-- 最佳: {demo_best} | 最差: {demo_worst}
 
 ## ⚠️ 异常 / 🛠 自修
 
@@ -1570,8 +1738,19 @@ def write_weekly_markdown(payload: dict, apply: bool) -> str:
     else:
         period_line = "历史记录未声明（以 account.db 原行及 summary 为准）"
     week_num = payload.get("trade_week_num")
+    _wl = payload.get("live_close_long_count")
+    _ws = payload.get("live_close_short_count")
+    _wm = payload.get("missed_opps_window_count")
+    _facts_bits = []
+    if _wl is not None and _ws is not None:
+        _facts_bits.append(f"平仓方向: 多 {int(_wl)} / 空 {int(_ws)}")
+    if _wm is not None:
+        _facts_bits.append(f"本窗口错失机会记录 {int(_wm)} 条")
+    side_facts_line = (
+        "> 确定性事实：" + "；".join(_facts_bits) + "（文字段与此冲突以本行为准）\n"
+        if _facts_bits else "")
     rows = []
-    for profile, label in (("live", "实盘"), ("demo", "模拟盘")):
+    for profile, label in (("live", "实盘"),):
         rows.append(
             "| {label} | {opens} | {closes} | {pnl} | {win_rate}% | "
             "{rejects} | {avg_hold} |".format(
@@ -1588,6 +1767,23 @@ def write_weekly_markdown(payload: dict, apply: bool) -> str:
             )
         )
 
+    side_breakdown = value("live", "close_side_breakdown", {}) or {}
+    side_rows = []
+    for side_key, label in (("long", "多"), ("short", "空")):
+        item = side_breakdown.get(side_key) or {}
+        wr = item.get("win_rate_pct")
+        avg = item.get("pnl_avg_usdt")
+        side_rows.append(
+            "| {label} | {count} | {wins} | {wr} | {pnl_sum} | {pnl_avg} |".format(
+                label=label,
+                count=int(item.get("close_count") or 0),
+                wins=int(item.get("win_count") or 0),
+                wr=("—" if wr is None else f"{float(wr):.2f}%"),
+                pnl_sum=number(item.get("pnl_sum_usdt")),
+                pnl_avg=("—" if avg is None else number(avg)),
+            )
+        )
+
     content = f"""# 小灵周报 {week_key[:10]}
 
 > 报告键：{week_key}（本周一边界）
@@ -1598,9 +1794,16 @@ def write_weekly_markdown(payload: dict, apply: bool) -> str:
 
 ## 成交与绩效
 
-| 盘别 | 成交开仓 | 成交平仓 | 已实现 PnL | 胜率 | 风控拒绝开仓尝试 | 平均持仓小时 |
+| 盘别 | 成交开仓 | 成交平仓 | 已实现 PnL | 胜率 | 风控拒绝开仓尝试 | 已平仓平均持仓小时 |
 |---|---:|---:|---:|---:|---|---:|
 {chr(10).join(rows)}
+
+{side_facts_line}
+## 平仓方向明细
+
+| 方向 | 平仓数 | 胜单数 | 胜率 | PnL 合计（USDT） | PnL 均值（USDT） |
+|---|---:|---:|---:|---:|---:|
+{chr(10).join(side_rows)}
 
 ## 复盘摘要
 
@@ -1616,6 +1819,100 @@ def write_weekly_markdown(payload: dict, apply: bool) -> str:
 """
     _atomic_write_text(path, content)
     print(f"[OK] atomically wrote weekly markdown: {path} ({path.stat().st_size}B)")
+    return str(path)
+
+
+def write_monthly_markdown(payload: dict, apply: bool) -> str:
+    """Render an authoritative monthly payload to a durable Markdown file."""
+    month_key = str(payload.get("month_start_ts") or "").strip()
+    if not month_key:
+        raise ValueError("monthly markdown 要求 month_start_ts")
+    path = MONTHLY_REPORTS_DIR / f"monthly-{month_key[:10]}.md"
+    if not apply:
+        print(f"[DRY-RUN] would atomically write monthly markdown: {path}")
+        return str(path)
+
+    def value(key: str, default=None):
+        return payload.get(f"live_{key}", payload.get(key, default))
+
+    def number(raw, digits=4):
+        if raw in (None, ""):
+            return "—"
+        try:
+            return f"{float(raw):.{digits}f}"
+        except (TypeError, ValueError):
+            return str(raw)
+
+    report_state = _report_state(payload)
+    report_label = (
+        f"最终报告｜{report_state['reason']}"
+        if report_state["status"] == "final"
+        else f"临时报告｜{report_state['reason']}"
+    )
+    start = str(payload.get("period_start_ts") or "")
+    end = str(payload.get("period_end_ts") or "")
+    if not start or not end:
+        raise ValueError("monthly markdown 缺少权威 period_start_ts/end_ts")
+    month_num = payload.get("trade_month_num")
+    side_breakdown = value("close_side_breakdown", {}) or {}
+    side_rows = []
+    for side_key, label in (("long", "多"), ("short", "空")):
+        item = side_breakdown.get(side_key) or {}
+        wr = item.get("win_rate_pct")
+        avg = item.get("pnl_avg_usdt")
+        side_rows.append(
+            "| {label} | {count} | {wins} | {wr} | {pnl_sum} | {pnl_avg} |".format(
+                label=label,
+                count=int(item.get("close_count") or 0),
+                wins=int(item.get("win_count") or 0),
+                wr=("—" if wr is None else f"{float(wr):.2f}%"),
+                pnl_sum=number(item.get("pnl_sum_usdt")),
+                pnl_avg=("—" if avg is None else number(avg)),
+            )
+        )
+    missed = payload.get("missed_opps_window_count")
+    missed_line = (
+        f"> 本窗口错失机会记录：{int(missed)} 条\n"
+        if missed is not None else ""
+    )
+    content = f"""# 小灵月报 {month_key[:10]}
+
+> 报告键：{month_key}（本月 1 号边界）
+> 统计窗口：[{start}, {end})，UTC+8
+> trade_month_num：{month_num if month_num is not None else "见 account.db"}
+> 报告状态：{report_label}
+> 最大回撤口径：确认平仓 realized PnL 累计曲线峰谷差，单位 USDT
+> Sharpe 近似口径：08:00 日界已实现 PnL（含零收益日），sqrt(365)，未扣无风险利率
+
+## 成交与绩效
+
+| 盘别 | 成交开仓 | 成交平仓 | 已实现 PnL | 最大回撤（USDT） | Sharpe 近似 | 风控拒绝开仓尝试 |
+|---|---:|---:|---:|---:|---:|---|
+| 实盘 | {int(value('open_count', 0) or 0)} | {int(value('close_count', 0) or 0)} | {number(value('total_pnl', 0.0))} | {number(value('max_drawdown'))} | {number(value('sharpe_approx'))} | {value('risk_rejected_open_summary', '0 笔') or '0 笔'} |
+
+{missed_line}## 平仓方向明细
+
+| 方向 | 平仓数 | 胜单数 | 胜率 | PnL 合计（USDT） | PnL 均值（USDT） |
+|---|---:|---:|---:|---:|---:|
+{chr(10).join(side_rows)}
+
+## 复盘摘要
+
+{payload.get("summary") or "无"}
+
+## 教训
+
+{payload.get("lessons") or "无"}
+
+---
+
+自动生成：daily_report_writer.py | {now_cst()} CST
+"""
+    _atomic_write_text(path, content)
+    print(
+        f"[OK] atomically wrote monthly markdown: {path} "
+        f"({path.stat().st_size}B)"
+    )
     return str(path)
 
 
@@ -1644,7 +1941,9 @@ def _weekly_percent_value(value, raw: dict, profile: str):
 def load_existing_weekly_payload(
     con: sqlite3.Connection, week_start: str
 ) -> dict:
-    """Merge one existing live/demo weekly pair using a read-only connection."""
+    """Merge one existing weekly report row using a read-only connection.
+
+    同 daily：历史周报可能是 live+demo 两行或 live 单行，放宽为只要求 live。"""
     rows = con.execute(
         "SELECT week_start_ts,profile,open_count,close_count,total_pnl,"
         "win_rate,avg_hold_hours,margin_util_pct,idle_ratio,summary,"
@@ -1652,9 +1951,10 @@ def load_existing_weekly_payload(
         "WHERE week_start_ts=? ORDER BY profile",
         (week_start,),
     ).fetchall()
-    if len(rows) != 2 or {str(row[1]) for row in rows} != {"live", "demo"}:
+    if not rows or "live" not in {str(row[1]) for row in rows}:
         raise RuntimeError(
-            f"weekly markdown backfill requires one live+demo pair: {week_start}")
+            f"weekly markdown backfill requires a live row: {week_start}")
+    rows = [row for row in rows if str(row[1]) == "live"]
     payload = {
         "week_start_ts": week_start,
         "trade_week_num": rows[0][12],
@@ -1662,8 +1962,6 @@ def load_existing_weekly_payload(
         "lessons": rows[0][10] or "",
         "raw": rows[0][11] or "",
     }
-    if rows[0][12] != rows[1][12]:
-        raise RuntimeError("weekly live/demo trade_week_num differs")
     raw = _raw_object(payload["raw"])
     audit = raw.get("report_audit")
     if isinstance(audit, dict):
@@ -1713,6 +2011,14 @@ def _commit_then_write_weekly(
     return write_weekly_markdown(payload, apply)
 
 
+def _commit_then_write_monthly(
+    con: sqlite3.Connection, payload: dict, apply: bool
+) -> str:
+    """Commit DB facts before monthly file replacement."""
+    con.commit()
+    return write_monthly_markdown(payload, apply)
+
+
 def _commit_then_write_daily(
     con: sqlite3.Connection, payload: dict, apply: bool
 ) -> str:
@@ -1722,8 +2028,8 @@ def _commit_then_write_daily(
 
 
 def main():
-    global DB_PATH, REPORTS_DIR, WEEKLY_REPORTS_DIR
-    global LIVE_TRADES_DB, DEMO_TRADES_DB, LEDGER_DB
+    global DB_PATH, REPORTS_DIR, WEEKLY_REPORTS_DIR, MONTHLY_REPORTS_DIR
+    global LIVE_TRADES_DB, LEDGER_DB
     ap = argparse.ArgumentParser(description="Daily Report Writer (P7 hardened writer)")
     ap.add_argument("--stdin", action="store_true", help="从 stdin 读 JSON")
     ap.add_argument("--json-file", help="从文件读 JSON")
@@ -1762,19 +2068,22 @@ def main():
     )
     ap.add_argument("--kind", choices=("daily", "weekly", "monthly"), default="daily",
                     help="报告类型：daily=daily_reports（默认）；weekly=weekly_reports（需 week_start_ts）；monthly=monthly_reports（需 month_start_ts）")
-    ap.add_argument("--profiles", choices=("live", "demo", "both"), default="both",
-                    help="写入 profile 范围：both=同一 payload 写 live+demo（默认）；live/demo=仅写单段，避免重复调用冲突")
-    ap.add_argument("--db-path", default=str(DB_PATH), help="account.db 路径（默认 <PROJECT_ROOT>\\db\\account.db；测试可传临时库）")
+    ap.add_argument("--profiles", choices=("live",), default="live",
+                    help="写入 profile 范围（2026-08-06 demo 下线后只剩 live）")
+    ap.add_argument("--db-path", default=str(DB_PATH), help="account.db 路径（默认 ./db//account.db；测试可传临时库）")
     ap.add_argument("--reports-dir", default=str(REPORTS_DIR), help="日报 markdown 输出目录")
     ap.add_argument(
         "--weekly-reports-dir",
         default=str(WEEKLY_REPORTS_DIR),
         help="周报 markdown 输出目录",
     )
+    ap.add_argument(
+        "--monthly-reports-dir",
+        default=str(MONTHLY_REPORTS_DIR),
+        help="月报 markdown 输出目录",
+    )
     ap.add_argument("--live-trades-db", default=str(LIVE_TRADES_DB),
                     help="live_trades.db 路径")
-    ap.add_argument("--demo-trades-db", default=str(DEMO_TRADES_DB),
-                    help="demo_trades.db 路径")
     ap.add_argument("--ledger-db", default=str(LEDGER_DB),
                     help="ledger.db 路径（风控拒绝尝试事实源）")
     args = ap.parse_args()
@@ -1782,8 +2091,8 @@ def main():
     DB_PATH = Path(args.db_path)
     REPORTS_DIR = Path(args.reports_dir)
     WEEKLY_REPORTS_DIR = Path(args.weekly_reports_dir)
+    MONTHLY_REPORTS_DIR = Path(args.monthly_reports_dir)
     LIVE_TRADES_DB = Path(args.live_trades_db)
-    DEMO_TRADES_DB = Path(args.demo_trades_db)
     LEDGER_DB = Path(args.ledger_db)
 
     payload = (
@@ -1809,7 +2118,7 @@ def main():
         if args.no_markdown:
             fail("--backfill-daily-revision 不允许 --no-markdown")
         if args.profiles != "both":
-            fail("--backfill-daily-revision 必须同时校验 live/demo")
+            fail("--backfill-daily-revision 需要 live 行")
         if args.apply and not args.backup_dir:
             fail("--backfill-daily-revision --apply 必须提供 --backup-dir")
     if args.markdown_only and args.kind == "weekly":
@@ -1926,6 +2235,7 @@ def main():
 
     con = sqlite3.connect(DB_PATH)
     weekly_markdown_pending = False
+    monthly_markdown_pending = False
     daily_markdown_pending = False
     try:
         if (args.kind == "daily"
@@ -1933,6 +2243,8 @@ def main():
             payload = prepare_daily_payload(payload)
         elif args.kind == "weekly":
             payload = prepare_weekly_payload(payload)
+        elif args.kind == "monthly":
+            payload = prepare_monthly_payload(payload)
 
         if args.markdown_only:
             if args.kind != "daily":
@@ -1942,10 +2254,7 @@ def main():
             _inherit_existing_daily_revision(con, payload)
             result = {"markdown_only": True, "path": write_markdown(payload, True)}
         elif args.correct_existing:
-            profiles = (
-                ["live", "demo"] if args.profiles == "both"
-                else [args.profiles]
-            )
+            profiles = ["live"]
             corrector = (
                 correct_existing_daily
                 if args.kind == "daily" else correct_existing_weekly
@@ -1962,15 +2271,8 @@ def main():
             result = rewrite_null_and_renumber(con, args.apply)
         else:
             writer = {"daily": write_daily, "weekly": write_weekly, "monthly": write_monthly}[args.kind]
-            # weekly/monthly 判断 demo 段是否需要：demo_total_pnl / demo_equity 任一存在即写
-            has_demo = any(payload.get(k) is not None for k in
-                           ("demo_equity", "demo_session_pnl", "demo_total_pnl", "demo_realized_pnl"))
-            if args.profiles == "demo":
-                result = writer(con, {**payload, "profile": "demo"}, args.apply)
-            else:
-                result = writer(con, payload, args.apply)
-                if args.profiles == "both" and has_demo:
-                    result["demo"] = writer(con, {**payload, "profile": "demo"}, args.apply)
+            # demo 段写入随 2026-08-06 全量下线移除，只写 live。
+            result = writer(con, payload, args.apply)
             if args.kind == "daily" and not args.no_markdown:
                 if args.apply:
                     daily_markdown_pending = True
@@ -1978,14 +2280,15 @@ def main():
                     write_markdown(payload, False)
             elif args.kind == "weekly" and not args.no_markdown:
                 payload["trade_week_num"] = result.get("trade_week_num")
-                write_result = result.get("demo")
-                if payload["trade_week_num"] is None and isinstance(
-                        write_result, dict):
-                    payload["trade_week_num"] = write_result.get(
-                        "trade_week_num")
                 weekly_markdown_pending = True
+            elif args.kind == "monthly" and not args.no_markdown:
+                payload["trade_month_num"] = result.get("trade_month_num")
+                monthly_markdown_pending = True
         if weekly_markdown_pending:
             result["markdown"] = _commit_then_write_weekly(
+                con, payload, args.apply)
+        elif monthly_markdown_pending:
+            result["markdown"] = _commit_then_write_monthly(
                 con, payload, args.apply)
         elif daily_markdown_pending:
             result["markdown"] = _commit_then_write_daily(

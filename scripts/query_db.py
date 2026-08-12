@@ -2,10 +2,10 @@
 """Small read-only SQLite helper for OKX cron/diagnostic sessions.
 
 Usage examples (always call through run_okx_python.ps1):
-  query_db.py <PROJECT_ROOT>\\db\\account.db system_state
-  query_db.py <PROJECT_ROOT>\\db\\account.db cycle_runs --limit 20
-  query_db.py <PROJECT_ROOT>\\db\\account.db --list-tables
-  query_db.py <PROJECT_ROOT>\\db\\account.db --sql "SELECT * FROM system_state"
+  query_db.py ./db//account.db system_state
+  query_db.py ./db//account.db cycle_runs --limit 20
+  query_db.py ./db//account.db --list-tables
+  query_db.py ./db//account.db --sql "SELECT * FROM system_state"
 
 This script intentionally only supports read-only statements.
 """

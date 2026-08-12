@@ -1,18 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import os
@@ -27,7 +15,7 @@ from _okx_http import fetch_candles_batch_sync, fetch_instruments_sync
 from public_macro import import_xsearch_etf, latest_snapshot, reconcile_etf_consensus
 from regime_classifier import classify_regime
 
-DEFAULT_DB_ROOT = Path(_project_path('db'))
+DEFAULT_DB_ROOT = Path(r"./db")
 FRED_SERIES = {
     # 兼容字段名仍为 dxy，但实际序列是 FRED Nominal Broad U.S. Dollar Index，
     # 不是 ICE DXY。展示层必须标 USD_BROAD(DTWEXBGS)，禁混称。
@@ -540,8 +528,8 @@ def _deterministic_sentiment(news_con: sqlite3.Connection) -> int:
     （脱 OKX 硬依赖，OKX 死也不归零）。写库仍走慢采（news.db 单写者），不破单写不变量。"""
     try:
         import sys as _sys
-        if _project_path('scripts') not in _sys.path:
-            _sys.path.insert(0, _project_path('scripts'))
+        if r"./scripts" not in _sys.path:
+            _sys.path.insert(0, r"./scripts")
         import sentiment_compute as _sc
         main_db = next((r[2] for r in news_con.execute("PRAGMA database_list").fetchall()
                         if r[1] == "main"), None)
@@ -836,7 +824,6 @@ def main() -> int:
         fear_greed_label = fear_row.get("label")
         etf_confirmed = public_macro_snapshot.get("etf_confirmed") or {}
         etf_provisional = public_macro_snapshot.get("etf_provisional") or {}
-        etf_conflict = public_macro_snapshot.get("etf_conflict") or {}
         btc_etf_net_flow_usd = to_float(etf_confirmed.get("value"))
 
         if etf_confirmed:
@@ -844,12 +831,6 @@ def main() -> int:
                 "source": etf_confirmed.get("source"),
                 "status": etf_confirmed.get("status"),
                 "source_as_of": etf_confirmed.get("observation_date"),
-            }
-        elif etf_conflict:
-            etf_meta = {
-                "source": etf_conflict.get("source"),
-                "status": "conflict",
-                "source_as_of": etf_conflict.get("observation_date"),
             }
         elif etf_provisional:
             etf_meta = {

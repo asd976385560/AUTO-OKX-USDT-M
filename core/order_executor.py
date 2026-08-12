@@ -1,53 +1,46 @@
 # -*- coding: utf-8 -*-
-"""V2.0 §7 契约 B —— 确定性下单/止损/平仓/回读（live + Demo 分 profile 定仓）。
+"""V2.0 §7 契约 B —— 确定性下单/止损/平仓/回读（仅 live）。
 
 live 下单**唯一路径**：order_executor.open_position()，其内部**强制调** risk_validator.validate()
 （LLM 物理越不过闸）。本模块把 live_trader.md §4/§8 现为「LLM 手拼 okx 命令 + 手挂止损」的
 下单层搬成确定性代码，回执仍喂 trades_writer 落库（writer 不变）。
 
 核心不变量（方案 §7）：
-  - **OPEN**：装配现场 → 强制 risk_validator → 市价开仓**即附挂 SL**（原子无裸仓窗口）
+  - **OPEN**：装配现场 → 强制 risk_validator → 市价开仓**即附挂 SL**，并可选附挂
+    与决策卡 target 一致的 TP（SL 原子保护不变量不因 TP 失败而降级）
     → 附挂失败则独立 algo SL（重试1）→ 仍失败立即市价平掉刚开仓（不留裸实盘仓）
     → 回读 fills 求真实成交（拉不到 → repair_queue + reject + P0）。
   - **CLOSE**（2026-07-03 主路径反转）：OKX API 现仓确认 posSide → reduceOnly 市价单
     （拿 ordId 即时确认；绝不翻反向仓）主路径 → 被拒转 swap close 兜底 → 51087 下架/
     51001 不存在明确拒因 → fills→订单状态双源确认求真 pnl，两端点均无 →
     unconfirmed(pnl=NULL)+repair_queue。
-  - Demo：不使用 live 的 1%/20%/98% 仓位比例；公共安全预检后，新开先确认目标
-    杠杆，再按 symbol/side/tdMode 实时读取 OKX Demo max-size。查询失败不下单。
+**2026-08-06 demo 全量下线**：本模块此前还有一条独立的 demo 定仓分支（不走 live 的
+1%/20%/98% 比例，改按 symbol/side/tdMode 实时读 OKX Demo max-size；合约规格另带
+x-simulated-trading 头现拉 Demo 环境 ctVal/lotSz/minSz）。该分支连同 demo 账本与历史
+数据已全部移除，`_require_live_profile()` 现对任何非 live profile 硬拒——**不静默当
+live 处理**，否则残留调用方会拿真钱执行一笔它以为是模拟的订单。
 
 现仓/equity 权威一律 OKX API（禁 position_snapshots GROUP BY，红线 #6）。
-ctVal/lotSz：live=market.db.instruments_cache → 缺/stale 现拉 → 仍缺 reject（不拿默认 1.0 蒙）；
-Demo=带 x-simulated-trading 头现拉 Demo 环境 ctVal/lotSz/minSz（缓存只存 live 口径）；
-失败即拒绝，禁止回退 live 规格。
+ctVal/lotSz：market.db.instruments_cache → 缺/stale 现拉 → 仍缺 reject（不拿默认 1.0 蒙）。
 零模型名（红线 #1）。
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import json
 import math
 import os
+import sqlite3
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 _CORE = os.path.dirname(os.path.abspath(__file__))
 _CORE_LIB = os.path.join(_CORE, "lib")
-_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _project_path('collectors'))
+_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", r"./collectors")
 for _p in (_CORE, _CORE_LIB, _COLLECTORS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -60,9 +53,15 @@ import account_capacity as ac        # noqa: E402  core/account_capacity.py
 import _okxorder as ox               # noqa: E402  core/lib/_okxorder.py
 import ledger                        # noqa: E402  collectors/ledger.py（connect ro/WAL）
 import execution_intent as ei         # noqa: E402  core/execution_intent.py
-from decision_card import validate_card  # noqa: E402
+from core import actor_attestation as actor_att  # noqa: E402
+from decision_card import (  # noqa: E402
+    validate_card,
+    validate_multitimeframe_analysis,
+)
+from experience_contract import validate_contract as validate_experience_contract  # noqa: E402
+from multitimeframe_gate import check_multitimeframe_readiness  # noqa: E402
 
-DEFAULT_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _project_path('db')))
+DEFAULT_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", r"./db"))
 FILLS_RETRY = 3
 FILLS_RETRY_WAIT = 1.5
 # 2026-07-03：订单状态第二权威源（demo fills 端点延迟 6-52s，订单状态端点即时）。
@@ -236,6 +235,25 @@ def _open_fill_accounting(
     }
 
 
+def _single_order_fill_audit(
+    fill_margin: Any, equity: Any,
+) -> tuple[Optional[float], Optional[bool]]:
+    """成交后单笔保证金复审（纯函数，可单测）：返回 (占净值比, 是否破 15% 硬边界)。
+
+    口径 = 真实成交保证金 ÷ 执行时 equity（与 validator 预检同源）。任一输入
+    缺失/非法 → (None, None)，不臆算不误报。突破处置 = 告警 + repair_queue
+    人工出口，绝不阻断不追溯（主人拍板口径，2026-08-08）。"""
+    try:
+        margin = float(fill_margin)
+        eq = float(equity)
+    except (TypeError, ValueError):
+        return None, None
+    if not (math.isfinite(margin) and math.isfinite(eq)) or margin < 0 or eq <= 0:
+        return None, None
+    ratio = margin / eq
+    return ratio, ratio > rv.MAX_SINGLE_ORDER_IMR_RATIO + _EPS
+
+
 def fetch_equity(profile: str) -> Optional[float]:
     r = ox.get_balance(profile)
     for row in r.get("data", []):
@@ -276,66 +294,35 @@ def fetch_open_positions(profile: str) -> list[dict[str, Any]]:
     return out
 
 
-_DEMO_SPEC_MEMO: dict[str, dict[str, Any]] = {}  # symbol → demo 现拉规格（进程内 memo）
-_OKX_PUBLIC_INSTRUMENTS = "https://www.okx.com/api/v5/public/instruments"
+# `_DEMO_SPEC_MEMO` / `_fetch_demo_instrument()` 随 2026-08-06 demo 全量下线移除：
+# 二者只服务 demo 环境的合约规格现拉（instruments_cache 只存 live 口径，demo 同名
+# 合约规格可能不同，故当年必须带 x-simulated-trading 头直连 public 端点）。
 
 
-def _fetch_demo_instrument(symbol: str) -> Optional[dict[str, Any]]:
-    """现拉 demo 环境 instrument 元数据。
+def _require_live_profile(profile: Any, where: str) -> None:
+    """2026-08-06 demo 全量下线后，本模块只服务 `profile='live'`。
 
-    CLI `market instruments` 的 demo profile 不保证带 x-simulated-trading 头；demo 环境
-    同名合约规格可能与 live 不同，因此必须带头直连 public 端点（无需凭证）。
-    任何失败返 None；Demo 调用方必须 fail-closed，禁止回退 live 规格。"""
-    try:
-        import httpx  # vendored <PROJECT_ROOT>\Lib\site-packages（wrapper 注入 PYTHONPATH）
-        r = httpx.get(_OKX_PUBLIC_INSTRUMENTS,
-                      params={"instType": "SWAP", "instId": symbol},
-                      headers={"x-simulated-trading": "1"}, timeout=20)
-        for row in (r.json().get("data") or []):
-            if isinstance(row, dict) and row.get("instId") == symbol:
-                return row
-    except Exception as exc:
-        print(f"[order_executor] WARN demo instruments HTTP fetch failed for "
-              f"{symbol}: {exc}", file=sys.stderr)
-    return None
+    **必须硬拒而不是静默当 live 处理**：demo 下线前，`profile='demo'` 走的是完全
+    不同的容量分支（`okx_demo_max_size_only`）、不同的合约规格来源和不同的账本。
+    若有残留调用方（旧脚本、手工临时脚本、未更新的回放工具）仍传 'demo'，静默把
+    它当 live 就意味着**拿真钱执行一笔本以为是模拟的订单**。宁可 raise。
+    """
+    value = str(profile).strip().lower()
+    if value != "live":
+        raise ValueError(
+            f"{where}: 只支持 profile='live'，收到 {profile!r}。"
+            "demo 已于 2026-08-06 全量下线；若这是旧脚本请更新调用方，"
+            "**不要**改成 live 直接重跑——先确认它本来要不要动真钱。"
+        )
 
 
 def fetch_instrument_specs(symbol: str, profile: str,
                            db_root: Path = DEFAULT_DB_ROOT) -> dict[str, Any]:
-    """ctVal/lotSz/minSz。live：instruments_cache（market.db）优先 → 缺则现拉。
-
-    demo：instruments_cache 只存 live 口径，demo 同名合约规格可能不同；跳过缓存主路径，
-    带 x-simulated-trading 头现拉 Demo 环境规格（进程内 memo）；现拉失败直接返回空规格，
-    由开仓闸拒绝，禁止用 live 元数据替代。"""
+    """ctVal/lotSz/minSz：instruments_cache（market.db）优先 → 缺则现拉。"""
+    _require_live_profile(profile, "fetch_instrument_specs")
     ct_val = lot_sz = min_sz = None
     src = None
     db_root = Path(db_root)  # 调用方（trader agent）常传 str 路径——强制 Path，避免 str/str TypeError
-    is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
-    if is_demo:
-        memo = _DEMO_SPEC_MEMO.get(symbol)
-        if memo:
-            return dict(memo)
-        inst = _fetch_demo_instrument(symbol)
-        if inst:
-            ct_val = _to_float(inst.get("ctVal"))
-            lot_sz = _to_float(inst.get("lotSz"))
-            min_sz = _to_float(inst.get("minSz"))
-        if (ct_val is not None and lot_sz is not None and min_sz is not None
-                and ct_val > 0 and lot_sz > 0 and min_sz > 0):
-            out = {"ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz,
-                   "source": "demo_fetch", "spec_source": "demo_fetch"}
-            _DEMO_SPEC_MEMO[symbol] = dict(out)
-            return out
-        print(
-            f"[order_executor] WARN demo instrument fetch/spec invalid for {symbol}; "
-            "fail-closed without live fallback",
-            file=sys.stderr,
-        )
-        return {
-            "ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz,
-            "source": "demo_fetch_failed",
-            "spec_source": "demo_fetch_failed",
-        }
     market_db = db_root / "market.db"
     if market_db.exists():
         try:
@@ -552,10 +539,8 @@ _POSITION_SZ_TOL = 1e-8
 
 
 def _trade_ledger_path(profile: str, db_root: Path) -> Path:
-    profile_label = (
-        "demo" if str(profile).lower() == "demo"
-        or "demo" in str(profile).lower() else "live")
-    return Path(db_root) / f"{profile_label}_trades.db"
+    _require_live_profile(profile, "_trade_ledger_path")
+    return Path(db_root) / "live_trades.db"
 
 
 def _read_trade_ledger_positions(
@@ -644,9 +629,7 @@ def _verify_pretrade_ledger_positions(
         })
     return {
         "ok": not diffs,
-        "profile": (
-            "demo" if str(profile).lower() == "demo"
-            or "demo" in str(profile).lower() else "live"),
+        "profile": "live",
         "ledger_groups": len(ledger_positions),
         "exchange_groups": len(exchange_positions),
         "diffs": diffs,
@@ -680,68 +663,195 @@ def _verify_open_settled(symbol: str, side: str, profile: str, pre_sz: float,
     return None
 
 
-_SCRIPTS_DIR = os.environ.get("OKX_SCRIPTS_DIR", _project_path('scripts'))
+_SCRIPTS_DIR = os.environ.get("OKX_SCRIPTS_DIR", r"./scripts")
 _AUTOHEAL_TIMEOUT_SEC = 180
+_AUTOHEAL_CONTRACT_VERSION = 1
 
 
-def _try_autoheal_ledger(profile: str, db_root, cycle_id: Optional[str]) -> bool:
+def _autoheal_client_result(profile: str, db_root, cycle_id: Optional[str],
+                            request_id: str, *, status: str, rc: int,
+                            reason: str,
+                            finding_kind: str | None =
+                            "AUTOHEAL-CONTRACT-INVALID") -> dict[str, Any]:
+    finding = ({"kind": finding_kind, "sev": "P1", "reason": reason}
+               if finding_kind else None)
+    return {
+        "contract_version": _AUTOHEAL_CONTRACT_VERSION,
+        "request_id": request_id,
+        "profile": str(profile),
+        "cycle": str(cycle_id) if cycle_id is not None else None,
+        "db_root": str(Path(db_root).resolve()),
+        "status": status,
+        "applied": False,
+        "p0": False,
+        "blocking": rc != 0,
+        "reason": reason,
+        "findings": [finding] if finding else [],
+        "healed": [],
+        "needs_human": [finding] if finding else [],
+        "rc": rc,
+    }
+
+
+def _read_autoheal_contract(path: Path, *, request_id: str, profile: str,
+                            cycle_id: Optional[str], db_root: Path,
+                            returncode: int) -> dict[str, Any]:
+    """Read json-out only and bind it to this exact pretrade request."""
+    expected_cycle = str(cycle_id) if cycle_id is not None else None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > 2_000_000:
+            raise ValueError("json-out exceeds 2 MB")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("json-out root is not an object")
+        checks = {
+            "contract_version": data.get("contract_version") == _AUTOHEAL_CONTRACT_VERSION,
+            "request_id": data.get("request_id") == request_id,
+            "profile": data.get("profile") == str(profile),
+            "cycle": data.get("cycle") == expected_cycle,
+            "db_root": Path(str(data.get("db_root") or "")).resolve()
+                       == db_root.resolve(),
+            "status": data.get("status") in {
+                "ok", "applied", "needs_human", "error", "skipped",
+                "p0_blocked",
+            },
+            "applied": type(data.get("applied")) is bool,
+            "p0": type(data.get("p0")) is bool,
+            "blocking": type(data.get("blocking")) is bool,
+            "findings": isinstance(data.get("findings"), list),
+            "healed": isinstance(data.get("healed"), list),
+            "needs_human": isinstance(data.get("needs_human"), list),
+            "rc": type(data.get("rc")) is int
+                  and data.get("rc") in (0, 1, 2, 3, 4),
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed:
+            raise ValueError("contract fields invalid: " + ",".join(failed))
+        if data["blocking"] != (data["rc"] != 0):
+            raise ValueError("blocking/rc mismatch")
+        if data["p0"] != (data["rc"] == 4):
+            raise ValueError("p0/rc mismatch")
+        status_by_rc = {
+            0: {"ok", "applied"}, 1: {"needs_human"}, 2: {"error"},
+            3: {"skipped"}, 4: {"p0_blocked"},
+        }
+        if data["status"] not in status_by_rc[data["rc"]]:
+            raise ValueError("status/rc mismatch")
+        healed_applied = any(
+            isinstance(item, dict) and item.get("applied") is True
+            for item in data["healed"])
+        if data["applied"] != healed_applied:
+            raise ValueError("applied/healed mismatch")
+        findings_p0 = any(
+            isinstance(item, dict)
+            and str(item.get("sev") or "").upper() == "P0"
+            for item in data["findings"])
+        if data["p0"] != findings_p0:
+            raise ValueError("p0/findings mismatch")
+        if int(returncode) != data["rc"]:
+            raise ValueError(
+                f"process rc={returncode} differs from contract rc={data['rc']}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        return _autoheal_client_result(
+            profile, db_root, cycle_id, request_id,
+            status="contract_invalid", rc=2,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _try_autoheal_ledger(profile: str, db_root,
+                         cycle_id: Optional[str]) -> dict[str, Any]:
     """插入点 B：pretrade 账仓不一致时，拒单前给一次确定性自愈机会（2026-08-04）。
 
-    Live 永久只读；即使设置 `OKX_LEDGER_AUTOHEAL_APPLY=1` 或
-    `OKX_LEDGER_AUTOHEAL_UNRECORDED=1`，本层也不会向 Live 子进程传写参数。
-    两个开关只允许 Demo 账本自愈。EXACT 判定、单轮上限、方向限制和幂等等
-    闸门都在 `scripts/ledger_autoheal.py` 内，本层不复制规则。
+    公开版只运行诊断，不传任何写入开关。本层不复制分级规则。
 
-    **fail-closed 语义不变**：本函数只可能让「账本修好后本就该通过」的校验重新通过，
-    绝不会让校验不通过的单放行——调用方在自愈后必须重跑
-    `_verify_pretrade_ledger_positions`，仍不 ok 照旧拒单。
-
-    子进程隔离 + 全异常吞掉：自愈崩溃/超时一律返回 False，退回原有拒单路径。
+    只读取原子 `--json-out`，严格核对 request/profile/cycle/db_root/rc。
+    缺失、损坏、过期或任何非零契约都返回 blocking 结果。只有安全
+    `applied=true, blocking=false` 时调用方才可重跑账仓校验。
     `--self-cycle` 让本轮自己的 running runner 不被误判为互斥冲突。
-    环境变量 `OKX_DISABLE_LEDGER_AUTOHEAL=1` 可一键关掉本层。
+    环境变量 `OKX_DISABLE_LEDGER_AUTOHEAL=1` 可一键关掉本层（回退纯人工口径）。
     """
+    request_id = uuid.uuid4().hex
+    resolved_db_root = Path(db_root).resolve()
     if os.environ.get("OKX_DISABLE_LEDGER_AUTOHEAL") == "1":
-        return False
+        return _autoheal_client_result(
+            profile, resolved_db_root, cycle_id, request_id,
+            status="disabled", rc=0,
+            reason="OKX_DISABLE_LEDGER_AUTOHEAL=1",
+            finding_kind=None,
+        )
+    out_json = Path(tempfile.gettempdir()) / (
+        f"okx-ledger-autoheal-{os.getpid()}-{request_id}.json")
     try:
         import subprocess  # 局部 import：仅此罕见分支需要，不拖累安全层常态路径
 
         heal_py = os.path.join(_SCRIPTS_DIR, "ledger_autoheal.py")
         if not os.path.exists(heal_py):
-            return False
-        apply_enabled = (
-            str(profile) == "demo"
-            and os.environ.get("OKX_LEDGER_AUTOHEAL_APPLY") == "1"
-        )
-        unrecorded_enabled = (
-            apply_enabled
-            and os.environ.get("OKX_LEDGER_AUTOHEAL_UNRECORDED") == "1"
-        )
+            return _autoheal_client_result(
+                profile, resolved_db_root, cycle_id, request_id,
+                status="client_error", rc=2,
+                reason=f"ledger_autoheal.py missing: {heal_py}",
+            )
+        out_json.unlink(missing_ok=True)
         cmd = [sys.executable, heal_py, "--profile", str(profile),
-               "--db-root", str(db_root)]
-        if apply_enabled:
-            cmd.append("--apply")
-        if unrecorded_enabled:
-            cmd.append("--enable-unrecorded")
+               "--db-root", str(resolved_db_root),
+               "--request-id", request_id, "--json-out", str(out_json)]
         if cycle_id:
             cmd += ["--self-cycle", str(cycle_id)]
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
                               timeout=_AUTOHEAL_TIMEOUT_SEC)
-        data = json.loads(proc.stdout or "{}")
-        # Live classification can never repair the ledger in public code. Keep
-        # the caller fail-closed even if stale subprocess output claims a write.
-        if str(profile) == "live":
-            return False
-        return any(h.get("applied") for h in data.get("healed", []))
-    except Exception:  # noqa: BLE001  自愈失败绝不影响拒单主路径
-        return False
+        return _read_autoheal_contract(
+            out_json, request_id=request_id, profile=str(profile),
+            cycle_id=cycle_id, db_root=resolved_db_root,
+            returncode=proc.returncode,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _autoheal_client_result(
+            profile, resolved_db_root, cycle_id, request_id,
+            status="client_error", rc=2,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        try:
+            out_json.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _verify_sl_placed(
+def _autoheal_audit_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the receipt useful without copying order ids or raw API payloads."""
+    findings = []
+    for item in result.get("findings", [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        findings.append({
+            "kind": str(item.get("kind") or "UNKNOWN"),
+            "sev": str(item.get("sev") or ""),
+            "symbol": item.get("symbol"),
+            "side": item.get("side"),
+            "reason": str(item.get("reason") or "")[:240],
+        })
+    return {
+        "contract_version": result.get("contract_version"),
+        "request_id": result.get("request_id"),
+        "status": result.get("status"),
+        "rc": result.get("rc"),
+        "applied": result.get("applied"),
+        "p0": result.get("p0"),
+        "blocking": result.get("blocking"),
+        "findings": findings,
+    }
+
+
+def _verify_trigger_placed(
     symbol: str,
     pos_side: str,
     profile: str,
-    sl_trigger_px: Optional[float] = None,
+    trigger_kind: str,
+    trigger_px: Optional[float] = None,
     tol_pct: float = 0.001,
     retries: int = 2,
     *,
@@ -750,17 +860,21 @@ def _verify_sl_placed(
     expected_algo_id: Optional[str] = None,
     expected_ord_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """回读 pending algo，确认是“本次、同侧、足量、有效”的保护性止损。
+    """回读 pending algo，确认是“本次、同侧、足量、有效”的 TP/SL。
 
     附挂 SL 没有调用方已知的 algoId，因此必须以 cTime>=本次下单时刻识别，旧的
     同价单不能通过。独立 algo 必须精确匹配刚返回的 algoId；即使个别展示字段缺失，
     这个强身份仍可兼容，但只要字段存在就必须与本次请求一致。
     """
-    expected_sl = _to_float(sl_trigger_px)
-    if (expected_sl is None or not math.isfinite(expected_sl)
-            or expected_sl <= 0):
+    kind = str(trigger_kind or "").lower()
+    if kind not in ("sl", "tp"):
+        return {"verified": False, "found": [], "error": "invalid_trigger_kind"}
+    field = "slTriggerPx" if kind == "sl" else "tpTriggerPx"
+    expected_trigger = _to_float(trigger_px)
+    if (expected_trigger is None or not math.isfinite(expected_trigger)
+            or expected_trigger <= 0):
         return {"verified": False, "found": [],
-                "error": "invalid_sl_trigger_px"}
+                "error": f"invalid_{kind}_trigger_px"}
     expected_size = _to_float(expected_sz)
     if (expected_size is None or not math.isfinite(expected_size)
             or expected_size <= 0):
@@ -794,8 +908,9 @@ def _verify_sl_placed(
         for a in algos:
             if not isinstance(a, dict):
                 continue
-            slpx = _to_float(a.get("slTriggerPx"))
-            if slpx is None or not math.isfinite(slpx) or slpx <= 0:
+            row_trigger = _to_float(a.get(field))
+            if (row_trigger is None or not math.isfinite(row_trigger)
+                    or row_trigger <= 0):
                 continue
             algo_id = str(a.get("algoId") or "")
             exact_algo = bool(expected_algo and algo_id == expected_algo)
@@ -849,8 +964,8 @@ def _verify_sl_placed(
             elif not exact_algo:
                 errors.append("sz_missing")
 
-            if abs(slpx - expected_sl) / expected_sl > tolerance:
-                errors.append("slTriggerPx")
+            if abs(row_trigger - expected_trigger) / expected_trigger > tolerance:
+                errors.append(field)
 
             linked = a.get("linkedOrd")
             linked_ord_id = ""
@@ -861,7 +976,7 @@ def _verify_sl_placed(
 
             summary = {
                 "algoId": algo_id or None,
-                "slTriggerPx": slpx,
+                field: row_trigger,
                 "posSide": row_pos_side or None,
                 "side": row_side or None,
                 "reduceOnly": raw_reduce_only,
@@ -878,6 +993,36 @@ def _verify_sl_placed(
     return {"verified": False, "found": found}
 
 
+def _verify_sl_placed(
+    symbol: str, pos_side: str, profile: str,
+    sl_trigger_px: Optional[float] = None, tol_pct: float = 0.001,
+    retries: int = 2, *, expected_sz: Optional[float] = None,
+    since_ms: Optional[float] = None,
+    expected_algo_id: Optional[str] = None,
+    expected_ord_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return _verify_trigger_placed(
+        symbol, pos_side, profile, "sl", sl_trigger_px, tol_pct, retries,
+        expected_sz=expected_sz, since_ms=since_ms,
+        expected_algo_id=expected_algo_id, expected_ord_id=expected_ord_id,
+    )
+
+
+def _verify_tp_placed(
+    symbol: str, pos_side: str, profile: str,
+    tp_trigger_px: Optional[float] = None, tol_pct: float = 0.001,
+    retries: int = 2, *, expected_sz: Optional[float] = None,
+    since_ms: Optional[float] = None,
+    expected_algo_id: Optional[str] = None,
+    expected_ord_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return _verify_trigger_placed(
+        symbol, pos_side, profile, "tp", tp_trigger_px, tol_pct, retries,
+        expected_sz=expected_sz, since_ms=since_ms,
+        expected_algo_id=expected_algo_id, expected_ord_id=expected_ord_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # OPEN
 # ---------------------------------------------------------------------------
@@ -886,6 +1031,10 @@ def validate_receipt_context(
     *,
     cycle_id: Optional[str] = None,
     required: bool = True,
+    expected_symbol: Optional[str] = None,
+    expected_side: Optional[str] = None,
+    expected_regime: Optional[str] = None,
+    require_experience: bool = False,
 ) -> list[str]:
     """Validate the full decision envelope before any exchange side effect.
 
@@ -903,6 +1052,46 @@ def validate_receipt_context(
         errors.append("receipt_context.decision_protocol 必须是 decision_card_v1")
     errors.extend(validate_card(context.get("decision_card"),
                                 "receipt_context.decision_card"))
+    card = context.get("decision_card")
+    if expected_symbol is not None:
+        errors.extend(validate_multitimeframe_analysis(
+            card,
+            "receipt_context.decision_card",
+            expected_cycle=str(cycle_id or ""),
+            expected_side=expected_side,
+            expected_symbol=expected_symbol,
+        ))
+    history = (
+        card.get("historical_experience")
+        if isinstance(card, dict) else None
+    )
+    evidence_contract = (
+        history.get("evidence_contract")
+        if isinstance(history, dict) else None
+    )
+    if require_experience or evidence_contract is not None:
+        expected_as_of = None
+        try:
+            if cycle_id:
+                expected_as_of = datetime.strptime(
+                    cycle_id, "%Y-%m-%dT%H:%M"
+                ).strftime("%Y-%m-%d %H:%M:00")
+        except (TypeError, ValueError):
+            expected_as_of = None
+        contract_errors = validate_experience_contract(
+            evidence_contract,
+            expected_symbol=expected_symbol,
+            expected_side=expected_side,
+            expected_regime=expected_regime,
+            expected_action="open" if expected_symbol else None,
+            expected_profile="live" if expected_symbol else None,
+            expected_as_of=expected_as_of,
+        )
+        errors.extend(
+            "receipt_context.decision_card.historical_experience."
+            f"evidence_contract: {item}"
+            for item in contract_errors
+        )
     ctx_cycle = context.get("cycle_id")
     if cycle_id and ctx_cycle != cycle_id:
         errors.append(
@@ -931,13 +1120,15 @@ def open_position(
     available_margin: Optional[float] = None,
     receipt_context: Optional[dict[str, Any]] = None,
     account_imr: Optional[float] = None,
+    tp_trigger_px: Optional[float] = None,
 ) -> dict[str, Any]:
-    is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
-    profile_label = "demo" if is_demo else "live"
+    _require_live_profile(profile, "open_position")
+    profile_label = "live"
     side = str(side or "").lower()
     action_taken = "OPEN_LONG" if side == "long" else "OPEN_SHORT"
     capacity_audit: Optional[dict[str, Any]] = None
     position_reconciliation_audit: Optional[dict[str, Any]] = None
+    multitimeframe_readiness_audit: Optional[dict[str, Any]] = None
     intent_path = Path(db_root) / "ledger.db"
     intent_fingerprint: Optional[str] = None
     intent_ord_id: Optional[str] = None
@@ -954,6 +1145,9 @@ def open_position(
             base["capacity"] = dict(capacity_audit)
         if position_reconciliation_audit is not None:
             base["position_reconciliation"] = dict(position_reconciliation_audit)
+        if multitimeframe_readiness_audit is not None:
+            base["multitimeframe_readiness"] = dict(
+                multitimeframe_readiness_audit)
         base.update(kw)
         return base
 
@@ -1010,13 +1204,21 @@ def open_position(
     # 账户/下单 I/O 前 fail-safe 拒绝，避免已成交后才在回读比较处爆类型异常。
     if sl_trigger_px is None:
         return receipt(False, action_taken="REJECT", reject_reason="no_sl",
-                       reject_detail="开仓必须提供止损价（§4 红线，live/demo 一致）")
+                       reject_detail="开仓必须提供止损价（§4 红线）")
     normalized_sl = _to_float(sl_trigger_px)
     if (normalized_sl is None or not math.isfinite(normalized_sl)
             or normalized_sl <= 0):
         return receipt(False, action_taken="REJECT", reject_reason="bad_sl",
                        reject_detail=f"止损价非法: {sl_trigger_px}")
     sl_trigger_px = normalized_sl
+    if tp_trigger_px is not None:
+        normalized_tp = _to_float(tp_trigger_px)
+        if (normalized_tp is None or not math.isfinite(normalized_tp)
+                or normalized_tp <= 0):
+            return receipt(
+                False, action_taken="REJECT", reject_reason="bad_tp",
+                reject_detail=f"止盈价非法: {tp_trigger_px}")
+        tp_trigger_px = normalized_tp
     normalized_lev = _to_float(lev)
     if (normalized_lev is None or not math.isfinite(normalized_lev)
             or normalized_lev <= 0):
@@ -1034,7 +1236,16 @@ def open_position(
     # I/O 前完成 JSON 与卡片校验。这样 Python 中误写 JSON 的 true/false 会在
     # 调 open_position 之前失败，而不是成交后组回执时失败。
     ctx_errors = validate_receipt_context(
-        receipt_context, cycle_id=cycle_id, required=not ox.is_dryrun())
+        receipt_context,
+        cycle_id=cycle_id,
+        required=not ox.is_dryrun(),
+        expected_symbol=symbol,
+        expected_side=side,
+        expected_regime=(
+            str((receipt_context or {}).get("regime") or "") or None
+        ),
+        require_experience=not ox.is_dryrun(),
+    )
     if ctx_errors:
         return receipt(
             False, action_taken="REJECT",
@@ -1044,6 +1255,58 @@ def open_position(
         return receipt(
             False, action_taken="REJECT", reject_reason="cycle_id_required",
             reject_detail="非 dry-run 开仓必须提供调度 cycle_id")
+
+    # Wave1 序6 接管闸（终稿边界表 #3 / T4）：分析与执行 actor epoch 不同
+    # （overloaded 切换等）时，OPEN/ADD 必须携带确定性重验凭证；同 actor
+    # 正常轮零负担直通。非 dry-run 时间线不可得时无法证明未接管，必须在
+    # 任何账户/订单 I/O 前 fail-closed；CLOSE/REDUCE 去风险恒不受阻。
+    actor_timeline_note = None
+    if not ox.is_dryrun():
+        try:
+            _analysis_ts = None
+            _acon = None
+            try:
+                _acon = sqlite3.connect(
+                    f"file:{Path(db_root) / 'analysis.db'}?mode=ro",
+                    uri=True, timeout=5)
+                _row = _acon.execute(
+                    "SELECT ts FROM analysis_runs WHERE cycle_id=?",
+                    (cycle_id,)).fetchone()
+                _analysis_ts = _row[0] if _row else None
+            except sqlite3.Error:
+                _analysis_ts = None
+            finally:
+                if _acon is not None:
+                    _acon.close()
+            _tl = actor_att.timeline_state(cycle_id, _analysis_ts)
+        except Exception as exc:  # noqa: BLE001
+            _tl = {"available": False,
+                   "reason": f"timeline_error:{type(exc).__name__}"}
+        if not _tl.get("available"):
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="actor_timeline_required",
+                reject_detail=(
+                    "非 dry-run OPEN/ADD 必须能解析本 cycle actor 时间线；"
+                    f"当前不可用: {_tl.get('reason')}"),
+            )
+        elif _tl.get("handoff_detected"):
+            _att = (receipt_context or {}).get("actor_attestation")
+            _att_errors = actor_att.verify_attestation(
+                _att, cycle_id, db_root=db_root)
+            if _att_errors:
+                return receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="handoff_attestation_required",
+                    reject_detail=(
+                        "检测到分析与执行 actor 不同"
+                        f"（epoch {_tl.get('analysis_epoch')}→"
+                        f"{_tl.get('current_epoch')}），接管必须先跑 "
+                        "scripts/actor_attestation.py 重验并把产物整份放入 "
+                        "receipt_context['actor_attestation']: "
+                        + "；".join(_att_errors)))
+            actor_timeline_note = (
+                f"handoff_verified:chain={_tl.get('actor_chain_hash')}")
 
     # 先于任何交易所读取占住逻辑意图；相同已完成请求直接返回原回执。
     # 同 profile 任一标的存在 in-flight/uncertain 时全局 fail-closed，避免在
@@ -1058,6 +1321,7 @@ def open_position(
             "intended_sz": intended_sz,
             "lev": lev,
             "sl_trigger_px": sl_trigger_px,
+            "tp_trigger_px": tp_trigger_px,
             "mgn_mode": mgn_mode,
         }
         try:
@@ -1116,6 +1380,57 @@ def open_position(
                 p0=True)
         intent_fingerprint = str(reserved["fingerprint"])
 
+    # 目标2硬闸：OPEN/ADD 只允许使用本调度 cycle 对应的精确已收盘
+    # 15m/1H/4H K线，且 OHLCV 与全部决策指标都有效。新上市暖机不足、
+    # 陈旧回退、库不可读均 clean reject；CLOSE/REDUCE 不经过本函数，去风险
+    # 路径不受影响。闸门只读 market.db，位于任何交易所读取/下单之前。
+    multitimeframe_readiness_audit = check_multitimeframe_readiness(
+        db_root, symbol, str(cycle_id))
+    if not multitimeframe_readiness_audit.get("ready"):
+        gaps = [
+            f"{row.get('timeframe')}:{row.get('classification')}"
+            for row in multitimeframe_readiness_audit.get("timeframes", [])
+            if not row.get("ready")
+        ]
+        detail = (
+            "OPEN/ADD 必须具备本 cycle 精确已收盘的15m/1H/4H OHLCV及"
+            "MA5/MA20/ATR14/RSI14/MACD完整指标；"
+            f"当前未就绪: {','.join(gaps) or multitimeframe_readiness_audit.get('error') or 'unknown'}"
+        )
+        return _finish_clean(
+            receipt(
+                False,
+                action_taken="REJECT",
+                reject_reason="multitimeframe_data_not_ready",
+                reject_detail=detail,
+            ),
+            "multitimeframe_data_not_ready",
+        )
+    card_multitimeframe = (
+        ((receipt_context or {}).get("decision_card") or {}).get(
+            "multitimeframe_analysis")
+        if isinstance((receipt_context or {}).get("decision_card"), dict)
+        else None
+    )
+    supplied_contract = (
+        card_multitimeframe.get("evidence_contract")
+        if isinstance(card_multitimeframe, dict) else None
+    )
+    actual_contract = multitimeframe_readiness_audit.get("evidence_contract")
+    if supplied_contract != actual_contract:
+        return _finish_clean(
+            receipt(
+                False,
+                action_taken="REJECT",
+                reject_reason="multitimeframe_context_mismatch",
+                reject_detail=(
+                    "决策卡三周期证据与 market.db 本 cycle 精确闭合真值不一致；"
+                    "拒绝使用旧周期、篡改或非权威证据开仓"
+                ),
+            ),
+            "multitimeframe_context_mismatch",
+        )
+
     # ── 装配现场：硬闸输入一律以 OKX API 为权威，禁 caller 注入绕闸 ──
     # 非 dryrun 一律以 API 真值为准，caller 传值仅留作偏差留痕。
     # 现仓 API 失败 = 敞口未知 → 拒单，不当零仓。
@@ -1124,101 +1439,84 @@ def open_position(
         caller_equity = equity
         caller_available_margin = available_margin
         caller_account_imr = account_imr
-        if is_demo:
-            # Demo 容量不读取 balance/totalEq/availBal；这些字段与 live 的抵押品、
-            # 账户模式口径不同。真正容量在公共安全预检及（必要时）set_leverage 后，
-            # 按 symbol/side/tdMode 从 account max-size 实时取得。
-            equity = None
-            available_margin = None
-            account_imr = None
-            if caller_equity is not None:
-                input_divergence.append(
-                    f"demo equity caller={caller_equity} ignored_for_sizing")
-            if caller_available_margin is not None:
-                input_divergence.append(
-                    "demo available_margin "
-                    f"caller={caller_available_margin} ignored_for_sizing")
-            if caller_account_imr is not None:
-                input_divergence.append(
-                    "demo account_imr "
-                    f"caller={caller_account_imr} ignored_for_sizing")
-        else:
-            # live 余额只拉一次：totalEq 是全账户折 USD 权益，不等于
-            # USDT-SWAP 可用结算币保证金；必须从 details.USDT 取
-            # availBal/availEq；账户组合 IMR 同样只认这次 balance 的顶层 imr。
-            # 任一缺失都禁回退 caller/totalEq。
-            try:
-                balance_payload = ox.get_balance(profile)
-            except Exception as exc:
-                balance_payload = {"ok": False, "error": str(exc)}
-            capacity = ac.extract_settlement_capacity(balance_payload, "USDT")
-            api_equity = _to_float(capacity.get("total_equity"))
-            api_available_margin = _to_float(capacity.get("available_margin"))
-            api_account_imr = _to_float(capacity.get("account_imr"))
-            capacity_audit = {
-                "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
-                "source": capacity.get("source"),
-                "available_margin": api_available_margin,
-                "account_imr": api_account_imr,
-                "account_imr_source": capacity.get("account_imr_source"),
-                "account_imr_error": capacity.get("account_imr_error"),
-                "account_mgn_ratio_observation_only": capacity.get(
-                    "account_mgn_ratio_observation_only"
-                ),
-                "frozen_balance": capacity.get("frozen_balance"),
-                "error": capacity.get("error"),
-            }
-            if (api_account_imr is None
-                    or not math.isfinite(api_account_imr)
-                    or api_account_imr < 0):
-                return _finish_clean(receipt(
-                    False, action_taken="REJECT",
-                    reject_reason="account_imr_fetch_failed",
-                    reject_detail=(
-                        "账户初始保证金 imr 不可用，拒开"
-                        "（禁回退 caller/持仓本地估算）: "
-                        f"{capacity.get('account_imr_error') or capacity.get('error')}"),
-                    p0=True,
-                ), "account_imr_fetch_failed")
-            if (not capacity.get("ok") or api_available_margin is None
-                    or not math.isfinite(api_available_margin)
-                    or api_available_margin < 0):
-                return _finish_clean(receipt(
-                    False, action_taken="REJECT",
-                    reject_reason="available_margin_fetch_failed",
-                    reject_detail=(
-                        "USDT 可用保证金不可用，拒开（禁回退 totalEq/caller）: "
-                        f"{capacity.get('error')}"),
-                    p0=True,
-                ), "available_margin_fetch_failed")
-            if (api_equity is None or not math.isfinite(api_equity)
-                    or api_equity <= 0):
-                return _finish_clean(receipt(
-                    False, action_taken="REJECT",
-                    reject_reason="equity_fetch_failed",
-                    reject_detail="totalEq 非法，拒开（禁回退 caller）",
-                    p0=True,
-                ), "equity_fetch_failed")
-            if (caller_equity is not None
-                    and abs((_to_float(caller_equity) or 0.0)
-                            - api_equity) > 1.0):
-                input_divergence.append(
-                    f"equity caller={caller_equity} → API={api_equity}")
-            if (caller_available_margin is not None
-                    and abs((_to_float(caller_available_margin) or 0.0)
-                            - api_available_margin) > 1.0):
-                input_divergence.append(
-                    "available_margin "
-                    f"caller={caller_available_margin} → API={api_available_margin}")
-            if (caller_account_imr is not None
-                    and abs((_to_float(caller_account_imr) or 0.0)
-                            - api_account_imr) > 1.0):
-                input_divergence.append(
-                    f"account_imr caller={caller_account_imr} "
-                    f"→ API={api_account_imr}")
-            equity = api_equity
-            available_margin = api_available_margin
-            account_imr = api_account_imr
+        # demo 分支（容量不读 balance，改按 account max-size 实时取）随 2026-08-06
+        # 全量下线移除；只剩 live 的余额/IMR 路径。
+        # live 余额只拉一次：totalEq 是全账户折 USD 权益，不等于
+        # USDT-SWAP 可用结算币保证金；必须从 details.USDT 取
+        # availBal/availEq；账户组合 IMR 同样只认这次 balance 的顶层 imr。
+        # 任一缺失都禁回退 caller/totalEq。
+        try:
+            balance_payload = ox.get_balance(profile)
+        except Exception as exc:
+            balance_payload = {"ok": False, "error": str(exc)}
+        capacity = ac.extract_settlement_capacity(balance_payload, "USDT")
+        api_equity = _to_float(capacity.get("total_equity"))
+        api_available_margin = _to_float(capacity.get("available_margin"))
+        api_account_imr = _to_float(capacity.get("account_imr"))
+        capacity_audit = {
+            "settlement_ccy": capacity.get("settlement_ccy", "USDT"),
+            "source": capacity.get("source"),
+            "available_margin": api_available_margin,
+            "account_imr": api_account_imr,
+            "account_imr_source": capacity.get("account_imr_source"),
+            "account_imr_error": capacity.get("account_imr_error"),
+            "account_mgn_ratio_observation_only": capacity.get(
+                "account_mgn_ratio_observation_only"
+            ),
+            "frozen_balance": capacity.get("frozen_balance"),
+            "error": capacity.get("error"),
+        }
+        if (api_account_imr is None
+                or not math.isfinite(api_account_imr)
+                or api_account_imr < 0):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="account_imr_fetch_failed",
+                reject_detail=(
+                    "账户初始保证金 imr 不可用，拒开"
+                    "（禁回退 caller/持仓本地估算）: "
+                    f"{capacity.get('account_imr_error') or capacity.get('error')}"),
+                p0=True,
+            ), "account_imr_fetch_failed")
+        if (not capacity.get("ok") or api_available_margin is None
+                or not math.isfinite(api_available_margin)
+                or api_available_margin < 0):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="available_margin_fetch_failed",
+                reject_detail=(
+                    "USDT 可用保证金不可用，拒开（禁回退 totalEq/caller）: "
+                    f"{capacity.get('error')}"),
+                p0=True,
+            ), "available_margin_fetch_failed")
+        if (api_equity is None or not math.isfinite(api_equity)
+                or api_equity <= 0):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="equity_fetch_failed",
+                reject_detail="totalEq 非法，拒开（禁回退 caller）",
+                p0=True,
+            ), "equity_fetch_failed")
+        if (caller_equity is not None
+                and abs((_to_float(caller_equity) or 0.0)
+                        - api_equity) > 1.0):
+            input_divergence.append(
+                f"equity caller={caller_equity} → API={api_equity}")
+        if (caller_available_margin is not None
+                and abs((_to_float(caller_available_margin) or 0.0)
+                        - api_available_margin) > 1.0):
+            input_divergence.append(
+                "available_margin "
+                f"caller={caller_available_margin} → API={api_available_margin}")
+        if (caller_account_imr is not None
+                and abs((_to_float(caller_account_imr) or 0.0)
+                        - api_account_imr) > 1.0):
+            input_divergence.append(
+                f"account_imr caller={caller_account_imr} "
+                f"→ API={api_account_imr}")
+        equity = api_equity
+        available_margin = api_available_margin
+        account_imr = api_account_imr
         try:
             api_positions = fetch_open_positions(profile)
         except PositionsUnavailable as exc:
@@ -1271,16 +1569,52 @@ def open_position(
                 "pretrade_api_positions_invalid",
             )
         position_reconciliation_audit = position_check
-        if not position_check["ok"] and _try_autoheal_ledger(
-                profile_label, db_root, cycle_id):
-            # 自愈写了 close 行 → 用同一份 api_positions 重新校验（不重复打 API）。
-            # 仍不 ok 就落回下面原有的 fail-closed 拒单路径，语义不变。
-            try:
-                position_check = _verify_pretrade_ledger_positions(
-                    profile_label, db_root, api_positions)
-                position_reconciliation_audit = position_check
-            except (TradeLedgerUnavailable, PositionsUnavailable):
-                pass
+        if not position_check["ok"]:
+            autoheal_result = _try_autoheal_ledger(
+                profile_label, db_root, cycle_id)
+            autoheal_audit = _autoheal_audit_view(autoheal_result)
+            position_reconciliation_audit = {
+                **position_check,
+                "autoheal": autoheal_audit,
+            }
+            if autoheal_result.get("blocking"):
+                kinds = sorted({
+                    str(item.get("kind") or "UNKNOWN")
+                    for item in autoheal_result.get("findings", [])
+                    if isinstance(item, dict)
+                })
+                detail = (
+                    f"ledger_autoheal status={autoheal_result.get('status')} "
+                    f"rc={autoheal_result.get('rc')} "
+                    f"findings={','.join(kinds) or 'UNKNOWN'}"
+                )
+                _enqueue_repair(
+                    profile_label, symbol, None,
+                    f"pretrade_ledger_autoheal_blocked:{detail}", db_root)
+                return _finish_clean(
+                    receipt(
+                        False, action_taken="REJECT",
+                        reject_reason="pretrade_ledger_autoheal_blocked",
+                        reject_detail=(
+                            "交易前账仓不一致，且账本自愈契约为阻断态；"
+                            "已在重新校验、mark、风险计算和下单前停止。"
+                            f" {detail}"),
+                        p0=True,
+                    ),
+                    "pretrade_ledger_autoheal_blocked",
+                )
+            if autoheal_result.get("applied") is True:
+                # 只有 rc=0/blocking=false 且真写入后才重验；仍使用同份
+                # api_positions，不为放行重复打 API。
+                try:
+                    position_check = _verify_pretrade_ledger_positions(
+                        profile_label, db_root, api_positions)
+                    position_reconciliation_audit = {
+                        **position_check,
+                        "autoheal": autoheal_audit,
+                    }
+                except (TradeLedgerUnavailable, PositionsUnavailable):
+                    pass
         if not position_check["ok"]:
             diffs = position_check["diffs"]
             compact = ";".join(
@@ -1323,13 +1657,9 @@ def open_position(
             print(f"[order_executor] WARN input_divergence: {input_divergence}", file=sys.stderr)
     else:
         # dryrun/单测：live 允许显式注入 equity/available_margin/account_imr，
-        # 缺项时由同一次 balance 补齐；Demo 即使 dryrun 也不得把 balance 或
-        # account_imr 当成容量，后续仍走 account max-size 只读查询。
-        if is_demo:
-            available_margin = None
-            account_imr = None
-        elif (equity is None or available_margin is None
-              or account_imr is None):
+        # 缺项时由同一次 balance 补齐。
+        if (equity is None or available_margin is None
+                or account_imr is None):
             try:
                 capacity = ac.extract_settlement_capacity(
                     ox.get_balance(profile), "USDT")
@@ -1361,18 +1691,17 @@ def open_position(
                 "account_imr": _to_float(account_imr),
                 "frozen_balance": None,
             }
-        if not is_demo:
-            account_imr = _to_float(account_imr)
-            if (account_imr is None or not math.isfinite(account_imr)
-                    or account_imr < 0):
-                return _finish_clean(receipt(
-                    False, action_taken="REJECT",
-                    reject_reason="account_imr_fetch_failed",
-                    reject_detail=(
-                        "账户初始保证金 imr 不可用，拒开"
-                        "（dryrun/单测须显式注入或由 balance 提供）"),
-                    p0=True,
-                ), "account_imr_fetch_failed")
+        account_imr = _to_float(account_imr)
+        if (account_imr is None or not math.isfinite(account_imr)
+                or account_imr < 0):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="account_imr_fetch_failed",
+                reject_detail=(
+                    "账户初始保证金 imr 不可用，拒开"
+                    "（dryrun/单测须显式注入或由 balance 提供）"),
+                p0=True,
+            ), "account_imr_fetch_failed")
         if open_positions is None:
             try:
                 open_positions = fetch_open_positions(profile)
@@ -1380,6 +1709,35 @@ def open_position(
                 open_positions = []
         if mark_px is None:
             mark_px = ox.get_mark_price(symbol, profile)
+    if tp_trigger_px is not None:
+        mark_for_tp = _to_float(mark_px)
+        if mark_for_tp is None or not math.isfinite(mark_for_tp) or mark_for_tp <= 0:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT", reject_reason="mark_px_fetch_failed",
+                reject_detail="止盈几何校验需要有效 mark_px"),
+                "mark_px_fetch_failed")
+        bad_geometry = (
+            side == "long" and tp_trigger_px <= mark_for_tp
+        ) or (
+            side == "short" and tp_trigger_px >= mark_for_tp
+        )
+        if bad_geometry:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT", reject_reason="bad_tp_geometry",
+                reject_detail=(
+                    f"止盈方向非法: side={side} mark={mark_px} tp={tp_trigger_px}"),
+            ), "bad_tp_geometry")
+        card = (receipt_context or {}).get("decision_card") or {}
+        rr = card.get("risk_reward") if isinstance(card, dict) else None
+        target = _to_float(rr.get("target")) if isinstance(rr, dict) else None
+        if (target is None
+                or abs(target - tp_trigger_px) / tp_trigger_px > 0.001):
+            return _finish_clean(receipt(
+                False, action_taken="REJECT", reject_reason="tp_context_mismatch",
+                reject_detail=(
+                    "tp_trigger_px 必须与已验证 decision_card.risk_reward.target "
+                    f"一致（target={target}, tp={tp_trigger_px}）"),
+            ), "tp_context_mismatch")
     specs = fetch_instrument_specs(symbol, profile, db_root)
     ct_val = specs.get("ct_val")
     lot_sz = specs.get("lot_sz")
@@ -1389,123 +1747,27 @@ def open_position(
         for p in open_positions)
     lev_warn = None
 
-    if is_demo:
-        # 第一阶段只校公共安全与交易所规格。必须先于 set_leverage，防止一个本应
-        # 被拒绝的请求也修改 Demo 账户杠杆配置。
-        try:
-            preflight = rv.validate(
-                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-                profile="demo", available_margin=None,
-                min_order_size=min_sz, preflight_only=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _finish_clean(receipt(
-                False, action_taken="REJECT",
-                reject_reason="risk_validation_exception",
-                reject_detail=(
-                    "Demo 风控预检异常，订单尚未提交并已清理执行意图: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                p0=True,
-            ), f"risk_validation_exception:{type(exc).__name__}")
-        if not preflight["approved"]:
-            return _finish_clean(receipt(
-                False, action_taken="REJECT",
-                reject_reason=preflight["reject_reason"],
-                reject_detail=preflight["reject_detail"],
-                risk=preflight,
-            ), f"risk_reject:{preflight['reject_reason']}")
-
-        # OKX CLI 当前 max-size 不透传 leverage，接口会使用账户当前杠杆。
-        # 新开必须先成功设置目标杠杆；加仓则不改，沿用 API 现仓杠杆。
-        if new_open:
-            lr = ox.set_leverage(
-                symbol, lev, mgn_mode, profile,
-                pos_side=side if mgn_mode == "isolated" else None,
-            )
-            if not lr.get("ok"):
-                return _finish_clean(receipt(
-                    False, action_taken="REJECT",
-                    reject_reason="set_leverage_failed",
-                    reject_detail=str(lr.get("sMsg") or lr.get("error")),
-                    risk=preflight,
-                ), "set_leverage_failed")
-
-        try:
-            max_size_payload = ox.get_max_size(symbol, mgn_mode, profile)
-        except Exception as exc:
-            max_size_payload = {"ok": False, "error": str(exc)}
-        directional_capacity = ac.extract_directional_max_size(
-            max_size_payload, symbol, side)
-        exchange_max_size = _to_float(
-            directional_capacity.get("max_size"))
-        capacity_audit = {
-            "source": directional_capacity.get("source"),
-            "inst_id": symbol,
-            "side": side,
-            "td_mode": mgn_mode,
-            "direction_field": directional_capacity.get("direction_field"),
-            "direction_value": directional_capacity.get("direction_value"),
-            "max_size": exchange_max_size,
-            "queried_after_target_leverage": bool(new_open),
-            "error": directional_capacity.get("error"),
-        }
-        if (not directional_capacity.get("ok")
-                or exchange_max_size is None
-                or not math.isfinite(exchange_max_size)
-                or exchange_max_size < 0):
-            return _finish_clean(receipt(
-                False, action_taken="REJECT",
-                reject_reason="demo_max_size_fetch_failed",
-                reject_detail=(
-                    "OKX Demo 实时最大可开张数不可用，拒开；"
-                    "禁止回退 balance/totalEq/max-avail-size/live 公式: "
-                    f"{directional_capacity.get('error')}"),
-                risk=preflight, p0=True,
-            ), "demo_max_size_fetch_failed")
-
-        # 第二阶段只按交易所 minSz/lotSz 与本次方向 max-size 定仓。
-        try:
-            v = rv.validate(
-                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-                profile="demo", available_margin=None,
-                exchange_max_size=exchange_max_size,
-                min_order_size=min_sz,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _finish_clean(receipt(
-                False, action_taken="REJECT",
-                reject_reason="risk_validation_exception",
-                reject_detail=(
-                    "Demo 容量风控异常，订单尚未提交并已清理执行意图: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                p0=True,
-            ), f"risk_validation_exception:{type(exc).__name__}")
-    else:
-        # Live 保持 1% 名义下限、可用保证金×98% 与组合 IMR 66.6% 整单拒绝规则。
-        try:
-            v = rv.validate(
-                symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-                mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-                open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-                profile="live", available_margin=available_margin,
-                account_imr=account_imr,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _finish_clean(receipt(
-                False, action_taken="REJECT",
-                reject_reason="risk_validation_exception",
-                reject_detail=(
-                    "Live 风控异常，订单尚未提交并已清理执行意图: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                p0=True,
-            ), f"risk_validation_exception:{type(exc).__name__}")
+    # demo 的两阶段 max-size 定仓分支（预检 → set_leverage → account max-size →
+    # 按 minSz/lotSz 收敛）随 2026-08-06 全量下线移除；只剩 live 的完整预算闸。
+    # Live 保持 1% 名义下限、可用保证金×98% 与组合 IMR 66.6% 整单拒绝规则。
+    try:
+        v = rv.validate(
+            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+            profile="live", available_margin=available_margin,
+            account_imr=account_imr,
+        )
+    except Exception as exc:  # fail closed before leverage/order mutation
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="risk_validation_exception",
+            reject_detail=(
+                "Live 风控异常，订单尚未提交并已清理执行意图: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            p0=True,
+        ), f"risk_validation_exception:{type(exc).__name__}")
 
     if not v["approved"]:
         return _finish_clean(receipt(
@@ -1518,8 +1780,8 @@ def open_position(
     effective_lev = (_to_float((v.get("math") or {}).get("effective_lev"))
                      or lev)
 
-    # live 仍在完整预算闸通过后设杠杆；Demo 已在 max-size 查询前完成。
-    if not is_demo and new_open:
+    # live 在完整预算闸通过后才设杠杆。
+    if new_open:
         lr = ox.set_leverage(symbol, lev, mgn_mode, profile)
         if not lr.get("ok"):
             return _finish_clean(receipt(
@@ -1545,7 +1807,7 @@ def open_position(
     try:
         pr = ox.place_market_open(
             symbol, side, approved_sz, profile, mgn_mode=mgn_mode,
-            sl_trigger_px=sl_trigger_px)
+            sl_trigger_px=sl_trigger_px, tp_trigger_px=tp_trigger_px)
     except Exception as exc:
         _enqueue_repair(profile_label, symbol, None,
                         "place_exception_ambiguous", db_root)
@@ -1670,11 +1932,51 @@ def open_position(
 
     def make_open_trade(fa0: dict[str, Any], fill_source0: str,
                         sl_mode0: str, sl_verified0: bool,
-                        algo_id0: Optional[str]) -> dict[str, Any]:
+                        algo_id0: Optional[str], tp_mode0: str,
+                        tp_verified0: bool) -> dict[str, Any]:
         accounting = _open_fill_accounting(
             fa0, approved_sz=approved_sz, mark_px=mark_px,
             ct_val=ct_val, effective_lev=effective_lev,
             dryrun=ox.is_dryrun())
+        # 2026-08-08 单笔保证金闸：按真实成交保证金复审（执行时 equity 口径）。
+        # 异常滑点突破 15% 硬边界 → 如实记账 + 告警 + repair_queue 人工出口，
+        # 不阻断不追溯——后续每笔 OPEN/ADD 本就重过 validator 预检（14.7% 定仓
+        # 预算），不设新封锁状态（主人拍板口径）。
+        so_ratio, so_breached = _single_order_fill_audit(
+            accounting.get("margin"), equity)
+        if so_breached:
+            print(
+                f"[order_executor] WARN 单笔成交保证金 {so_ratio:.1%} 超硬边界 "
+                f"{rv.MAX_SINGLE_ORDER_IMR_RATIO:.0%}（滑点/口径漂移），"
+                f"如实记账仅告警 sym={symbol}", file=sys.stderr)
+            _enqueue_repair(profile, symbol, ord_id,
+                            f"single_order_cap_breached:{so_ratio:.4f}", db_root)
+        # 2026-08-10 Wave1 序7 止损风险闸：按真实成交价复审止损风险（与保证金
+        # 复审同款口径：滑点突破 5% 硬边界 → 如实记账 + 告警 + repair_queue，
+        # 不阻断不追溯；validator 预检已按 mark 缩量）。
+        so_risk_usdt = None
+        so_risk_pct = None
+        so_risk_breached = False
+        _fill_px_a = accounting.get("fill_px")
+        _notional_a = accounting.get("notional")
+        if (sl_trigger_px is not None and _fill_px_a and _notional_a
+                and equity):
+            _dist = abs(float(_fill_px_a) - float(sl_trigger_px)) / float(
+                _fill_px_a)
+            so_risk_usdt = float(_notional_a) * (
+                _dist + rv.RISK_FEE_BUFFER_PCT + rv.RISK_SLIPPAGE_BUFFER_PCT)
+            so_risk_pct = so_risk_usdt / float(equity)
+            so_risk_breached = (
+                so_risk_pct > rv.MAX_SINGLE_ORDER_RISK_PCT_EQUITY + 1e-9)
+        if so_risk_breached:
+            print(
+                f"[order_executor] WARN 单笔成交止损风险 {so_risk_pct:.1%} "
+                f"超硬边界 {rv.MAX_SINGLE_ORDER_RISK_PCT_EQUITY:.0%}"
+                f"（滑点/口径漂移），如实记账仅告警 sym={symbol}",
+                file=sys.stderr)
+            _enqueue_repair(
+                profile, symbol, ord_id,
+                f"single_order_risk_cap_breached:{so_risk_pct:.4f}", db_root)
         return {
             "symbol": symbol, "action": "open", "side": side,
             "sz": accounting["sz"],
@@ -1685,14 +1987,28 @@ def open_position(
             "fill_px": accounting["fill_px"], "px": accounting["fill_px"],
             "lev": effective_lev, "margin": accounting["margin"],
             "notional": accounting["notional"], "pnl": 0.0,
-            "channel": "demo" if is_demo else "live",
+            "channel": "live",
             "reason": reasoning, "open_id": ord_id, "sl_trigger_px": sl_trigger_px,
             "algo_id": algo_id0, "sl_mode": sl_mode0,
             "sl_verified": sl_verified0, "fill_source": fill_source0,
+            "tp_trigger_px": tp_trigger_px, "tp_mode": tp_mode0,
+            "tp_verified": tp_verified0,
             "fill_ts": fa0.get("fill_ts"),
             "ts_source": fa0.get("ts_source"),
             # 回执带本环境真实 ct_val，writer 补算优先用行内值。
             "ct_val": ct_val, "ordId": ord_id,
+            # 单笔保证金审计（push/复盘直读；HOLD/ADJUST 无 trade 行天然无此字段）
+            "single_order_imr_ratio": so_ratio,
+            "max_single_order_imr_ratio": rv.MAX_SINGLE_ORDER_IMR_RATIO,
+            "single_order_cap_breached": so_breached,
+            # 止损风险审计（Wave1 序7；口径 = 名义×(成交价距SL+0.2%缓冲)÷equity）
+            "single_order_risk_usdt": so_risk_usdt,
+            "single_order_risk_pct_equity": so_risk_pct,
+            "max_single_order_risk_pct_equity": (
+                rv.MAX_SINGLE_ORDER_RISK_PCT_EQUITY),
+            "single_order_risk_cap_breached": so_risk_breached,
+            "risk_clamped": bool(v.get("clamped")),
+            "risk_adjustments": list(v.get("adjustments") or []),
         }
 
     def journal_open_once(trade0: dict[str, Any], *, unwind: bool = False,
@@ -1700,7 +2016,7 @@ def open_position(
         nonlocal open_fill_journaled
         if open_fill_journaled:
             return
-        _journal_fill("demo" if is_demo else "live", trade0, db_root, cycle_id,
+        _journal_fill("live", trade0, db_root, cycle_id,
                       journal_action or action_taken, unwind=unwind)
         open_fill_journaled = True
 
@@ -1709,6 +2025,9 @@ def open_position(
     #   algo：独立 reduceOnly algo，返回 algoId 后仍须 pending 回读通过才算 verified。
     #   超时恢复路径 attached 状态未知 → 不采信附挂，强制走独立 algo 补挂（belt）。
     algo_id = None
+    tp_mode = "none"
+    tp_verified = False
+    tp_warning = None
     attached_ok = bool(pr.get("sl_attached")) and not recovered_timeout
     # 附挂 SL 用 get_algo_orders 回读；验证后才置 sl_verified=True。
     # 回读不到 → attached_ok=False，落回下方独立 algo SL 兜底防裸仓。
@@ -1782,7 +2101,8 @@ def open_position(
             fa_unwind, source_unwind = resolve_open_fill()
             if fa_unwind.get("ok"):
                 trade_unwind_open = make_open_trade(
-                    fa_unwind, source_unwind, "none", False, None)
+                    fa_unwind, source_unwind, "none", False, None,
+                    "none", False)
                 journal_open_once(trade_unwind_open, unwind=True,
                                   journal_action="UNWIND_OPEN")
             elif fa_unwind.get("state") != "canceled":
@@ -1822,6 +2142,39 @@ def open_position(
                            reject_detail="附挂+独立 SL 均失败，已市价平掉裸仓",
                            risk=v, unwind=unwind, p0=True))
 
+    # ── 可选止盈验证 ──
+    # TP 缺失不等于裸仓：SL 已安全确认时不平仓，只把未兑现的止盈保护写 repair。
+    tp_attached_ok = (
+        bool(pr.get("tp_attached")) and tp_trigger_px is not None
+        and not recovered_timeout
+    )
+    if tp_trigger_px is not None and ox.is_dryrun():
+        # DRYRUN 只证明参数已进入确定性下单装配，不伪称交易所已回读确认，
+        # 也绝不能向生产 repair_queue 写一条虚假的 TP 缺失告警。
+        tp_mode, tp_verified = "dryrun_simulated", False
+    elif tp_attached_ok:
+        try:
+            _vtp = _verify_tp_placed(
+                symbol, side, profile, tp_trigger_px,
+                expected_sz=approved_sz, since_ms=pre_place_ms,
+                expected_ord_id=ord_id)
+        except Exception as exc:
+            _vtp = {"verified": False, "found": [],
+                    "error": f"verify_exception:{type(exc).__name__}"}
+        if _vtp.get("verified"):
+            tp_mode, tp_verified = "attached", True
+        else:
+            tp_warning = "tp_unsecured"
+    elif tp_trigger_px is not None:
+        tp_warning = "tp_unsecured"
+    if tp_warning:
+        _enqueue_repair(profile, symbol, ord_id, "tp_unsecured_after_open", db_root)
+        print(
+            f"[order_executor] WARN 可选 TP 未回读确认 {symbol}；SL 已保护，"
+            "不 unwind，已入 repair_queue",
+            file=sys.stderr,
+        )
+
     # ── 回读真实成交（ord_id 缺失=超时恢复路径 → 用下单时刻做时间窗，防历史成交混入）──
     fa, fill_source = resolve_open_fill()
     if fa.get("state") == "canceled":
@@ -1844,12 +2197,15 @@ def open_position(
 
     # 从这里开始已是权威确认的成交，立即落一次 journal；后面只组回执，
     # 不再进入任何 SL I/O，故 SL 回读/补挂异常无法跳过此留痕。
-    trade = make_open_trade(fa, fill_source, sl_mode, sl_verified, algo_id)
+    trade = make_open_trade(
+        fa, fill_source, sl_mode, sl_verified, algo_id, tp_mode, tp_verified)
     journal_open_once(trade)
     return _finish_completed(receipt(True, trades=[trade], risk=v, ord_id=ord_id,
                    clamped=v.get("clamped"), adjustments=v.get("adjustments"),
                    lev_warn=lev_warn,
                    sl_mode=sl_mode, sl_verified=sl_verified,
+                   tp_mode=tp_mode, tp_verified=tp_verified,
+                   tp_warning=tp_warning,
                    recovered_timeout=recovered_timeout,
                    fill_source=fill_source,
                    spec_source=specs.get("spec_source"),
@@ -1870,14 +2226,14 @@ def close_position(
     _unwind: bool = False,
     receipt_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    is_demo = str(profile).lower() == "demo" or "demo" in str(profile).lower()
+    _require_live_profile(profile, "close_position")
     resolved_side = pos_side
 
     def receipt(ok: bool, **kw) -> dict[str, Any]:
         # 与 OPEN 相同：执行前完整验证，执行后只原样携带决策上下文，
         # 禁止 Agent 在成交后再手工拼 status/protocol/card/cycle。
         base = dict(receipt_context or {})
-        base.update({"profile": "demo" if is_demo else "live", "ok": ok,
+        base.update({"profile": "live", "ok": ok,
                 "cycle_id": cycle_id,
                 "action_taken": kw.pop("action_taken", "CLOSE"),
                 "symbol": symbol, "trades": kw.pop("trades", []),
@@ -2084,7 +2440,7 @@ def close_position(
         "requested_sz": pos_sz,
         "pre_position_sz": pos_sz,
         "fill_px": fill_px, "px": fill_px, "pnl": pnl,
-        "channel": "demo" if is_demo else "live", "reason": reasoning,
+        "channel": "live", "reason": reasoning,
         "reduce_only_fallback": used_reduce_only,
         "fill_source": fill_source, "pnl_approx": pnl_approx,
         "fill_ts": fill_ts, "ts_source": ts_source,
@@ -2095,7 +2451,7 @@ def close_position(
         trade["fill_ratio"] = actual_fill_sz / pos_sz
     elif fill_contract_error:
         trade["fill_contract_error"] = fill_contract_error
-    _journal_fill("demo" if is_demo else "live", trade, db_root, cycle_id,
+    _journal_fill("live", trade, db_root, cycle_id,
                   "UNWIND_CLOSE" if _unwind else "CLOSE", unwind=_unwind)
     return receipt(True, action_taken="CLOSE", trades=[trade],
                    reduce_only_fallback=used_reduce_only,
@@ -2171,13 +2527,10 @@ def _enqueue_repair(profile: str, symbol: str, ord_id: Optional[str],
     try:
         ts = ledger.now_cst()
         issue = f"[{profile}] {symbol} ord={ord_id}: {reason}"
-        fills_file = _project_path('tmp', f'repair_{profile}_{symbol}_fills.json')
-        wrapper = "'" + _project_path(
-            "scripts", "run_okx_python.ps1").replace("'", "''") + "'"
-        cli = "'" + _project_path(
-            "scripts", "_okxcli.py").replace("'", "''") + "'"
+        fills_file = f"./tmp/repair_{profile}_{symbol}_fills.json"
         fix = (
-            f"pwsh -NoProfile -File {wrapper} {cli} "
+            "pwsh -NoProfile -File ./scripts/run_okx_python.ps1 "
+            "./scripts/_okxcli.py "
             f"--profile {profile} --compact --out-file {fills_file} "
             f"swap fills --instId {symbol} --archive"
         )

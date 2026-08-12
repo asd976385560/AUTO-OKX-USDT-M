@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-r"""V2.0 trades 落库 writer（live/demo trader 写 live_trades.db/demo_trades.db 的唯一通道）。
+r"""V2.0 trades 落库 writer（live trader 写 live_trades.db 的唯一通道）。
 
-trader agent 完成判断后，把当前回执 JSON 从 UTF-8 文件或 stdin 喂进来，写进对应
-profile 的 trade_cycles + trades 表。
+trader agent 完成判断后，把当前回执 JSON 从 UTF-8 文件或 stdin 喂进来，写进
+live_trades.db 的 trade_cycles + trades 表。
+2026-08-06 demo 全量下线后 `--profile demo` 已非合法写入目标（见 DB_MAP 处注释）。
 红线「写库必走 writer」：trader agent 严禁手写 INSERT，强制走本脚本。
 
 用法：
     # 当前回执文件模式（推荐；receipt.json 必须满足下述完整契约）
-    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 \
-        <PROJECT_ROOT>\collectors\trades_writer.py --json-file receipt.json \
-        --cycle-id 2026-06-18T14:00 --profile demo
+    pwsh -NoProfile -File ./scripts/run_okx_python.ps1 \
+        ./collectors/trades_writer.py --json-file receipt.json \
+        --cycle-id 2026-06-18T14:00 --profile live
 
     # stdin 模式（仅在调用方能保证 UTF-8 字节时使用）
     经项目 wrapper 运行 trades_writer.py --stdin \
@@ -23,7 +24,7 @@ profile 的 trade_cycles + trades 表。
     {
       "cycle_id": "2026-06-18T14:00",
       "ts": "2026-06-18 14:05:30",   -- 调用方报告时刻，仅存 raw.reported_ts
-      "mode": "live",                 -- 必须与显式 --profile 一致：live|demo
+      "mode": "live",                 -- 必须与显式 --profile 一致：live（demo 已于 2026-08-06 下线）
       "status": "ok",                 -- 必填：ok|skipped|degraded|error
       "decision": "HOLD",             -- 'traded'|'hold'|'skip'|'degraded'|'error'
       "action": "BTC/USDT: hold",    -- 简短动作描述
@@ -35,8 +36,8 @@ profile 的 trade_cycles + trades 表。
       "equity": 999.22,
       "avail_before": 999.22,        -- 等效 equity
       "avail_after": 999.22,
-      "pnl_session": 0.0,            -- 本轮 realized PnL（live/demo 同义：demo 真交易，pnl 参与 cum_pnl 与对账）
-      "pnl_open": -14.50,            -- 当前持仓浮盈亏（live/demo 同义）
+      "pnl_session": 0.0,            -- 本轮 realized PnL（参与 cum_pnl 与对账）
+      "pnl_open": -14.50,            -- 当前持仓浮盈亏
       "leverage": 5,
       "note": "...",                 -- 额外说明（可选）
       "trades": [
@@ -82,18 +83,6 @@ profile 的 trade_cycles + trades 表。
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import math
@@ -104,9 +93,13 @@ from datetime import datetime as dt, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-if _project_path() not in sys.path:
-    sys.path.insert(0, _project_path())
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 from core.decision_card import validate_card  # noqa: E402
+from scripts.live_decision_facts import validate_facts as validate_live_facts  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 _TS_ISO_RE = re.compile(
@@ -168,8 +161,8 @@ import sqlite3
 # HANDOFF-4A（2026-07-16）：CLI 落库成功后 detached 拍一次 dispatcher（事件驱动派发）。
 # 守卫导入：任何异常→None→静默禁用——writer 落库优先，nudge 永不致命。守护闸详见模块 docstring。
 try:
-    if _project_path('collectors') not in sys.path:
-        sys.path.insert(0, _project_path('collectors'))
+    if str(_PROJECT_ROOT / "collectors") not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT / "collectors"))
     import _dispatch_nudge as _nudge_mod
 except Exception:  # noqa: BLE001
     _nudge_mod = None
@@ -177,7 +170,8 @@ except Exception:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 # DB paths
 # ---------------------------------------------------------------------------
-_PRODUCTION_DB_ROOT = Path(_project_path('db')).resolve()
+# 2026-08-06 demo 全量下线：demo_trades.db 已不再是合法写入目标。
+_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / "db").resolve()
 
 
 def _runtime_db_root(explicit: str | Path | None = None) -> Path:
@@ -190,8 +184,8 @@ def _runtime_db_path(
     db_root: str | Path | None = None,
     specific_env: str | None = None,
 ) -> Path:
-    # An explicit root is an isolation boundary and therefore wins over legacy
-    # per-database environment overrides.
+    # An explicit root is an isolation boundary and wins over legacy per-DB
+    # environment overrides.
     if db_root is not None:
         return _runtime_db_root(db_root) / filename
     if specific_env and os.environ.get(specific_env):
@@ -199,15 +193,15 @@ def _runtime_db_path(
     return _runtime_db_root() / filename
 
 
-def _trade_db_path(profile: str, db_root: str | Path | None = None) -> Path | None:
-    filename = {"live": "live_trades.db", "demo": "demo_trades.db"}.get(profile)
+def _trade_db_path(
+    profile: str,
+    db_root: str | Path | None = None,
+) -> Path | None:
+    filename = {"live": "live_trades.db"}.get(profile)
     return _runtime_db_path(filename, db_root) if filename else None
 
 
-DB_MAP = {
-    profile: _trade_db_path(profile)
-    for profile in ("live", "demo")
-}
+DB_MAP = {"live": _trade_db_path("live")}
 
 # ---------------------------------------------------------------------------
 # 连接
@@ -330,8 +324,11 @@ def normalize_receipt(data: dict) -> dict:
 _CTVAL_CACHE: dict = {}
 
 
-def _ctval_for(symbol: str) -> float:
-    mkt_path = os.environ.get("OKX_MARKET_DB", _project_path('db', 'market.db'))
+def _ctval_for(
+    symbol: str,
+    db_root: str | Path | None = None,
+) -> float:
+    mkt_path = _runtime_db_path("market.db", db_root, "OKX_MARKET_DB")
     key = (mkt_path, symbol)
     if key in _CTVAL_CACHE:
         return _CTVAL_CACHE[key]
@@ -552,6 +549,16 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
         if action_taken == "REJECT" and status != "error":
             errors.append("action_taken=REJECT 时 status 必须是 error")
 
+        live_facts = data.get("live_facts")
+        if live_facts is not None:
+            errors.extend(validate_live_facts(
+                live_facts,
+                expected_cycle=str(data.get("cycle_id") or ""),
+                expected_profile=str(data.get("_profile") or "live"),
+                require_ok=status == "ok",
+                max_age_s=30 * 60,
+            ))
+
         n_orders = data.get("n_orders")
         if n_orders is not None:
             if isinstance(n_orders, bool) or not isinstance(n_orders, int):
@@ -682,6 +689,86 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
                 and actual_sz > approved_sz + max(1e-9, 1e-9 * approved_sz)
             ):
                 errors.append(f"trades[{i}].sz 超过 approved_sz")
+    return errors
+
+
+def validate_strict_live_receipt(data: dict) -> list[str]:
+    """Extra contract for Agent-authored live receipts using a facts file.
+
+    Executor receipts retain their existing same-process contract.  The stricter
+    path is intentionally scoped to the CLI/facts-file workflow where schema
+    drift and hand-calculated live facts were observed.
+    """
+    if not isinstance(data, dict):
+        return ["回执必须是 dict"]
+    payload = normalize_receipt(data)
+    errors: list[str] = []
+    claimed = payload.get("mode") or payload.get("profile")
+    if claimed != "live":
+        errors.append("严格 Live 回执必须显式包含 mode=live 或 profile=live")
+    required = (
+        "status",
+        "decision",
+        "action_taken",
+        "n_orders",
+        "equity",
+        "regime",
+        "trades",
+        "errors",
+        "live_facts",
+    )
+    for key in required:
+        if key not in payload:
+            errors.append(f"严格 Live 回执缺少 {key}")
+    if not str(payload.get("action_taken") or "").strip():
+        errors.append("严格 Live 回执 action_taken 不得为空")
+    if not str(payload.get("regime") or "").strip():
+        errors.append("严格 Live 回执 regime 不得为空")
+    if not isinstance(payload.get("trades"), list):
+        errors.append("严格 Live 回执 trades 必须是 list")
+    if not isinstance(payload.get("errors"), list):
+        errors.append("严格 Live 回执 errors 必须是 list")
+
+    facts = payload.get("live_facts")
+    if isinstance(facts, dict):
+        status = str(payload.get("status") or "").lower()
+        errors.extend(validate_live_facts(
+            facts,
+            expected_cycle=str(payload.get("cycle_id") or ""),
+            expected_profile="live",
+            require_ok=status == "ok",
+            max_age_s=30 * 60,
+        ))
+        fact_equity = (facts.get("balance") or {}).get("totalEq")
+        if (
+            str(payload.get("status") or "").lower() == "error"
+            and fact_equity is None
+            and payload.get("equity") is None
+        ):
+            pass  # 余额查询本身 blocking 时仍允许终态错误回执留痕。
+        else:
+            try:
+                receipt_equity = float(payload.get("equity"))
+                canonical_equity = float(fact_equity)
+                tolerance = max(1e-6, abs(canonical_equity) * 1e-8)
+                if abs(receipt_equity - canonical_equity) > tolerance:
+                    errors.append("equity 必须等于 live_facts.balance.totalEq")
+            except (TypeError, ValueError):
+                errors.append("equity/live_facts.balance.totalEq 必须是有效数字")
+
+    human_fields = {
+        key: payload.get(key)
+        for key in (
+            "action", "action_taken", "decision", "note", "reasoning",
+            "decision_summary", "decision_card",
+        )
+        if key in payload
+    }
+    human_text = json.dumps(human_fields, ensure_ascii=False)
+    if "0.0666" in human_text:
+        errors.append("检测到错误 IMR 阈值 0.0666；唯一硬阈值是 0.666")
+    if re.search(r"60\s*%.{0,12}(?:硬上限|硬闸|上限|闸)", human_text):
+        errors.append("检测到已取消的同侧/集中度 60% 硬闸")
     return errors
 
 
@@ -881,7 +968,7 @@ def _write_trades(
                 f"trusted_timestamp 不是有效 CST 时间: {trusted_timestamp!r}")
     else:
         completed_at = writer_commit_at
-    mode = data.get("_profile", "full")  # 由 main() 注入 --profile 值（live|demo）
+    mode = data.get("_profile", "full")  # 由 main() 注入 --profile 值（现仅 live）
     incoming_trades = [t for t in (data.get("trades") or [])
                        if isinstance(t, dict) and t.get("action", "none") != "none"]
     # 顶层缺 decision/n_orders → 从 action_taken/trades 推导；已有值不覆盖
@@ -972,6 +1059,18 @@ def _write_trades(
     if not is_maintenance:
         raw_obj["status"] = data.get("status")
         raw_obj["decision"] = decision
+        # Agent 常自带 ``raw``，旧逻辑因此只存 raw 子对象，把 CLI 通过
+        # ``--facts-file`` 注入的顶层权威事实静默丢掉；push 随后又回退旧快照。
+        # 明确把确定性字段提升进 cycle raw，且以 writer 已校验的顶层值覆盖同名摘要。
+        for canonical_key in (
+            "live_facts",
+            "action_taken",
+            "errors",
+            "n_orders",
+            "equity",
+        ):
+            if canonical_key in data:
+                raw_obj[canonical_key] = data[canonical_key]
     if equity_fallback_mark and isinstance(raw_obj, dict):
         raw_obj = {**raw_obj, **equity_fallback_mark}
     if score_backfill_mark and isinstance(raw_obj, dict):
@@ -1156,7 +1255,9 @@ def _write_trades(
                     # 分列合约与缓存的 live 口径可差 100x）；无行内值才查缓存
                     row_ctval = _as_pos_float(t.get("ct_val"))
                     base = px * sz * (row_ctval if row_ctval is not None
-                                      else _ctval_for(str(symbol)))
+                                      else _ctval_for(
+                                          str(symbol), db_root=db_path.parent
+                                      ))
                     if notional is None:
                         notional = base
                     if margin is None:
@@ -1265,8 +1366,8 @@ def _regime_for_ts(
     宁可继续留 NULL，也不让 regime 查询失败连累交易记录。
     """
     try:
-        if _project_path('scripts') not in sys.path:
-            sys.path.insert(0, _project_path('scripts'))
+        if str(_PROJECT_ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
         from _regime_read import regime_at as _regime_at  # noqa: E402
         # 与本模块 account.db 同源取库根：夹具把 OKX_ACCOUNT_DB 指到临时目录时，
         # regime 查询跟着落到同一目录，不会穿到生产 regime.db。
@@ -1303,8 +1404,8 @@ def write_experiences(
     # 传给历史 close 的“ts<=平仓时刻”匹配，会错误落入 fallback 而不闭合真实 open。
     now_ts = strict_cst_ts(now_ts) or now_cst()
     try:
-        if _project_path('scripts') not in sys.path:
-            sys.path.insert(0, _project_path('scripts'))
+        if str(_PROJECT_ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
         import trade_experience_writer as _tew  # noqa: E402
         acc_path = _runtime_db_path("account.db", db_root, "OKX_ACCOUNT_DB")
         acc = sqlite3.connect(acc_path, timeout=10)
@@ -1547,9 +1648,8 @@ def replay_from_journal(args) -> int:
             if rec.get("profile") != args.profile:
                 continue
             if args.ordid:
-                # Apply authorization accepts only the exchange's real ordId.
-                # algoId/recovered-timeout fallbacks are useful for diagnosis
-                # but are not a unique live-ledger repair identity.
+                # Apply authorization accepts only the exchange's real ordId;
+                # algoId/recovered-timeout fallbacks are diagnostic only.
                 strict_ordid = rec["trade"].get("ordId")
                 if not strict_ordid or str(strict_ordid) != str(args.ordid):
                     continue
@@ -1557,8 +1657,8 @@ def replay_from_journal(args) -> int:
                 continue  # 微单测试记录默认不重放（显式 --ordid 才碰）
             if not args.replay_dry_run and rec.get("unwind"):
                 # 核验修：unwind close（SL 失败平裸仓）回执 trades=[]、账本无对应 open——
-                # 直接重放=close-without-open 净仓错向。dry plan 保留并标注 unwind
-                # 供监控 P1 人工核实；apply 即使给了 ordId 也继续硬阻断。
+                # 直接重放=close-without-open 净仓错向。dry plan 保留并标注
+                # unwind；apply 即使给了 ordId 也继续硬阻断。
                 blocked_unwinds.append({
                     "ordId": rec["trade"].get("ordId") or None,
                     "cycle": rec.get("cycle_id"),
@@ -1587,8 +1687,6 @@ def replay_from_journal(args) -> int:
         }, ensure_ascii=False))
         return 3
     if args.replay_dry_run:
-        # A planning scan is byte-read-only: do not call connect(), whose WAL
-        # pragma can create/change SQLite sidecars even without DML.
         con = sqlite3.connect(
             f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10
         )
@@ -1715,7 +1813,8 @@ def replay_from_journal(args) -> int:
 # ---------------------------------------------------------------------------
 def commit_receipt(data: dict, profile: str,
                    db_path: Path | None = None,
-                   nudge: bool = True) -> dict:
+                   nudge: bool = True,
+                   require_live_facts: bool = False) -> dict:
     """在当前确定性进程内完成回执校验、主账、经验库与 dispatcher nudge。
 
     live 执行 helper 应在 order_executor 返回后直接调用本函数，避免把“交易所已成交”
@@ -1739,6 +1838,10 @@ def commit_receipt(data: dict, profile: str,
             ),
         }
     payload["_profile"] = profile
+    if require_live_facts:
+        strict_errors = validate_strict_live_receipt(payload)
+        if strict_errors:
+            return {"ok": False, "error": "; ".join(strict_errors)}
     result = write_trades(payload, target)
     if not result.get("ok") or result.get("refused"):
         return result
@@ -1772,10 +1875,18 @@ def main() -> int:
     parser.add_argument("--stdin", action="store_true", help="从 stdin 读 JSON 回执")
     parser.add_argument("--json-file", type=str, help="从 UTF-8 文件读 JSON 回执（方案A：杜绝 echo 管道外层 shell GBK 编码坏码）")
     parser.add_argument("--cycle-id", type=str, help="cycle_id")
-    parser.add_argument("--profile", type=str, choices=["live", "demo"], required=True)
+    parser.add_argument("--profile", type=str, choices=["live"], required=True)
     parser.add_argument(
         "--db-root", type=str,
         help="运行时数据库目录（缺省读取 OKX_DB_ROOT，再回退项目 db）",
+    )
+    parser.add_argument(
+        "--facts-file",
+        type=str,
+        help=(
+            "live_decision_facts.py 生成的同 cycle 只读事实包；提供后启用严格 "
+            "Agent 回执契约"
+        ),
     )
     # 旧 quick-write 参数只为让历史调用得到结构化拒绝原因而保留解析，
     # 不再出现在 --help，也绝不据此拼装缺少 decision_card 的伪回执。
@@ -1843,7 +1954,31 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1
 
-    result = commit_receipt(data, args.profile, db_path)
+    require_live_facts = bool(args.facts_file)
+    if args.facts_file:
+        try:
+            with open(args.facts_file, "r", encoding="utf-8") as facts_handle:
+                facts = json.load(facts_handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "ok": False,
+                "error": f"读取 --facts-file 失败: {exc}",
+            }, ensure_ascii=False))
+            return 1
+        if data.get("live_facts") not in (None, facts):
+            print(json.dumps({
+                "ok": False,
+                "error": "回执内 live_facts 与 --facts-file 不一致",
+            }, ensure_ascii=False))
+            return 1
+        data["live_facts"] = facts
+
+    result = commit_receipt(
+        data,
+        args.profile,
+        db_path,
+        require_live_facts=require_live_facts,
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1
 

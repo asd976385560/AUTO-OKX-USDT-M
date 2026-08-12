@@ -21,9 +21,12 @@ fetch_items / collect / main）；区别仅在：
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import sqlite3
 import sys
+import time
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -31,10 +34,14 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._news_http import fetch_text as _fetch_text_httpx  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _news_http import fetch_text as _fetch_text_httpx  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -47,6 +54,11 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # 站点原生 RSS（webapi/flashnews 已 404；此为同站可达端点）
 DEFAULT_ENDPOINT = "https://www.panewslab.com/rss.xml"
+OFFICIAL_PAGE_ENDPOINT = "https://panews.io/newsflash"
+_ARTICLE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
 
 # ── 币种抽取 ──────────────────────────────────────────────────────────────
 # 1) 中文币名 → 符号（先匹配，避免「比特币」被英文规则漏掉）
@@ -128,6 +140,126 @@ def _fetch(url: str, timeout: int = 15) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
+def _stable_dedupe_hash(article_id: str) -> str:
+    return hashlib.sha256(
+        f"panews|{article_id.strip().lower()}".encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _resolve_devalue(values: list, ref, seen: set[int] | None = None):
+    """Resolve the small reference-array format embedded by React Router SSR."""
+    if isinstance(ref, bool) or not isinstance(ref, int):
+        return ref
+    if ref < 0:
+        return None
+    if ref >= len(values):
+        raise ValueError(f"PANews page reference out of range: {ref}")
+    seen = set(seen or ())
+    if ref in seen:
+        raise ValueError(f"PANews page cyclic reference: {ref}")
+    seen.add(ref)
+    value = values[ref]
+    if isinstance(value, dict):
+        resolved = {}
+        for raw_key, raw_value in value.items():
+            key = (
+                _resolve_devalue(values, int(raw_key[1:]), seen)
+                if isinstance(raw_key, str) and re.fullmatch(r"_\d+", raw_key)
+                else raw_key
+            )
+            resolved[str(key)] = _resolve_devalue(values, raw_value, seen)
+        return resolved
+    if isinstance(value, list):
+        return [_resolve_devalue(values, child, seen) for child in value]
+    return value
+
+
+def _parse_official_page(page_text: str, max_age_hours: int) -> list[dict]:
+    """Strictly parse PANews' server-rendered official newsflash payload."""
+    chunks: list[str] = []
+    for match in re.finditer(
+        r"streamController\.enqueue\((.*?)\);\s*</script>",
+        page_text,
+        re.S,
+    ):
+        argument = match.group(1).strip()
+        decoded = json.loads(argument)
+        if not isinstance(decoded, str):
+            raise ValueError("PANews stream chunk is not a JSON string")
+        chunks.append(decoded)
+    if not chunks:
+        raise ValueError("PANews official page stream payload missing")
+
+    payload = None
+    parse_errors: list[str] = []
+    for chunk in chunks:
+        try:
+            values = json.loads(chunk)
+            if not isinstance(values, list):
+                continue
+            resolved = _resolve_devalue(values, 0)
+            candidate = (
+                resolved.get("loaderData", {})
+                .get("routes/newsflash", {})
+                .get("payload")
+            )
+            if isinstance(candidate, dict) and isinstance(
+                    candidate.get("articles"), list):
+                payload = candidate
+                break
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
+            parse_errors.append(f"{type(exc).__name__}: {exc}")
+    if payload is None:
+        detail = "; ".join(parse_errors)[:240]
+        raise ValueError(f"PANews official page articles missing: {detail}")
+
+    articles = payload["articles"]
+    if not articles:
+        raise ValueError("PANews official page returned an empty initial article page")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    out: list[dict] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            raise ValueError("PANews official page article is not an object")
+        article_id = str(article.get("id") or "").strip().lower()
+        title = str(article.get("title") or "").strip()
+        published = str(article.get("publishedAt") or "").strip()
+        if not _ARTICLE_ID_RE.fullmatch(article_id) or not title or not published:
+            raise ValueError("PANews official page article required fields invalid")
+        try:
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"PANews official page publishedAt invalid: {published}"
+            ) from exc
+        if dt.tzinfo is None:
+            raise ValueError("PANews official page publishedAt lacks timezone")
+        if dt.astimezone(timezone.utc) < cutoff:
+            continue
+        description = str(article.get("desc") or "").strip()
+        canonical_url = (
+            "https://www.panewslab.com/zh/articles/" + article_id)
+        out.append({
+            "source": SOURCE_ID,
+            "title": title,
+            "url": canonical_url,
+            "event_time": dt.astimezone(CST).strftime(TS_FMT),
+            "symbols": _extract_symbols(title),
+            "severity": _severity(title),
+            "tags": _tags(title),
+            "level": "B",
+            "dedupe_hash": _stable_dedupe_hash(article_id),
+            "raw": {
+                "feed": "panews_official_page",
+                "guid": article_id,
+                "publishedAt": published,
+                "description": description,
+                "isImportant": bool(article.get("isImportant")),
+            },
+        })
+    return out
+
+
 def _extract_symbols(title: str) -> list[str]:
     title = title or ""
     found: list[str] = []
@@ -165,11 +297,7 @@ def _tags(title: str) -> list[str]:
 def _parse(xml_text: str, max_age_hours: int) -> list[dict]:
     out: list[dict] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        print(f"[WARN] PANews RSS parse error: {e}", file=sys.stderr)
-        return out
+    root = ET.fromstring(xml_text)
     items = root.findall(".//item")
     for item in items:
         title = (item.findtext("title") or "").strip()
@@ -196,38 +324,122 @@ def _parse(xml_text: str, max_age_hours: int) -> list[dict]:
             "symbols": _extract_symbols(title),
             "severity": _severity(title), "tags": _tags(title),
             "level": "B",
+            "dedupe_hash": _stable_dedupe_hash(guid) if guid else None,
             "raw": {"feed": "panews_rss", "guid": guid, "pubDate": pub},
         })
     return out
 
 
 def fetch_items(endpoint: str = DEFAULT_ENDPOINT, max_age_hours: int = 24,
-                timeout: int = 15, errors: list[str] | None = None) -> list[dict]:
+                timeout: int = 15, errors: list[str] | None = None,
+                retry_timeout: int = 6,
+                official_page_endpoint: str = OFFICIAL_PAGE_ENDPOINT,
+                page_timeout: int = 8,
+                retry_stats: dict | None = None) -> list[dict]:
     """errors（2026-07-06 可观测性）：调用方传入 list 时，fetch 失败的简短原因
     （HTTP 码/超时等，截 150 字）append 进去——供 collect() 把 err 带回
     news_collect → ledger.collection_runs.err（degraded 行也必须带明细，
     无法区分限流/网络）。不传则行为同旧版（只打 stderr）。"""
-    try:
-        return _parse(_fetch(endpoint, timeout=timeout), max_age_hours)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        print(f"[WARN] PANews fetch failed: {e}", file=sys.stderr)
-        if errors is not None:
-            errors.append(f"fetch: {e}"[:150])
-    except Exception as e:  # noqa: BLE001
-        print(f"[ERR] PANews: {e}", file=sys.stderr)
-        if errors is not None:
-            errors.append(f"{type(e).__name__}: {e}"[:150])
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        if attempt == 2:
+            time.sleep(0.5)
+        try:
+            parsed = _parse(
+                _fetch(endpoint, timeout=(timeout if attempt == 1 else retry_timeout)),
+                max_age_hours,
+            )
+            if retry_stats is not None:
+                retry_stats.update({
+                    "attempts": attempt,
+                    "recovered_after_retry": attempt == 2,
+                })
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    rss_error = last_error
+    for page_attempt in (1, 2):
+        if page_attempt == 2:
+            time.sleep(0.5)
+        try:
+            page_text = _fetch_text_httpx(
+                official_page_endpoint,
+                timeout=float(page_timeout),
+                headers={
+                    "User-Agent": UA,
+                    "Accept": "text/html,application/xhtml+xml,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            parsed = _parse_official_page(page_text, max_age_hours)
+            if retry_stats is not None:
+                retry_stats.update({
+                    "attempts": 2 + page_attempt,
+                    "rss_attempts": 2,
+                    "official_page_attempts": page_attempt,
+                    "recovered_after_fallback": True,
+                    "transport": "official_page",
+                })
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    message = (
+        f"rss={type(rss_error).__name__}: {rss_error}; "
+        f"official_page={type(last_error).__name__}: {last_error}"
+    )[:150]
+    print(f"[WARN] PANews fetch failed after retry: {message}", file=sys.stderr)
+    if errors is not None:
+        errors.append(f"fetch: {message}"[:150])
+    if retry_stats is not None:
+        retry_stats.update({
+            "attempts": 4,
+            "rss_attempts": 2,
+            "official_page_attempts": 2,
+            "final_failed": True,
+        })
     return []
+
+
+def _reuse_existing_hashes(items: list[dict], db_path: str) -> int:
+    """Reuse legacy hashes for already-seen PANews UUID URLs without writing."""
+    urls = sorted({str(item.get("url") or "") for item in items if item.get("url")})
+    path = Path(str(db_path))
+    if not urls or not path.exists():
+        return 0
+    placeholders = ",".join("?" for _ in urls)
+    con = sqlite3.connect(
+        f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = con.execute(
+            "SELECT url, hash FROM news_items "
+            f"WHERE source=? AND url IN ({placeholders}) ORDER BY id DESC",
+            (SOURCE_ID, *urls),
+        ).fetchall()
+    finally:
+        con.close()
+    existing: dict[str, str] = {}
+    for url, value in rows:
+        if url not in existing and re.fullmatch(r"[0-9a-f]{32,64}", str(value or "")):
+            existing[url] = str(value)
+    reused = 0
+    for item in items:
+        value = existing.get(str(item.get("url") or ""))
+        if value:
+            item["dedupe_hash"] = value
+            reused += 1
+    return reused
 
 
 def collect(db_path: str, endpoint: str = DEFAULT_ENDPOINT,
             max_age_hours: int = 24, apply: bool = False) -> dict:
     fetch_errs: list[str] = []
+    retry_stats: dict = {}
     items = fetch_items(endpoint=endpoint, max_age_hours=max_age_hours,
-                        errors=fetch_errs)
+                        errors=fetch_errs, retry_stats=retry_stats)
     err_txt = "; ".join(fetch_errs)[:150] if fetch_errs else None
     if not apply:
         out = {"ok": True, "dry_run": True, "fetched": len(items),
+               "retry_stats": retry_stats,
                "sample": [{"t": it["title"][:70], "et": it["event_time"],
                            "sym": it["symbols"], "sev": it["severity"],
                            "tags": it["tags"]}
@@ -235,8 +447,11 @@ def collect(db_path: str, endpoint: str = DEFAULT_ENDPOINT,
         if err_txt:
             out["err"] = err_txt
         return out
+    existing_hash_reused = _reuse_existing_hashes(items, db_path)
     res = news_writer.write_news(items, db_path)
     res["fetched"] = len(items)
+    res["retry_stats"] = retry_stats
+    res["existing_hash_reused"] = existing_hash_reused
     if err_txt and not res.get("err"):
         res["err"] = err_txt
     return res

@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
-"""采集交易所账单，沉淀手续费、资金费、已实现盈亏与余额变化。"""
+"""采集交易所账单（仅 live），沉淀手续费、资金费、已实现盈亏与余额变化。
+
+2026-08-06 demo 全量下线修：`--profiles` 原默认 `"live,demo"`，而
+`daily_maintenance.py` 调它时**不传该参数**——也就是说每天 07:55 都会照默认
+去拉一次 demo 账单，并往 `account_bills` 插 `profile='demo'` 行。demo 历史行
+当天刚被清掉 2459 条，这条链会一天天把它们重新灌回来（OKX 的 demo 账户还在，
+凭证也还在 CLI 配置里，调用会成功）。默认改为 `"live"`，并对 demo 直接拒绝。
+"""
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -20,7 +15,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, r"./collectors")
 import ledger  # noqa: E402
 
 from _okxcli import okx_json
@@ -43,6 +38,11 @@ def fmt_ms(value) -> str | None:
 
 
 def collect(profile: str, limit: int) -> list[tuple]:
+    if "demo" in str(profile).strip().lower():
+        raise ValueError(
+            f"collect_account_bills 只支持 live，收到 {profile!r}。"
+            "demo 已于 2026-08-06 全量下线，账单历史行也已清除；"
+            "再采会把 profile='demo' 行重新写回 account_bills。")
     payload = okx_json(
         "account", "bills", "--instType", "SWAP", "--limit", str(limit),
         global_args=["--profile", profile], timeout_sec=45,
@@ -68,9 +68,9 @@ def collect(profile: str, limit: int) -> list[tuple]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="实盘/模拟盘账单采集")
-    ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--profiles", default="live,demo")
+    ap = argparse.ArgumentParser(description="实盘账单采集")
+    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--profiles", default="live")
     ap.add_argument("--limit", type=int, default=100)
     args = ap.parse_args()
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]

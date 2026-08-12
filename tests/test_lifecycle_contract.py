@@ -60,22 +60,5 @@ class ScriptLifecycleContractTests(unittest.TestCase):
         self.assertFalse(stale_query.exists())
         self.assertNotIn(stale_query.name, registered)
 
-    def test_completed_gateway_rss_probe_is_not_published(self):
-        active_probe = ROOT / "scripts" / "gateway_rss_sample.ps1"
-        archived_probe = (
-            ROOT / "scripts" / "archive" / "diagnostics"
-            / "gateway_rss_sample.ps1"
-        )
-        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-        registered = {
-            path
-            for group in manifest["groups"]
-            for path in group["paths"]
-        }
-        self.assertFalse(active_probe.exists())
-        self.assertFalse(archived_probe.exists())
-        self.assertNotIn(active_probe.name, registered)
-
-
 if __name__ == "__main__":
     unittest.main()

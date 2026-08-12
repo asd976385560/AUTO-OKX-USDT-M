@@ -14,25 +14,13 @@ r"""确定性累计交易 PnL（2026-06-26）。
 agent 取本脚本**回执**（非自己拼 SQL），既得真值又守红线。trades.db 仅含 V2.0 期成交，
 故必须叠加冻结基线才是终生累计（裸 SUM(trades.pnl) 会丢 −281/−282 历史）。
 
-权威基线键＝`{profile}_cum_pnl`（其余 *_realized_pnl* 为已弃用历史键）。
+权威基线键＝`{profile}_cum_pnl`（其余 *_realized_pnl* 为历史僵尸键，已清理，见 memory）。
 
 用法：
-  python cum_pnl.py --profile live --db-root <PROJECT_ROOT>/db
-  python cum_pnl.py --both --db-root <PROJECT_ROOT>/db        # 双盘 JSON
+  python cum_pnl.py --profile live --db-root ./db
+  python cum_pnl.py --both --db-root ./db        # {"live": {...}} 包一层
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -118,13 +106,17 @@ def cum_for(db_root, profile: str, as_of_ts=None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="累计交易PnL（未扣手续费/资金费）= 冻结基线 + V2.0 trades.pnl 增量")
-    ap.add_argument("--db-root", default=_project_path('db'))
-    ap.add_argument("--profile", choices=["live", "demo"])
+    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--profile", choices=["live"])
     ap.add_argument("--both", action="store_true")
     ap.add_argument("--as-of", dest="as_of_ts", help="累计到该 UTC+8 时点（YYYY-MM-DD HH:MM:SS）")
     args = ap.parse_args()
+    # 2026-08-06 demo 全量下线：`--both` 与「不传 --profile」原先都会算 demo。
+    # 库删掉后 _v2_delta 的 `if not db.exists()` 会兜住不抛，但输出里会多一个
+    # baseline=None / cum_pnl=0.0 的 demo 块——那是**假数**，会被下游当真值读。
+    # `--both` 保留为兼容别名（脚本 docstring 与历史运维记录都写过），只出 live。
     if args.both or not args.profile:
-        out = {p: cum_for(args.db_root, p, args.as_of_ts) for p in ("live", "demo")}
+        out = {"live": cum_for(args.db_root, "live", args.as_of_ts)}
     else:
         out = cum_for(args.db_root, args.profile, args.as_of_ts)
     print(json.dumps(out, ensure_ascii=False))

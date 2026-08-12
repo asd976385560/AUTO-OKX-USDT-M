@@ -33,7 +33,7 @@ def main() -> int:
     ap.add_argument("--latency-ms", type=int, default=None, help="本轮取数耗时(ms)，可缺")
     ap.add_argument("--err", default=None, help="失败/降级原因摘要，可缺")
     ap.add_argument("--db-root", default=os.path.join(os.path.dirname(_COLLECTORS), "db"),
-                    help="db 目录，默认 <PROJECT_ROOT>\\db")
+                    help="db 目录，默认 ./db")
     args = ap.parse_args()
 
     ledger_db = os.path.join(args.db_root, "ledger.db")

@@ -12,8 +12,8 @@
 索引：(severity, ts)、(event_time)。
 
 用法：
-  python apply_news_edge_schema.py --db-root <PROJECT_ROOT>\\db [--dry-run]
-  python apply_news_edge_schema.py --db-root <PROJECT_ROOT>\\db --apply \
+  python apply_news_edge_schema.py --db-root ./db [--dry-run]
+  python apply_news_edge_schema.py --db-root ./db --apply \
       --backup-dir <BACKUP_DIR> [--verify]
 """
 from __future__ import annotations

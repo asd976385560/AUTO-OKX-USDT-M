@@ -1,29 +1,18 @@
 # -*- coding: utf-8 -*-
 """V2.0 慢采脚本（系统层，零 agent）。
 
-由 OpenClaw 命令型 cron `okx-slow-collect` 每小时 :02 调度，归入 :00 槽。
+由聚合 runner `collect_cycle.py --tier hourly`（cron `okx-collect-hourly` 每小时 :00）
+作为末步串行调用，归入 :00 槽（2026-08-08 整并前：独立 cron `okx-slow-collect` 每小时 :02）。
 
 包装现有 collect_slow.py（**原样不改**），结尾：
   1. 写账本 collection_runs(cycle_id, 'slow', status)
   2. 写账本 collection_runs(cycle_id, 'regime', status)
   3. 通过 _dispatch_nudge 通知 core/dispatcher.py；定时 dispatcher 负责兜底
 
-与生产隔离：默认 --db-root <PROJECT_ROOT>\\db；tmp 验证传临时目录。--dry-collect 跳过真采集
+与生产隔离：默认 --db-root ./db；tmp 验证传临时目录。--dry-collect 跳过真采集
 （不联网、不写生产），只验账本+触发 plumbing。
 """
 from __future__ import annotations
-
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
 
 import argparse
 import json
@@ -34,7 +23,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, _project_path('collectors'))
+sys.path.insert(0, r"./collectors")
 import ledger          # noqa: E402
 
 try:  # HANDOFF-4B 采集侧事件通知（可缺省，守卫式导入照 analyst_writer 惯例）
@@ -46,7 +35,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-ROOT = Path(_project_path())
+ROOT = Path(r".")
 SCRIPTS = ROOT / "scripts"
 CST = timezone(timedelta(hours=8))
 # 子进程隐藏窗口：本脚本被 wscript 以无窗口起，console 子进程(pwsh)默认会新开可见窗口——加此 flag 抑制

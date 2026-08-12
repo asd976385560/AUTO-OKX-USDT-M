@@ -14,9 +14,9 @@ introspect-safe：运行时取两库 cross_market 的**非生成列**交集来�
 
 用法：
   # 干跑（只报将拷多少行、列交集，不写）
-  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db [--dry-run]
+  python apply_regime_split.py --db-root ./db [--dry-run]
   # 真迁 + 校验
-  python apply_regime_split.py --db-root <PROJECT_ROOT>\\db --apply \
+  python apply_regime_split.py --db-root ./db --apply \
       --backup-dir <BACKUP_DIR> --verify
 """
 from __future__ import annotations

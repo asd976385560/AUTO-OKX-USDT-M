@@ -485,7 +485,6 @@ def latest_observation(
     *,
     sources: tuple[str, ...] | None = None,
     statuses: tuple[str, ...] | None = None,
-    observation_date: str | None = None,
 ) -> dict[str, Any] | None:
     clauses = ["metric=?"]
     params: list[Any] = [metric]
@@ -495,9 +494,6 @@ def latest_observation(
     if statuses:
         clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
         params.extend(statuses)
-    if observation_date is not None:
-        clauses.append("observation_date=?")
-        params.append(observation_date)
     row = con.execute(
         "SELECT metric,observation_date,source,collected_at,value,unit,label,"
         "status,source_url,raw FROM macro_observations WHERE "
@@ -506,77 +502,6 @@ def latest_observation(
         params,
     ).fetchone()
     return dict(row) if row else None
-
-
-def latest_etf_state(con: sqlite3.Connection) -> dict[str, Any]:
-    """Return exactly one ETF state from the globally newest observation day."""
-    empty = {
-        "observation_date": None,
-        "etf_confirmed": None,
-        "etf_provisional": None,
-        "etf_conflict": None,
-    }
-    if not table_exists(con):
-        return empty
-    row = con.execute(
-        "SELECT MAX(observation_date) FROM macro_observations WHERE metric=? "
-        "AND ("
-        "(source=? AND ((status='cross_checked' AND value IS NOT NULL) "
-        "OR status='conflict')) "
-        "OR (source IN (?,?) AND status='source_reported' "
-        "AND value IS NOT NULL)"
-        ")",
-        (
-            METRIC_BTC_ETF,
-            SOURCE_ETF_CONSENSUS,
-            SOURCE_FARSIDE,
-            SOURCE_SOSOVALUE,
-        ),
-    ).fetchone()
-    observed = row[0] if row and row[0] else None
-    if observed is None:
-        return empty
-
-    confirmed = latest_observation(
-        con,
-        METRIC_BTC_ETF,
-        sources=(SOURCE_ETF_CONSENSUS,),
-        statuses=("cross_checked",),
-        observation_date=observed,
-    )
-    if confirmed is not None:
-        return {
-            **empty,
-            "observation_date": observed,
-            "etf_confirmed": confirmed,
-        }
-
-    conflict = latest_observation(
-        con,
-        METRIC_BTC_ETF,
-        sources=(SOURCE_ETF_CONSENSUS,),
-        statuses=("conflict",),
-        observation_date=observed,
-    )
-    if conflict is not None:
-        return {
-            **empty,
-            "observation_date": observed,
-            "etf_conflict": conflict,
-        }
-
-    provisional = latest_observation(
-        con,
-        METRIC_BTC_ETF,
-        sources=(SOURCE_FARSIDE, SOURCE_SOSOVALUE),
-        statuses=("source_reported",),
-        observation_date=observed,
-    )
-    return {
-        **empty,
-        "observation_date": observed,
-        "etf_provisional": provisional,
-    }
 
 
 def latest_snapshot(con: sqlite3.Connection) -> dict[str, Any]:
@@ -597,14 +522,31 @@ def latest_snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         dxy_d1 = (
             float(dxy_rows[0]["value"]) / float(dxy_rows[1]["value"]) - 1.0
         )
-    etf = latest_etf_state(con)
+    etf_confirmed = latest_observation(
+        con,
+        METRIC_BTC_ETF,
+        sources=(SOURCE_ETF_CONSENSUS,),
+        statuses=("cross_checked",),
+    )
+    etf_provisional = latest_observation(
+        con,
+        METRIC_BTC_ETF,
+        sources=(SOURCE_FARSIDE, SOURCE_SOSOVALUE),
+        statuses=("source_reported",),
+    )
+    etf_conflict = latest_observation(
+        con,
+        METRIC_BTC_ETF,
+        sources=(SOURCE_ETF_CONSENSUS,),
+        statuses=("conflict",),
+    )
     return {
         "fear_greed": fear,
         "dxy_calc_ecb": dxy,
         "dxy_calc_ecb_d1": dxy_d1,
-        "etf_confirmed": etf["etf_confirmed"],
-        "etf_provisional": etf["etf_provisional"],
-        "etf_conflict": etf["etf_conflict"],
+        "etf_confirmed": etf_confirmed,
+        "etf_provisional": etf_provisional,
+        "etf_conflict": etf_conflict,
     }
 
 
@@ -623,9 +565,6 @@ def source_dates(con: sqlite3.Connection) -> dict[str, str | None]:
     }
     out: dict[str, str | None] = {}
     for source_id, metric in mapping.items():
-        if metric == METRIC_BTC_ETF:
-            out[source_id] = latest_etf_state(con)["observation_date"]
-            continue
         row = con.execute(
             "SELECT MAX(observation_date) FROM macro_observations WHERE metric=? "
             "AND status!='conflict' AND value IS NOT NULL",

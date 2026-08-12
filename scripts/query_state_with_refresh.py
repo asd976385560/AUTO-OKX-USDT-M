@@ -7,23 +7,11 @@ snapshot collection.
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import subprocess
 from pathlib import Path
 
-ROOT = Path(_project_path())
+ROOT = Path(r".")
 PWSH = "C:/Program Files/PowerShell/7/pwsh.exe"
 RUN_OKX = ROOT / "scripts" / "run_okx_python.ps1"
 

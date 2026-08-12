@@ -58,7 +58,8 @@ CONTENT_RULES = (
 
 def _tracked_paths(root: Path) -> list[str]:
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        ["git", "-c", f"safe.directory={root.as_posix()}",
+         "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=root,
         check=False,
         capture_output=True,

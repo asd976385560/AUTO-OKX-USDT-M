@@ -17,24 +17,24 @@
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.risk_validator import (
+    MAX_LEVERAGE,
+    MAX_PORTFOLIO_IMR_RATIO,
+    MAX_SINGLE_ORDER_IMR_RATIO,
+)
+from core.decision_card import validate_multitimeframe_analysis
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -201,6 +201,110 @@ def card_text(value: Any, limit: int = 150) -> str:
     return clip(" ".join(raw.replace("\r", " ").replace("\n", " ").split()), limit)
 
 
+def format_multitimeframe_analysis(
+    action: str,
+    decision_card: dict[str, Any],
+    *,
+    decision: dict[str, Any] | None = None,
+    cycle_id: str | None = None,
+    fallback_symbol: str | None = None,
+    evidence_limit: int = 110,
+    reason_limit: int = 140,
+) -> str:
+    """Render every actual OPEN/ADD leg without inventing confidence.
+
+    OPEN/ADD is fail-visible: malformed or missing structured evidence is shown
+    as incomplete and the versioned validator blocks delivery.  Risk-reducing
+    and no-trade actions explicitly say the OPEN evidence contract is N/A.
+    """
+    import re as _re
+
+    has_open = bool(_re.search(r"\b(?:OPEN_LONG|OPEN_SHORT|ADD)\b", action))
+    if not has_open:
+        return (
+            "非OPEN/ADD，本轮不适用 | 校准可信度=未通过 | "
+            "可信度声明=禁止"
+        )
+
+    decision = decision if isinstance(decision, dict) else {}
+    raw_entries = decision.get("multitimeframe_analyses")
+    entries = list(raw_entries) if isinstance(raw_entries, list) else []
+    if not entries:
+        expected_side = str(
+            decision.get("multitimeframe_expected_side") or "").strip().lower()
+        if expected_side not in {"long", "short"}:
+            expected_side = (
+                "long" if action == "OPEN_LONG"
+                else "short" if action == "OPEN_SHORT"
+                else ""
+            )
+        entries = [{
+            "symbol": (
+                decision.get("multitimeframe_expected_symbol")
+                or fallback_symbol
+                or ""
+            ),
+            "side": expected_side,
+            "decision_card": decision_card,
+            "conflicting_cards": False,
+        }]
+
+    valid_count = 0
+    group_lines: list[str] = []
+    for raw_entry in entries:
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        expected_symbol = str(entry.get("symbol") or "").strip()
+        expected_side = str(entry.get("side") or "").strip().lower()
+        card = entry.get("decision_card")
+        if not isinstance(card, dict):
+            card = {}
+        errors: list[str] = []
+        if entry.get("conflicting_cards"):
+            errors.append("同一交易对/方向的分批成交携带冲突决策卡")
+        errors.extend(validate_multitimeframe_analysis(
+            card,
+            expected_cycle=str(cycle_id or ""),
+            expected_side=(
+                expected_side if expected_side in {"long", "short"} else None),
+            expected_symbol=expected_symbol or None,
+        ))
+        group_lines.append(
+            f"交易对={expected_symbol or '-'} side={expected_side or '-'}")
+        if errors:
+            group_lines.append(
+                "结构校验失败（外发前校验将失败）："
+                + "；".join(errors[:3]))
+            continue
+
+        block = card["multitimeframe_analysis"]
+        timeframes = block["timeframes"]
+        contract = block["evidence_contract"]
+        contract_timeframes = contract["timeframes"]
+        for timeframe in ("15m", "1H", "4H"):
+            row = timeframes[timeframe]
+            evidence_row = contract_timeframes[timeframe]
+            group_lines.append(
+                f"{timeframe} rank={row['relative_rank']} "
+                f"direction={str(row['direction']).lower()} "
+                f"exact={evidence_row['observed_bar_ts']} | "
+                f"{card_text(row['evidence'], evidence_limit)}"
+            )
+        group_lines.append(
+            f"选择={block['selected_timeframe']}/"
+            f"{str(block['selected_direction']).lower()} rank=1 | "
+            f"symbol={contract['symbol']} | "
+            "方法=三周期相对最优（非概率） | "
+            f"理由={card_text(block['selection_reason'], reason_limit)} | "
+            "校准可信度=未通过 | 可信度声明=禁止 | "
+            f"evidence_hash={contract['evidence_hash']}"
+        )
+        valid_count += 1
+    return (
+        f"OPEN/ADD覆盖={valid_count}/{len(entries)}\n"
+        + "\n".join(group_lines)
+    )
+
+
 def _short_symbol(value: Any) -> str:
     """'LAB-USDT-SWAP' → 'LAB'：去合约后缀，供标题短显示。"""
     s = str(value or "").strip()
@@ -213,6 +317,9 @@ def _short_symbol(value: Any) -> str:
 
 def _iter_trades(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """payload.trades 展开为逐笔 list：兼容 {live:[...],demo:[...]} 与 list
+
+    demo 键的读取**刻意保留**：2026-08-06 前的归档 payload 仍是双盘形态，重渲染
+    历史推送时要读得出来。新 payload 不再产生该键。
     两种形态，dict 形态各笔补 profile；任何异常返回 []（fail-safe，不影响主渲染）。"""
     try:
         raw = payload.get("trades")
@@ -233,8 +340,42 @@ def _iter_trades(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return []
 
 
+def _single_order_risk_segment(payload: dict[str, Any]) -> str:
+    """风控行「本单保证金 X%/限15%」段（2026-08-08 单笔闸，可单测）。
+
+    字段来自 executor 成交后审计，经 payload trades 透传；本轮无 OPEN/ADD 成交
+    （HOLD/CLOSE 轮或历史 payload）返回空串——不显示不伪造。多笔取最大比率；
+    滑点突破标记优先于缩量标记。fail-safe：异常返回空串不影响主渲染。"""
+    try:
+        rows = [
+            t for t in _iter_trades(payload)
+            if isinstance(t, dict)
+            and str(t.get("action") or "").lower() in ("open", "add")
+            and isinstance(t.get("single_order_imr_ratio"), (int, float))
+        ]
+        if not rows:
+            return ""
+        so_max = max(t["single_order_imr_ratio"] for t in rows)
+        cap = next(
+            (t.get("max_single_order_imr_ratio") for t in rows
+             if isinstance(t.get("max_single_order_imr_ratio"), (int, float))),
+            MAX_SINGLE_ORDER_IMR_RATIO,
+        )
+        marks = ""
+        if any(t.get("single_order_cap_breached") for t in rows):
+            # 2026-08-08 主人拍板措辞：实际处置=stderr 登记+入 repair_queue 人工出口
+            # （无 C2C 外发），文案忠实现状，不写「已告警」。
+            marks = "(滑点超限,已入修复队列)"
+        elif any(t.get("risk_clamped") for t in rows):
+            marks = "(已缩量)"
+        return f" | 本单保证金 {so_max * 100:.1f}%/限{cap * 100:.0f}%{marks}"
+    except Exception:
+        return ""
+
+
 def _normalize_positions(value: Any) -> list[dict[str, Any]]:
     """positions 形态兼容：dict {live:[...],demo:[...]} 合并展开为 list（各项补 profile）；
+    （demo 键同上：只为读历史归档 payload 保留。）
     list 原样过滤非 dict 项；异常返回 []。"""
     try:
         out: list[dict[str, Any]] = []
@@ -431,9 +572,9 @@ def qq_markdown_hardbreak(content: str) -> str:
     return "\n".join(f"{line}  " if line.strip() else "" for line in lines).rstrip() + "\n"
 
 
-LEDGER_DB = _project_path('db', 'ledger.db')
-ACCOUNT_DB = _project_path('db', 'account.db')
-DB_ROOT = _project_path('db')
+LEDGER_DB = "./db/ledger.db"
+ACCOUNT_DB = "./db/account.db"
+DB_ROOT = "./db"
 SNAPSHOT_FRESH_MIN = 30
 
 
@@ -635,8 +776,6 @@ def validate_input(payload: dict[str, Any]) -> None:
     assets = section(payload, "assets")
     if not isinstance(assets.get("live"), dict):
         fail("assets.live 必为 dict，包括 equity/totalEq", 3)
-    if not isinstance(assets.get("demo"), dict):
-        fail("assets.demo 必为 dict，包括 equity/totalEq", 3)
 
     market = section(payload, "market")
     if market.get("btc") is None and market.get("btc_price") is None:
@@ -698,8 +837,8 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
     hhmm = first_nonempty(payload.get("hhmm"), cycle.get("hhmm"), default=datetime.now().strftime("%H:%M"))
-    # channel 使用固定语义 live|demo，不接收 agent 自报值。
-    channel = "live|demo"
+    # channel 使用固定语义 live，不接收 agent 自报值。
+    channel = "live"
     action = first_nonempty(payload.get("action_taken"), decision.get("action_taken"), execution.get("action_taken"), default="OPEN_LONG").upper()
     # 动作枚举归一（2026-07-03 C4a）：agent 传下划线粘连的复合标签（HOLD_NONE / HOLD_BOTH_LANES_NO_TRADE 等）时，
     # validate_push_format 的 \b 枚举校验必挂（_ 是 word char，\bHOLD\b 匹配不到 HOLD_NONE）。
@@ -724,7 +863,6 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     action_summary = first_nonempty(decision.get("summary"), execution.get("summary"), payload.get("action_summary"), default="")
 
     live = section(assets, "live")
-    demo = section(assets, "demo")
     # positions dict 形态兼容：{live:[...],demo:[...]} 合并展开为 list（各项补 profile）。
     positions = _normalize_positions(payload.get("positions"))
     exceptions = list_section(payload, "exceptions")
@@ -737,12 +875,6 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     ))
     live_pnl = money(value_at(live, ["realized_pnl", "pnl", "sum_pnl"], "-"))
     live_positions = num_only(first_nonempty(live.get("positions"), live.get("position_count"), live.get("n_positions"), default=""), default="-")
-    demo_equity = money(value_at(demo, ["current_equity", "equity", "totalEq", "total_eq"], "-"))
-    demo_available = money(value_at(
-        demo, ["available_margin", "availBal", "available_balance", "available"], "-"
-    ))
-    demo_pnl = money(value_at(demo, ["realized_pnl", "pnl", "sum_pnl"], "-"))
-    demo_positions = num_only(first_nonempty(demo.get("positions"), demo.get("position_count"), demo.get("n_positions"), default=""), default="-")
 
     # 纯脚本 builder 已把 as-of 最近快照投影到构建时点前的全部落账成交；这能覆盖
     # trader 跨 cycle 交错完成。标记必须与 cycle_id 精确相同，旧/外部 payload仍走
@@ -750,9 +882,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     _positions_projected = bool(_cycle_id) and str(payload.get("positions_projected_cycle") or "") == str(_cycle_id)
     if _positions_projected:
         _live_n = sum(1 for p in positions if str(p.get("profile") or "live").lower() == "live")
-        _demo_n = sum(1 for p in positions if str(p.get("profile") or "").lower() == "demo")
         live_positions = str(_live_n)
-        demo_positions = str(_demo_n)
 
     imr_unit = risk.get("portfolio_imr_ratio_unit") or "fraction"
     current_imr_pct = portfolio_ratio_pct(
@@ -760,7 +890,10 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     projected_imr_pct = portfolio_ratio_pct(
         risk.get("projected_portfolio_imr_ratio"), imr_unit)
     max_imr_pct = portfolio_ratio_pct(
-        first_nonempty(risk.get("max_portfolio_imr_ratio"), 0.666),
+        first_nonempty(
+            risk.get("max_portfolio_imr_ratio"),
+            MAX_PORTFOLIO_IMR_RATIO,
+        ),
         imr_unit,
     )
     if current_imr_pct != "-":
@@ -785,50 +918,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
                 f" | 旧payload单笔字段 {with_pct(legacy_margin_pct)}"
                 "（历史只读）"
             )
-    demo_capacity = section(risk, "demo_capacity")
-    demo_capacity_entries = demo_capacity.get("entries")
-    if not isinstance(demo_capacity_entries, list):
-        demo_capacity_entries = []
-    demo_capacity_first = (
-        demo_capacity_entries[0]
-        if demo_capacity_entries and isinstance(demo_capacity_entries[0], dict)
-        else demo_capacity
-    )
-    demo_actual_sz = num_only(
-        demo_capacity_first.get("actual_open_sz"), default="-")
-    demo_max_sz = num_only(
-        first_nonempty(
-            demo_capacity_first.get("max_size"),
-            demo_capacity_first.get("exchange_max_sz"),
-            demo_capacity_first.get("exchange_max_size"),
-            demo_capacity_first.get("max_sz_exchange"),
-            demo_capacity_first.get("direction_value"),
-            default="-",
-        ),
-        default="-",
-    )
-    demo_cap_symbol = _short_symbol(
-        demo_capacity_first.get("inst_id") or "")
-    demo_cap_lev = num_only(
-        demo_capacity_first.get("effective_lev"), default="-")
-    demo_cap_context = " ".join(
-        part for part in (
-            demo_cap_symbol,
-            f"@{demo_cap_lev}x" if demo_cap_lev != "-" else "",
-        ) if part
-    )
-    if demo_actual_sz != "-":
-        demo_capacity_display = (
-            f"{demo_actual_sz}张 / 实时容量 {demo_max_sz}张"
-            if demo_max_sz != "-"
-            else f"{demo_actual_sz}张 / 实时容量未回读"
-        )
-    elif demo_max_sz != "-":
-        demo_capacity_display = f"未成交 / 实时容量 {demo_max_sz}张"
-    else:
-        demo_capacity_display = "本轮无开/加仓"
-    if demo_cap_context and demo_capacity_display != "本轮无开/加仓":
-        demo_capacity_display += f"({demo_cap_context})"
+    # Demo 开仓容量展示段随 2026-08-06 demo 全量下线移除。
     leverage = first_nonempty(risk.get("lev"), risk.get("leverage"), risk.get("max_leverage"), default="-")
     side_pct = pct(value_at(risk, ["side_pct", "same_side_pct", "same_side_exposure_pct"], "-"))
     position_count = num_only(first_nonempty(risk.get("position_count"), risk.get("pos_count"), default=live_positions), default="-")
@@ -837,25 +927,17 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     # 资金/持仓数/累计收益权威回读（2026-07-04）：cycle_count 权威覆盖的同模式推广——
     # 库权威值覆盖 agent 传值（#588 双盘 equity 填错 / 假 0 仓 / 累计收益手写污染即此因）；
     # 每项独立回退：DB stale/不可用 → 保留 agent 值，渲染永不因回读失败。
-    for _profile in ("live", "demo"):
+    for _profile in ("live",):
         _eq = authoritative_equity(_profile)
         _cum = authoritative_cum_pnl(_profile)
         _pos = None if _positions_projected else authoritative_position_count(_profile)
-        if _profile == "live":
-            if _eq is not None:
-                live_equity = money(_eq)
-            if _cum is not None:
-                live_pnl = money(_cum)
-            if _pos is not None:
-                live_positions = str(_pos)
-                position_count = live_positions
-        else:
-            if _eq is not None:
-                demo_equity = money(_eq)
-            if _cum is not None:
-                demo_pnl = money(_cum)
-            if _pos is not None:
-                demo_positions = str(_pos)
+        if _eq is not None:
+            live_equity = money(_eq)
+        if _cum is not None:
+            live_pnl = money(_cum)
+        if _pos is not None:
+            live_positions = str(_pos)
+            position_count = live_positions
 
     if _positions_projected:
         position_count = live_positions
@@ -885,6 +967,17 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     historical = decision_card.get("historical_experience")
     if not isinstance(historical, dict):
         historical = {}
+    fallback_mtf_symbol = (
+        symbol if isinstance(symbol, str) and "/" not in symbol
+        and symbol.upper().endswith("-SWAP") else None
+    )
+    multitimeframe_report = format_multitimeframe_analysis(
+        action,
+        decision_card,
+        decision=decision,
+        cycle_id=str(_cycle_id or ""),
+        fallback_symbol=fallback_mtf_symbol,
+    )
     # 被从异常段移出的行情/风控判断条目 → 追加到决策依据段末尾
     if misplaced_decisions:
         moved_lines = []
@@ -910,15 +1003,13 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     # 当前 payload 报真实落库行数（db_rows_*，0 是合法值禁 falsy 链）；
     # 归档 payload 无该键时回退兼容字段展示。
     _dbl = execution.get("db_rows_live")
-    _dbd = execution.get("db_rows_demo")
-    if _dbl is None and _dbd is None:
-        exec_meta = "落库 live=-笔 | demo=-笔"
+    if _dbl is None:
+        exec_meta = "落库 live=-笔"
     else:
-        exec_meta = (f"落库 live={_dbl if _dbl is not None else '-'}笔"
-                     f" | demo={_dbd if _dbd is not None else '-'}笔")
+        exec_meta = f"落库 live={_dbl}笔"
     execution_result = first_nonempty(execution.get("result"), default=f"{action} {symbol} fill={fill_price} stop={stop_price}")
     # 执行段回退：execution.* 全缺而 payload.trades 有内容时，
-    # 从 trades（live+demo）逐笔拼
+    # 从 trades 逐笔拼
     # "SIDE symbol sz@fill_px pnl=…"（≤3 笔 + 溢出计数）。独立 try/except：回退失败保持现行为。
     try:
         _has_exec = any(execution.get(k) not in (None, "", "-")
@@ -951,6 +1042,9 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     # 兼容：旧键 next_p7_time 仍读（历史 agent 传值）；新中性键 next_review_time 优先。
     next_review = first_nonempty(timeline.get("next_review_time"), timeline.get("next_p7_time"), default="08:05")
 
+    # 2026-08-08 单笔保证金闸：本轮有 OPEN/ADD 成交时在风控行追加「本单保证金 X%/限15%」。
+    single_order_txt = _single_order_risk_segment(payload)
+
     content_parts = [
         f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
         (f"Agent自主裁决 | {action_summary}" if decision_card
@@ -958,19 +1052,21 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         "",
         "📊 资产",
         f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益(交易PnL·未扣费) {live_pnl} USDT | {live_positions}仓",
-        f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示·非开仓容量) | 累计收益(交易PnL·未扣费) {demo_pnl} USDT | {demo_positions}仓",
         "",
         "💼 持仓详情",
         format_positions(positions),
         "",
         "🛡 风控",
-        f"Live组合保证金 {margin_display} | Demo开仓 {demo_capacity_display} | 杠杆 {leverage}x / 10x | 同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / demo {demo_positions}(数量仅观察) | {risk_status}",
+        f"Live组合保证金 {margin_display} | 杠杆 {leverage}x / {MAX_LEVERAGE:g}x | 同侧 {with_pct(side_pct)}(观察) | 持仓 {position_count}(数量仅观察) | {risk_status}{single_order_txt}",
         "",
         "🌍 行情",
         f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | regime={regime} | USD_BROAD {dxy}",
         "",
         "🎯 Agent裁决",
         decision_reason,
+        "",
+        "🧩 三周期判断",
+        multitimeframe_report,
         "",
         "🧭 六项决策卡",
         (
@@ -1000,7 +1096,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         f"{execution_result}\n{exec_meta}",
         "",
         "⏰ 时间线",
-        f"下次HH:01: {next_hh01}min | 下次复盘: {next_review}",
+        f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
         "",
         "⚠️ 异常",
         clip(format_exceptions(exceptions), EXCEPTIONS_MAX, tail="…（更多异常见归档）"),
@@ -1014,14 +1110,14 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         funding_anomalies = first_nonempty(market.get("funding_anomalies"), default="无")
         content_parts.extend([
             "",
-            "🌐 宏观 HH:01",
+            "🌐 宏观 HH:00",
             f"USD_BROAD(DTWEXBGS) {first_nonempty(macro.get('dxy'), dxy)} ({with_pct(macro.get('dxy_d1'))}) | VIX {first_nonempty(macro.get('vix'), default='-')} | SPX {first_nonempty(macro.get('spx'), default='-')} ({with_pct(macro.get('spx_d1'))})",
             f"DXY_CALC_ECB {first_nonempty(macro.get('dxy_calc_ecb'), default='-')} ({with_pct(macro.get('dxy_calc_ecb_d1'))}, 非ICE官方报价) | Fear&Greed {first_nonempty(macro.get('fear_greed'), default='-')}/{first_nonempty(macro.get('fear_greed_label'), default='-')}",
             f"BTC市值Δ24h(≠ETF净流) {first_nonempty(macro.get('btc_mcap_chg_24h_usd'), macro.get('btc_etf_proxy'), default='-')} | TVL {first_nonempty(macro.get('tvl'), default='-')} | BTC.D {with_pct(macro.get('btc_dominance'))}",
             f"BTC ETF净流 {first_nonempty(macro.get('btc_etf_net_flow_usd'), default='-')} | 状态 {first_nonempty(macro.get('btc_etf_flow_status'), default='missing')} | as_of {first_nonempty(macro.get('btc_etf_flow_as_of'), default='-')}",
             f"降级源: {degraded_sources}",
             "",
-            "📊 全市场 HH:01",
+            "📊 全市场 HH:00",
             f"TOP3 涨幅: {top_gainers}",
             f"TOP3 跌幅: {top_losers}",
             f"资金费率异常: {funding_anomalies}",
@@ -1060,16 +1156,15 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             "",
             "📊 资产",
             f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益 {live_pnl} USDT | {live_positions}仓",
-            f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示·非容量) | 累计收益 {demo_pnl} USDT | {demo_positions}仓",
             "",
             "💼 持仓详情",
             clip(format_positions(positions), 520, tail="\n…（其余持仓见账本）"),
             "",
             "🛡 风控",
             clip(
-                f"Live组合保证金 {margin_display} | Demo开仓 {demo_capacity_display} | 杠杆 {leverage}x / 10x | "
+                f"Live组合保证金 {margin_display} | 杠杆 {leverage}x / {MAX_LEVERAGE:g}x | "
                 f"同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / "
-                f"demo {demo_positions}(数量仅观察) | {risk_status}",
+                f"{risk_status}",
                 210,
             ),
             "",
@@ -1079,6 +1174,9 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             "",
             "🎯 Agent裁决",
             clip(decision_reason, 180),
+            "",
+            "🧩 三周期判断",
+            multitimeframe_report,
             "",
             "🧭 六项决策卡",
             compact_card,
@@ -1090,7 +1188,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             clip(f"{execution_result}\n{exec_meta}", 180),
             "",
             "⏰ 时间线",
-            f"下次HH:01: {next_hh01}min | 下次复盘: {next_review}",
+            f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
             "",
             "⚠️ 异常",
             clip(format_exceptions(exceptions), 120, tail="…（更多异常见账本）"),
@@ -1098,7 +1196,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         if include_macro:
             compact_parts.extend([
                 "",
-                "🌐 宏观 HH:01",
+                "🌐 宏观 HH:00",
                 clip(
                     f"USD_BROAD {first_nonempty(macro.get('dxy'), dxy)} "
                     f"({with_pct(macro.get('dxy_d1'))}) | "
@@ -1116,12 +1214,15 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
         # 极端兜底仍按“逐段再压缩”而非裁尾，保证所有必填段存在。
         if len(content) > MAX_CONTENT_CHARS:
-            compact_parts[8] = clip(format_positions(positions), 260, tail="\n…（其余持仓见账本）")
-            compact_parts[17] = clip(decision_reason, 100)
-            compact_parts[20] = clip(compact_card, 360)
-            compact_parts[23] = clip(compact_history, 90)
-            compact_parts[26] = clip(f"{execution_result}\n{exec_meta}", 100)
-            compact_parts[32] = clip(format_exceptions(exceptions), 60)
+            compact_parts[7] = clip(
+                format_positions(positions), 260,
+                tail="\n…（其余持仓见账本）")
+            compact_parts[16] = clip(decision_reason, 100)
+            compact_parts[22] = clip(compact_card, 360)
+            compact_parts[25] = clip(compact_history, 90)
+            compact_parts[28] = clip(
+                f"{execution_result}\n{exec_meta}", 100)
+            compact_parts[34] = clip(format_exceptions(exceptions), 60)
             content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
         if len(content) > MAX_CONTENT_CHARS:
             minimal_card = (
@@ -1137,20 +1238,21 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
                 f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
                 f"Agent自主裁决 | {clip(action_summary, 80)}",
                 "", "📊 资产",
-                f"🟢 实盘：资金 ${live_equity} | 可用 ${live_available} | {live_positions}仓",
-                f"🟡 模拟盘：资金 ${demo_equity} | snapshot availBal ${demo_available}(展示) | {demo_positions}仓",
+                f"🟢 实盘：资金 ${live_equity} | 可用 ${live_available} | "
+                f"累计收益 {live_pnl} USDT | {live_positions}仓",
                 "", "💼 持仓详情",
                 clip(format_positions(positions), 120, tail="\n…（其余见账本）"),
                 "", "🛡 风控",
-                clip(f"Live组合保证金 {margin_display} | Demo {demo_capacity_display} | 杠杆 {leverage}x | {risk_status}", 120),
+                clip(f"Live组合保证金 {margin_display} | 杠杆 {leverage}x | {risk_status}", 120),
                 "", "🌍 行情",
                 f"BTC ${btc} | ETH ${eth} | regime={regime} | USD_BROAD {dxy}",
-                "", "🎯 Agent裁决", clip(decision_reason, 70),
-                "", "🧭 六项决策卡", minimal_card,
+                 "", "🎯 Agent裁决", clip(decision_reason, 70),
+                 "", "🧩 三周期判断", multitimeframe_report,
+                 "", "🧭 六项决策卡", minimal_card,
                 "", "📚 历史经验", clip(compact_history, 60),
                 "", "⚙️ 执行", clip(f"{execution_result}\n{exec_meta}", 70),
                 "", "⏰ 时间线",
-                f"下次HH:01: {next_hh01}min | 下次复盘: {next_review}",
+                f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
                 "", "⚠️ 异常", clip(format_exceptions(exceptions), 40),
                 "", "…（推送过长已最小化，完整事实以账本和分析归档为准）",
             ]
@@ -1162,7 +1264,8 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         "content": content,
         "char_count": len(content),
         "sections": ["header", "assets", "positions", "risk", "market", "decision",
-                     "decision_card", "experience", "execution", "timeline", "exceptions"],
+                     "multitimeframe_analysis", "decision_card", "experience",
+                     "execution", "timeline", "exceptions"],
     }
 
 
@@ -1177,7 +1280,7 @@ def main() -> int:
                              "agent 捕获 stdout 中文会乱码；后续 validate --file / 归档 content_file 直读此文件）")
     parser.add_argument("--db-root", default=None,
                         help="库权威覆盖（轮次/资金/持仓数/累计收益/耗时）的读取根目录；"
-                             "默认 <PROJECT_ROOT>/db")
+                             "默认 ./db")
     args = parser.parse_args()
 
     if args.db_root:

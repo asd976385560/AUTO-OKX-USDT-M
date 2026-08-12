@@ -3,7 +3,7 @@
 
 只读脚本必须用 mode=ro 打开数据库；路径错或文件缺失时立即失败，
 禁止 sqlite 静默创建 0 字节假库（如 bash 反斜杠被吃
-写出 <PROJECT_ROOT>db\\account.db 0 字节污染的病灶）。统一改走 mode=ro 只读 URI：
+写出 .db\\account.db 0 字节污染的病灶）。统一改走 mode=ro 只读 URI：
 库文件缺失/不可读时直接抛 sqlite3.OperationalError（期望的 fail-fast）。
 
 用法：

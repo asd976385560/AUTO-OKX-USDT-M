@@ -3,7 +3,7 @@
 
 Facts are split deliberately:
 
-* filled opens/closes come from ``live_trades.db`` / ``demo_trades.db``;
+* filled opens/closes come from ``live_trades.db``;
 * risk-rejected open attempts come from ``ledger.db.execution_intents``;
 * rejected or incomplete rows in ``trades`` never count as fills.
 
@@ -12,21 +12,11 @@ the same facts before rendering QQ text and before invoking the report writer.
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
-
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
 import argparse
 import json
+import math
 import sqlite3
+import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -43,10 +33,9 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 DAILY_ANCHOR_HOUR = 8
 DAILY_ANCHOR_MINUTE = 0
 PROFILE_DB = {
-    "live": Path(_project_path('db', 'live_trades.db')),
-    "demo": Path(_project_path('db', 'demo_trades.db')),
+    "live": Path(r"./db/live_trades.db"),
 }
-LEDGER_DB = Path(_project_path('db', 'ledger.db'))
+LEDGER_DB = Path(r"./db/ledger.db")
 FILL_ACTIONS = {"open", "close"}
 POSITION_INCREASE_ACTIONS = {"open", "add"}
 POSITION_DECREASE_ACTIONS = {"close", "reduce"}
@@ -123,6 +112,32 @@ def weekly_window(week_start_ts: str | datetime) -> tuple[str, str]:
         second=0, microsecond=0)
     start = anchor - timedelta(days=7)
     return start.strftime(TS_FMT), anchor.strftime(TS_FMT)
+
+
+def monthly_window(month_start_ts: str | datetime) -> tuple[str, str]:
+    """Return the previous complete calendar month on the 08:00 fact anchor.
+
+    ``month_start_ts`` is the current month's report key (day 1 at 00:00).
+    Facts cover ``[previous month day 1 08:00, current month day 1 08:00)``
+    so the interval is exactly tiled by the existing daily report windows.
+    """
+    report_month = parse_cst(month_start_ts)
+    end = report_month.replace(
+        day=1,
+        hour=DAILY_ANCHOR_HOUR,
+        minute=DAILY_ANCHOR_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    previous_month_last_day = end - timedelta(days=1)
+    start = previous_month_last_day.replace(
+        day=1,
+        hour=DAILY_ANCHOR_HOUR,
+        minute=DAILY_ANCHOR_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return start.strftime(TS_FMT), end.strftime(TS_FMT)
 
 
 def rolling_window(
@@ -248,6 +263,27 @@ def filled_trade_stats(
     best = max(closed_with_pnl, key=lambda row: float(row["pnl"]), default=None)
     worst = min(closed_with_pnl, key=lambda row: float(row["pnl"]), default=None)
 
+    # 2026-08-10 Wave0-2：平仓方向分解进入权威事实——周报文字段曾把 10空/3多
+    # 手写成 11空/2多、把 USDT 均值标成百分比；方向计数与均值此后只认这里。
+    close_side_breakdown = {}
+    for side_key in ("long", "short"):
+        side_rows = [
+            row for row in closed_with_pnl
+            if str(row.get("side") or "").strip().lower() == side_key
+        ]
+        side_pnl = sum(float(row["pnl"]) for row in side_rows)
+        side_wins = sum(float(row["pnl"]) > 0 for row in side_rows)
+        close_side_breakdown[side_key] = {
+            "close_count": len(side_rows),
+            "win_count": side_wins,
+            "win_rate_pct": (
+                side_wins / len(side_rows) * 100 if side_rows else None
+            ),
+            "pnl_sum_usdt": side_pnl,
+            "pnl_avg_usdt": side_pnl / len(side_rows) if side_rows else None,
+            "pnl_unit": "USDT",
+        }
+
     return {
         "source": str(Path(db_path)),
         "period_start_ts": start,
@@ -267,6 +303,7 @@ def filled_trade_stats(
         ),
         "best_trade": _trade_label(best) if best else None,
         "worst_trade": _trade_label(worst) if worst else None,
+        "close_side_breakdown": close_side_breakdown,
         "excluded_rejected_rows": len(rejected_rows),
         "excluded_rejected_row_ids": rejected_rows,
         "excluded_incomplete_rows": len(incomplete_rows),
@@ -286,6 +323,88 @@ def filled_trade_stats(
             }
             for row in fills
         ],
+    }
+
+
+def realized_performance_stats(
+    db_path: Path,
+    start_ts: str,
+    end_ts: str,
+    *,
+    end_exclusive: bool = True,
+) -> dict:
+    """Compute transparent monthly metrics from confirmed close-fill PnL.
+
+    ``max_drawdown_usdt`` is the largest peak-to-trough loss on the cumulative
+    realized-PnL curve, starting from zero. ``sharpe_approx`` is the annualized
+    sample mean/stdev of 08:00-anchored daily realized PnL, including zero-PnL
+    days and using ``sqrt(365)``.  It is ``None`` when variance is zero.
+    These are reporting diagnostics, not account-equity or risk-gate inputs.
+    """
+    start = parse_cst(fmt_ts(start_ts))
+    end = parse_cst(fmt_ts(end_ts))
+    if end <= start:
+        raise ValueError("performance interval must have end > start")
+    seconds = (end - start).total_seconds()
+    if seconds % 86400 != 0:
+        raise ValueError("performance interval must tile whole 24h fact days")
+
+    stats = filled_trade_stats(
+        Path(db_path),
+        start.strftime(TS_FMT),
+        end.strftime(TS_FMT),
+        end_exclusive=end_exclusive,
+    )
+    closes = [
+        row for row in stats["fill_rows"]
+        if row["action"] == "close" and row.get("pnl") is not None
+    ]
+
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for row in closes:
+        cumulative += float(row["pnl"])
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+
+    day_count = int(seconds // 86400)
+    daily_pnl = [0.0 for _ in range(day_count)]
+    for row in closes:
+        row_ts = parse_cst(str(row["ts"]))
+        index = int((row_ts - start).total_seconds() // 86400)
+        if 0 <= index < day_count:
+            daily_pnl[index] += float(row["pnl"])
+
+    sharpe = None
+    if len(daily_pnl) >= 2:
+        deviation = statistics.stdev(daily_pnl)
+        if deviation > 1e-12:
+            sharpe = statistics.mean(daily_pnl) / deviation * math.sqrt(365.0)
+
+    return {
+        "source": str(Path(db_path)),
+        "period_start_ts": start.strftime(TS_FMT),
+        "period_end_ts": end.strftime(TS_FMT),
+        "period_end_exclusive": bool(end_exclusive),
+        "realized_pnl": float(stats["realized_pnl"]),
+        "close_count": int(stats["close_count"]),
+        "closed_with_pnl_count": int(stats["closed_with_pnl_count"]),
+        "max_drawdown_usdt": float(max_drawdown),
+        "sharpe_approx": sharpe,
+        "daily_anchor": "08:00 Asia/Shanghai",
+        "daily_observations": day_count,
+        "daily_realized_pnl": daily_pnl,
+        "definitions": {
+            "max_drawdown_usdt": (
+                "peak-to-trough drawdown of cumulative confirmed close-fill "
+                "realized PnL, starting at zero"
+            ),
+            "sharpe_approx": (
+                "annualized mean/stdev of 08:00-anchored daily realized PnL; "
+                "zero-PnL days included; sqrt(365); no risk-free adjustment"
+            ),
+        },
     }
 
 
@@ -389,6 +508,93 @@ def open_position_avg_hold_hours(
     return weighted_hours / total_qty if total_qty > 0 else None
 
 
+def closed_position_hold_stats(
+    db_path: Path,
+    start_ts: str,
+    end_ts: str,
+    *,
+    end_exclusive: bool = True,
+) -> dict:
+    """Return FIFO holding time for confirmed close fills in the report window.
+
+    Lots are reconstructed from all confirmed position-changing fills before
+    ``end_ts`` so a position opened before the report window is still paired
+    correctly.  Each fully matched ``close`` row contributes one observation;
+    multiple FIFO lots consumed by that close are quantity-weighted first, then
+    observations are averaged equally across close fills.  Any unmatched close
+    makes the aggregate unknown instead of silently publishing a partial mean.
+    """
+    start = parse_cst(fmt_ts(start_ts))
+    end = parse_cst(fmt_ts(end_ts))
+    con = _connect_ro(Path(db_path))
+    try:
+        op = "<" if end_exclusive else "<="
+        rows = con.execute(
+            "SELECT id,ts,symbol,action,side,sz,fill_px,raw FROM trades "
+            f"WHERE datetime(ts){op}datetime(?) ORDER BY datetime(ts),id",
+            (end.strftime(TS_FMT),),
+        ).fetchall()
+    finally:
+        con.close()
+
+    lots: dict[tuple[str, str], list[list[Any]]] = defaultdict(list)
+    samples: list[float] = []
+    unmatched_close_row_ids: list[int] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        if (_explicitly_rejected(row) or not _positive(row.get("sz"))
+                or not _positive(row.get("fill_px"))):
+            continue
+        action = str(row.get("action") or "").strip().lower()
+        if action not in POSITION_INCREASE_ACTIONS | POSITION_DECREASE_ACTIONS:
+            continue
+        row_ts = parse_cst(str(row["ts"]))
+        key = (str(row.get("symbol") or ""), str(row.get("side") or ""))
+        qty = float(row["sz"])
+        if action in POSITION_INCREASE_ACTIONS:
+            lots[key].append([qty, row_ts])
+            continue
+
+        remaining = qty
+        matched = 0.0
+        weighted_hours = 0.0
+        while remaining > 1e-12 and lots[key]:
+            lot_qty, opened_at = lots[key][0]
+            take = min(remaining, float(lot_qty))
+            weighted_hours += take * max(
+                0.0, (row_ts - opened_at).total_seconds() / 3600.0)
+            matched += take
+            remaining -= take
+            lots[key][0][0] -= take
+            if lots[key][0][0] <= 1e-12:
+                lots[key].pop(0)
+
+        in_window = row_ts >= start and (
+            row_ts < end if end_exclusive else row_ts <= end)
+        if not in_window or action != "close":
+            continue
+        tolerance = max(1e-9, qty * 1e-9)
+        if matched <= 0 or remaining > tolerance:
+            unmatched_close_row_ids.append(int(row["id"]))
+            continue
+        samples.append(weighted_hours / matched)
+
+    average = (
+        sum(samples) / len(samples)
+        if samples and not unmatched_close_row_ids else None
+    )
+    return {
+        "closed_position_avg_hold_hours": average,
+        "closed_position_hold_sample_count": len(samples),
+        "closed_position_hold_unmatched_count": len(unmatched_close_row_ids),
+        "closed_position_hold_unmatched_row_ids": unmatched_close_row_ids,
+        "closed_position_hold_definition": (
+            "FIFO quantity-weighted hours per confirmed close fill; "
+            "arithmetic mean across fully matched close fills"
+        ),
+    }
+
+
 def profile_statistics(
     profile: str,
     trade_db: Path,
@@ -410,6 +616,14 @@ def profile_statistics(
         "risk_rejected_open_attempts": rejects,
     }
     if include_avg_hold:
+        result.update(closed_position_hold_stats(
+            trade_db,
+            start_ts,
+            end_ts,
+            end_exclusive=end_exclusive,
+        ))
+        # Keep the current-open age as a separately named turnover diagnostic;
+        # it must never populate weekly_reports.avg_hold_hours.
         result["open_position_avg_hold_hours"] = (
             open_position_avg_hold_hours(trade_db, end_ts)
         )
@@ -420,7 +634,7 @@ def _cli() -> int:
     parser = argparse.ArgumentParser(
         description="Read-only authoritative fill/reject metrics for reports"
     )
-    parser.add_argument("--profile", choices=("live", "demo", "both"),
+    parser.add_argument("--profile", choices=("live", "both"),
                         default="both")
     parser.add_argument("--as-of", default=now_cst())
     parser.add_argument("--window", choices=("daily", "rolling", "explicit"),
@@ -434,7 +648,7 @@ def _cli() -> int:
         "--include-rows", action="store_true",
         help="包含逐笔 fill 明细；默认仅输出紧凑汇总",
     )
-    parser.add_argument("--db-root", default=_project_path('db'))
+    parser.add_argument("--db-root", default=r"./db")
     args = parser.parse_args()
 
     as_of = fmt_ts(args.end_ts or args.as_of)
@@ -451,7 +665,7 @@ def _cli() -> int:
     # exclusive so an exact 08:05:00 fill cannot be counted in two reports.
     end_exclusive = bool(args.end_exclusive or args.window == "daily")
     root = Path(args.db_root)
-    profiles = ("live", "demo") if args.profile == "both" else (args.profile,)
+    profiles = ("live",) if args.profile == "both" else (args.profile,)
     payload = {
         "as_of_ts": as_of,
         "period_start_ts": start,
