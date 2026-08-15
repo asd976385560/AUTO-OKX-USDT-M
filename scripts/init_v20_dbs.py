@@ -4,9 +4,8 @@
 | 库            | 唯一 writer   | 读者          | 本脚本动作                         |
 |:--------------|:--------------|:--------------|:-----------------------------------|
 | regime.db     | 慢采脚本      | 分析员        | 建 cross_market（schema 同现 market.db）|
-| analysis.db   | 分析员        | 双 trader     | 建 analysis_runs + analysis_signals |
+| analysis.db   | 分析员        | 实盘 trader   | 建 analysis_runs + analysis_signals |
 | live_trades.db| 实盘 trader   | 复盘          | 建 trades + trade_cycles            |
-| demo_trades.db| 模拟 trader   | 复盘          | 建 trades + trade_cycles（同构）    |
 | ledger.db     | 各采集器      | 全体          | 委托 ledger.init_ledger             |
 
 幂等（CREATE IF NOT EXISTS）。WAL/busy_timeout 复用 ledger.connect（单一来源）。
@@ -111,7 +110,7 @@ CREATE TABLE IF NOT EXISTS analysis_signals (
 CREATE INDEX IF NOT EXISTS idx_analysis_signals_cycle ON analysis_signals(cycle_id);
 """
 
-# live_trades.db / demo_trades.db：同构。每个 trader 是自己库的唯一 writer。
+# live_trades.db：实盘 trader 是唯一 writer。
 DDL_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
