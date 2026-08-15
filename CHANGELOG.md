@@ -5,6 +5,8 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-16
+
 ### Added
 
 - Added OKX announcement collection, official instrument and contract-history
@@ -123,6 +125,7 @@ All notable public-release changes are recorded here. Public versions follow
 - CI now scans the complete candidate tree for concrete delivery routes, private
   host paths and runtime artifacts without echoing matched values.
 
-[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.1
 [1.1.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.0
 [1.0.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.0.0
