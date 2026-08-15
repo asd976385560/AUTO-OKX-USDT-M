@@ -257,6 +257,7 @@ class ReviewerReadyTests(unittest.TestCase):
                 "steps": {
                     "reconcile": {"rc": 1, "accepted": True},
                     "account_bills": {"rc": 0, "accepted": True},
+                    "missed_opportunities": {"rc": 0, "accepted": True},
                     "quality_metrics": {
                         "rc": 0,
                         "accepted": True,
@@ -296,6 +297,7 @@ class ReviewerReadyTests(unittest.TestCase):
             steps = [
                 ("reconcile", ["reconcile.py"], 1, (0, 1)),
                 ("account_bills", ["account_bills.py"], 1, (0,)),
+                ("missed_opportunities", ["missed.py"], 1, (0,)),
                 ("quality_metrics", ["quality_metrics.py"], 1, (0,)),
                 ("noncritical", ["noncritical.py"], 1, (0,)),
             ]

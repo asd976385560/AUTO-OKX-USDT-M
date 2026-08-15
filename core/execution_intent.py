@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """Durable execution-intent idempotency for order side effects.
 
-The order executor reserves one logical OPEN before any exchange write.  A
-completed intent returns its stored receipt on an identical retry; in-flight or
-ambiguous intents are fail-closed and require reconciliation instead of a
-second order.
+The order executor reserves one logical side effect before any exchange write.
+A completed intent returns its stored receipt on an identical retry; in-flight
+or ambiguous intents are fail-closed and require reconciliation instead of a
+second order.  ``action='open'`` remains the backward-compatible default.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-TERMINAL_STATES = frozenset({"completed", "failed_clean", "reconciled"})
+TERMINAL_STATES = frozenset({"completed", "failed_clean"})
 
 
 SCHEMA = """
@@ -69,8 +69,14 @@ def canonical_request(payload: dict[str, Any]) -> tuple[str, str]:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw
 
 
-def _key(profile: str, cycle_id: str, symbol: str, side: str) -> tuple[str, ...]:
-    return (profile, cycle_id, symbol, "open", side)
+def _key(
+    profile: str,
+    cycle_id: str,
+    symbol: str,
+    side: str,
+    action: str = "open",
+) -> tuple[str, ...]:
+    return (profile, cycle_id, symbol, action, side)
 
 
 def _pending_profile_intents(
@@ -81,7 +87,7 @@ def _pending_profile_intents(
     return con.execute(
         "SELECT profile,cycle_id,symbol,action,side,state,updated_at,ord_id,error "
         "FROM execution_intents WHERE profile=? "
-        "AND state NOT IN ('completed','failed_clean','reconciled') "
+        "AND state NOT IN ('completed','failed_clean') "
         "ORDER BY updated_at,cycle_id,symbol,action,side",
         (profile,),
     ).fetchall()
@@ -109,8 +115,9 @@ def reserve(
     side: str,
     request: dict[str, Any],
     now_ts: str,
+    action: str = "open",
 ) -> dict[str, Any]:
-    """Reserve an OPEN or return a stored receipt / fail-closed conflict."""
+    """Reserve one action or return a stored receipt / fail-closed conflict."""
     fingerprint, request_json = canonical_request(request)
     con = _connect(path)
     try:
@@ -119,7 +126,7 @@ def reserve(
         row = con.execute(
             "SELECT * FROM execution_intents WHERE profile=? AND cycle_id=? "
             "AND symbol=? AND action=? AND side=?",
-            _key(profile, cycle_id, symbol, side),
+            _key(profile, cycle_id, symbol, side, action),
         ).fetchone()
         if row is None:
             pending = _pending_profile_intents(con, profile)
@@ -131,7 +138,7 @@ def reserve(
                 "(profile,cycle_id,symbol,action,side,request_fingerprint,"
                 "request_json,state,reserved_at,updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (*_key(profile, cycle_id, symbol, side), fingerprint,
+                (*_key(profile, cycle_id, symbol, side, action), fingerprint,
                  request_json, "reserved", now_ts, now_ts),
             )
             con.commit()
@@ -173,29 +180,11 @@ def reserve(
                 "receipt_json=NULL,error=NULL "
                 "WHERE profile=? AND cycle_id=? AND symbol=? AND action=? AND side=?",
                 (fingerprint, request_json, now_ts, now_ts,
-                 *_key(profile, cycle_id, symbol, side)),
+                 *_key(profile, cycle_id, symbol, side, action)),
             )
             con.commit()
             return {"status": "reserved", "fingerprint": fingerprint,
                     "reused_failed_clean": True}
-
-        if state == "reconciled":
-            # The exchange fill and ledger row were recovered after the original
-            # executor lost its receipt.  This key must never place another order,
-            # but it is terminal and therefore must not freeze the whole profile.
-            pending = _pending_profile_intents(con, profile)
-            if pending:
-                con.commit()
-                return _blocking_result(pending)
-            con.commit()
-            return {
-                "status": "blocked",
-                "state": state,
-                "reason": "intent_reconciled",
-                "ord_id": row["ord_id"],
-                "same_fingerprint": same,
-                "pending_count": 0,
-            }
 
         con.commit()
         return {
@@ -234,6 +223,7 @@ def _transition(
     fingerprint: str,
     state: str,
     now_ts: str,
+    action: str = "open",
     ord_id: Optional[str] = None,
     receipt: Optional[dict[str, Any]] = None,
     error: Optional[str] = None,
@@ -242,8 +232,14 @@ def _transition(
     if receipt is not None:
         receipt_json = json.dumps(
             receipt, ensure_ascii=False, sort_keys=True, allow_nan=False)
-    submitted_at = now_ts if state in ("submitted", "uncertain") else None
-    completed_at = now_ts if state in ("completed", "reconciled") else None
+    # Some synchronous exchange mutations go directly from ``submitting`` to
+    # ``completed`` after readback.  A completed intent must still prove that
+    # an exchange side effect was submitted (protection algo amendments are
+    # the main example).
+    submitted_at = (
+        now_ts if state in ("submitted", "uncertain", "completed") else None
+    )
+    completed_at = now_ts if state == "completed" else None
     con = _connect(path)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -256,12 +252,12 @@ def _transition(
             "WHERE profile=? AND cycle_id=? AND symbol=? AND action=? AND side=? "
             "AND request_fingerprint=?",
             (state, now_ts, submitted_at, completed_at, ord_id, receipt_json,
-             error, *_key(profile, cycle_id, symbol, side), fingerprint),
+             error, *_key(profile, cycle_id, symbol, side, action), fingerprint),
         )
         if cur.rowcount != 1:
             raise RuntimeError(
                 f"execution intent transition lost: {profile}/{cycle_id}/"
-                f"{symbol}/open/{side} -> {state}")
+                f"{symbol}/{action}/{side} -> {state}")
         con.commit()
     except Exception:
         con.rollback()
@@ -284,11 +280,6 @@ def mark_completed(path: Path, **kwargs: Any) -> None:
 
 def mark_failed_clean(path: Path, **kwargs: Any) -> None:
     _transition(path, state="failed_clean", **kwargs)
-
-
-def mark_reconciled(path: Path, **kwargs: Any) -> None:
-    """Close an intent whose exchange fill and ledger row were reconciled later."""
-    _transition(path, state="reconciled", **kwargs)
 
 
 def mark_uncertain(path: Path, **kwargs: Any) -> None:

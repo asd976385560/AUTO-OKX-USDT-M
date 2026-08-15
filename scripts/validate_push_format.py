@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """v7.2 推送格式自检脚本
 
-在 QQ 外发前、归档前调用，检查推送内容是否符合 push 模板格式
-（templates/push_template.md / agents/push.md）。
+在 QQ 外发前、归档前调用，检查推送内容是否符合
+templates/push_template.md 的固定格式。
 不符合 → exit 1 并写 repair_queue；过时格式 → warn 不阻塞。
 
 输入：stdin JSON 或 --content "..." 直接传字符串
@@ -25,11 +25,14 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
 CST = timezone(timedelta(hours=8))
-DB_PATH = Path(r'./db/account.db')
+DB_PATH = Path(r'.\db\account.db')
 
 # 2026-08-12 20:00（北京时间）起的新报告契约。历史归档继续按原始
 # 16 项基线复核，禁止用后来新增的展示字段反向判坏既有送达证据。
 MULTITIMEFRAME_REPORT_REQUIRED_FROM = '2026-08-12T20:00'
+EXECUTION_AUDIT_REQUIRED_FROM = '2026-08-14T02:15'
+BUSINESS_ATTESTATION_REQUIRED_FROM = '2026-08-14T07:00'
+INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = '2026-08-15T08:00'
 _CYCLE_ID_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:(?:00|15|30|45)$')
 _OPEN_REPORT_RE = re.compile(r'\b(?:OPEN_LONG|OPEN_SHORT|ADD)\b')
 _MTF_LINE_RE = re.compile(
@@ -46,7 +49,7 @@ _MTF_GROUP_HEADER_RE = re.compile(
 REQUIRED_SECTIONS = [
     (r'第\d+轮', '轮次'),
     (r'⏱', '耗时'),
-    (r'\b(OPEN_LONG|OPEN_SHORT|CLOSE|STOP_LOSS|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD)\b', '动作'),
+    (r'\b(OPEN_LONG|OPEN_SHORT|CLOSE|STOP_LOSS|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD|ERROR|DEGRADED)\b', '动作'),
     (r'📊 资产', '资产段'),
     (r'🟢 实盘', '实盘资产'),
     # 2026-08-06：demo 全量下线，模拟盘资产段不再必填（渲染侧同步移除）。
@@ -237,6 +240,76 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         errors.extend(mtf_errors)
         missing.extend(mtf_missing)
 
+    execution_audit_required = bool(
+        cycle_id is not None
+        and _CYCLE_ID_RE.fullmatch(str(cycle_id))
+        and str(cycle_id) >= EXECUTION_AUDIT_REQUIRED_FROM
+    )
+    if execution_audit_required:
+        execution_section = content.split('⚙️ 执行', 1)[1] \
+            if '⚙️ 执行' in content else ''
+        if '⏰ 时间线' in execution_section:
+            execution_section = execution_section.split('⏰ 时间线', 1)[0]
+        first_action = re.search(
+            r'\b(ADJUST|ERROR|DEGRADED)\b', first_line)
+        required_tokens: tuple[tuple[str, str], ...] = ()
+        if first_action and first_action.group(1) == 'ADJUST':
+            required_tokens = (
+                ('ADJUST_PROTECTION', '调保护动作原语'),
+                ('no_fill', '调保护零成交语义'),
+                ('path=', '调保护执行路径'),
+                ('sz=', '调保护覆盖张数'),
+                ('SL=', '调保护已应用止损'),
+                ('algoId=', '调保护算法单身份'),
+                ('readback=verified/', '调保护回读状态'),
+                ('exchange_side_effect=protection_only', '调保护副作用边界'),
+            )
+        elif first_action:
+            required_tokens = (
+                ('no_fill', '错误终态零成交语义'),
+                ('orders=0', '错误终态零订单'),
+                ('exchange_side_effect=none', '错误终态零交易所副作用'),
+                ('reason=', '错误终态原始原因'),
+            )
+        for token, name in required_tokens:
+            if token not in execution_section:
+                errors.append(f'执行段缺少版本化必填字段: {name}')
+                missing.append(name)
+
+    business_attestation_required = bool(
+        cycle_id is not None
+        and _CYCLE_ID_RE.fullmatch(str(cycle_id))
+        and str(cycle_id) >= BUSINESS_ATTESTATION_REQUIRED_FROM
+    )
+    if business_attestation_required:
+        execution_section = content.split('⚙️ 执行', 1)[1] \
+            if '⚙️ 执行' in content else ''
+        if '⏰ 时间线' in execution_section:
+            execution_section = execution_section.split('⏰ 时间线', 1)[0]
+        if not re.search(r'账实成交=\d+笔', execution_section):
+            errors.append('执行段缺少版本化账实成交计数')
+            missing.append('账实成交计数')
+        if not re.search(r'业务指纹=[0-9a-f]{64}\b', execution_section):
+            errors.append('执行段缺少版本化业务指纹')
+            missing.append('业务指纹')
+
+    inter_report_exchange_required = bool(
+        cycle_id is not None
+        and _CYCLE_ID_RE.fullmatch(str(cycle_id))
+        and str(cycle_id) >= INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM
+    )
+    if inter_report_exchange_required:
+        execution_section = content.split('⚙️ 执行', 1)[1] \
+            if '⚙️ 执行' in content else ''
+        if '⏰ 时间线' in execution_section:
+            execution_section = execution_section.split('⏰ 时间线', 1)[0]
+        if not re.search(r'报告间交易所成交=\d+笔', execution_section):
+            errors.append('执行段缺少报告间交易所成交计数')
+            missing.append('报告间交易所成交计数')
+        if not re.search(r'区间指纹=[0-9a-f]{64}\b', execution_section):
+            errors.append('执行段缺少报告间交易所成交区间指纹')
+            missing.append('区间指纹')
+
     for pattern, msg in DEPRECATED_PATTERNS:
         if re.search(pattern, content):
             warnings.append(f"过时格式: {msg}")
@@ -255,6 +328,13 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         'cycle_id': cycle_id,
         'multitimeframe_contract_required': versioned_required,
         'multitimeframe_required_from': MULTITIMEFRAME_REPORT_REQUIRED_FROM,
+        'execution_audit_required': execution_audit_required,
+        'execution_audit_required_from': EXECUTION_AUDIT_REQUIRED_FROM,
+        'business_attestation_required': business_attestation_required,
+        'business_attestation_required_from': BUSINESS_ATTESTATION_REQUIRED_FROM,
+        'inter_report_exchange_required': inter_report_exchange_required,
+        'inter_report_exchange_required_from': (
+            INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM),
     }
 
 

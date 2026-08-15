@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-12
+last-updated: 2026-08-16
 updated-by: Codex
-change-summary: Sync the live-only runtime, consolidated collection, multitimeframe evidence and public safety boundary.
+change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidence, action contracts and public safety gates.
 -->
 
 <p align="center">
@@ -72,13 +72,14 @@ the release workflow passes version, current-main ancestry, and full CI checks.
 
 ## Latest synchronization
 
-The 2026-08-12 synchronization uses the actual runtime source and reapplies portable public safety boundaries before it enters this repository:
+This branch synchronizes the actual runtime source through 2026-08-15 and reapplies portable public safety boundaries before it enters this repository:
 
 - Demo runtime capability, roles, and database initialization targets are retired; the main chain is unified live → push;
-- `collect_cycle.py` aggregates hourly fast → news → slow and quarter-hour fast → news runs with per-step results and failure isolation;
-- every OPEN/ADD is bound to exact closed 15m/1H/4H evidence for the same cycle and independently revalidated by the writer and executor; news time layers, asset classes, experience contracts, and model-shadow evaluation are included;
+- `collect_cycle.py` aggregates hourly fast → news → slow and quarter-hour fast → news runs with per-step results, absolute deadlines, and side-effect failure receipts;
+- OKX announcements, official contract history, BOLL/OBV, positioning batch identity, and bounded market-feature recovery are verified by complete-cycle SLA, field-coverage, and periodic-report audits;
+- every OPEN/ADD is bound to exact closed 15m/1H/4H evidence for the same cycle, while REDUCE and ADJUST_PROTECTION now have explicit action contracts; the writer and executor revalidate independently;
 - Live risk gates combine the 66.6% portfolio IMR cap, 15% single-order incremental IMR cap, 5% stop-loss risk cap, available margin, finite-number checks, ledger-position consistency, and actor attestation;
-- Push uses a 17-field complete-report contract and separately audits scheduled slots, archives, and exact delivery receipts;
+- Push uses 16 static required sections; multitimeframe, execution-audit, and business-attestation evidence are independent versioned hard gates, with separate slot, archive, and exact-delivery audits;
 - public paths are project-relative or placeholders, migrations default to dry-run and require explicit authorization plus verified backups, and public `ledger_autoheal.py` is permanently read-only;
 - business and alert destinations come only from `OKX_QQ_TARGET` and `OKX_QQ_ALERT_TARGET`; real credentials, destinations, host state, databases, logs, and incident-repair tools are excluded.
 

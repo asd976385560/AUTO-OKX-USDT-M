@@ -1,9 +1,9 @@
 <!--
 doc: push_template
-doc-version: V2.0-template
-last-updated: 2026-08-12
+doc-version: V2.2-template
+last-updated: 2026-08-14
 updated-by: Codex
-change-summary: 2026-08-12T20:00 起新增版本化三周期判断段；OPEN/ADD 必须显示 exact 15m/1H/4H、唯一 rank、rank=1 选择与证据 hash，非开仓明确不适用，历史归档仍按原16项基线复核。
+change-summary: 补 07:00 账实成交/业务指纹必填契约与全量不截断不分段外发口径（此前模板落后于 validator）。
 role: 推送 format=3 模板（scripts/push_pipeline.py 纯脚本唯一路径 -> 统一 QQ target + reports/ 归档）
 权威: skill.md §9 + scripts/push_pipeline.py（agents/push.md 仅历史，agent 已删 07-17）
 工具: scripts/build_push_payload.py -> render_push_report.py -> validate_push_format.py -> push_archive.py -> qq_push.py -> system_state_writer.py
@@ -26,7 +26,7 @@ Agent自主裁决 | 摘要
 📊 资产
 🟢 实盘：资金 $X | 累计收益(交易PnL·未扣费) X USDT | N仓
 
-💼 持仓详情（每仓一行；空仓写"空仓"）
+💼 持仓详情（每仓一行；空仓写"空仓"。SL 双口径（2026-08-13）：`SL缓冲(现价)X%|计划距(开仓)Y%`——缓冲=方向感知 mark→SL 距离，随行情变动，≤0 显式标"已到触发边界"，>50% 标值异常；计划距=|sl−开仓均价|/开仓均价，entry 与 SL 冻结故恒定（语义即如此，非 bug）。缓冲不可得（markPx 缺且无 30 分钟内 fresh tick）只显 `计划SL距(开仓)Y%`；无 SL 记录仍显真 `SL未挂`）
 
 🛡 风控  Live组合保证金 当前 X% | 有开单则预计 Y% / 66.6% | 杠杆 Xx/10x | 同侧 X%(观察) | 持仓 N(数量仅观察) | PASS[ | 本单保证金 X%/限15%(已缩量|滑点超限,已入修复队列)]（OPEN/ADD 轮追加，2026-08-08；破限标记优先于缩量）
 
@@ -75,7 +75,7 @@ Agent自主裁决 | 摘要
 | Agent裁决 | `🎯 Agent裁决` | analysis_signals.reasoning + decision_card.agent_judgement |
 | 时间线 | `⏰ 时间线` | 下轮槽位 |
 
-> 权威回读（2026-07-04）：轮次 / 资金 / 累计收益 / N仓 由 `render_push_report.py` 从库权威覆盖 agent 传值（ledger.stage_dispatch / account_snapshots / cum_pnl.py / position_snapshots）；agent 传值仅在 DB stale/不可用时作回退。
+> 权威回读（2026-08-14 校正）：轮次 / 资金 / 累计收益由 `render_push_report.py` 从库覆盖。持仓数通常回读 `position_snapshots`；但 builder 带与报告 cycle 精确一致的 `positions_projected_cycle` 时，render 必须使用同 cycle `live_facts.as_of` 交易前基线加 `(facts.as_of, 构建时点]` 已落账 trades 的投影数组，避免本轮成交后被旧快照覆盖。只补新开/发生变化仓的 mark、SL、保证金与持仓时长，未变化 facts 行保持原样；半开窗避免重复计算 facts 时点成交。
 
 换行硬要求：`line_count >= 18`（`MIN_LINE_COUNT`）且**两个空格结尾的硬换行行 >= 12**（`MIN_HARDBREAK_LINES`）。content 必须保留每个 `\n` 与非空行尾两个空格（QQ Markdown 硬换行）。
 
@@ -83,13 +83,19 @@ Agent自主裁决 | 摘要
 
 > B10 防呆（live/demo 资金相同即疑似误填）已随 2026-08-06 demo 全量下线从 `validate_push_format.py` 移除——推送只剩实盘一个资金槽，无从混淆。
 
-## 4. 17 项必含与 emoji 锚点
+## 4. 16 项必含与 emoji 锚点
 
-`validate_push_format.py` 保留 **16 项**静态 `REQUIRED_SECTIONS`，并在 2026-08-12T20:00 边界后追加版本化的三周期判断硬闸，因此当前新报告合计 **17 项**必含。其中 **10 个 emoji 锚点**如下；另 7 项是轮次、耗时、动作、资金、累计收益、BTC、ETH。边界前历史归档仍按原 16 项复核：
+`validate_push_format.py` 当前共有 **16 项** `REQUIRED_SECTIONS`（2026-08-06 模拟盘资产段随 demo 下线删除，17→16）。其中 **9 个 emoji 锚点**如下；另 7 项是轮次、耗时、动作、资金、累计收益、BTC、ETH：
 
-`📊 资产` / `🟢 实盘` / `💼 持仓详情` / `🛡 风控` / `🌍 行情` / `🎯 Agent裁决` / `🧩 三周期判断` / `🧭 六项决策卡` / `📚 历史经验` / `⏰ 时间线`
+`📊 资产` / `🟢 实盘` / `💼 持仓详情` / `🛡 风控` / `🌍 行情` / `🎯 Agent裁决` / `🧭 六项决策卡` / `📚 历史经验` / `⏰ 时间线`
 
 `⚙️ 执行` 与 `⚠️ 异常` 仍是固定 render 骨架，但不冒充当前 `REQUIRED_SECTIONS`。摘要行**必含市场实质**（价格/信号/动作理由至少其一）；**禁**流程性空话。异常段数字取本轮实测，**禁**照抄上一轮。
+
+`2026-08-14T02:15`（北京时间）为执行审计契约边界。该 cycle 起，只有 executor 成功返回精确 `ADJUST_PROTECTION`、受支持 path、完整尺寸和最终保护回读，才可展示 ADJUST；执行段必须写 `no_fill`、`path=`、`sz=`、SL/TP、`algoId=`、`readback=verified`、`protection_only=true`。显式 ERROR/DEGRADED 业务终态仅在 trades=0、orders=0 且 intent 为空或 pristine `failed_clean` 时可报告，执行段必须写 `no_fill orders=0 exchange_side_effect=none reason=...`。unknown/partial/submitted/completed 一律失败关闭。边界前历史归档不反向加责、不补推；无业务周期行的上游 `failure_report` 仍按其独立 `2026-08-13T04:00` 边界处理。
+
+`2026-08-14T07:00`（北京时间）为业务指纹契约边界。该 cycle 起，`⚙️ 执行` 段必须**可见**地写出本轮账实成交计数与业务指纹：`账实成交=<N>笔 | 业务指纹=<64位十六进制>`（`validate_push_format` 按 `账实成交=\d+笔` 与 `业务指纹=[0-9a-f]{64}` 硬校验，缺任一即 exit 1、禁止外发）。指纹由 builder 对交易终态与逐笔成交生成，`push_pipeline` 在归档前与外发前各重读一次权威库比对；迟到成交、活跃租约或终态漂移一律失败关闭。上游失败报告走同一边界的缺席指纹口径。
+
+`2026-08-14`（主人拍板）起**推送正文不再有任何字数压缩或段内截断**：render 全量输出（无压缩版/最小化版回退，无"…详情见归档/推送过长"尾标），`qq_push` 整条单发不做本地分段——超长消息由 QQ 侧自行分段展示。归档仍在外发之前完成硬检。
 
 三周期段采用独立的版本化硬校验，不塞进静态 `REQUIRED_SECTIONS`：新 OPEN/ADD 必须只有 15m/1H/4H 三行、rank 恰为 1/2/3、选择指向相同方向的 rank=1、精确时点为 UTC `Z` 时间、显示实际开仓完整 `instId`、方法明确为非概率，并携带完整 64 位 `evidence_hash`；缺失或结构不一致即 exit 1、禁止外发。render 还会先用共享决策卡契约重验 cycle、实际开仓 symbol、选择方法、校准许可及证据 hash，自洽文本不能绕过结构校验。
 
@@ -145,7 +151,7 @@ pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\s
 
 | 校验项 | 由谁 | 失败行为 |
 |---|---|---|
-| 新报告 17 项必含（16 项 REQUIRED_SECTIONS + 边界后版本化三周期段）+ 换行结构 | `scripts/validate_push_format.py --file <render 产物> --cycle-id <cycle>` | exit 1/2，**不外发**，写 repair_queue |
+| 16 项 REQUIRED_SECTIONS + 换行结构 + 边界后版本化三周期段 | `scripts/validate_push_format.py --file <render 产物> --cycle-id <cycle>` | exit 1/2，**不外发**，写 repair_queue |
 | format=4 / 旧口径字样（基准/累计收益率%/→现值/session_return_pct） | 同上（DEPRECATED_PATTERNS，7 项） | WARN（提示重组） |
 | ~~双盘 equity 误填（B10）~~ | 已随 2026-08-06 demo 下线从校验器移除 | — |
 | 归档真伪（header/📊/≥300B） | `scripts/push_archive.py`（rc=2） | 禁外发，回 render 重走 |

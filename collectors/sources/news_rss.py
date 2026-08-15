@@ -28,11 +28,12 @@ import time
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
@@ -47,6 +48,10 @@ if hasattr(sys.stdout, "reconfigure"):
 CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) OKX-V2-RSS/1.0"
+RSS_COLD_RETRY_DELAY_SECONDS = 5.0
+RSS_COLD_RETRY_TIMEOUT_SECONDS = 8.0
+RSS_COLD_RETRY_WORKERS = 2
+RSS_MAX_RECOVERY_WAVES = 2  # normal alternate-transport wave + one cold wave
 
 DEFAULT_FEEDS = [
     ("Cointelegraph", "https://cointelegraph.com/rss"),
@@ -247,6 +252,100 @@ def _fetch_official_publisher_fallback(
     ) from last_error
 
 
+def _fetch_cold_feed_once(
+    result: dict,
+    max_age_hours: int,
+    *,
+    timeout: float,
+) -> list[dict]:
+    """One new-client request to the same canonical publisher endpoint."""
+    text = _fetch_text_httpx(
+        str(result["endpoint"]),
+        timeout=float(timeout),
+        headers={
+            "User-Agent": UA,
+            "Accept": "application/rss+xml, application/xml, */*",
+        },
+    )
+    return _parse_feed(str(result["name"]), text, max_age_hours)
+
+
+def _cold_retry_failed_feeds(
+    results: list[dict],
+    max_age_hours: int,
+    *,
+    delay: float = RSS_COLD_RETRY_DELAY_SECONDS,
+    timeout: float = RSS_COLD_RETRY_TIMEOUT_SECONDS,
+    workers: int = RSS_COLD_RETRY_WORKERS,
+) -> None:
+    """Retry only the exact final-failure set after one shared cool-down.
+
+    Every task uses ``_fetch_text_httpx``, which creates and closes an
+    independent client.  There is one request per remaining publisher, no
+    loop, no alternate publisher, and no historical-cycle capability.
+    """
+    failed_indexes = [
+        index for index, result in enumerate(results)
+        if result.get("status") == "failed"
+    ]
+    if not failed_indexes:
+        return
+    time.sleep(max(0.0, float(delay)))
+    maximum_workers = max(1, min(int(workers), len(failed_indexes)))
+    outcomes: dict[int, tuple[list[dict] | None, Exception | None]] = {}
+    with ThreadPoolExecutor(max_workers=maximum_workers) as executor:
+        futures = {
+            executor.submit(
+                _fetch_cold_feed_once,
+                results[index],
+                max_age_hours,
+                timeout=float(timeout),
+            ): index
+            for index in failed_indexes
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                outcomes[index] = (future.result(), None)
+            except Exception as exc:  # noqa: BLE001 - per-publisher isolation
+                outcomes[index] = (None, exc)
+
+    for index in failed_indexes:
+        result = results[index]
+        parsed, error = outcomes[index]
+        prior_transport_attempts = int(result.get("transport_attempts") or 0)
+        pre_cold_error = str(result.get("err") or "")[:150]
+        result.update({
+            "attempts": 3,
+            "cold_retry_requested": True,
+            "cold_retry_wave": 1,
+            "cold_retry_delay_seconds": float(delay),
+            "cold_retry_timeout_seconds": float(timeout),
+            "cold_retry_workers": maximum_workers,
+            "transport_attempts": prior_transport_attempts + 1,
+            "historical_retry": False,
+            "unbounded_retry": False,
+            "pre_cold_error": pre_cold_error or None,
+        })
+        if error is None:
+            result.update({
+                "status": "ok",
+                "items": parsed or [],
+                "recovered_after_retry": True,
+                "recovered_after_cold_retry": True,
+                "transport": "httpx_cold_new_client",
+            })
+            result.pop("err", None)
+        else:
+            result["cold_retry_error"] = (
+                f"{type(error).__name__}: {error}"
+            )[:150]
+            result["err"] = (
+                f"hot={pre_cold_error[:70] or 'unknown'}; "
+                f"cold={type(error).__name__}: {error}"
+            )[:150]
+
+
 def _extract_symbols(title: str) -> list[str]:
     found = []
     for m in _COIN_RE.finditer(title or ""):
@@ -392,7 +491,25 @@ def fetch_rss_items(feeds=None, max_age_hours: int = 24,
                     )
                 else:
                     detail = f"{type(retry_error).__name__}: {retry_error}"
-                result.update({"attempts": 2, "err": detail[:150]})
+                result.update({
+                    "attempts": 2,
+                    "transport_attempts": (
+                        6 if result["endpoint"] in
+                        OFFICIAL_PUBLISHER_FALLBACKS else 4
+                    ),
+                    "err": detail[:150],
+                })
+
+    # A simultaneous proxy/TLS break can defeat every immediate transport.
+    # Give only that exact final-failure set one delayed, low-concurrency,
+    # new-client wave within the same collection run.
+    _cold_retry_failed_feeds(
+        results,
+        max_age_hours,
+        delay=RSS_COLD_RETRY_DELAY_SECONDS,
+        timeout=RSS_COLD_RETRY_TIMEOUT_SECONDS,
+        workers=RSS_COLD_RETRY_WORKERS,
+    )
 
     for result in results:
         parsed = result.pop("items")
@@ -421,9 +538,12 @@ def collect(db_path: str, max_age_hours: int = 24, apply: bool = False) -> dict:
     err_txt = "; ".join(fetch_errs)[:150] if fetch_errs else None
     retry_recovered = sum(
         1 for row in outcomes if row.get("recovered_after_retry"))
+    cold_retry_recovered = sum(
+        1 for row in outcomes if row.get("recovered_after_cold_retry"))
     if not apply:
         out = {"ok": True, "dry_run": True, "fetched": len(items),
                "subsources": outcomes, "retry_recovered": retry_recovered,
+               "cold_retry_recovered": cold_retry_recovered,
                "sample": [{"t": it["title"][:70], "et": it["event_time"],
                            "sym": it["symbols"], "sev": it["severity"]}
                           for it in items[:8]]}
@@ -434,6 +554,7 @@ def collect(db_path: str, max_age_hours: int = 24, apply: bool = False) -> dict:
     res["fetched"] = len(items)
     res["subsources"] = outcomes
     res["retry_recovered"] = retry_recovered
+    res["cold_retry_recovered"] = cold_retry_recovered
     if err_txt and not res.get("err"):
         res["err"] = err_txt
     return res

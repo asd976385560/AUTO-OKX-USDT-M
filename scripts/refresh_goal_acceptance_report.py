@@ -11,8 +11,20 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import _acceptance_thresholds as thresholds
+
 
 CST = timezone(timedelta(hours=8))
+
+
+def _coverage_target_pct(now: datetime | None = None) -> str:
+    """当前生效的完善率/完整度闸门（预注册激活边界解析，四族同一数值）。"""
+    return f"{thresholds.coverage_target_rate(now or datetime.now(CST)):.0%}"
+
+
+def _credibility_target_pct(now: datetime | None = None) -> str:
+    """当前生效的前向校准门（预注册激活边界解析；点精度与 Wilson 同值）。"""
+    return f"{thresholds.shadow_target_precision(now or datetime.now(CST)):.0%}"
 CONTRACT_DIRECT_METHODS = {
     "rubik_common_bucket",
     "official_public_oi_trades_candle_reconciled_fallback",
@@ -220,6 +232,7 @@ def refresh_report_completeness(
     valid = int(audit["valid"])
     rate = float(audit["completeness_rate"])
     target = float(audit["target_rate"])
+    target_pct = f"{target:.0%}"
     invalid = int(audit.get("invalid", expected - valid))
     if (
         expected <= 0
@@ -634,7 +647,7 @@ def refresh_report_completeness(
         "filters": [
             f"Push为{push_start}至{push_end}共{push_expected}个计划槽",
             f"日报为{start}至{end}共{expected}份",
-            "Push归档与精确送达、日报各自独立达到99%",
+            f"Push归档与精确送达、日报各自独立达到{target_pct}",
             "不补推历史缺槽",
         ],
     })
@@ -762,7 +775,7 @@ def refresh_report_completeness(
         (
             "日报基线窗口已按canonical validator复核；Push改按完整计划槽"
             f"重建后，报告完整{push_report_complete}/{push_expected}、精确"
-            f"送达{push_exact_complete}/{push_expected}，整体未达99%。"
+            f"送达{push_exact_complete}/{push_expected}，整体未达{target_pct}。"
         ),
         body,
     )
@@ -776,9 +789,9 @@ def refresh_report_completeness(
     reports_block = _one(blocks, "id", "reports_section")
     reports_block["body"] = (
         (
-            "## 日报与Push三个独立门均达到99%\n\n"
+            f"## 日报与Push三个独立门均达到{target_pct}\n\n"
             if passed else
-            "## 日报已达99%，Push严格计划槽完整度仍未达标\n\n"
+            f"## 日报已达{target_pct}，Push严格计划槽完整度仍未达标\n\n"
         )
         + f"Push窗口 {push_start} 至 {push_end} 应有{push_expected}槽，"
         f"生产归档经独立复验完整{push_report_complete}槽（"
@@ -792,7 +805,7 @@ def refresh_report_completeness(
         + (
             "前向门已通过。"
             if forward_passed else
-            "不足96槽或未达99%，不得替代长期门。"
+            f"不足96槽或未达{target_pct}，不得替代长期门。"
         )
         + "报告修订仍要求dry-run、隔离"
         "副本、备份与人工重发评审。"
@@ -804,10 +817,11 @@ def refresh_report_completeness(
             "报告与推送完整度三个独立门均达到硬门槛；"
             if passed else
             "日报完整率已达标，但Push报告和精确送达按完整计划槽均未达到"
-            "99%，所以报告与推送总体门仍未通过；"
+            f"{target_pct}，所以报告与推送总体门仍未通过；"
         )
         + "全市场影子判断、增强版时间点"
-        "校准及冻结模型未来前向评估链均已落地。90%可信度仍明确未达，"
+        f"校准及冻结模型未来前向评估链均已落地。{_credibility_target_pct()}"
+        "可信度仍明确未达，"
         "4H逐币99%和当日三次自然调度的+50%吞吐仍需由后续真实调度"
         "证据验收。只有其余硬门槛分别被独立证据满足后，才允许提交真实"
         "交易扩容评审。"
@@ -841,6 +855,7 @@ def refresh_source_health(
     forward_rate = float(forward["complete_rate"])
     forward_available_rate = float(forward["available_rate"])
     target = float(audit["target_rate"])
+    target_pct = f"{target:.0%}"
     if (
         expected <= 0
         or not 0 <= observed <= expected
@@ -988,7 +1003,8 @@ def refresh_source_health(
         "status": "达标" if audit["overall_status"] == "PASSED" else "未达标",
         "next_gate": (
             "08:00自然快照验证BRKB/SHOP闭合4H后逐币覆盖；fast修复后前向"
-            f"至少{forward['minimum_slots']}槽且≥99%，14日滚动窗也须≥99%"
+            f"至少{forward['minimum_slots']}槽且≥{target_pct}，"
+            f"14日滚动窗也须≥{target_pct}"
         ),
     })
 
@@ -1023,7 +1039,7 @@ def refresh_source_health(
             {"field": "forward_available_rate", "label": "前向运行可用率", "format": "percent"},
             {"field": "forward_expected_slots", "label": "前向槽数", "format": "number"},
             {"field": "forward_status", "label": "前向状态", "type": "text"},
-            {"field": "status", "label": "整体99%", "type": "text"},
+            {"field": "status", "label": f"整体{target_pct}", "type": "text"},
         ],
         "defaultSort": {"field": "complete_rate", "direction": "asc"},
         "layout": "full",
@@ -1069,7 +1085,8 @@ def refresh_source_health(
     )
     data_block = _one(blocks, "id", "data_section")
     data_block["body"] = (
-        "## 官方行情主域已更新，逐币4H与历史计划槽仍待99%\n\n"
+        f"## 官方行情主域已更新，逐币4H仍待99%、"
+        f"历史计划槽仍待{target_pct}\n\n"
         "Ticker、合约元数据、15m及资金费/OI逐币覆盖均为100%；1H为"
         f"99.063%，4H为{per_symbol_min:.3%}。BRKB与SHOP当前各有33根4H，"
         "MACD需要34根且只允许已收盘K线，最早由08:00自然快照验收；其余"
@@ -1094,7 +1111,8 @@ def refresh_source_health(
             "报告与推送完整度总体门仍未通过；"
         )
         + "全市场影子判断、冻结模型未来"
-        "前向评估和fast计划槽双窗审计均已落地。90%可信度仍明确未达，"
+        f"前向评估和fast计划槽双窗审计均已落地。{_credibility_target_pct()}"
+        "可信度仍明确未达，"
         "fast 14日可用率、4H逐币99%和当日三次自然调度的+50%吞吐仍需"
         "分别由后续真实调度证据验收。只有其余硬门槛独立满足后，才允许"
         "提交真实交易扩容评审。"
@@ -2119,6 +2137,7 @@ def refresh_news_source_health(
     if not rows:
         raise ValueError("news-source audit has no source rows")
     target = float(audit["target_rate"])
+    target_pct = f"{target:.0%}"
     if not 0 < target <= 1:
         raise ValueError("news-source target invalid")
     source_ids = [str(item.get("source") or "") for item in rows]
@@ -2258,7 +2277,7 @@ def refresh_news_source_health(
             ],
             "metric_definitions": [
                 "严格完整率=status ok的应运行槽/全部应运行槽",
-                "可用率=(ok+degraded)/全部应运行槽，仅作诊断不替代99%门槛",
+                f"可用率=(ok+degraded)/全部应运行槽，仅作诊断不替代{target_pct}门槛",
             ],
         },
     })
@@ -2311,7 +2330,7 @@ def refresh_news_source_health(
             {"field": "expected_slots", "label": "应运行槽", "format": "number"},
             {"field": "strict_complete_rate", "label": "严格完整率", "format": "percent"},
             {"field": "available_rate", "label": "可用率", "format": "percent"},
-            {"field": "status", "label": "24h/99%闸门", "type": "text"},
+            {"field": "status", "label": f"24h/{target_pct}闸门", "type": "text"},
         ],
         "defaultSort": {"field": "source", "direction": "asc"},
         "layout": "full",
@@ -2359,7 +2378,7 @@ def refresh_news_source_health(
             f"{child_complete}/{child_expected}；全部已启用确定性新闻源合计"
             f"{all_complete}/{all_expected}。关键源子状态为"
             f"{forward['critical_status']}，总体状态为{forward['all_sources_status']}，"
-            f"仍须至少{audit['minimum_window_hours']}小时后才可判定99%。"
+            f"仍须至少{audit['minimum_window_hours']}小时后才可判定{target_pct}。"
             f"其中尚未到应运行时点的低频源仍按各自计划槽和24小时最小分母"
             f"验收，不能用当前零槽提前判定。{panews_text}"
         ),
@@ -2381,9 +2400,154 @@ def refresh_news_source_health(
     gate["status"] = "未达标"
     gate["next_gate"] = (
         "4H与fast继续独立验收；全部已启用确定性新闻源至少观察24小时，"
-        "每源严格完整率均须>=99%，关键源状态仅作子指标"
+        f"每源严格完整率均须>={target_pct}，关键源状态仅作子指标"
     )
     return artifact
+
+
+POSITIONING_BATCH_PRIMARY_KEY = (
+    "cycle_id", "symbol", "timeframe", "source",
+)
+POSITIONING_HOURLY_FORWARD_START = "2026-08-13T03:00:00+08:00"
+POSITIONING_AVAILABILITY_FORWARD_START = "2026-08-13T03:00:00+08:00"
+POSITIONING_HOURLY_MINIMUM_SLOTS = 24
+POSITIONING_AVAILABILITY_MINIMUM_SLOTS = 96
+
+
+def _validate_positioning_forward_window(
+    window: dict,
+    *,
+    label: str,
+    expected_start: str,
+    expected_schedule_minutes: int,
+    expected_minimum_slots: int,
+    target: float,
+) -> dict:
+    if not isinstance(window, dict):
+        raise ValueError(f"positioning {label} window missing")
+    if (
+        str(window.get("start_cst")) != expected_start
+        or int(window.get("schedule_minutes", -1)) != expected_schedule_minutes
+        or int(window.get("minimum_slots", -1)) != expected_minimum_slots
+        or not math.isclose(
+            float(window.get("target_rate", -1)), target,
+            rel_tol=0.0, abs_tol=1.0e-12,
+        )
+    ):
+        raise ValueError(f"positioning {label} governance changed")
+    slots = list(window.get("slots") or [])
+    expected_slots = int(window.get("expected_slots", -1))
+    if expected_slots != len(slots):
+        raise ValueError(f"positioning {label} slot count disagrees")
+    passed_slots = 0
+    expected_symbol_rows = 0
+    valid_symbol_rows = 0
+    official_passed = 0
+    for slot in slots:
+        denominator = int(slot.get("expected_symbols", -1))
+        valid = int(slot.get("valid_symbols", -1))
+        coverage = float(slot.get("coverage_rate", -1))
+        official = slot.get("official_instrument_snapshot")
+        if (
+            not isinstance(official, dict)
+            or denominator <= 0
+            or not 0 <= valid <= denominator
+            or not math.isclose(
+                coverage, valid / denominator,
+                rel_tol=0.0, abs_tol=1.0e-6,
+            )
+        ):
+            raise ValueError(f"positioning {label} slot values disagree")
+        official_ok = str(official.get("status")) == "PASSED"
+        metadata_rate = float(official.get("metadata_coverage_rate", 0.0))
+        slot_passed = bool(
+            official_ok
+            and metadata_rate >= target
+            and not list(slot.get("batch_reasons") or [])
+            and coverage >= target
+            and int(slot.get("invalid_row_count", 0)) == 0
+            and not list(slot.get("duplicate_symbols") or [])
+            and not list(slot.get("extra_symbols") or [])
+        )
+        expected_slot_status = "PASSED" if slot_passed else "NOT_MET"
+        if str(slot.get("status")) != expected_slot_status:
+            raise ValueError(f"positioning {label} slot status disagrees")
+        passed_slots += int(slot_passed)
+        expected_symbol_rows += denominator
+        valid_symbol_rows += valid
+        official_passed += int(official_ok)
+    slot_rate = passed_slots / expected_slots if expected_slots else 0.0
+    symbol_rate = (
+        valid_symbol_rows / expected_symbol_rows
+        if expected_symbol_rows else 0.0
+    )
+    official_rate = (
+        official_passed / expected_slots if expected_slots else 0.0
+    )
+    reported = {
+        "passed_slots": int(window.get("passed_slots", -1)),
+        "expected_symbol_rows": int(window.get("expected_symbol_rows", -1)),
+        "valid_symbol_rows": int(window.get("valid_symbol_rows", -1)),
+    }
+    expected_counts = {
+        "passed_slots": passed_slots,
+        "expected_symbol_rows": expected_symbol_rows,
+        "valid_symbol_rows": valid_symbol_rows,
+    }
+    if reported != expected_counts:
+        raise ValueError(f"positioning {label} aggregate counts disagree")
+    for field, value in (
+        ("slot_pass_rate", slot_rate),
+        ("symbol_coverage_rate", symbol_rate),
+        ("official_snapshot_slot_rate", official_rate),
+    ):
+        if not math.isclose(
+            float(window.get(field, -1)), value,
+            rel_tol=0.0, abs_tol=1.0e-6,
+        ):
+            raise ValueError(f"positioning {label} {field} disagrees")
+    requirements = {
+        "minimum_slots_met": expected_slots >= expected_minimum_slots,
+        "slot_pass_rate_at_least_target": slot_rate >= target,
+        "symbol_coverage_rate_at_least_target": symbol_rate >= target,
+        "official_snapshot_slot_rate_at_least_target": official_rate >= target,
+    }
+    if window.get("requirements") != requirements:
+        raise ValueError(f"positioning {label} requirements disagree")
+    expected_status = (
+        "INSUFFICIENT_EVIDENCE"
+        if not requirements["minimum_slots_met"]
+        else "PASSED"
+        if all(requirements.values())
+        else "NOT_MET"
+    )
+    if str(window.get("status")) != expected_status:
+        raise ValueError(f"positioning {label} status disagrees")
+    return {
+        "start_cst": expected_start,
+        "expected_slots": expected_slots,
+        "passed_slots": passed_slots,
+        "minimum_slots": expected_minimum_slots,
+        "slot_pass_rate": slot_rate,
+        "symbol_coverage_rate": symbol_rate,
+        "official_snapshot_slot_rate": official_rate,
+        "status": expected_status,
+    }
+
+
+def _missing_positioning_window(
+    *, start: str, minimum_slots: int,
+) -> dict:
+    return {
+        "start_cst": start,
+        "expected_slots": 0,
+        "passed_slots": 0,
+        "minimum_slots": minimum_slots,
+        "slot_pass_rate": 0.0,
+        "symbol_coverage_rate": 0.0,
+        "official_snapshot_slot_rate": 0.0,
+        "status": "NOT_PROVIDED",
+    }
 
 
 def refresh_positioning_coverage(
@@ -2394,7 +2558,7 @@ def refresh_positioning_coverage(
     natural_relative_path: str,
     isolated_relative_path: str,
 ) -> dict:
-    """Add isolated and natural full-universe official positioning evidence."""
+    """Add latest, immutable-batch and forward-window positioning evidence."""
     for audit in (natural_audit, isolated_audit):
         if audit.get("artifact_type") != "positioning_coverage_audit":
             raise ValueError("unexpected positioning audit")
@@ -2403,8 +2567,134 @@ def refresh_positioning_coverage(
     natural_rate = float(natural_audit["coverage_rate"])
     isolated_rate = float(isolated_audit["coverage_rate"])
     target = float(natural_audit["minimum_rate"])
+    target_pct = f"{target:.0%}"
     if not 0 <= natural_rate <= 1 or not 0 <= isolated_rate <= 1:
         raise ValueError("invalid positioning coverage rate")
+    natural_valid = int(natural_audit["valid_symbols"])
+    natural_universe = int(natural_audit["universe_symbols"])
+    isolated_valid = int(isolated_audit["valid_symbols"])
+    isolated_universe = int(isolated_audit["universe_symbols"])
+    if (
+        natural_universe <= 0
+        or isolated_universe <= 0
+        or not 0 <= natural_valid <= natural_universe
+        or not 0 <= isolated_valid <= isolated_universe
+        or not math.isclose(
+            natural_rate, natural_valid / natural_universe,
+            rel_tol=0.0, abs_tol=1.0e-6,
+        )
+        or not math.isclose(
+            isolated_rate, isolated_valid / isolated_universe,
+            rel_tol=0.0, abs_tol=1.0e-6,
+        )
+    ):
+        raise ValueError("positioning counts and rates disagree")
+    natural_expected_status = (
+        "PASSED"
+        if (
+            natural_rate >= target
+            and not list(natural_audit.get("invalid_rows") or [])
+            and not list(natural_audit.get("duplicate_symbols") or [])
+            and not list(natural_audit.get("extra_symbols") or [])
+        )
+        else "NOT_MET"
+    )
+    isolated_expected_status = (
+        "PASSED"
+        if (
+            isolated_rate >= target
+            and not list(isolated_audit.get("invalid_rows") or [])
+            and not list(isolated_audit.get("duplicate_symbols") or [])
+            and not list(isolated_audit.get("extra_symbols") or [])
+        )
+        else "NOT_MET"
+    )
+    if (
+        str(natural_audit.get("status")) != natural_expected_status
+        or str(isolated_audit.get("status")) != isolated_expected_status
+    ):
+        raise ValueError("positioning latest status disagrees")
+    safety_fields = {
+        "mode", "production_database_writes",
+        "production_threshold_change_allowed", "orders_placed",
+    }
+    if safety_fields & set(natural_audit):
+        if (
+            str(natural_audit.get("mode")) != "read_only"
+            or int(natural_audit.get("production_database_writes", -1)) != 0
+            or bool(natural_audit.get(
+                "production_threshold_change_allowed", True))
+            or int(natural_audit.get("orders_placed", -1)) != 0
+        ):
+            raise ValueError("positioning audit safety flags invalid")
+
+    storage = natural_audit.get("storage_contract")
+    if isinstance(storage, dict):
+        expected_key = list(POSITIONING_BATCH_PRIMARY_KEY)
+        storage_passed = bool(
+            storage.get("expected_primary_key") == expected_key
+            and storage.get("actual_primary_key") == expected_key
+            and bool(storage.get(
+                "cross_cycle_upstream_ts_reuse_supported", False))
+            and str(storage.get("status")) == "PASSED"
+        )
+        if str(storage.get("status")) == "PASSED" and not storage_passed:
+            raise ValueError("positioning storage contract status disagrees")
+    else:
+        storage_passed = False
+
+    hourly_raw = natural_audit.get("forward_after_remediation")
+    hourly = (
+        _validate_positioning_forward_window(
+            hourly_raw,
+            label="hourly",
+            expected_start=POSITIONING_HOURLY_FORWARD_START,
+            expected_schedule_minutes=60,
+            expected_minimum_slots=POSITIONING_HOURLY_MINIMUM_SLOTS,
+            target=target,
+        )
+        if isinstance(hourly_raw, dict)
+        else _missing_positioning_window(
+            start=POSITIONING_HOURLY_FORWARD_START,
+            minimum_slots=POSITIONING_HOURLY_MINIMUM_SLOTS,
+        )
+    )
+    availability_raw = natural_audit.get("decision_availability_forward")
+    availability = (
+        _validate_positioning_forward_window(
+            availability_raw,
+            label="availability",
+            expected_start=POSITIONING_AVAILABILITY_FORWARD_START,
+            expected_schedule_minutes=15,
+            expected_minimum_slots=POSITIONING_AVAILABILITY_MINIMUM_SLOTS,
+            target=target,
+        )
+        if isinstance(availability_raw, dict)
+        else _missing_positioning_window(
+            start=POSITIONING_AVAILABILITY_FORWARD_START,
+            minimum_slots=POSITIONING_AVAILABILITY_MINIMUM_SLOTS,
+        )
+    )
+    latest_passed = natural_expected_status == "PASSED"
+    if isinstance(hourly_raw, dict) and isinstance(availability_raw, dict):
+        if not storage_passed:
+            expected_overall = "NOT_MET"
+        elif "INSUFFICIENT_EVIDENCE" in {
+            hourly["status"], availability["status"],
+        }:
+            expected_overall = "PENDING_FORWARD_EVIDENCE"
+        elif (
+            latest_passed
+            and hourly["status"] == "PASSED"
+            and availability["status"] == "PASSED"
+        ):
+            expected_overall = "PASSED"
+        else:
+            expected_overall = "NOT_MET"
+        if str(natural_audit.get("overall_status")) != expected_overall:
+            raise ValueError("positioning overall status disagrees")
+    else:
+        expected_overall = "NOT_MET"
 
     manifest = artifact["manifest"]
     _advance_report_generated_at(
@@ -2413,7 +2703,7 @@ def refresh_positioning_coverage(
     sources = manifest["sources"]
     natural_source = _upsert_id(sources, "positioning_coverage")
     natural_source.update({
-        "label": "官方REST全宇宙持仓倾向自然生产覆盖审计",
+        "label": "官方REST持仓倾向不可覆盖批次与双前向审计",
         "path": natural_relative_path,
         "query": {
             "engine": "SQLite read-only exact-batch audit",
@@ -2423,12 +2713,14 @@ def refresh_positioning_coverage(
                 "AND timeframe='1H' AND collected_ts=? ORDER BY symbol"
             ),
             "description": (
-                "以最新ticker交易宇宙为分母，对最新自然生产批次逐币校验"
-                "缺失、重复、比例代数和来源时间。"
+                "以最新ticker交易宇宙为分母，先验证cycle级不可覆盖主键，"
+                "再对最新自然批次、24个整点批次窗和96个15分钟决策"
+                "可用性窗逐币校验缺失、重复、比例代数和真实来源时间。"
             ),
             "executed_at": natural_audit["generated_at_utc"],
             "tables_used": [
                 "market.db.tick_snapshots",
+                "market.db.official_instrument_snapshot_runs/rows",
                 "market.db.market_positioning",
                 natural_relative_path,
             ],
@@ -2436,10 +2728,13 @@ def refresh_positioning_coverage(
                 "最新USDT线性SWAP ticker宇宙",
                 "source=okx_rest_contract_long_short_ratio",
                 "timeframe=1H且精确collected_ts批次",
+                "批次主键=cycle_id+symbol+timeframe+source",
+                "小时与15分钟窗均从2026-08-13 03:00 +08:00重新累计",
             ],
             "metric_definitions": [
                 "覆盖率=无重复且比例合法的宇宙内symbol/最新ticker宇宙",
                 "long/short为账户数占比，不是持仓名义金额",
+                "最终验收=最新批次、存储契约、24整点窗、96决策槽均通过",
             ],
         },
     })
@@ -2480,12 +2775,15 @@ def refresh_positioning_coverage(
     coverage_row = _upsert_key(
         datasets["coverage"], "data_family", "official_positioning_1H")
     coverage_row.update({
-        "valid_symbols": int(natural_audit["valid_symbols"]),
-        "universe": int(natural_audit["universe_symbols"]),
+        "valid_symbols": natural_valid,
+        "universe": natural_universe,
         "coverage_rate": natural_rate,
         "target_rate": target,
         "gap_to_target_pp": round((natural_rate - target) * 100, 3),
         "status": "达标" if natural_rate >= target else "未达标",
+        "acceptance_status": (
+            "达标" if expected_overall == "PASSED" else "未达标"),
+        "overall_status": expected_overall,
     })
     datasets["positioning_coverage"] = [
         {
@@ -2496,6 +2794,10 @@ def refresh_positioning_coverage(
             "coverage_rate": isolated_rate,
             "missing": ", ".join(isolated_audit["missing_symbols"]) or "无",
             "status": isolated_audit["status"],
+            "storage_contract_status": "N/A",
+            "hourly_forward_status": "N/A",
+            "availability_forward_status": "N/A",
+            "overall_status": "ISOLATED_ONLY",
         },
         {
             "evidence": "最新自然生产批次",
@@ -2505,6 +2807,15 @@ def refresh_positioning_coverage(
             "coverage_rate": natural_rate,
             "missing": ", ".join(natural_audit["missing_symbols"]) or "无",
             "status": natural_audit["status"],
+            "storage_contract_status": (
+                "PASSED" if storage_passed else "NOT_MET"),
+            "hourly_forward_slots": hourly["expected_slots"],
+            "hourly_forward_minimum_slots": hourly["minimum_slots"],
+            "hourly_forward_status": hourly["status"],
+            "availability_forward_slots": availability["expected_slots"],
+            "availability_forward_minimum_slots": availability["minimum_slots"],
+            "availability_forward_status": availability["status"],
+            "overall_status": expected_overall,
         },
     ]
     headline = datasets["headline"][0]
@@ -2513,12 +2824,25 @@ def refresh_positioning_coverage(
         "positioning_valid_symbols": int(natural_audit["valid_symbols"]),
         "positioning_universe_symbols": int(natural_audit["universe_symbols"]),
         "positioning_missing_symbols": len(natural_audit["missing_symbols"]),
+        "positioning_storage_contract_status": (
+            "PASSED" if storage_passed else "NOT_MET"),
+        "positioning_hourly_forward_expected_slots": hourly["expected_slots"],
+        "positioning_hourly_forward_minimum_slots": hourly["minimum_slots"],
+        "positioning_hourly_forward_status": hourly["status"],
+        "positioning_availability_forward_expected_slots": (
+            availability["expected_slots"]),
+        "positioning_availability_forward_minimum_slots": (
+            availability["minimum_slots"]),
+        "positioning_availability_forward_status": availability["status"],
+        "positioning_overall_status": expected_overall,
     })
 
     table = _upsert_id(manifest["tables"], "positioning_coverage_table")
     table.update({
-        "title": "官方REST持仓倾向：隔离与自然生产证据",
-        "subtitle": "隔离成功不替代自然批次；自然批次按精确collected_ts计数。",
+        "title": "官方REST持仓倾向：隔离、自然批次与长期验收",
+        "subtitle": (
+            "隔离成功不替代自然证据；最新批次达标也不替代"
+            "24个整点与96个决策槽。"),
         "dataset": "positioning_coverage",
         "sourceId": "positioning_coverage",
         "density": "dense",
@@ -2529,7 +2853,11 @@ def refresh_positioning_coverage(
             {"field": "universe_symbols", "label": "宇宙", "format": "number"},
             {"field": "coverage_rate", "label": "覆盖率", "format": "percent"},
             {"field": "missing", "label": "缺失", "type": "text"},
-            {"field": "status", "label": "99%验收", "type": "text"},
+            {"field": "status", "label": "最新批次", "type": "text"},
+            {"field": "storage_contract_status", "label": "批次键", "type": "text"},
+            {"field": "hourly_forward_status", "label": "24整点窗", "type": "text"},
+            {"field": "availability_forward_status", "label": "96决策槽", "type": "text"},
+            {"field": "overall_status", "label": "总体", "type": "text"},
         ],
         "defaultSort": {"field": "evidence", "direction": "asc"},
         "layout": "full",
@@ -2557,7 +2885,8 @@ def refresh_positioning_coverage(
         blocks.insert(insert_at, positioning_block)
     coverage_chart = _one(manifest["charts"], "id", "coverage_chart")
     coverage_chart["subtitle"] = (
-        "官方持仓倾向最新自然批次已过99%；4H新上市标的历史仍待成熟。"
+        f"官方持仓倾向最新自然批次已过{target_pct}，双前向窗仍按自然时间累计；"
+        "4H新上市标的历史仍待成熟。"
     )
 
     per_symbol_min = min(
@@ -2575,29 +2904,50 @@ def refresh_positioning_coverage(
         "current": (
             f"官方1H持仓倾向自然批次 {natural_rate:.3%}"
             f"（{natural_audit['valid_symbols']}/{natural_audit['universe_symbols']}，"
-            f"缺{len(natural_audit['missing_symbols'])}币）；4H逐币 "
+            f"缺{len(natural_audit['missing_symbols'])}币），批次键"
+            f"{'通过' if storage_passed else '未通过'}，小时前向"
+            f"{hourly['expected_slots']}/{hourly['minimum_slots']}槽"
+            f"（{hourly['status']}），15分钟可用性前向"
+            f"{availability['expected_slots']}/{availability['minimum_slots']}槽"
+            f"（{availability['status']}）；4H逐币 "
             f"{per_symbol_min:.3%}；{fast_text}"
         ),
         "status": "未达标",
         "next_gate": (
-            "后续自然快照复核4H逐币覆盖；持仓倾向继续观察自然整点批次；"
-            "fast前向至少96槽且14日滚动窗均须>=99%"
+            "持仓倾向从2026-08-13 03:00重新累计24个整点批次和96个"
+            f"15分钟决策槽，三项率均须>={target_pct}；同时复核4H逐币覆盖，"
+            f"fast前向至少96槽且14日滚动窗均须>={target_pct}"
         ),
     })
     data_block = _one(blocks, "id", "data_section")
     missing_text = ", ".join(natural_audit["missing_symbols"]) or "无"
+    one_hour_rate = next(
+        (float(row["coverage_rate"]) for row in datasets["coverage"]
+         if str(row.get("data_family")) == "1H"),
+        0.0,
+    )
+    four_hour_rate = next(
+        (float(row["coverage_rate"]) for row in datasets["coverage"]
+         if str(row.get("data_family")) == "4H"),
+        per_symbol_min,
+    )
     data_block["body"] = (
-        "## 官方持仓倾向已覆盖全宇宙，4H与历史计划槽仍待99%\n\n"
+        f"## 持仓倾向最新批次已达{target_pct}，不可覆盖批次键已生效，"
+        "双前向窗仍待成熟\n\n"
         "Ticker、合约元数据、15m及资金费/OI逐币覆盖均为100%；"
-        f"1H为99.063%，4H为{per_symbol_min:.3%}。官方Trading Statistics "
+        f"1H为{one_hour_rate:.3%}，4H为{four_hour_rate:.3%}。"
+        "官方Trading Statistics "
         "REST已独立于100币盘口集合，按最新全部USDT线性SWAP采1H账户"
         f"多空比：隔离验收{isolated_audit['valid_symbols']}/"
         f"{isolated_audit['universe_symbols']}，最新自然生产批次"
         f"{natural_audit['valid_symbols']}/{natural_audit['universe_symbols']}="
-        f"{natural_rate:.3%}，达到99%但不冒充100%；精确批次缺失为"
-        f"{missing_text}，没有人工补写。公共REST主域为openapi.okx.com，"
-        "旧域只在原请求总预算内有界回退。BRKB与SHOP的4H闭合历史由"
-        "后续自然快照验收；fast长期与前向计划槽仍分别核验。"
+        f"{natural_rate:.3%}；精确批次缺失为{missing_text}。旧主键造成的"
+        "历史缺行没有人工补写，小时批次完整性与15分钟决策可用性均从"
+        f"03:00重新累计，当前分别为{hourly['expected_slots']}/"
+        f"{hourly['minimum_slots']}槽和{availability['expected_slots']}/"
+        f"{availability['minimum_slots']}槽，总体状态{expected_overall}。"
+        "公共REST主域为openapi.okx.com，旧域只在原请求总预算内有界回退；"
+        "4H闭合历史、fast长期与前向计划槽继续独立验收。"
     )
     return artifact
 
@@ -2940,6 +3290,15 @@ def refresh_multitimeframe_coverage(
     positioning = next(
         (row for row in datasets["coverage"]
          if row.get("data_family") == "official_positioning_1H"), None)
+    positioning_headline = datasets["headline"][0]
+    positioning_window_text = (
+        f"，批次键{positioning_headline.get('positioning_storage_contract_status', 'NOT_MET')}，"
+        f"小时前向{positioning_headline.get('positioning_hourly_forward_expected_slots', 0)}/"
+        f"{positioning_headline.get('positioning_hourly_forward_minimum_slots', 24)}槽，"
+        f"15分钟可用性{positioning_headline.get('positioning_availability_forward_expected_slots', 0)}/"
+        f"{positioning_headline.get('positioning_availability_forward_minimum_slots', 96)}槽，"
+        f"总体{positioning_headline.get('positioning_overall_status', 'NOT_MET')}"
+    )
     gate = _one(datasets["gates"], "goal", "关键数据完善率")
     current_parts = [
         "已收盘原始OHLCV " + "、".join(
@@ -2951,7 +3310,9 @@ def refresh_multitimeframe_coverage(
     ]
     if positioning:
         current_parts.append(
-            f"官方1H持仓倾向 {float(positioning['coverage_rate']):.3%}")
+            f"官方1H持仓倾向最新批次 "
+            f"{float(positioning['coverage_rate']):.3%}"
+            f"{positioning_window_text}")
     if contract:
         current_parts.append(
             f"15m合约OI/主动买卖量最新直采 "
@@ -2975,6 +3336,7 @@ def refresh_multitimeframe_coverage(
                 "等待新区4H指标自然成熟；"
             )
             + "fast前向至少96槽且14日滚动窗>=99%；"
+            "持仓倾向至少24个整点与96个决策槽均>=99%；"
             "合约统计最新直采和至少96个前向槽均>=99%；"
             "新闻关键源完成24小时严格前向验收"),
     })
@@ -3008,9 +3370,10 @@ def refresh_multitimeframe_coverage(
     supporting_parts: list[str] = []
     if positioning:
         supporting_parts.append(
-            "官方1H持仓倾向"
+            "官方1H持仓倾向最新批次"
             f"{int(positioning['valid_symbols'])}/{int(positioning['universe'])}="
             f"{float(positioning['coverage_rate']):.3%}"
+            f"{positioning_window_text}"
         )
     if contract:
         supporting_parts.append(
@@ -3361,17 +3724,6 @@ def refresh_contract_statistics_coverage(
     source = "okx_rest_contract_oi_taker_15m"
     if natural_audit.get("source") != source or isolated_audit.get("source") != source:
         raise ValueError("unexpected contract-statistics source")
-    isolated_result = isolated_audit["audit"]
-    # Validate the structural contract before ancillary provenance fields so a
-    # malformed split reports the actionable root cause deterministically.
-    natural_split = _validated_contract_coverage_split(
-        natural_audit, label="natural")
-    isolated_split = _validated_contract_coverage_split(
-        isolated_result, label="isolated")
-    _require_contract_quarter_cycle(
-        natural_audit["latest_cycle_id"], label="natural")
-    _require_contract_quarter_cycle(
-        isolated_audit["cycle_id"], label="isolated")
     for label, evidence in (
         ("natural", natural_audit), ("isolated", isolated_audit),
     ):
@@ -3381,6 +3733,15 @@ def refresh_contract_statistics_coverage(
         ):
             raise ValueError(
                 f"{label} contract-statistics evidence is not read-only")
+    isolated_result = isolated_audit["audit"]
+    natural_split = _validated_contract_coverage_split(
+        natural_audit, label="natural")
+    isolated_split = _validated_contract_coverage_split(
+        isolated_result, label="isolated")
+    _require_contract_quarter_cycle(
+        natural_audit["latest_cycle_id"], label="natural")
+    _require_contract_quarter_cycle(
+        isolated_audit["cycle_id"], label="isolated")
     natural_rate = float(natural_split["coverage"])
     isolated_rate = float(isolated_split["coverage"])
     natural_direct_rate = float(natural_split["direct_rate"])
@@ -4027,15 +4388,15 @@ def refresh_contract_statistics_coverage(
     coverage_chart = _one(manifest["charts"], "id", "coverage_chart")
     coverage_chart.update({
         "subtitle": (
-            "官方1H持仓倾向与最新15m合约OI/主动买卖量模型可用直采均已过"
+            "官方1H持仓倾向最新批次与最新15m合约OI/主动买卖量模型可用直采均已过"
             f"99%；后者计划槽前向直采{forward_direct_rate:.3%}、"
             f"{forward_expected}/{forward_minimum}槽，最新与长期门均已通过。"
             if contract_gate_passed else
-            "官方1H持仓倾向与最新15m合约OI/主动买卖量模型可用直采均已过"
+            "官方1H持仓倾向最新批次与最新15m合约OI/主动买卖量模型可用直采均已过"
             f"99%；后者计划槽前向直采{forward_direct_rate:.3%}，仅"
             f"{forward_expected}/{forward_minimum}槽，仍未通过长期门。"
             if latest_passed else
-            f"官方1H持仓倾向已过99%；{latest_cycle_label}最新15m合约"
+            f"官方1H持仓倾向最新批次已过99%（双前向窗另验）；{latest_cycle_label}最新15m合约"
             f"OI/主动买卖量运行可用性{natural_rate:.3%}，但模型可用"
             f"直采仅{natural_direct_rate:.3%}，低于99%。"
         ),
@@ -4044,13 +4405,23 @@ def refresh_contract_statistics_coverage(
 
     positioning = _one(
         datasets["coverage"], "data_family", "official_positioning_1H")
+    positioning_headline = datasets["headline"][0]
+    positioning_window_text = (
+        f"，批次键{positioning_headline.get('positioning_storage_contract_status', 'NOT_MET')}，"
+        f"小时前向{positioning_headline.get('positioning_hourly_forward_expected_slots', 0)}/"
+        f"{positioning_headline.get('positioning_hourly_forward_minimum_slots', 24)}槽，"
+        f"15分钟可用性{positioning_headline.get('positioning_availability_forward_expected_slots', 0)}/"
+        f"{positioning_headline.get('positioning_availability_forward_minimum_slots', 96)}槽，"
+        f"总体{positioning_headline.get('positioning_overall_status', 'NOT_MET')}"
+    )
     coverage_4h = _one(datasets["coverage"], "data_family", "4H")
     fast = (datasets.get("fast_source_health") or [{}])[0]
     gate = _one(datasets["gates"], "goal", "关键数据完善率")
     gate.update({
         "current": (
-            f"官方1H持仓倾向 {positioning['coverage_rate']:.3%}"
-            f"（{positioning['valid_symbols']}/{positioning['universe']}）；"
+            f"官方1H持仓倾向最新批次 {positioning['coverage_rate']:.3%}"
+            f"（{positioning['valid_symbols']}/{positioning['universe']}）"
+            f"{positioning_window_text}；"
             f"15m合约OI/主动买卖量模型可用直采 {natural_direct_rate:.3%}"
             f"（{natural_split['direct']}/{natural_split['universe']}）；"
             f"运行可用性 {natural_rate:.3%}、合规续用 "
@@ -4065,7 +4436,8 @@ def refresh_contract_statistics_coverage(
         ),
         "status": "未达标",
         "next_gate": (
-            "后续自然快照复核4H逐币覆盖；合约统计直采与计划槽均至少96槽；"
+            "后续自然快照复核4H逐币覆盖；持仓倾向24整点与96决策槽均达99%；"
+            "合约统计直采与计划槽均至少96槽；"
             "fast前向至少96槽且14日滚动窗均须>=99%"
         ),
     })
@@ -4097,14 +4469,15 @@ def refresh_contract_statistics_coverage(
         if contract_gate_passed else
         "## 最新15m合约直采过99%，但严格前向窗尚未完成"
         if latest_passed else
-        "## 官方1H持仓倾向通过，最新15m合约模型可用直采低于99%"
+        "## 官方1H持仓倾向最新批次通过，双前向窗另验；最新15m合约模型可用直采低于99%"
     )
     data_block = _one(blocks, "id", "data_section")
     data_block["body"] = (
         contract_heading + "\n\n"
         "Ticker、合约元数据、15m及资金费/OI逐币覆盖均为100%；"
-        f"官方1H账户多空比自然批次{positioning['valid_symbols']}/"
-        f"{positioning['universe']}={positioning['coverage_rate']:.3%}。"
+        f"官方1H账户多空比最新自然批次{positioning['valid_symbols']}/"
+        f"{positioning['universe']}={positioning['coverage_rate']:.3%}"
+        f"{positioning_window_text}。"
         "新增官方15m合约持仓量与主动买卖量不再与盘口并发争抢网络："
         f"{failed_text}改为基础快采后串行执行并保留一次有界失败重试，"
         f"{historical_full_text}{latest_cycle_label}最新自然周期严格有效"
@@ -4532,6 +4905,17 @@ def refresh_overall_narrative(artifact: dict) -> dict:
     positioning_evidence = (
         (datasets.get("positioning_coverage") or [{}, {}])[-1]
     )
+    positioning_overall_status = str(
+        headline.get("positioning_overall_status", "NOT_MET"))
+    positioning_gate_passed = positioning_overall_status == "PASSED"
+    positioning_window_text = (
+        f"批次键{headline.get('positioning_storage_contract_status', 'NOT_MET')}，"
+        f"小时前向{headline.get('positioning_hourly_forward_expected_slots', 0)}/"
+        f"{headline.get('positioning_hourly_forward_minimum_slots', 24)}槽，"
+        f"15分钟可用性{headline.get('positioning_availability_forward_expected_slots', 0)}/"
+        f"{headline.get('positioning_availability_forward_minimum_slots', 96)}槽，"
+        f"总体{positioning_overall_status}"
+    )
     latest_contract_passed = bool(
         contract
         and float(contract["coverage_rate"])
@@ -4583,7 +4967,8 @@ def refresh_overall_narrative(artifact: dict) -> dict:
         f"{headline['signals_plus_50_target']:.2f}条。官方REST账户多空比"
         f"{positioning_evidence.get('cycle', '最新')}自然批次"
         f"{positioning['valid_symbols']}/{positioning['universe']}="
-        f"{positioning['coverage_rate']:.3%}；{contract_text}"
+        f"{positioning['coverage_rate']:.3%}，{positioning_window_text}；"
+        f"{contract_text}"
         f"资产分类有行率{headline.get('asset_class_row_coverage_rate', 0):.3%}、"
         f"官方兼容率{headline.get('asset_class_official_compatibility_rate', 0):.3%}；"
         f"日报{report_row['numerator']}/{report_row['denominator']}通过；Push报告"
@@ -4629,11 +5014,19 @@ def refresh_overall_narrative(artifact: dict) -> dict:
     gates["body"] = (
         "## 未通过的硬门槛仍需自然时间证据\n\n"
         + (
-            "报告与推送完整度三个独立门均达到99%；"
+            f"报告与推送完整度三个独立门均达到{_coverage_target_pct()}；"
             if report_gate_passed else
-            "日报已达到99%，但Push报告与精确送达按完整计划槽仍未达到99%；"
+            f"日报已达到{_coverage_target_pct()}，但Push报告与精确送达按"
+            f"完整计划槽仍未达到{_coverage_target_pct()}；"
         )
-        + "官方1H持仓倾向已达到99%；"
+        + (
+            "官方1H持仓倾向最新批次、不可覆盖批次键、24整点窗与96决策槽"
+            f"均达到{_coverage_target_pct()}；"
+            if positioning_gate_passed else
+            f"官方1H持仓倾向最新批次已达到{_coverage_target_pct()}，"
+            "但24整点窗与96决策槽"
+            f"总体仍为{positioning_overall_status}；"
+        )
         + (
             "官方15m合约OI/主动买卖量最新直采与96槽前向均达到99%，"
             if contract_gate_passed else
@@ -4645,12 +5038,14 @@ def refresh_overall_narrative(artifact: dict) -> dict:
             if multitimeframe_ready else
             "4H全指标就绪率仍未达99%；"
         )
-        + f"fast 14日长期窗口仍未达99%，当日判断量为"
+        + f"fast 14日长期窗口仍未达{_coverage_target_pct()}，当日判断量为"
         f"{observed_snapshots}/3自然周期、{observed_records}/{throughput_target}条"
         + ("，该吞吐硬门已达标；" if throughput_met else "，该吞吐硬门未达标；")
-        + "分析可信度也远低于90%。新闻子源虽已逐发布方记账，严格前向窗"
-        "尚不足24小时。下一步只观察后续自然日吞吐、至少96个"
-        "fast与合约统计前向槽、新闻24小时前向槽，并在新合约统计积累出足够历史后"
+        + f"分析可信度也远低于{_credibility_target_pct()}。"
+        "新闻子源虽已逐发布方记账，严格前向窗"
+        "尚不足24小时。下一步只观察后续自然日吞吐、持仓倾向24整点与"
+        "96决策槽、至少96个fast与合约统计前向槽、新闻24小时前向槽，"
+        "并在新合约统计积累出足够历史后"
         "预注册新的独立未来模型验收。任何一步失败都不扩大真实交易。"
     )
     methods = _one(blocks, "id", "methods")
@@ -4728,7 +5123,8 @@ def refresh_overall_narrative(artifact: dict) -> dict:
             "96个前向槽后，fast长期窗口是否仍受历史缺口拖累？合约统计"
             "最新直采率、前向直采符号行率和逐槽通过率能否同时保持99%？"
             "新闻关键父源"
-            "和六个RSS发布方在24小时后能否各自保持99%严格完整率？"
+            f"和六个RSS发布方在24小时后能否各自保持"
+            f"{_coverage_target_pct()}严格完整率？"
             + (
                 f"当日三个自然周期已累计{observed_records}条并达到"
                 f"{throughput_target}条吞吐目标，后续日是否能持续保持？"
@@ -4737,7 +5133,7 @@ def refresh_overall_narrative(artifact: dict) -> dict:
                 f"{throughput_target}条？"
             )
             + "新合约OI和主动买卖量积累后，预注册模型在"
-            "完全独立未来窗能否同时达到90%"
+            f"完全独立未来窗能否同时达到{_credibility_target_pct()}"
             "精确率、N>=100、>=5天、>=100周期和ECE<=5pp？在这些问题有"
             "肯定证据前，目标保持进行中。"
         ),
@@ -4767,7 +5163,14 @@ def refresh_overall_narrative(artifact: dict) -> dict:
 
 
 def _parse_source_cst(value: str) -> datetime:
-    parsed = datetime.fromisoformat(str(value))
+    # 采集侧工件时间戳混有 UTC-Z 写法（market 三表/cross_market 口径）。Python
+    # 3.11+ 的 fromisoformat 直接吃 'Z'，3.10 会抛 Invalid isoformat string——
+    # 先归一到 '+00:00' 让两侧解析结果完全一致（与 render_push_report._ts_age_minutes
+    # 同写法），语义不变：带 Z 即 UTC，随后仍统一 astimezone 到 UTC+8。
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=CST)
     return parsed.astimezone(CST)
@@ -5091,6 +5494,35 @@ def main(argv=None) -> int:
         ),
         "positioning_status": (
             positioning_result["status"] if positioning_result else None
+        ),
+        "positioning_storage_contract_status": (
+            positioning_result.get("storage_contract", {}).get("status")
+            if positioning_result
+            else None
+        ),
+        "positioning_overall_status": (
+            positioning_result.get("overall_status", "NOT_MET")
+            if positioning_result else None
+        ),
+        "positioning_hourly_forward_slots": (
+            positioning_result.get("forward_after_remediation", {}).get(
+                "expected_slots", 0)
+            if positioning_result else None
+        ),
+        "positioning_hourly_forward_minimum_slots": (
+            positioning_result.get("forward_after_remediation", {}).get(
+                "minimum_slots", POSITIONING_HOURLY_MINIMUM_SLOTS)
+            if positioning_result else None
+        ),
+        "positioning_availability_forward_slots": (
+            positioning_result.get("decision_availability_forward", {}).get(
+                "expected_slots", 0)
+            if positioning_result else None
+        ),
+        "positioning_availability_forward_minimum_slots": (
+            positioning_result.get("decision_availability_forward", {}).get(
+                "minimum_slots", POSITIONING_AVAILABILITY_MINIMUM_SLOTS)
+            if positioning_result else None
         ),
         "selective_status": (
             selective_result["acceptance"]["confidence_90_status"]

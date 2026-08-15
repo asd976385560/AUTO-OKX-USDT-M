@@ -30,7 +30,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import httpx
 
@@ -85,6 +85,7 @@ _PROXY = os.environ.get("OKX_PROXY_URL") or None
 _TIMEOUT = float(os.environ.get("OKX_HTTP_TIMEOUT", "30"))
 _WORKERS = int(os.environ.get("OKX_HTTP_WORKERS", "8"))
 _STATS_WORKERS = int(os.environ.get("OKX_HTTP_STATS_WORKERS", "48"))
+_MIN_TRANSPORT_FALLBACK_SECONDS = 0.5
 # 两个15m合约统计端点会同时启动；各48路会让同一代理瞬时承受约96条
 # TLS请求并产生SSL EOF/整批长尾。隔离A/B在同一427币周期证实各12路可在
 # 30秒内100%直采，因此使用独立并发上限，不影响整点1H持仓倾向端点。
@@ -100,6 +101,12 @@ _CONTRACT_STATS_WORKERS = int(os.environ.get(
 _MIN_INTERVAL = float(os.environ.get("OKX_HTTP_MIN_INTERVAL", "0.11"))
 _ENDPOINT_INTERVAL = {
     "/api/v5/market/candles": float(os.environ.get("OKX_HTTP_CANDLES_INTERVAL", "0.055")),
+    "/api/v5/market/history-mark-price-candles": float(
+        os.environ.get("OKX_HTTP_MARK_HISTORY_INTERVAL", "0.11")
+    ),
+    "/api/v5/market/history-index-candles": float(
+        os.environ.get("OKX_HTTP_INDEX_HISTORY_INTERVAL", "0.22")
+    ),
     "/api/v5/public/funding-rate": float(os.environ.get("OKX_HTTP_FUNDING_INTERVAL", "0.11")),
     # Trading Statistics 的规则是 IP + Instrument ID；每个 symbol 独立限频。
     "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract": float(
@@ -120,8 +127,79 @@ _CONTRACT_STATS_PERIODS = {
     "1Wutc", "1Mutc", "3Mutc",
 }
 
+_MARK_INDEX_HISTORY_BARS = {
+    "1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H",
+    "6H", "12H", "1D", "2D", "3D", "1W", "1M", "3M",
+    "6Hutc", "12Hutc", "1Dutc", "2Dutc", "3Dutc", "1Wutc",
+    "1Mutc", "3Mutc",
+}
+
 _BUCKETS: dict[str, list] = {}
 _BUCKETS_LOCK = threading.Lock()
+
+
+def _history_window_params(
+    begin_ms: int | str | None,
+    end_ms: int | str | None,
+) -> dict[str, str]:
+    """Validate optional OKX history bounds and return request parameters.
+
+    Trading Statistics calls name the chronological lower bound ``begin`` and
+    the upper bound ``end``.  Both are Unix milliseconds.  Keeping validation
+    here prevents a malformed research window from silently becoming an
+    unbounded production request.
+    """
+    normalized: dict[str, int] = {}
+    for name, value in (("begin", begin_ms), ("end", end_ms)):
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise ValueError(f"{name}_ms must be a Unix millisecond integer")
+        try:
+            integer = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name}_ms must be a Unix millisecond integer"
+            ) from exc
+        if integer < 0 or str(value).strip() != str(integer):
+            raise ValueError(f"{name}_ms must be a Unix millisecond integer")
+        normalized[name] = integer
+    if (
+        "begin" in normalized
+        and "end" in normalized
+        and normalized["begin"] >= normalized["end"]
+    ):
+        raise ValueError("begin_ms must be earlier than end_ms")
+    return {name: str(value) for name, value in normalized.items()}
+
+
+def _history_candle_pagination_params(
+    after_ms: int | str | None,
+    before_ms: int | str | None,
+) -> dict[str, str]:
+    """Validate OKX mark/index candle pagination cursors.
+
+    ``after`` asks for records earlier than the cursor and ``before`` asks for
+    records newer than it.  The bounded research fetcher normally supplies
+    only ``after`` and independently filters every returned row to its fixed
+    local time window.
+    """
+    normalized: dict[str, str] = {}
+    for name, value in (("after", after_ms), ("before", before_ms)):
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise ValueError(f"{name}_ms must be a Unix millisecond integer")
+        try:
+            integer = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name}_ms must be a Unix millisecond integer"
+            ) from exc
+        if integer < 0 or str(value).strip() != str(integer):
+            raise ValueError(f"{name}_ms must be a Unix millisecond integer")
+        normalized[name] = str(integer)
+    return normalized
 
 
 def _bucket(path: str) -> list:
@@ -159,32 +237,68 @@ def _client() -> httpx.Client:
 
 
 def _get_data(client: httpx.Client, path: str, params: Optional[dict] = None,
-              retries: int = 2, deadline: float | None = None,
-              throttle_key: str | None = None) -> list:
+               retries: int = 2, deadline: float | None = None,
+               throttle_key: str | None = None,
+               transport_fallback: Callable[
+                   [str, Optional[dict], float], list
+               ] | None = None,
+               transport_fallback_reserve_s: float = 0.0) -> list:
     """GET public data with one shared retry/deadline budget.
 
     Attempts rotate through the configured official domains.  Domain failover
     never adds attempts beyond ``retries + 1`` and never converts an exhausted
     request into usable data, so callers retain their fail-closed semantics.
+    Opt-in callers may reserve part of that same deadline for a transport-only
+    fallback; the reserve never extends the caller's original deadline.
     """
     last: Optional[Exception] = None
+    last_absolute_url: str | None = None
+    normal_deadline = deadline
+    if deadline is not None and transport_fallback is not None:
+        available = max(0.0, deadline - time.monotonic())
+        reserve = min(
+            max(0.0, float(transport_fallback_reserve_s)),
+            max(0.0, available - _MIN_TRANSPORT_FALLBACK_SECONDS),
+        )
+        if reserve >= _MIN_TRANSPORT_FALLBACK_SECONDS:
+            normal_deadline = deadline - reserve
     for i in range(retries + 1):
         if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"okx batch deadline exceeded: {path}")
+        if (
+            normal_deadline is not None
+            and time.monotonic() >= normal_deadline
+        ):
+            if isinstance(last, httpx.TransportError):
+                break
             raise TimeoutError(f"okx batch deadline exceeded: {path}")
         _throttle(path, throttle_key)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"okx batch deadline exceeded: {path}")
+        if (
+            normal_deadline is not None
+            and time.monotonic() >= normal_deadline
+        ):
+            if isinstance(last, httpx.TransportError):
+                break
+            raise TimeoutError(f"okx batch deadline exceeded: {path}")
         try:
             timeout = None
-            if deadline is not None:
-                timeout = max(0.1, min(_TIMEOUT, deadline - time.monotonic()))
-                if timeout <= 0.1 and time.monotonic() >= deadline:
+            if normal_deadline is not None:
+                timeout = max(
+                    0.1,
+                    min(_TIMEOUT, normal_deadline - time.monotonic()),
+                )
+                if timeout <= 0.1 and time.monotonic() >= normal_deadline:
                     raise TimeoutError(f"okx batch deadline exceeded: {path}")
             request_kwargs = {"params": params}
             if timeout is not None:
                 request_kwargs["timeout"] = timeout
             base = _BASE_URLS[i % len(_BASE_URLS)]
-            request_url = f"{base}{path}" if len(_BASE_URLS) > 1 else path
+            last_absolute_url = f"{base}{path}"
+            request_url = (
+                last_absolute_url if len(_BASE_URLS) > 1 else path
+            )
             r = client.get(request_url, **request_kwargs)
             r.raise_for_status()
             j = r.json()
@@ -197,13 +311,38 @@ def _get_data(client: httpx.Client, path: str, params: Optional[dict] = None,
             last = exc
             if i < retries:
                 delay = 0.3 * (i + 1)
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
+                if normal_deadline is not None:
+                    remaining = normal_deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     delay = min(delay, remaining)
                 time.sleep(delay)
-    raise RuntimeError(f"okx GET {path} {params or ''} failed: {last}")
+    # A caller may opt into one alternate TLS stack for the exact final URL.
+    # This is deliberately outside the normal path: only a transport failure
+    # may invoke it, it shares the original deadline, and HTTP/API/JSON errors
+    # remain authoritative failures.
+    if (
+        transport_fallback is not None
+        and isinstance(last, httpx.TransportError)
+        and last_absolute_url is not None
+    ):
+        fallback_timeout = _TIMEOUT
+        if deadline is not None:
+            fallback_timeout = deadline - time.monotonic()
+        if fallback_timeout >= _MIN_TRANSPORT_FALLBACK_SECONDS:
+            try:
+                return transport_fallback(
+                    last_absolute_url,
+                    params,
+                    float(fallback_timeout),
+                )
+            except Exception as fallback_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"okx GET {path} {params or ''} failed across TLS stacks: "
+                    f"httpx={type(last).__name__}: {last}; "
+                    f"fallback={type(fallback_exc).__name__}: {fallback_exc}"
+                ) from fallback_exc
+    raise RuntimeError(f"okx GET {path} {params or ''} failed: {last}") from last
 
 
 def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn,
@@ -256,7 +395,14 @@ def _deadline_from_timeout(timeout_s: float | None) -> float | None:
     return time.monotonic() + max(0.1, float(timeout_s))
 
 
-def fetch_tickers_all_sync(request_timeout_s: float | None = None) -> list[dict]:
+def fetch_tickers_all_sync(
+    request_timeout_s: float | None = None,
+    *,
+    transport_fallback: Callable[
+        [str, Optional[dict], float], list
+    ] | None = None,
+    transport_fallback_reserve_s: float = 0.0,
+) -> list[dict]:
     """所有 SWAP ticker（单次调用返全量）。"""
     with _client() as c:
         return _get_data(
@@ -264,6 +410,8 @@ def fetch_tickers_all_sync(request_timeout_s: float | None = None) -> list[dict]
             "/api/v5/market/tickers",
             {"instType": "SWAP"},
             deadline=_deadline_from_timeout(request_timeout_s),
+            transport_fallback=transport_fallback,
+            transport_fallback_reserve_s=transport_fallback_reserve_s,
         )
 
 
@@ -283,6 +431,82 @@ def fetch_candles_batch_sync(symbols: Sequence[str], bar: str = "1H",
         lambda s: {"instId": s, "bar": bar, "limit": str(limit)},
         lambda data: data,
         batch_timeout_s=batch_timeout_s,
+    )
+
+
+def fetch_mark_price_candles_history_batch_sync(
+    symbols: Sequence[str],
+    bar: str = "1H",
+    limit: int = 100,
+    batch_timeout_s: float | None = None,
+    *,
+    after_ms: int | str | None = None,
+    before_ms: int | str | None = None,
+    request_retries: int = 2,
+    outcomes: dict[str, dict] | None = None,
+) -> dict:
+    """Fetch one bounded page of official mark-price candle history.
+
+    Results keep the caller's SWAP instrument IDs as outer keys and preserve
+    the official ``[ts,o,h,l,c,confirm]`` rows unchanged.
+    """
+    if bar not in _MARK_INDEX_HISTORY_BARS:
+        raise ValueError(f"unsupported mark-price history bar: {bar}")
+    limit = max(1, min(int(limit), 100))
+    pagination = _history_candle_pagination_params(after_ms, before_ms)
+    path = "/api/v5/market/history-mark-price-candles"
+    return _batch(
+        symbols,
+        lambda _symbol: path,
+        lambda symbol: {
+            "instId": symbol,
+            "bar": bar,
+            "limit": str(limit),
+            **pagination,
+        },
+        lambda data: data,
+        batch_timeout_s=batch_timeout_s,
+        workers=max(1, min(16, _WORKERS)),
+        request_retries=request_retries,
+        outcomes=outcomes,
+    )
+
+
+def fetch_index_candles_history_batch_sync(
+    index_ids: Sequence[str],
+    bar: str = "1H",
+    limit: int = 100,
+    batch_timeout_s: float | None = None,
+    *,
+    after_ms: int | str | None = None,
+    before_ms: int | str | None = None,
+    request_retries: int = 2,
+    outcomes: dict[str, dict] | None = None,
+) -> dict:
+    """Fetch one bounded page of official index candle history.
+
+    Callers pass index IDs such as ``BTC-USDT``; results use those same IDs as
+    outer keys and preserve the official candle rows unchanged.
+    """
+    if bar not in _MARK_INDEX_HISTORY_BARS:
+        raise ValueError(f"unsupported index history bar: {bar}")
+    limit = max(1, min(int(limit), 100))
+    pagination = _history_candle_pagination_params(after_ms, before_ms)
+    path = "/api/v5/market/history-index-candles"
+    return _batch(
+        index_ids,
+        lambda _index_id: path,
+        lambda index_id: {
+            "instId": index_id,
+            "bar": bar,
+            "limit": str(limit),
+            **pagination,
+        },
+        lambda data: data,
+        batch_timeout_s=batch_timeout_s,
+        workers=max(1, min(16, _WORKERS)),
+        request_retries=request_retries,
+        outcomes=outcomes,
     )
 
 
@@ -385,6 +609,11 @@ def fetch_contract_long_short_ratios_batch_sync(
     period: str = "1H",
     limit: int = 1,
     batch_timeout_s: float | None = None,
+    *,
+    begin_ms: int | str | None = None,
+    end_ms: int | str | None = None,
+    request_retries: int = 2,
+    outcomes: dict[str, dict] | None = None,
 ) -> dict:
     """官方合约账户多空比，返回 ``{symbol: [[ts, ratio], ...]}``。
 
@@ -394,6 +623,7 @@ def fetch_contract_long_short_ratios_batch_sync(
     if period not in _CONTRACT_STATS_PERIODS:
         raise ValueError(f"unsupported contract statistics period: {period}")
     limit = max(1, min(int(limit), 100))
+    window = _history_window_params(begin_ms, end_ms)
     path = "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract"
     return _batch(
         symbols,
@@ -402,11 +632,14 @@ def fetch_contract_long_short_ratios_batch_sync(
             "instId": symbol,
             "period": period,
             "limit": str(limit),
+            **window,
         },
         lambda data: data,
         batch_timeout_s=batch_timeout_s,
         workers=max(_WORKERS, min(64, _STATS_WORKERS)),
         throttle_key_fn=lambda symbol: symbol,
+        request_retries=request_retries,
+        outcomes=outcomes,
     )
 
 
@@ -416,6 +649,8 @@ def fetch_contract_open_interest_history_batch_sync(
     limit: int = 1,
     batch_timeout_s: float | None = None,
     *,
+    begin_ms: int | str | None = None,
+    end_ms: int | str | None = None,
     request_retries: int = 2,
     outcomes: dict[str, dict] | None = None,
 ) -> dict:
@@ -427,6 +662,7 @@ def fetch_contract_open_interest_history_batch_sync(
     if period not in _CONTRACT_STATS_PERIODS:
         raise ValueError(f"unsupported contract statistics period: {period}")
     limit = max(1, min(int(limit), 100))
+    window = _history_window_params(begin_ms, end_ms)
     path = "/api/v5/rubik/stat/contracts/open-interest-history"
     return _batch(
         symbols,
@@ -435,6 +671,7 @@ def fetch_contract_open_interest_history_batch_sync(
             "instId": symbol,
             "period": period,
             "limit": str(limit),
+            **window,
         },
         lambda data: data,
         batch_timeout_s=batch_timeout_s,
@@ -452,6 +689,8 @@ def fetch_contract_taker_volumes_batch_sync(
     limit: int = 1,
     batch_timeout_s: float | None = None,
     *,
+    begin_ms: int | str | None = None,
+    end_ms: int | str | None = None,
     request_retries: int = 2,
     outcomes: dict[str, dict] | None = None,
 ) -> dict:
@@ -466,6 +705,7 @@ def fetch_contract_taker_volumes_batch_sync(
     if unit not in {"0", "1", "2"}:
         raise ValueError(f"unsupported contract taker volume unit: {unit}")
     limit = max(1, min(int(limit), 100))
+    window = _history_window_params(begin_ms, end_ms)
     path = "/api/v5/rubik/stat/taker-volume-contract"
     return _batch(
         symbols,
@@ -475,6 +715,7 @@ def fetch_contract_taker_volumes_batch_sync(
             "period": period,
             "unit": unit,
             "limit": str(limit),
+            **window,
         },
         lambda data: data,
         batch_timeout_s=batch_timeout_s,

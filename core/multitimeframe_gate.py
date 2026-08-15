@@ -268,6 +268,169 @@ def validate_evidence_contract(
     return errors
 
 
+def load_persisted_analysis_evidence(
+    db_root: str | Path,
+    symbol: str,
+    cycle_id: str,
+) -> dict[str, Any]:
+    """Load the writer-validated OPEN evidence anchor without writing.
+
+    ``analyst_writer`` compares this evidence contract with ``market.db``
+    immediately before committing the signal.  A later collection can revise
+    the same already-closed official candle and therefore recompute indicators.
+    The persisted signal is the immutable hand-off authority for that race; it
+    is never a substitute for the current readiness check.
+    """
+    result: dict[str, Any] = {
+        "status": "NOT_FOUND",
+        "mode": "read_only",
+        "symbol": str(symbol),
+        "cycle_id": str(cycle_id),
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    }
+    analysis_db = Path(db_root) / "analysis.db"
+    if not analysis_db.is_file():
+        result["error"] = "analysis_db_missing"
+        return result
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{analysis_db.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT action,side,decision_card FROM analysis_signals "
+            "WHERE cycle_id=? AND symbol=? LIMIT 1",
+            (str(cycle_id), str(symbol)),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        result["status"] = "UNREADABLE"
+        result["error"] = (
+            f"analysis_db_unreadable:{type(exc).__name__}:{exc}"
+        )
+        return result
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        return result
+    result["action"] = str(row["action"] or "").strip().lower()
+    result["side"] = str(row["side"] or "").strip().lower()
+    if result["action"] not in {"open_long", "open_short"}:
+        result["status"] = "INVALID"
+        result["error"] = "persisted_signal_not_open"
+        return result
+    expected_side = "long" if result["action"] == "open_long" else "short"
+    if result["side"] != expected_side:
+        result["status"] = "INVALID"
+        result["error"] = "persisted_signal_side_mismatch"
+        return result
+    try:
+        card = json.loads(row["decision_card"] or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["status"] = "INVALID"
+        result["error"] = "persisted_decision_card_invalid_json"
+        return result
+    block = card.get("multitimeframe_analysis") \
+        if isinstance(card, dict) else None
+    contract = block.get("evidence_contract") \
+        if isinstance(block, dict) else None
+    errors = validate_evidence_contract(
+        contract,
+        expected_symbol=str(symbol),
+        expected_cycle=str(cycle_id),
+    )
+    if errors:
+        result["status"] = "INVALID"
+        result["error"] = "persisted_evidence_invalid"
+        result["validation_errors"] = errors
+        return result
+    result["status"] = "VALID"
+    result["evidence_contract"] = contract
+    result["evidence_hash"] = contract.get("evidence_hash")
+    return result
+
+
+def resolve_execution_evidence_anchor(
+    db_root: str | Path,
+    symbol: str,
+    cycle_id: str,
+    expected_side: str,
+    supplied_contract: Any,
+    current_contract: Any,
+) -> dict[str, Any]:
+    """Resolve exact-current or post-analysis-revision evidence safely.
+
+    The normal path remains an exact supplied/current match.  A mismatch is
+    accepted only when the supplied contract exactly matches the independently
+    persisted, writer-validated signal for the same cycle and symbol.  Callers
+    must still prove the current three timeframes are ready before invoking
+    this helper.
+    """
+    supplied_errors = validate_evidence_contract(
+        supplied_contract,
+        expected_symbol=str(symbol),
+        expected_cycle=str(cycle_id),
+    )
+    current_errors = validate_evidence_contract(
+        current_contract,
+        expected_symbol=str(symbol),
+        expected_cycle=str(cycle_id),
+    )
+    result: dict[str, Any] = {
+        "ok": False,
+        "mode": "read_only",
+        "symbol": str(symbol),
+        "cycle_id": str(cycle_id),
+        "expected_side": str(expected_side).strip().lower(),
+        "supplied_evidence_hash": (
+            supplied_contract.get("evidence_hash")
+            if isinstance(supplied_contract, dict) else None
+        ),
+        "current_evidence_hash": (
+            current_contract.get("evidence_hash")
+            if isinstance(current_contract, dict) else None
+        ),
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    }
+    if supplied_errors or current_errors:
+        result["reason"] = "invalid_evidence_contract"
+        result["supplied_validation_errors"] = supplied_errors
+        result["current_validation_errors"] = current_errors
+        return result
+    if supplied_contract == current_contract:
+        result.update({
+            "ok": True,
+            "evidence_anchor": "current_market_exact",
+            "post_analysis_market_revision": False,
+        })
+        return result
+    persisted = load_persisted_analysis_evidence(
+        db_root, symbol, cycle_id)
+    result["persisted_status"] = persisted.get("status")
+    result["persisted_evidence_hash"] = persisted.get("evidence_hash")
+    if (
+        persisted.get("status") == "VALID"
+        and persisted.get("side") == str(expected_side).strip().lower()
+        and supplied_contract == persisted.get("evidence_contract")
+    ):
+        result.update({
+            "ok": True,
+            "evidence_anchor": "analysis_db_writer_validated",
+            "post_analysis_market_revision": True,
+        })
+        return result
+    result["reason"] = "supplied_evidence_not_persisted_anchor"
+    result["persisted_side"] = persisted.get("side")
+    if persisted.get("error"):
+        result["persisted_error"] = persisted.get("error")
+    return result
+
+
 def check_multitimeframe_readiness(
     db_root: str | Path,
     symbol: str,

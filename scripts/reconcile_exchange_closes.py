@@ -48,8 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, r"./scripts")
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r".\scripts")
+sys.path.insert(0, r".\collectors")
 from _okxcli import okx_json  # noqa: E402
 import trades_writer  # noqa: E402  （硬化 writer：write_trades / write_experiences / normalize_ts）
 
@@ -59,6 +59,46 @@ SZ_TOL = 1e-6              # 张数比较容差（float 累加误差级）
 CONSUME_WINDOW_MIN = 45    # 账本 close 行 ts ↔ fills 组时间匹配窗口（分钟）
 OPEN_TS_BUFFER_MIN = 10    # fills 检索窗口起点 = 最早 open 行 ts - buffer（fills 常先于落库 ts）
 RAW_FILLS_CAP = 50         # raw 里最多存多少条 fills 明细
+
+
+def _report_business_context(raw, cycle_id):
+    """从原业务终态回执中提取有界的报告上下文。
+
+    交易所保护单可能在 Agent 已落 HOLD/WAIT 终态后成交。对账回收同一
+    cycle 时会重写 ``trade_cycles.raw``；如果只保留超长 raw 的文本前缀，
+    Push 就会丢失同轮 ``decision_card_v1``、Live facts 与组合 IMR。
+
+    这里只保留报告实际消费的已验证字段；特意不携带 live_facts.exchange
+    原始 API 大块，避免多次对账时 raw 无界嵌套增长。
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    context = {}
+    card = raw.get("decision_card")
+    protocol = raw.get("decision_protocol")
+    if isinstance(card, dict) and card:
+        context["decision_card"] = card
+        if protocol:
+            context["decision_protocol"] = protocol
+
+    facts = raw.get("live_facts")
+    if isinstance(facts, dict):
+        report_fact_keys = (
+            "schema_version", "source", "cycle_id", "profile", "status",
+            "as_of", "as_of_ms", "position_truth_verified", "balance",
+            "positions", "errors",
+        )
+        compact_facts = {
+            key: facts[key] for key in report_fact_keys if key in facts
+        }
+        if compact_facts:
+            context["live_facts"] = compact_facts
+
+    if context:
+        context["business_context_preserved"] = True
+        context["business_context_source_cycle_id"] = cycle_id
+    return context
 
 
 def f(v, default=None):
@@ -553,11 +593,19 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
     trades.append(reconcile_trade)
 
     prev_note = (prev["note"] if prev else "") or ""
+    prev_raw_full = None
     prev_raw_obj = None
     if prev and prev["raw"]:
         try:
-            prev_raw_obj = json.loads(prev["raw"]) if len(prev["raw"]) < 20000 else \
-                {"_truncated": prev["raw"][:2000]}
+            parsed = json.loads(prev["raw"])
+            prev_raw_full = parsed if isinstance(parsed, dict) else None
+            prev_raw_obj = (
+                parsed if len(prev["raw"]) < 20000
+                else {
+                    "_truncated": prev["raw"][:2000],
+                    "_original_chars": len(prev["raw"]),
+                }
+            )
         except (json.JSONDecodeError, TypeError):
             prev_raw_obj = {"_unparsed": str(prev["raw"])[:2000]}
 
@@ -581,6 +629,7 @@ def apply_reconcile(db_path, profile, sym, side, ghost_sz, matched, con_ro,
                         "ts": prev["ts"], "note": prev_note[:1000],
                         "raw": prev_raw_obj} if prev else None),
     }
+    raw_obj.update(_report_business_context(prev_raw_full, cycle_id))
 
     data = {
         "cycle_id": cycle_id,
@@ -837,7 +886,7 @@ def classify(profile, by_key, nets, ven):
 def main():
     ap = argparse.ArgumentParser(description="交易所侧/执行后平仓漏落账对账")
     ap.add_argument("--profile", choices=["live"], required=True)
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--apply", action="store_true",
                     help="对精确匹配幽灵经 trades_writer 补 close 行（默认 dry-run 只报告）")
     ap.add_argument("--ordid",

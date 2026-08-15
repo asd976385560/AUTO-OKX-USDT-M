@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-public-scope
-last-updated: 2026-08-12
+last-updated: 2026-08-16
 updated-by: Codex
-change-summary: Record the sanitized live-only runtime synchronization and permanently read-only public recovery boundary.
+change-summary: Record the sanitized 2026-08-15 runtime synchronization, recovery evidence and retained public safety boundary.
 -->
 
 # Public release scope
@@ -12,6 +12,8 @@ This file records the intended V2.0 public synchronization boundary.
 ## Included
 
 - deterministic collectors, writers, risk validation, order execution and dispatcher code;
+- sanitized OKX announcement, official-history, market-feature recovery,
+  complete-cycle SLA and deterministic live-position action tooling;
 - Agent role sources and report templates;
 - `db/schema.sql` without runtime databases;
 - the public-only `scripts/lifecycle.json` and its read-only validator;

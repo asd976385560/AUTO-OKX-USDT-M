@@ -56,13 +56,6 @@ RISK_SLIPPAGE_BUFFER_PCT = 0.0010  # 入场 + SL 触发市价滑点合并预算
 _EPS = 1e-9
 
 
-def _is_finite_number(value: Any) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return False
-
-
 # ---------------------------------------------------------------------------
 # lot_sz 步进取整
 # ---------------------------------------------------------------------------
@@ -80,6 +73,125 @@ def _round_up_to_step(value: float, step: float) -> float:
         return value
     n = math.ceil((value - _EPS) / step)
     return round(n * step, 12)
+
+
+def size_for_target_stop_risk(
+    *,
+    mark_px: float,
+    ct_val: float,
+    lot_sz: float,
+    equity: float,
+    sl_trigger_px: float,
+    target_risk_pct_equity: float,
+    min_order_size: Optional[float] = None,
+) -> dict[str, Any]:
+    """Convert one explicit stop-risk target into deterministic contracts.
+
+    This helper is sizing only; it never approves an order.  The caller must
+    still pass the resulting ``intended_sz`` through :func:`validate` using
+    authoritative execution-time account and market inputs.  Keeping the
+    conversion here prevents Agents/runners from reimplementing the fee,
+    slippage, minimum-notional, and lot-rounding rules.
+    """
+    values = {
+        "mark_px": mark_px,
+        "ct_val": ct_val,
+        "lot_sz": lot_sz,
+        "equity": equity,
+        "sl_trigger_px": sl_trigger_px,
+        "target_risk_pct_equity": target_risk_pct_equity,
+    }
+    normalized: dict[str, float] = {}
+    for name, raw in values.items():
+        if isinstance(raw, bool):
+            return {"ok": False, "error": f"{name}_invalid"}
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return {"ok": False, "error": f"{name}_invalid"}
+        if not math.isfinite(number) or number <= 0:
+            return {"ok": False, "error": f"{name}_invalid"}
+        normalized[name] = number
+
+    target_pct = normalized["target_risk_pct_equity"]
+    if target_pct > MAX_SINGLE_ORDER_RISK_PCT_EQUITY + _EPS:
+        return {
+            "ok": False,
+            "error": "target_risk_pct_exceeds_hard_cap",
+            "target_risk_pct_equity": target_pct,
+            "max_single_order_risk_pct_equity": (
+                MAX_SINGLE_ORDER_RISK_PCT_EQUITY
+            ),
+        }
+
+    mark = normalized["mark_px"]
+    stop = normalized["sl_trigger_px"]
+    contract_value = normalized["ct_val"]
+    lot = normalized["lot_sz"]
+    total_equity = normalized["equity"]
+    stop_distance_pct = abs(stop - mark) / mark
+    if stop_distance_pct > MAX_SL_DEVIATION + _EPS:
+        return {
+            "ok": False,
+            "error": "sl_deviation_exceeds",
+            "stop_distance_pct": stop_distance_pct,
+            "max_sl_deviation": MAX_SL_DEVIATION,
+        }
+
+    per_contract_notional = mark * contract_value
+    risk_distance_pct = (
+        stop_distance_pct + RISK_FEE_BUFFER_PCT + RISK_SLIPPAGE_BUFFER_PCT
+    )
+    per_contract_risk = per_contract_notional * risk_distance_pct
+    target_risk_usdt = total_equity * target_pct
+    intended_sz = _round_down_to_step(target_risk_usdt / per_contract_risk, lot)
+
+    minimum_sz = lot
+    if min_order_size is not None:
+        if isinstance(min_order_size, bool):
+            return {"ok": False, "error": "min_order_size_invalid"}
+        try:
+            normalized_min = float(min_order_size)
+        except (TypeError, ValueError, OverflowError):
+            return {"ok": False, "error": "min_order_size_invalid"}
+        if not math.isfinite(normalized_min) or normalized_min <= 0:
+            return {"ok": False, "error": "min_order_size_invalid"}
+        minimum_sz = max(minimum_sz, _round_up_to_step(normalized_min, lot))
+    min_notional_sz = _round_up_to_step(
+        MIN_NOTIONAL_PCT * total_equity / per_contract_notional,
+        lot,
+    )
+    minimum_sz = max(minimum_sz, min_notional_sz)
+    minimum_risk_usdt = minimum_sz * per_contract_risk
+    if intended_sz + _EPS < minimum_sz:
+        return {
+            "ok": False,
+            "error": "target_risk_below_minimum_order",
+            "target_risk_usdt": target_risk_usdt,
+            "minimum_risk_usdt": minimum_risk_usdt,
+            "minimum_sz": minimum_sz,
+            "min_notional_sz": min_notional_sz,
+        }
+
+    intended_risk_usdt = intended_sz * per_contract_risk
+    return {
+        "ok": True,
+        "intended_sz": intended_sz,
+        "target_risk_pct_equity": target_pct,
+        "target_risk_usdt": target_risk_usdt,
+        "intended_risk_usdt": intended_risk_usdt,
+        "intended_risk_pct_equity": intended_risk_usdt / total_equity,
+        "stop_distance_pct": stop_distance_pct,
+        "risk_distance_pct": risk_distance_pct,
+        "risk_fee_buffer_pct": RISK_FEE_BUFFER_PCT,
+        "risk_slippage_buffer_pct": RISK_SLIPPAGE_BUFFER_PCT,
+        "per_contract_notional": per_contract_notional,
+        "per_contract_risk": per_contract_risk,
+        "lot_sz": lot,
+        "minimum_sz": minimum_sz,
+        "min_notional_sz": min_notional_sz,
+        "max_single_order_risk_pct_equity": MAX_SINGLE_ORDER_RISK_PCT_EQUITY,
+    }
 
 
 def _same_side_notional(open_positions: list[dict[str, Any]], side: str,
@@ -253,31 +365,18 @@ def validate(
     }
 
     # ── 数据完备性（instrument 未知/缺 = 下架或不存在 → 物理无法定仓）──
-    if not _is_finite_number(mark_px) or float(mark_px) <= 0:
+    if mark_px is None or mark_px <= 0:
         return _reject("bad_mark_px", f"mark_px 非法: {mark_px}")
-    mark_px = float(mark_px)
-    if not _is_finite_number(equity) or float(equity) <= 0:
+    if equity is None or equity <= 0:
         return _reject("bad_equity", f"equity 非法: {equity}")
-    if (not _is_finite_number(ct_val) or float(ct_val) <= 0
-            or not _is_finite_number(lot_sz) or float(lot_sz) <= 0):
+    if ct_val is None or ct_val <= 0 or lot_sz is None or lot_sz <= 0:
         return _reject("instrument_unknown",
                        f"{symbol} ctVal/lotSz 缺失（下架/不存在/未缓存）: "
                        f"ctVal={ct_val} lotSz={lot_sz}")
     if side not in ("long", "short"):
         return _reject("bad_side", f"side 非法: {side!r}")
-    if not _is_finite_number(intended_sz) or float(intended_sz) <= 0:
+    if intended_sz is None or intended_sz <= 0:
         return _reject("bad_sz", f"intended_sz 非法: {intended_sz}")
-    equity = float(equity)
-    ct_val = float(ct_val)
-    lot_sz = float(lot_sz)
-    intended_sz = float(intended_sz)
-    math_box.update({
-        "intended_sz": intended_sz,
-        "mark_px": mark_px,
-        "ct_val": ct_val,
-        "lot_sz": lot_sz,
-        "equity": equity,
-    })
     try:
         lev = float(lev)
     except (TypeError, ValueError):

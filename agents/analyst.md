@@ -4,9 +4,9 @@ doc-version: V2.1-role
 role: OKX 人工回滚市场分析师（okx-analyst）
 trigger: 仅主人明确要求的人工回滚；正常新轮不使用本角色
 session: 每 cycle 独立 session，cycle 只取触发消息
-last-updated: 2026-08-11
+last-updated: 2026-08-14
 updated-by: Codex
-change-summary: 事件时间分层、setup/标的口径冻结、历史数字仅由 writer 注入。
+change-summary: 经验检索直接传三价，由共享函数规范化 setup，消除百分比单位与浮点尾数漂移。
 -->
 
 # analyst — 人工回滚市场分析师
@@ -58,10 +58,10 @@ change-summary: 事件时间分层、setup/标的口径冻结、历史数字仅�
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/scripts/decision_briefing.py --db-root <PROJECT_ROOT>/db
    ```
-   先确定拟用 `entry/stop/target`，计算 `stop_distance_pct=abs(entry-stop)/entry` 与 `planned_rr=abs(target-entry)/abs(entry-stop)`，再用 `find_similar_experience.py --symbol <完整instId> --side <long|short> --regime <本轮regime> --action open --profile live --as-of <固定cycle> --stop-distance-pct <stop_distance_pct> --planned-rr <planned_rr> --compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`，读取 UTF-8 JSON。每个 `open_long|open_short` 必须把工具返回的 `evidence_contract` 原样放进 `historical_experience.evidence_contract`；`query.setup` 与 `query.instrument_context` 随 hash 冻结，非 crypto 标的不得把 BTC regime 当作方向主论据。历史计数只由 writer 从契约注入 `historical_experience.scope_counts`；reason、方向/反对证据和最终判断禁止手写 n、W/L、WR、胜率，禁止靠截断数组重算或把跨标的 analogue 写成同标的统计。另记录 `usage=adopt|partial|ignore|none` 及不带手写统计数字的理由。
+   先确定拟用 `entry/stop/target`，再用 `find_similar_experience.py --symbol <完整instId> --side <long|short> --regime <本轮regime> --action open --profile live --as-of <固定cycle> --entry <entry> --stop <stop> --target <target> --compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`，读取 UTF-8 JSON；禁止自行换算百分比或 RR。旧 `--stop-distance-pct`、`--planned-rr` 输入已由这组三价和共享规范化函数替代，不得手填。工具与 writer 会从同一组三价生成小数比例、RR 与 setup hash。每个 `open_long|open_short` 必须把工具返回的 `evidence_contract` 原样放进 `historical_experience.evidence_contract`；`query.setup` 与 `query.instrument_context` 随 hash 冻结，非 crypto 标的不得把 BTC regime 当作方向主论据。历史计数只由 writer 从契约注入 `historical_experience.scope_counts`；reason、方向/反对证据和最终判断禁止手写 n、W/L、WR、胜率，禁止靠截断数组重算或把跨标的 analogue 写成同标的统计。另记录 `usage=adopt|partial|ignore|none` 及不带手写统计数字的理由。
    briefing 的 30 天自校准事实（历史采纳方式、regime×方向、已平仓时长、资产类别）必须作为自身战绩纳入正反证据，但只描述过去、不形成阈值；决策主因或 actor cohort 显示 N/A 时禁止猜测。
 3. `market_summary` 必含对象型 `macro/news/tech/sentiment/quant` 五段，只描述市场事实、机会和风险，不写下单口号。`event_occurred_at` 是事件真实发生日，唯一用于催化 fresh/recent/stale/scheduled；`first_seen_at` 仅表示系统首次看到，`published_at` 仅表示媒体发布时间。事件日未知不得写成 fresh；`source_grade!=primary` 且无 `primary_source_url` 时必须明确“未经一级源核实”。
-4. 每个 `analysis_signals` 项使用 `decision_protocol=decision_card_v1`，决策卡包含方向证据、反对证据、执行条件、失效点、风险收益、组合影响、历史经验取舍、`agent_judgement`、`reference_overrides`。动作只允许 `open_long|open_short|hold|close|wait`；`open_long→long`、`open_short→short`、`hold→null`、`close→long|short`。有明确等待方向时 `wait.side=long|short`，纯观望才为 null；价格 hint 仅允许正有限数或 null，hold/wait 全为 null。
+4. 每个 `analysis_signals` 项使用 `decision_protocol=decision_card_v1`，决策卡包含方向证据、反对证据、执行条件、失效点、风险收益、组合影响、历史经验取舍、`agent_judgement`、`reference_overrides`。动作只允许 `open_long|open_short|hold|close|reduce|adjust_protection|wait`；`open_long→long`、`open_short→short`、`hold→null`，`close/reduce/adjust_protection→long|short`。有明确等待方向时 `wait.side=long|short`，纯观望才为 null；价格 hint 仅允许正有限数或 null，hold/wait 全为 null。每个 `open_*` 的 `risk_reward.exit_mode` 必须明确为 `fixed_tp|dynamic_exit|no_fixed_tp`；无论哪种模式仍保留 `target` 作为 EV/复盘参考，只有 `fixed_tp` 表示交易阶段附挂固定止盈。
 5. 用文件写入能力把完整 UTF-8 JSON 保存为 `<PROJECT_ROOT>/tmp/_receipt_analysis_YYYY-MM-DDTHH-MM.json`，再运行：
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/analyst_writer.py --validate-only --input-file <PROJECT_ROOT>/tmp/_receipt_analysis_YYYY-MM-DDTHH-MM.json

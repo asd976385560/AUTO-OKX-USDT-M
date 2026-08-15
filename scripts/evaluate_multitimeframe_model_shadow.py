@@ -21,14 +21,25 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+import _acceptance_thresholds as thresholds
 import offline_multitimeframe_calibration as calibration
 
 
 UTC = timezone.utc
 HORIZON_MINUTES = {"15m": 15, "1H": 60, "4H": 240}
+CANDIDATE_MODEL_KEYS = tuple(
+    f"{horizon}_{side}"
+    for horizon in HORIZON_MINUTES
+    for side in ("long", "short")
+)
+CANDIDATE_PROBABILITY_FIELDS = {
+    key: f"candidate_probability_{key}" for key in CANDIDATE_MODEL_KEYS
+}
 LABEL_COLUMNS = (
     "model_id", "model_parameters_sha256", "cycle_id", "symbol", "side",
-    "horizon", "research_probability", "signal_available_at_utc",
+    "horizon", "research_probability", "selected_probability_rank",
+    "selected_margin_rank", "selected_cross_section_size",
+    "signal_available_at_utc",
     "entry_tick_ts_utc", "entry_price", "entry_last", "entry_executable",
     "entry_price_source", "outcome_tick_ts_utc", "outcome_price",
     "outcome_last", "outcome_executable", "outcome_price_source",
@@ -39,10 +50,14 @@ LABEL_COLUMNS = (
     "opposite_side_same_horizon_probability", "selected_vs_opposite_margin",
     "selected_side_horizon_votes", "selected_side_unanimous",
     "selected_side_mean_margin", "selected_side_min_margin",
+    "selected_model", "candidate_probability_count",
+    "selected_is_highest_candidate_probability",
+    *CANDIDATE_PROBABILITY_FIELDS.values(),
     "contract_statistics_available", "contract_statistics_source_ts_utc",
     "contract_statistics_available_at_utc", "contract_oi_log_usd",
     "contract_oi_log_change_15m", "contract_taker_total_log_usd",
     "contract_taker_buy_centered", "contract_oi_taker_interaction",
+    "asset_class",
     "source_file",
 )
 
@@ -79,6 +94,105 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _candidate_probabilities(record: dict[str, Any]) -> dict[str, float | None]:
+    raw = record.get("all_research_probabilities")
+    source = raw if isinstance(raw, dict) else {}
+    output: dict[str, float | None] = {}
+    for key in CANDIDATE_MODEL_KEYS:
+        probability = _optional_float(source.get(key))
+        output[key] = (
+            probability
+            if probability is not None and 0.0 <= probability <= 1.0
+            else None
+        )
+    return output
+
+
+def _highest_candidate_check(
+    selected_model: str | None,
+    selected_probability: float,
+    probabilities: dict[str, float | None],
+) -> bool | None:
+    valid = {
+        key: value for key, value in probabilities.items()
+        if value is not None
+    }
+    if len(valid) != len(CANDIDATE_MODEL_KEYS) or selected_model not in valid:
+        return None
+    return (
+        math.isclose(
+            selected_probability, float(valid[selected_model]),
+            rel_tol=1e-12, abs_tol=1e-12,
+        )
+        and math.isclose(
+            selected_probability, max(float(value) for value in valid.values()),
+            rel_tol=1e-12, abs_tol=1e-12,
+        )
+    )
+
+
+def _selected_cross_section_ranks(
+    records: list[dict[str, Any]],
+) -> dict[int, dict[str, int | None]]:
+    """Rank selected records without using any outcome information.
+
+    Ranks are computed from the complete selected cross-section in one frozen
+    artifact, so they remain stable while 15m/1H/4H outcomes mature at
+    different times.  Deterministic identity fields break exact ties.
+    """
+    eligible: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if record.get("selected_for_forward_evaluation") is not True:
+            continue
+        probability = _optional_float(record.get("research_probability"))
+        symbol = str(record.get("symbol") or "")
+        if probability is None or not 0.0 <= probability <= 1.0 or not symbol:
+            continue
+        ranking = record.get("ranking_diagnostics") or {}
+        eligible.append({
+            "index": index,
+            "probability": probability,
+            "margin": _optional_float(
+                ranking.get("selected_vs_opposite_margin")),
+            "symbol": symbol,
+            "side": str(record.get("side") or ""),
+            "horizon": str(record.get("horizon") or ""),
+        })
+    size = len(eligible)
+    result: dict[int, dict[str, int | None]] = {
+        int(item["index"]): {
+            "selected_probability_rank": None,
+            "selected_margin_rank": None,
+            "selected_cross_section_size": size,
+        }
+        for item in eligible
+    }
+    identity = lambda item: (  # noqa: E731
+        str(item["symbol"]), str(item["side"]),
+        str(item["horizon"]), int(item["index"]),
+    )
+    probability_order = sorted(
+        eligible,
+        key=lambda item: (-float(item["probability"]), *identity(item)),
+    )
+    for rank, item in enumerate(probability_order, start=1):
+        result[int(item["index"])]["selected_probability_rank"] = rank
+    margin_order = sorted(
+        (item for item in eligible if item["margin"] is not None),
+        key=lambda item: (-float(item["margin"]), *identity(item)),
+    )
+    for rank, item in enumerate(margin_order, start=1):
+        result[int(item["index"])]["selected_margin_rank"] = rank
+    return result
 
 
 def _ro(path: Path) -> sqlite3.Connection:
@@ -180,6 +294,9 @@ def _metrics(
     min_sample: int,
     min_days: int,
     min_cycles: int,
+    target_precision: float,
+    min_long_labels: int | None = None,
+    min_short_labels: int | None = None,
 ) -> dict[str, Any]:
     n = len(rows)
     successes = sum(bool(row["after_cost_hit"]) for row in rows)
@@ -191,22 +308,34 @@ def _metrics(
     )
     distinct_cycles = len({str(row["cycle_id"]) for row in rows})
     distinct_days = len({str(row["cycle_id"])[:10] for row in rows})
+    side_counts = Counter(str(row["side"]) for row in rows)
     requirements = {
         "minimum_sample_met": n >= min_sample,
         "minimum_days_met": distinct_days >= min_days,
         "minimum_cycles_met": distinct_cycles >= min_cycles,
-        "precision_at_least_90pct": precision is not None and precision >= 0.90,
-        "wilson_95_low_at_least_90pct": low is not None and low >= 0.90,
+        "precision_at_least_target": (
+            precision is not None and precision >= target_precision),
+        "wilson_95_low_at_least_target": (
+            low is not None and low >= target_precision),
         "ece_at_most_5pp": ece is not None and ece <= 0.05,
         "offline_gate_pass": offline_gate_pass,
     }
-    measurable = all(requirements[key] for key in (
-        "minimum_sample_met", "minimum_days_met", "minimum_cycles_met"
-    ))
+    measurable_keys = [
+        "minimum_sample_met", "minimum_days_met", "minimum_cycles_met",
+    ]
+    if min_long_labels is not None:
+        requirements["minimum_long_labels_met"] = (
+            side_counts.get("long", 0) >= min_long_labels)
+        measurable_keys.append("minimum_long_labels_met")
+    if min_short_labels is not None:
+        requirements["minimum_short_labels_met"] = (
+            side_counts.get("short", 0) >= min_short_labels)
+        measurable_keys.append("minimum_short_labels_met")
+    measurable = all(requirements[key] for key in measurable_keys)
     forward_pass = (
         measurable
-        and requirements["precision_at_least_90pct"]
-        and requirements["wilson_95_low_at_least_90pct"]
+        and requirements["precision_at_least_target"]
+        and requirements["wilson_95_low_at_least_target"]
         and requirements["ece_at_most_5pp"]
     )
     if not measurable:
@@ -224,6 +353,10 @@ def _metrics(
         "wilson_95_low": low,
         "wilson_95_high": high,
         "ece": ece,
+        "mean_research_probability": (
+            sum(float(row["research_probability"]) for row in rows) / n
+            if n else None
+        ),
         "mean_signed_return": (
             sum(float(row["signed_return"]) for row in rows) / n if n else None
         ),
@@ -237,7 +370,7 @@ def _metrics(
         ),
         "distinct_cycles": distinct_cycles,
         "distinct_days": distinct_days,
-        "side_counts": dict(sorted(Counter(str(row["side"]) for row in rows).items())),
+        "side_counts": dict(sorted(side_counts.items())),
         "horizon_counts": dict(sorted(Counter(str(row["horizon"]) for row in rows).items())),
         "requirements": requirements,
         "status": status,
@@ -262,7 +395,43 @@ def _diagnostic_metrics(
     min_sample: int,
     min_days: int,
     min_cycles: int,
+    target_precision: float,
 ) -> dict[str, Any]:
+    by_side = []
+    for side in ("long", "short"):
+        subset = [row for row in rows if row.get("side") == side]
+        by_side.append({
+            "side": side,
+            **_metrics(
+                subset,
+                offline_gate_pass=offline_gate_pass,
+                min_sample=min_sample,
+                min_days=min_days,
+                min_cycles=min_cycles,
+                target_precision=target_precision,
+            ),
+        })
+
+    by_horizon_side = []
+    for horizon in HORIZON_MINUTES:
+        for side in ("long", "short"):
+            subset = [
+                row for row in rows
+                if row.get("horizon") == horizon and row.get("side") == side
+            ]
+            by_horizon_side.append({
+                "horizon": horizon,
+                "side": side,
+                **_metrics(
+                    subset,
+                    offline_gate_pass=offline_gate_pass,
+                    min_sample=min_sample,
+                    min_days=min_days,
+                    min_cycles=min_cycles,
+                    target_precision=target_precision,
+                ),
+            })
+
     with_margin = [
         row for row in rows
         if row.get("selected_vs_opposite_margin") is not None
@@ -281,6 +450,7 @@ def _diagnostic_metrics(
                 min_sample=min_sample,
                 min_days=min_days,
                 min_cycles=min_cycles,
+                target_precision=target_precision,
             ),
         })
 
@@ -298,6 +468,7 @@ def _diagnostic_metrics(
                 min_sample=min_sample,
                 min_days=min_days,
                 min_cycles=min_cycles,
+                target_precision=target_precision,
             ),
         })
 
@@ -319,8 +490,101 @@ def _diagnostic_metrics(
                 min_sample=min_sample,
                 min_days=min_days,
                 min_cycles=min_cycles,
+                target_precision=target_precision,
             ),
         })
+
+    asset_classes = sorted({
+        str(row["asset_class"])
+        for row in rows if row.get("asset_class") is not None
+    })
+    by_asset_class = [{
+        "asset_class": asset_class,
+        **_metrics(
+            [row for row in rows if row.get("asset_class") == asset_class],
+            offline_gate_pass=offline_gate_pass,
+            min_sample=min_sample,
+            min_days=min_days,
+            min_cycles=min_cycles,
+            target_precision=target_precision,
+        ),
+    } for asset_class in asset_classes]
+
+    by_selected_model = [{
+        "selected_model": model_key,
+        **_metrics(
+            [row for row in rows if row.get("selected_model") == model_key],
+            offline_gate_pass=offline_gate_pass,
+            min_sample=min_sample,
+            min_days=min_days,
+            min_cycles=min_cycles,
+            target_precision=target_precision,
+        ),
+    } for model_key in CANDIDATE_MODEL_KEYS]
+
+    candidate_vector_rows = [
+        row for row in rows
+        if row.get("candidate_probability_count") == len(CANDIDATE_MODEL_KEYS)
+    ]
+    highest_check_rows = [
+        row for row in rows
+        if row.get("selected_is_highest_candidate_probability") is not None
+    ]
+    highest_check_passes = sum(
+        row["selected_is_highest_candidate_probability"] is True
+        for row in highest_check_rows
+    )
+
+    def concentration(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        counts = Counter(str(row["symbol"]) for row in subset)
+        total = len(subset)
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return {
+            "n_selected": total,
+            "distinct_symbols": len(counts),
+            "maximum_symbol_share": (
+                ranked[0][1] / total if total and ranked else None),
+            "symbol_selection_hhi": (
+                sum((count / total) ** 2 for count in counts.values())
+                if total else None
+            ),
+            "top_symbols_by_selection_count": [{
+                "symbol": symbol,
+                "selection_count": count,
+                "selection_share": count / total,
+                **_metrics(
+                    [row for row in subset if str(row["symbol"]) == symbol],
+                    offline_gate_pass=offline_gate_pass,
+                    min_sample=min_sample,
+                    min_days=min_days,
+                    min_cycles=min_cycles,
+                    target_precision=target_precision,
+                ),
+            } for symbol, count in ranked[:10]],
+        }
+
+    def top_k_metrics(rank_field: str) -> list[dict[str, Any]]:
+        output = []
+        for top_k in (1, 3, 5, 10):
+            subset = [
+                row for row in rows
+                if row.get(rank_field) is not None
+                and int(row[rank_field]) <= top_k
+            ]
+            output.append({
+                "top_k": top_k,
+                "rank_field": rank_field,
+                **_metrics(
+                    subset,
+                    offline_gate_pass=offline_gate_pass,
+                    min_sample=min_sample,
+                    min_days=min_days,
+                    min_cycles=min_cycles,
+                    target_precision=target_precision,
+                ),
+            })
+        return output
+
     return {
         "ranking_diagnostic_rows": len(with_margin),
         "ranking_diagnostic_coverage_rate": (
@@ -328,9 +592,33 @@ def _diagnostic_metrics(
         "contract_feature_flag_rows": len(with_contract_flag),
         "contract_feature_flag_coverage_rate": (
             len(with_contract_flag) / len(rows) if rows else None),
+        "candidate_probability_vector_rows": len(candidate_vector_rows),
+        "candidate_probability_vector_coverage_rate": (
+            len(candidate_vector_rows) / len(rows) if rows else None),
+        "highest_candidate_selection_check_rows": len(highest_check_rows),
+        "highest_candidate_selection_pass_rows": highest_check_passes,
+        "highest_candidate_selection_pass_rate": (
+            highest_check_passes / len(highest_check_rows)
+            if highest_check_rows else None
+        ),
+        "by_side": by_side,
+        "by_horizon_side": by_horizon_side,
+        "by_asset_class": by_asset_class,
+        "by_selected_model": by_selected_model,
         "by_selected_side_horizon_votes": by_votes,
         "by_selected_vs_opposite_margin_band": by_margin,
         "by_contract_statistics_availability": by_contract,
+        "by_selected_probability_top_k": top_k_metrics(
+            "selected_probability_rank"),
+        "by_selected_margin_top_k": top_k_metrics(
+            "selected_margin_rank"),
+        "selection_concentration": {
+            "all_selected": concentration(rows),
+            "selected_probability_top_1": concentration([
+                row for row in rows
+                if row.get("selected_probability_rank") == 1
+            ]),
+        },
     }
 
 
@@ -343,6 +631,8 @@ def evaluate(
     min_sample: int = 100,
     min_days: int = 5,
     min_cycles: int = 100,
+    min_long_labels: int = 30,
+    min_short_labels: int = 30,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     artifacts = _load_artifacts(shadow_root)
     con = _ro(market_db)
@@ -364,7 +654,10 @@ def evaluate(
             generated = _parse_utc(str(payload["generated_at_utc"]))
             if generated > as_of_utc:
                 continue
-            for record in payload.get("records") or []:
+            artifact_records = list(payload.get("records") or [])
+            cross_section_ranks = _selected_cross_section_ranks(
+                artifact_records)
+            for record_index, record in enumerate(artifact_records):
                 if record.get("selected_for_forward_evaluation") is not True:
                     continue
                 selected_records += 1
@@ -439,6 +732,13 @@ def evaluate(
                 )
                 ranking = record.get("ranking_diagnostics") or {}
                 future = record.get("future_retraining_features") or {}
+                selected_model = _optional_text(record.get("selected_model"))
+                candidate_probabilities = _candidate_probabilities(record)
+                candidate_probability_count = sum(
+                    value is not None
+                    for value in candidate_probabilities.values()
+                )
+                cross_section = cross_section_ranks.get(record_index) or {}
                 labels.append({
                     "model_id": model_key[0],
                     "model_parameters_sha256": model_key[1],
@@ -447,6 +747,12 @@ def evaluate(
                     "side": side,
                     "horizon": horizon,
                     "research_probability": probability,
+                    "selected_probability_rank": cross_section.get(
+                        "selected_probability_rank"),
+                    "selected_margin_rank": cross_section.get(
+                        "selected_margin_rank"),
+                    "selected_cross_section_size": cross_section.get(
+                        "selected_cross_section_size"),
                     "signal_available_at_utc": _iso(availability),
                     "entry_tick_ts_utc": entry_ts,
                     # Legacy last-price fields remain for diagnostic continuity.
@@ -480,6 +786,17 @@ def evaluate(
                         ranking.get("selected_side_mean_margin")),
                     "selected_side_min_margin": _optional_float(
                         ranking.get("selected_side_min_margin")),
+                    "selected_model": selected_model,
+                    "candidate_probability_count": candidate_probability_count,
+                    "selected_is_highest_candidate_probability": (
+                        _highest_candidate_check(
+                            selected_model, probability,
+                            candidate_probabilities,
+                        )),
+                    **{
+                        CANDIDATE_PROBABILITY_FIELDS[key]: value
+                        for key, value in candidate_probabilities.items()
+                    },
                     "contract_statistics_available": _optional_bool(
                         future.get("contract_statistics_available")),
                     "contract_statistics_source_ts_utc": future.get(
@@ -496,11 +813,15 @@ def evaluate(
                         future.get("contract_taker_buy_centered")),
                     "contract_oi_taker_interaction": _optional_float(
                         future.get("contract_oi_taker_interaction")),
+                    "asset_class": _optional_text(record.get("asset_class")),
                     "source_file": str(source_path.resolve()),
                 })
     finally:
         con.close()
 
+    # 前向校准门数值：按预注册激活边界解析（边界前 0.90、边界起 0.80）；点精度
+    # 与 Wilson 95% 下界共用同一数值，永远同步移动。
+    target_precision = thresholds.shadow_target_precision(as_of_utc)
     model_results: list[dict[str, Any]] = []
     by_model: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in labels:
@@ -513,6 +834,9 @@ def evaluate(
             min_sample=min_sample,
             min_days=min_days,
             min_cycles=min_cycles,
+            target_precision=target_precision,
+            min_long_labels=min_long_labels,
+            min_short_labels=min_short_labels,
         )
         horizon_results = []
         for horizon in HORIZON_MINUTES:
@@ -525,6 +849,25 @@ def evaluate(
                     min_sample=min_sample,
                     min_days=min_days,
                     min_cycles=min_cycles,
+                    target_precision=target_precision,
+                ),
+            })
+        day_results = []
+        for day in sorted({str(row["cycle_id"])[:10] for row in rows}):
+            subset = [
+                row for row in rows
+                if str(row["cycle_id"])[:10] == day
+            ]
+            day_results.append({
+                "day_cst": day,
+                "diagnostic_only": True,
+                **_metrics(
+                    subset,
+                    offline_gate_pass=model_offline_gate[model_key],
+                    min_sample=min_sample,
+                    min_days=min_days,
+                    min_cycles=min_cycles,
+                    target_precision=target_precision,
                 ),
             })
         model_results.append({
@@ -532,17 +875,20 @@ def evaluate(
             "model_parameters_sha256": model_key[1],
             "overall": overall,
             "by_horizon": horizon_results,
+            "by_day": day_results,
             "diagnostics": _diagnostic_metrics(
                 rows,
                 offline_gate_pass=model_offline_gate[model_key],
                 min_sample=min_sample,
                 min_days=min_days,
                 min_cycles=min_cycles,
+                target_precision=target_precision,
             ),
         })
 
     payload = {
         "schema_version": 2,
+        "label_schema_version": 3,
         "artifact_type": "frozen_multitimeframe_model_shadow_evaluation",
         "generated_at_utc": _iso(datetime.now(UTC)),
         "as_of_utc": _iso(as_of_utc),
@@ -555,12 +901,16 @@ def evaluate(
         "labels_written": len(labels),
         "round_trip_cost_bps": cost_bps,
         "acceptance_contract": {
-            "target_precision": 0.90,
-            "minimum_wilson_95_lower_bound": 0.90,
+            "target_precision": target_precision,
+            "minimum_wilson_95_lower_bound": target_precision,
+            "target_precision_migration": (
+                thresholds.shadow_migration_facts(as_of_utc)),
             "maximum_ece": 0.05,
             "minimum_sample": min_sample,
             "minimum_days": min_days,
             "minimum_distinct_cycles": min_cycles,
+            "minimum_long_labels": min_long_labels,
+            "minimum_short_labels": min_short_labels,
             "cycle_diversity_semantics": (
                 "distinct scheduled signal cycles; overlapping horizon windows "
                 "are not claimed to be statistically independent"
@@ -571,6 +921,15 @@ def evaluate(
             "cost_hurdle_bps_after_observed_spread": cost_bps,
         },
         "last_price_fields_are_diagnostic_only": True,
+        "feature_diagnostic_contract": {
+            "source": "frozen point-in-time shadow snapshots only",
+            "outcome_free_slices": (
+                "asset class, availability, and fixed sign bands"),
+            "temporal_slice": (
+                "day_cst is preregistered diagnostic-only stability evidence; "
+                "it never changes the overall production gate"),
+            "production_gate": False,
+        },
         "models": model_results,
         "confidence_claim_allowed": False,
         "production_threshold_change_allowed": False,
@@ -592,9 +951,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-sample", type=int, default=100)
     parser.add_argument("--min-days", type=int, default=5)
     parser.add_argument("--min-cycles", type=int, default=100)
+    parser.add_argument("--min-long-labels", type=int, default=30)
+    parser.add_argument("--min-short-labels", type=int, default=30)
     args = parser.parse_args(argv)
     try:
-        if args.cost_bps < 0 or min(args.min_sample, args.min_days, args.min_cycles) <= 0:
+        if (
+            args.cost_bps < 0
+            or min(args.min_sample, args.min_days, args.min_cycles) <= 0
+            or min(args.min_long_labels, args.min_short_labels) < 0
+        ):
             raise ValueError("cost and acceptance thresholds are invalid")
         payload, labels = evaluate(
             shadow_root=args.shadow_root,
@@ -604,6 +969,8 @@ def main(argv: list[str] | None = None) -> int:
             min_sample=args.min_sample,
             min_days=args.min_days,
             min_cycles=args.min_cycles,
+            min_long_labels=args.min_long_labels,
+            min_short_labels=args.min_short_labels,
         )
         calibration._atomic_json(args.json_out, payload)
         if args.labels_out:

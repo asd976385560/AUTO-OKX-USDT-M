@@ -27,6 +27,7 @@ from typing import Any
 
 
 UTC = timezone.utc
+CST = timezone(timedelta(hours=8), "Asia/Shanghai")
 HORIZONS = {"15m": 15, "1h": 60, "4h": 240}
 DEFAULT_COST_BPS = 20.0
 DEFAULT_MIN_SAMPLE = 100
@@ -157,8 +158,34 @@ def evaluate(
     min_sample: int = DEFAULT_MIN_SAMPLE,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     snapshots = _load_snapshots(snapshot_root)
+    eligible_snapshots: list[tuple[Path, dict[str, Any], datetime]] = []
+    clock_exclusions = {
+        "missing_generated_at_utc": 0,
+        "invalid_generated_at_utc": 0,
+        "future_generated_at_utc": 0,
+        "cycle_day_mismatch": 0,
+    }
+    for source_path, snapshot in snapshots:
+        generated_text = snapshot.get("generated_at_utc")
+        if not generated_text:
+            clock_exclusions["missing_generated_at_utc"] += 1
+            continue
+        try:
+            generated = _parse_utc(str(generated_text))
+        except (TypeError, ValueError):
+            clock_exclusions["invalid_generated_at_utc"] += 1
+            continue
+        if generated > as_of_utc:
+            clock_exclusions["future_generated_at_utc"] += 1
+            continue
+        cycle = str(snapshot.get("cycle_id") or "")
+        if cycle[:10] != generated.astimezone(CST).date().isoformat():
+            clock_exclusions["cycle_day_mismatch"] += 1
+            continue
+        eligible_snapshots.append((source_path, snapshot, generated))
+
     daily: dict[str, dict[str, Any]] = {}
-    for _source_path, snapshot in snapshots:
+    for _source_path, snapshot, _generated in eligible_snapshots:
         cycle = str(snapshot.get("cycle_id") or "")
         day = cycle[:10]
         if len(day) != 10:
@@ -167,6 +194,13 @@ def evaluate(
             "date": day,
             "snapshots": 0,
             "judgment_records": 0,
+            "judgment_counts": {
+                "long_bias": 0,
+                "short_bias": 0,
+                "wait_data": 0,
+                "wait_mixed": 0,
+                "other": 0,
+            },
             "symbols": set(),
             "minimum_records_target": 993,
             "minimum_snapshots_target": 3,
@@ -176,6 +210,12 @@ def evaluate(
         targets = snapshot.get("targets") or {}
         item["snapshots"] += 1
         item["judgment_records"] += len(records)
+        for record in records:
+            judgment = str(record.get("judgment") or "")
+            count_key = (
+                judgment if judgment in item["judgment_counts"] else "other"
+            )
+            item["judgment_counts"][count_key] += 1
         item["symbols"].update(
             str(record.get("symbol")) for record in records if record.get("symbol")
         )
@@ -196,6 +236,10 @@ def evaluate(
     for day in sorted(daily):
         item = daily[day]
         unique_symbols = len(item.pop("symbols"))
+        judgment_counts = item["judgment_counts"]
+        long_bias_records = int(judgment_counts["long_bias"])
+        short_bias_records = int(judgment_counts["short_bias"])
+        directional_judgment_records = long_bias_records + short_bias_records
         checks = {
             "minimum_records_met": (
                 item["judgment_records"] >= item["minimum_records_target"]
@@ -207,24 +251,49 @@ def evaluate(
                 unique_symbols >= item["minimum_unique_symbols_target"]
             ),
         }
+        directional_checks = {
+            "minimum_directional_records_met": (
+                directional_judgment_records >= item["minimum_records_target"]
+            ),
+            "minimum_snapshots_met": checks["minimum_snapshots_met"],
+            "minimum_unique_symbols_met": checks["minimum_unique_symbols_met"],
+        }
         daily_rows.append({
             **item,
             "unique_symbols": unique_symbols,
+            "directional_judgment_records": directional_judgment_records,
+            "long_bias_records": long_bias_records,
+            "short_bias_records": short_bias_records,
+            "minimum_directional_records_target": item["minimum_records_target"],
+            "directional_judgment_share": (
+                directional_judgment_records / item["judgment_records"]
+                if item["judgment_records"] else None
+            ),
+            "both_directional_sides_observed": bool(
+                long_bias_records and short_bias_records
+            ),
+            "minimum_directional_records_met": directional_checks[
+                "minimum_directional_records_met"
+            ],
+            "directional_daily_target_met": all(directional_checks.values()),
             **checks,
             "daily_target_met": all(checks.values()),
         })
+
+    as_of_cst_day = as_of_utc.astimezone(CST).date().isoformat()
+    completed_day_rows = [
+        row for row in daily_rows if str(row["date"]) < as_of_cst_day
+    ]
+    current_partial_day = next(
+        (row for row in daily_rows if row["date"] == as_of_cst_day), None
+    )
 
     market = _ro(market_db)
     labels: list[dict[str, Any]] = []
     candidate_records = 0
     try:
-        for source_path, payload in snapshots:
+        for source_path, payload, generated in eligible_snapshots:
             generated_text = payload.get("generated_at_utc")
-            if not generated_text:
-                continue
-            generated = _parse_utc(str(generated_text))
-            if generated > as_of_utc:
-                continue
             for record in payload.get("records") or []:
                 if record.get("execution_readiness") != "shadow_candidate":
                     continue
@@ -301,10 +370,27 @@ def evaluate(
         "as_of_utc": _iso_utc(as_of_utc),
         "snapshot_root": str(snapshot_root.resolve()),
         "snapshots_loaded": len(snapshots),
+        "snapshots_eligible_as_of": len(eligible_snapshots),
+        "snapshot_clock_quality": {
+            "as_of_utc": _iso_utc(as_of_utc),
+            "day_boundary_timezone": "Asia/Shanghai (UTC+08:00)",
+            "excluded": clock_exclusions,
+            "status": (
+                "PASSED" if not any(clock_exclusions.values()) else "DEGRADED"
+            ),
+        },
         "daily_throughput": {
             "metric": "auditable full-universe shadow judgment records",
+            "directional_metric": (
+                "long_bias plus short_bias records; wait and unknown records "
+                "remain visible but are excluded"
+            ),
             "days": daily_rows,
             "latest_day": daily_rows[-1] if daily_rows else None,
+            "latest_completed_day": (
+                completed_day_rows[-1] if completed_day_rows else None
+            ),
+            "current_partial_day": current_partial_day,
             "real_fills_are_not_a_throughput_target": True,
         },
         "shadow_candidate_records": candidate_records,

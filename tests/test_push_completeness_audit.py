@@ -221,6 +221,266 @@ class PushCompletenessAuditTests(unittest.TestCase):
             failure["reasons"],
         )
 
+    def test_future_business_attestations_are_required_and_must_agree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._fixture(Path(temp))
+            cycle = "2026-08-14T07:00"
+            row, _ = self._archive_attempt(fixture, cycle=cycle)
+            missing = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(missing["complete"])
+            self.assertIn(
+                "business attestation pre-archive missing or failed",
+                missing["reasons"],
+            )
+
+            terminal = {
+                "status": "succeeded",
+                "returncode": 0,
+                "finished_at": "2026-08-14 07:08:00",
+                "profile_lease_released": True,
+                "same_cycle_active_lease": False,
+            }
+            attestation = {
+                "ok": True,
+                "required": True,
+                "mode": "business_terminal",
+                "decision": "hold",
+                "n_orders": 0,
+                "trade_count": 0,
+                "sha256": "a" * 64,
+                "live_stage_terminal": terminal,
+            }
+            row["steps"]["business_attestation_pre_archive"] = attestation
+            row["steps"]["business_attestation_pre_send"] = dict(attestation)
+            complete = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertTrue(complete["complete"], complete)
+
+            row["steps"]["business_attestation_pre_send"] = {
+                **attestation, "sha256": "b" * 64,
+            }
+            drifted = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(drifted["complete"])
+            self.assertIn(
+                "business attestation sha256 drifted before send",
+                drifted["reasons"],
+            )
+
+    def test_future_failure_attestation_requires_full_intent_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._fixture(Path(temp))
+            cycle = "2026-08-14T07:00"
+            row, _ = self._archive_attempt(fixture, cycle=cycle)
+            terminal = {
+                "status": "failed",
+                "returncode": 86,
+                "finished_at": "2026-08-14 07:08:00",
+                "profile_lease_released": True,
+                "same_cycle_active_lease": False,
+            }
+            body = {
+                "schema_version": 1,
+                "profile": "live",
+                "cycle_id": cycle,
+                "terminal": "absent",
+                "trade_count": 0,
+                "failure_kind": "business_output_missing",
+                "intent_rows": 1,
+                "failed_clean_rows": 1,
+                "unsafe_rows": 0,
+            }
+            canonical = json.dumps(
+                body, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            attestation = {
+                "ok": True,
+                "required": True,
+                "mode": "upstream_failure",
+                **body,
+                "sha256": hashlib.sha256(
+                    canonical.encode("utf-8")).hexdigest(),
+                "live_stage_terminal": terminal,
+            }
+            row["steps"]["business_attestation_pre_archive"] = attestation
+            row["steps"]["business_attestation_pre_send"] = dict(attestation)
+            complete = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertTrue(complete["complete"], complete)
+
+            row["steps"]["business_attestation_pre_send"] = {
+                **attestation,
+                "unsafe_rows": 1,
+            }
+            drifted = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(drifted["complete"])
+            self.assertIn(
+                "failure attestation unsafe_rows drifted before send",
+                drifted["reasons"],
+            )
+
+    def test_inter_report_exchange_attestation_is_required_and_stable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._fixture(Path(temp))
+            cycle = "2026-08-15T08:00"
+            row, _ = self._archive_attempt(fixture, cycle=cycle)
+            barrier = {
+                "required": True,
+                "report_safe": True,
+                "status": "ok",
+                "rc": 0,
+                "blocking": False,
+            }
+            terminal = {
+                "status": "succeeded",
+                "returncode": 0,
+                "finished_at": "2026-08-15 08:08:00",
+                "profile_lease_released": True,
+                "same_cycle_active_lease": False,
+                "report_reconcile_barrier": barrier,
+            }
+            attestation = {
+                "ok": True,
+                "required": True,
+                "mode": "business_terminal",
+                "decision": "hold",
+                "n_orders": 0,
+                "trade_count": 0,
+                "sha256": "a" * 64,
+                "live_stage_terminal": terminal,
+            }
+            row["steps"]["business_attestation_pre_archive"] = attestation
+            row["steps"]["business_attestation_pre_send"] = dict(attestation)
+            missing = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(missing["complete"])
+            self.assertIn(
+                "inter-report exchange attestation pre-archive missing",
+                missing["reasons"],
+            )
+
+            interval = {
+                "inter_report_exchange_required": True,
+                "inter_report_exchange_schema_version": 1,
+                "inter_report_fill_count": 1,
+                "inter_report_sha256": "b" * 64,
+                "inter_report_window_start_exclusive_cst": (
+                    "2026-08-15 07:45:00"),
+                "inter_report_window_end_inclusive_cst": (
+                    "2026-08-15 08:00:00"),
+            }
+            pre_archive = {**attestation, **interval}
+            row["steps"]["business_attestation_pre_archive"] = pre_archive
+            row["steps"]["business_attestation_pre_send"] = dict(pre_archive)
+            complete = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertTrue(complete["complete"], complete)
+
+            row["steps"]["business_attestation_pre_send"] = {
+                **pre_archive,
+                "inter_report_fill_count": 2,
+            }
+            drifted = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(drifted["complete"])
+            self.assertIn(
+                "inter-report exchange attestation "
+                "inter_report_fill_count drifted before send",
+                drifted["reasons"],
+            )
+
+    def test_post_agent_report_barrier_is_required_from_fixed_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._fixture(Path(temp))
+            cycle = "2026-08-14T19:00"
+            row, _ = self._archive_attempt(fixture, cycle=cycle)
+            terminal = {
+                "status": "succeeded",
+                "returncode": 0,
+                "finished_at": "2026-08-14 19:08:00",
+                "profile_lease_released": True,
+                "same_cycle_active_lease": False,
+            }
+            attestation = {
+                "ok": True,
+                "required": True,
+                "mode": "business_terminal",
+                "decision": "hold",
+                "n_orders": 0,
+                "trade_count": 0,
+                "sha256": "a" * 64,
+                "live_stage_terminal": terminal,
+            }
+            row["steps"]["business_attestation_pre_archive"] = attestation
+            row["steps"]["business_attestation_pre_send"] = dict(attestation)
+            missing = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertFalse(missing["complete"])
+            self.assertIn(
+                "report reconcile barrier pre-archive incomplete",
+                missing["reasons"],
+            )
+
+            barrier = {
+                "required": True,
+                "report_safe": True,
+                "status": "ok",
+                "rc": 0,
+                "blocking": False,
+            }
+            attestation["live_stage_terminal"] = {
+                **terminal,
+                "report_reconcile_barrier": barrier,
+            }
+            row["steps"]["business_attestation_pre_archive"] = attestation
+            row["steps"]["business_attestation_pre_send"] = dict(attestation)
+            complete = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertTrue(complete["complete"], complete)
+
     def test_forward_window_stays_insufficient_before_96_slots(self):
         with tempfile.TemporaryDirectory() as temp:
             fixture = self._fixture(Path(temp))

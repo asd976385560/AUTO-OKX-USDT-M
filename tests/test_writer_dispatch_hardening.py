@@ -6,15 +6,17 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from unittest import mock
 
 from collectors import analyst_writer, trades_writer
 from core import dispatcher
 from core import multitimeframe_gate as mtf_gate
-from core.experience_contract import build_contract
+from core.experience_contract import build_contract, setup_from_prices
 from core.instrument_context import build_instrument_context
 
 
@@ -22,6 +24,19 @@ CST = timezone(timedelta(hours=8))
 
 
 class AnalysisValidationBudgetTests(unittest.TestCase):
+    def test_analysis_deadline_is_strict_at_cycle_plus_nine_thirty(self):
+        cycle = "2026-08-15T21:45"
+        before = datetime(2026, 8, 15, 21, 54, 29, tzinfo=CST)
+        boundary = datetime(2026, 8, 15, 21, 54, 30, tzinfo=CST)
+        self.assertIsNone(
+            analyst_writer.analysis_deadline_refusal(cycle, now=before))
+        refused = analyst_writer.analysis_deadline_refusal(
+            cycle, now=boundary)
+        self.assertEqual("analysis_deadline_exceeded", refused["error"])
+        self.assertEqual(0, refused["production_database_writes"])
+        self.assertIsNone(analyst_writer.analysis_deadline_refusal(
+            "2026-08-15T21:30", now=boundary))
+
     def test_two_failures_block_cycle_deterministically(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(
@@ -128,7 +143,8 @@ def _valid_card(label: str = "isolated test") -> dict:
         "invalidation_point": {"condition": "invalidated"},
         # Wave1 序5 起 open 卡须含数值 entry/stop/target（writer 重算 RR/EV）
         "risk_reward": {"entry": 100.0, "stop": 97.0, "target": 106.0,
-                        "rr": 2.0, "summary": "bounded"},
+                        "rr": 2.0, "summary": "bounded",
+                        "exit_mode": "fixed_tp"},
         "portfolio_impact": {"summary": "isolated"},
         "historical_experience": {
             "matched_wins": [],
@@ -178,6 +194,43 @@ def _experience_contract(cycle_id: str, symbol: str, side: str,
         same_symbol_similar=summary("same_symbol_similar"),
         cross_symbol_similar=summary("cross_symbol_similar"),
     )
+
+
+class CanonicalSetupGeometryTests(unittest.TestCase):
+    def test_writer_accepts_same_price_geometry_sealed_by_tool(self):
+        setup = setup_from_prices(0.0698, 0.0705, 0.0685)
+        contract = {"query": {"setup": setup}}
+        card = {
+            "risk_reward": {
+                "entry": 0.0698,
+                "stop": 0.0705,
+                "target": 0.0685,
+            }
+        }
+
+        self.assertEqual(
+            analyst_writer._validate_setup_contract(card, contract), [])
+
+    def test_writer_still_rejects_percent_unit_or_tampered_hash(self):
+        setup = setup_from_prices(0.0698, 0.0705, 0.0685)
+        setup["stop_distance_pct"] = 1.002865
+        contract = {"query": {"setup": setup}}
+        card = {
+            "risk_reward": {
+                "entry": 0.0698,
+                "stop": 0.0705,
+                "target": 0.0685,
+            }
+        }
+
+        errors = analyst_writer._validate_setup_contract(card, contract)
+        self.assertTrue(any("stop_distance_pct" in error for error in errors))
+
+        setup = setup_from_prices(0.0698, 0.0705, 0.0685)
+        setup["setup_hash"] = "tampered"
+        errors = analyst_writer._validate_setup_contract(
+            card, {"query": {"setup": setup}})
+        self.assertTrue(any("setup_hash" in error for error in errors))
 
 
 def _card_with_contract(cycle_id: str, symbol: str, side: str,
@@ -313,6 +366,238 @@ def _write_trade_cycle(path: Path, cycle: str, decision: str,
 
 
 class AnalystWriterHardeningTests(unittest.TestCase):
+    def _open_payload(self, root: Path, *, side: object = "long") -> dict:
+        cycle = "2026-07-29T14:00"
+        symbol = "BTC-USDT-SWAP"
+        _create_market_db(root / "market.db", cycle)
+        return {
+            "cycle_id": cycle,
+            "ts": "2026-07-29 14:01:00",
+            "mode": "full",
+            "status": "ok",
+            "decision_protocol": "decision_card_v1",
+            "regime": "",
+            "market_summary": {
+                name: {} for name in analyst_writer.MARKET_SUMMARY_SECTIONS
+            },
+            "signals": [{
+                "symbol": symbol,
+                "action": "open_long",
+                "side": side,
+                "decision_card": _card_with_contract(
+                    cycle, symbol, "long", db_root=root),
+            }],
+        }
+
+    def test_missing_open_side_is_losslessly_inferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._open_payload(root)
+            del payload["signals"][0]["side"]
+            normalized = analyst_writer.normalize_receipt(payload)
+            with mock.patch.object(
+                    analyst_writer, "DB_PATH", root / "analysis.db"):
+                errors = analyst_writer.validate_receipt(
+                    payload, db_root=root)
+        self.assertEqual("long", normalized["signals"][0]["side"])
+        self.assertEqual([], errors)
+
+    @staticmethod
+    def _deadline_refusal(cycle_id: str) -> dict:
+        return {
+            "ok": False,
+            "refused": True,
+            "error": "analysis_deadline_exceeded",
+            "cycle_id": cycle_id,
+            "deadline_at": "2026-08-15 23:09:30",
+            "checked_at": "2026-08-15 23:09:30",
+            "production_database_writes": 0,
+        }
+
+    def test_lock_wait_crossing_deadline_refuses_before_first_business_write(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "analysis.db"
+            _create_analysis_db(db)
+            cycle = "2026-08-15T23:00"
+            payload = {
+                "cycle_id": cycle,
+                "ts": "2026-08-15 23:01:00",
+                "mode": "full",
+                "status": "skipped",
+                "decision_protocol": "decision_card_v1",
+                "market_summary": None,
+                "signals": [],
+            }
+            begin_started = Event()
+            checks = 0
+
+            def deadline_side_effect(_cycle_id):
+                nonlocal checks
+                checks += 1
+                # Entry + post-validation checks are timely.  The third check
+                # runs only after BEGIN IMMEDIATE has waited for this test's
+                # real SQLite writer lock and must observe the crossed cutoff.
+                return (None if checks < 3
+                        else self._deadline_refusal(cycle))
+
+            class _BeginNotifyingConnection:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def execute(self, sql, parameters=()):
+                    if str(sql).strip().upper() == "BEGIN IMMEDIATE":
+                        begin_started.set()
+                    return self._inner.execute(sql, parameters)
+
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+            def notifying_connect(write=False, db_path=None):
+                self.assertTrue(write)
+                self.assertEqual(Path(db_path), db)
+                inner = sqlite3.connect(db, timeout=5)
+                inner.row_factory = sqlite3.Row
+                inner.execute("PRAGMA busy_timeout=5000")
+                return _BeginNotifyingConnection(inner)
+
+            with closing(sqlite3.connect(db, timeout=5)) as blocker:
+                blocker.execute("PRAGMA journal_mode=WAL")
+                blocker.execute("BEGIN IMMEDIATE")
+                with mock.patch.object(analyst_writer, "DB_PATH", db), \
+                        mock.patch.object(
+                            analyst_writer, "connect",
+                            side_effect=notifying_connect), \
+                        mock.patch.object(
+                            analyst_writer, "analysis_deadline_refusal",
+                            side_effect=deadline_side_effect), \
+                        ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        analyst_writer.write_analysis, payload)
+                    self.assertTrue(begin_started.wait(timeout=2))
+                    self.assertFalse(future.done())
+                    blocker.rollback()
+                    result = future.result(timeout=5)
+
+            self.assertEqual("analysis_deadline_exceeded", result["error"])
+            self.assertEqual(0, result["production_database_writes"])
+            self.assertEqual(3, checks)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(
+                    0, con.execute(
+                        "SELECT COUNT(*) FROM analysis_runs").fetchone()[0])
+                self.assertEqual(
+                    0, con.execute(
+                        "SELECT COUNT(*) FROM analysis_signals").fetchone()[0])
+
+    def test_deadline_crossed_before_commit_rolls_back_run_and_signals(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "analysis.db"
+            _create_analysis_db(db)
+            cycle = "2026-08-15T23:00"
+            with closing(sqlite3.connect(db)) as con:
+                con.execute(
+                    "INSERT INTO analysis_runs"
+                    "(cycle_id,ts,mode,raw,status) VALUES(?,?,?,?,?)",
+                    (cycle, "old-ts", "full", '{"old":true}', "error"),
+                )
+                con.execute(
+                    "INSERT INTO analysis_signals"
+                    "(cycle_id,symbol,action,side) VALUES(?,?,?,?)",
+                    (cycle, "OLD-USDT-SWAP", "wait", None),
+                )
+                con.commit()
+            payload = {
+                "cycle_id": cycle,
+                "ts": "2026-08-15 23:01:00",
+                "mode": "full",
+                "status": "skipped",
+                "decision_protocol": "decision_card_v1",
+                "market_summary": None,
+                "signals": [],
+            }
+            checks = 0
+
+            def deadline_side_effect(_cycle_id):
+                nonlocal checks
+                checks += 1
+                # Entry, post-validation and post-lock checks pass.  The
+                # fourth check is immediately before COMMIT, after both run
+                # replacement and signal deletion have executed in txn.
+                return (None if checks < 4
+                        else self._deadline_refusal(cycle))
+
+            with mock.patch.object(analyst_writer, "DB_PATH", db), \
+                    mock.patch.object(
+                        analyst_writer, "analysis_deadline_refusal",
+                        side_effect=deadline_side_effect):
+                result = analyst_writer.write_analysis(payload)
+
+            self.assertEqual("analysis_deadline_exceeded", result["error"])
+            self.assertEqual(0, result["production_database_writes"])
+            self.assertEqual(4, checks)
+            with closing(sqlite3.connect(db)) as con:
+                run = con.execute(
+                    "SELECT ts,raw,status FROM analysis_runs WHERE cycle_id=?",
+                    (cycle,),
+                ).fetchone()
+                signal = con.execute(
+                    "SELECT symbol,action FROM analysis_signals "
+                    "WHERE cycle_id=?",
+                    (cycle,),
+                ).fetchone()
+            self.assertEqual(("old-ts", '{"old":true}', "error"), run)
+            self.assertEqual(("OLD-USDT-SWAP", "wait"), signal)
+
+    def test_explicit_open_side_conflict_remains_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._open_payload(root, side="short")
+            normalized = analyst_writer.normalize_receipt(payload)
+            with mock.patch.object(
+                    analyst_writer, "DB_PATH", root / "analysis.db"):
+                errors = analyst_writer.validate_receipt(
+                    payload, db_root=root)
+        self.assertEqual("short", normalized["signals"][0]["side"])
+        self.assertTrue(any("不一致" in item for item in errors), errors)
+
+    def test_nonempty_mtf_evidence_string_becomes_one_item_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._open_payload(root)
+            row = payload["signals"][0]["decision_card"][
+                "multitimeframe_analysis"]["timeframes"]["15m"]
+            row["evidence"] = " one exact reason "
+            normalized = analyst_writer.normalize_receipt(payload)
+            with mock.patch.object(
+                    analyst_writer, "DB_PATH", root / "analysis.db"):
+                errors = analyst_writer.validate_receipt(
+                    payload, db_root=root)
+        evidence = normalized["signals"][0]["decision_card"][
+            "multitimeframe_analysis"]["timeframes"]["15m"]["evidence"]
+        self.assertEqual(["one exact reason"], evidence)
+        self.assertEqual([], errors)
+
+    def test_empty_or_object_mtf_evidence_remains_invalid(self) -> None:
+        for invalid in ("", {"reason": "not a list"}):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                payload = self._open_payload(root)
+                payload["signals"][0]["decision_card"][
+                    "multitimeframe_analysis"]["timeframes"]["15m"][
+                        "evidence"] = invalid
+                normalized = analyst_writer.normalize_receipt(payload)
+                with mock.patch.object(
+                        analyst_writer, "DB_PATH", root / "analysis.db"):
+                    errors = analyst_writer.validate_receipt(
+                        payload, db_root=root)
+                retained = normalized["signals"][0]["decision_card"][
+                    "multitimeframe_analysis"]["timeframes"]["15m"][
+                        "evidence"]
+            self.assertEqual(invalid, retained)
+            self.assertTrue(any("evidence" in item for item in errors), errors)
+
     def test_price_hints_are_numeric_and_hold_cannot_claim_stop_price(self):
         base = {
             "cycle_id": "2026-07-29T12:00",
@@ -408,6 +693,37 @@ class AnalystWriterHardeningTests(unittest.TestCase):
         }
         errors = analyst_writer.validate_receipt(unknown)
         self.assertTrue(any("action 不支持" in item for item in errors), errors)
+
+        # 持仓管理动作是 Agent 的正式裁决；必须绑定明确持仓方向，但不套
+        # OPEN/ADD 的多周期/历史 EV 进入闸。
+        for action in ("reduce", "adjust_protection"):
+            with self.subTest(action=action):
+                signal = {
+                    **base,
+                    "signals": [{
+                        "symbol": "BTC-USDT-SWAP",
+                        "action": action,
+                        "side": "long",
+                        "stop_hint": 95.0 if action == "adjust_protection" else None,
+                        "tp_hint": 110.0 if action == "adjust_protection" else None,
+                        "decision_card": _valid_card(action),
+                    }],
+                }
+                self.assertEqual(
+                    analyst_writer.validate_receipt(signal), [])
+
+        bad_reduce = {
+            **base,
+            "signals": [{
+                "symbol": "BTC-USDT-SWAP",
+                "action": "reduce",
+                "side": None,
+                "decision_card": _valid_card("bad reduce"),
+            }],
+        }
+        self.assertTrue(any(
+            "不一致" in item
+            for item in analyst_writer.validate_receipt(bad_reduce)))
 
         # hold = 持有既有仓位，恒无方向。
         hold_with_side = {
@@ -606,7 +922,8 @@ class AnalystWriterHardeningTests(unittest.TestCase):
 
             with mock.patch.object(
                     analyst_writer, "DB_PATH", root / "analysis.db"):
-                errors = analyst_writer.validate_receipt(payload)
+                errors = analyst_writer.validate_receipt(
+                    payload, db_root=root)
 
             self.assertTrue(
                 any("与 market.db 本 cycle" in item for item in errors),
@@ -670,6 +987,321 @@ class TradesWriterHardeningTests(unittest.TestCase):
                 json.loads(trade_raw)["ts_source"],
                 "fills.fillTime",
             )
+
+    def test_trade_level_decision_card_wins_over_top_level_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:05")
+            top_card = _valid_card("top-level fallback")
+            trade_card = _valid_card("symbol-specific canonical card")
+            payload["decision_card"] = top_card
+            payload["trades"][0]["decision_card"] = trade_card
+
+            with mock.patch.object(
+                trades_writer, "now_cst",
+                return_value="2026-07-29 12:06:00",
+            ):
+                result = trades_writer.write_trades(payload, db)
+
+            self.assertTrue(result["ok"], result)
+            with closing(sqlite3.connect(db)) as con:
+                trade_raw = con.execute("SELECT raw FROM trades").fetchone()[0]
+            persisted = json.loads(trade_raw)
+            self.assertEqual(persisted["decision_card"], trade_card)
+            self.assertNotEqual(persisted["decision_card"], top_card)
+
+    def test_first_write_duplicate_trade_identity_is_refused_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:07")
+            payload["trades"] = [
+                dict(payload["trades"][0]),
+                dict(payload["trades"][0]),
+            ]
+            with mock.patch.object(
+                trades_writer, "_analysis_context_for_cycle", return_value={}
+            ), mock.patch.object(
+                trades_writer, "_equity_snapshot_fallback", return_value=None
+            ):
+                result = trades_writer.write_trades(payload, db)
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["refused"], "duplicate_trade_identity")
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trade_cycles").fetchone()[0], 0)
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trades").fetchone()[0], 0)
+
+    def test_concurrent_disjoint_same_cycle_commits_merge_without_lost_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            cycle = "2026-07-29T12:08"
+            left = self._payload(cycle)
+            right = self._payload(cycle)
+            left["trades"][0]["ordId"] = "ORDER-LEFT"
+            right["trades"][0].update({
+                "symbol": "ETH-USDT-SWAP",
+                "fill_px": 3000.0,
+                "ordId": "ORDER-RIGHT",
+            })
+
+            def commit(payload):
+                return trades_writer.write_trades(payload, db)
+
+            with mock.patch.object(
+                trades_writer, "_analysis_context_for_cycle", return_value={}
+            ), mock.patch.object(
+                trades_writer, "_equity_snapshot_fallback", return_value=None
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(commit, payload) for payload in (left, right)]
+                results = [future.result(timeout=15) for future in futures]
+
+            self.assertTrue(all(result["ok"] for result in results), results)
+            with closing(sqlite3.connect(db)) as con:
+                symbols = [row[0] for row in con.execute(
+                    "SELECT symbol FROM trades ORDER BY symbol").fetchall()]
+                n_orders = con.execute(
+                    "SELECT n_orders FROM trade_cycles WHERE cycle_id=?",
+                    (cycle,),
+                ).fetchone()[0]
+            self.assertEqual(symbols, ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
+            self.assertEqual(n_orders, 2)
+
+    def test_structured_raw_compaction_preserves_full_live_facts(self) -> None:
+        facts = {"facts_hash": "f" * 64, "authority_blob": "F" * 70000}
+        oversized = {
+            "cycle_id": "2026-07-29T12:09",
+            "live_facts": facts,
+            "decision_card": _valid_card(),
+            "trades": [],
+            "position_action_results": [{
+                "request": {"action": "CLOSE", "symbol": "BTC-USDT-SWAP"},
+                "result": {"trades": [], "debug": "R" * 60000},
+            }],
+            "position_action_failures": [{
+                "request": {"action": "OPEN", "symbol": "ETH-USDT-SWAP"},
+                "problem": "contract error",
+                "result": {"trades": [], "debug": "E" * 60000},
+            }],
+        }
+
+        encoded = trades_writer._bounded_json(
+            oversized, 100000, "isolated trade_cycles.raw"
+        )
+        persisted = json.loads(encoded)
+        self.assertEqual(persisted["live_facts"], facts)
+        self.assertTrue(persisted["raw_structurally_truncated"])
+        self.assertIn("row_sha256", persisted["position_action_results"][0])
+        self.assertIn("row_sha256", persisted["position_action_failures"][0])
+
+    def test_oversized_authority_preserves_terminal_and_plan_binding_keys(self) -> None:
+        facts = {"facts_hash": "f" * 64, "authority_blob": "F" * 120000}
+        oversized = {
+            "schema_version": 1,
+            "cycle_id": "2026-07-29T12:09",
+            "status": "error",
+            "decision": "traded",
+            "batch_status": "partial",
+            "batch_ok": False,
+            "runner_in_progress": False,
+            "n_orders": 1,
+            "facts_hash": "f" * 64,
+            "position_action_plan_hash": "p" * 64,
+            "live_facts": facts,
+            "decision_card": _valid_card(),
+            "trades": [{"ordId": "ORDER-1", "symbol": "BTC-USDT-SWAP"}],
+            "debug": "D" * 50000,
+        }
+
+        encoded = trades_writer._bounded_json(
+            oversized, 100000, "isolated trade_cycles.raw"
+        )
+        persisted = json.loads(encoded)
+        self.assertEqual(persisted["live_facts"], facts)
+        self.assertEqual(persisted["batch_status"], "partial")
+        self.assertIs(persisted["runner_in_progress"], False)
+        self.assertEqual(persisted["position_action_plan_hash"], "p" * 64)
+        self.assertEqual(persisted["status"], "error")
+        self.assertEqual(persisted["n_orders"], 1)
+
+    def test_salvage_direct_ordid_uses_fill_size_and_writer_time_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:10")
+            trade = payload["trades"][0]
+            trade.update({"ordId": "ORDER-1", "sz": 9.0, "fill_sz": 1.25})
+            trade.pop("fill_ts")
+            trade.pop("ts_source")
+            with mock.patch.object(
+                trades_writer, "_analysis_context_for_cycle", return_value={}
+            ), mock.patch.object(
+                trades_writer, "_equity_snapshot_fallback", return_value=None
+            ), mock.patch.object(
+                trades_writer, "now_cst", return_value="2026-07-29 12:10:30"
+            ):
+                result = trades_writer.commit_side_effect_salvage(
+                    payload,
+                    "live",
+                    validation_errors=["missing fill_ts"],
+                    db_path=db,
+                    _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+                )
+
+            self.assertTrue(result["ok"], result)
+            with closing(sqlite3.connect(db)) as con:
+                sz, trade_raw = con.execute(
+                    "SELECT sz,raw FROM trades").fetchone()
+                cycle_raw = con.execute(
+                    "SELECT raw FROM trade_cycles").fetchone()[0]
+            self.assertEqual(sz, 1.25)
+            self.assertEqual(
+                json.loads(trade_raw)["ts_source"], "writer_commit_fallback"
+            )
+            quarantine = json.loads(cycle_raw)["contract_quarantine"]
+            self.assertEqual(quarantine["timestamp_fallbacks"][0]["ordId"],
+                             "ORDER-1")
+            self.assertEqual(
+                quarantine["size_mismatches"][0]["authoritative_fill_sz"], 1.25
+            )
+
+    def test_salvage_rejects_algoid_as_fill_identity_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:11")
+            payload["trades"][0].update({"algoId": "SL-ALGO-ONLY"})
+            result = trades_writer.commit_side_effect_salvage(
+                payload,
+                "live",
+                validation_errors=["missing direct order identity"],
+                db_path=db,
+                _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+            )
+            self.assertFalse(result["ok"], result)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trade_cycles").fetchone()[0], 0)
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trades").fetchone()[0], 0)
+
+    def test_salvage_partial_candidates_are_audited_and_not_marked_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:12")
+            trusted = dict(payload["trades"][0], ordId="ORDER-GOOD")
+            rejected = dict(payload["trades"][0], symbol="ETH-USDT-SWAP",
+                            fill_source="planned", ordId="ORDER-FAKE")
+            payload["trades"] = [trusted, rejected]
+            with mock.patch.object(
+                trades_writer, "_analysis_context_for_cycle", return_value={}
+            ), mock.patch.object(
+                trades_writer, "_equity_snapshot_fallback", return_value=None
+            ):
+                result = trades_writer.commit_side_effect_salvage(
+                    payload,
+                    "live",
+                    validation_errors=["mixed contract errors"],
+                    db_path=db,
+                    _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertTrue(result["partial_persisted"], result)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trades").fetchone()[0], 1)
+                cycle_raw = json.loads(con.execute(
+                    "SELECT raw FROM trade_cycles").fetchone()[0])
+            quarantine = cycle_raw["contract_quarantine"]
+            self.assertEqual(quarantine["candidate_count"], 2)
+            self.assertEqual(quarantine["side_effect_trades_preserved"], 1)
+            self.assertEqual(quarantine["rejected_count"], 1)
+            self.assertEqual(len(quarantine["rejected_candidates"][0]["trade_sha256"]),
+                             64)
+
+    def test_salvage_ordidless_close_rejects_untrusted_time_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:13")
+            payload["trades"][0].update({
+                "action": "close",
+                "fill_ts": "2026-07-29 12:13:05",
+                "ts_source": "caller.claimed_time",
+            })
+            result = trades_writer.commit_side_effect_salvage(
+                payload,
+                "live",
+                validation_errors=["close identity contract invalid"],
+                db_path=db,
+                _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+            )
+            self.assertFalse(result["ok"], result)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trade_cycles").fetchone()[0], 0)
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trades").fetchone()[0], 0)
+
+    def test_salvage_ordidless_close_rejects_fill_outside_cycle_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:13")
+            payload["trades"][0].update({
+                "action": "close",
+                "fill_ts": "2026-07-29 12:27:00",
+                "ts_source": "fills.fillTime",
+            })
+            result = trades_writer.commit_side_effect_salvage(
+                payload,
+                "live",
+                validation_errors=["close identity contract invalid"],
+                db_path=db,
+                _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+            )
+            self.assertFalse(result["ok"], result)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trade_cycles").fetchone()[0], 0)
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) FROM trades").fetchone()[0], 0)
+
+    def test_salvage_refused_write_is_not_reported_partial_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            payload = self._payload("2026-07-29T12:13")
+            trusted = dict(payload["trades"][0], ordId="ORDER-GOOD")
+            rejected = dict(payload["trades"][0], symbol="ETH-USDT-SWAP",
+                            fill_source="planned", ordId="ORDER-FAKE")
+            payload["trades"] = [trusted, rejected]
+            with mock.patch.object(
+                trades_writer, "_write_trades",
+                return_value={
+                    "ok": False,
+                    "refused": "ambiguous_merge",
+                    "error": "ambiguous_merge",
+                },
+            ):
+                result = trades_writer.commit_side_effect_salvage(
+                    payload,
+                    "live",
+                    validation_errors=["mixed contract errors"],
+                    db_path=db,
+                    _capability=trades_writer._SIDE_EFFECT_SALVAGE_CAPABILITY,
+                )
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["partial_persisted"], result)
+            self.assertEqual(result["preserved_count"], 0)
+            self.assertEqual(result["accepted_candidate_count"], 1)
+            self.assertEqual(result["error"], "ambiguous_merge")
 
     def test_missing_fill_ts_uses_explicit_writer_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -769,6 +1401,73 @@ class TradesWriterHardeningTests(unittest.TestCase):
                     "SELECT ts,equity FROM trade_cycles").fetchone()
             self.assertEqual(cycle_ts, "2026-07-29 12:36:00")
             self.assertEqual(equity, 777.0)
+
+    def test_current_hold_preserves_same_slot_reconciled_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live_trades.db"
+            _create_trade_db(db)
+            cycle = trades_writer.RECONCILE_ANALYSIS_TERMINAL_FROM
+            maintenance = self._payload(cycle)
+            maintenance.pop("status")
+            maintenance.pop("decision_protocol")
+            maintenance.pop("decision_card")
+            maintenance["raw"] = {
+                "reconcile_source": "exchange_fills_exact",
+                "symbol": "MU-USDT-SWAP",
+            }
+            maintenance["trades"] = [{
+                "symbol": "MU-USDT-SWAP",
+                "action": "close",
+                "side": "long",
+                "sz": 0.5,
+                "fill_px": 954.99,
+                "lev": 10.0,
+                "pnl": -4.21,
+                "reasoning": "exchange stop reconciliation",
+            }]
+            first = trades_writer.maintenance_write_trades(
+                maintenance, db,
+                trusted_timestamp="2026-08-14 03:45:04",
+                preserve_equity_none=True,
+            )
+            self.assertTrue(first["ok"], first)
+
+            current = {
+                "cycle_id": cycle,
+                "decision": "hold",
+                "status": "ok",
+                "decision_protocol": "decision_card_v1",
+                "decision_card": _valid_card("scheduled Agent HOLD"),
+                "action_taken": "HOLD",
+                "n_orders": 0,
+                "equity": 920.0,
+                "_profile": "live",
+                "raw": {"source": "scheduled_agent"},
+                "trades": [],
+            }
+            second = trades_writer.write_trades(current, db)
+            self.assertTrue(second["ok"], second)
+            self.assertFalse(second.get("refused"), second)
+            with closing(sqlite3.connect(db)) as con:
+                con.row_factory = sqlite3.Row
+                header = con.execute(
+                    "SELECT decision,n_orders,equity,raw FROM trade_cycles"
+                ).fetchone()
+                rows = con.execute(
+                    "SELECT symbol,action,side,sz,pnl FROM trades"
+                ).fetchall()
+            self.assertEqual((header["decision"], header["n_orders"]),
+                             ("traded", 1))
+            self.assertEqual(header["equity"], 920.0)
+            raw = json.loads(header["raw"])
+            self.assertEqual(raw["status"], "ok")
+            self.assertEqual(raw["action_taken"], "HOLD")
+            self.assertTrue(raw["reconciled_close_preserved"])
+            self.assertEqual(
+                [(row["symbol"], row["action"], row["side"], row["sz"],
+                  row["pnl"]) for row in rows],
+                [("MU-USDT-SWAP", "close", "long", 0.5, -4.21)],
+            )
 
     def test_confirmed_fill_contract_and_failure_receipts_are_closed(self) -> None:
         payload = self._payload("2026-07-29T13:00")
@@ -873,6 +1572,46 @@ class TradesWriterHardeningTests(unittest.TestCase):
 
 
 class DispatcherHardeningTests(unittest.TestCase):
+    def test_future_push_waits_for_post_agent_report_barrier(self):
+        cycle = "2026-08-14T19:00"
+        now = datetime(2026, 8, 14, 19, 12, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-14 19:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+            self.assertTrue(dispatcher.ledger.try_stage(
+                ledger_path, cycle, "live"))
+            fired: list = []
+            with (
+                mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis),
+                mock.patch.object(
+                    dispatcher, "live_report_barrier_ready",
+                    return_value=False),
+            ):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertFalse(fired, (fired, out))
+            self.assertFalse(dispatcher.ledger.stage_dispatched(
+                ledger_path, cycle, "push"))
+
+            with (
+                mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis),
+                mock.patch.object(
+                    dispatcher, "live_report_barrier_ready",
+                    return_value=True),
+            ):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual([("push", cycle, "full")], fired, out)
+
     def test_profile_lease_serializes_cycles_and_owner_only_releases(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "ledger.db"
@@ -915,6 +1654,239 @@ class DispatcherHardeningTests(unittest.TestCase):
                         dispatcher.trade_written(root, "live", cycle),
                         expected,
                     )
+
+    def test_business_error_reportable_is_forward_only_and_zero_side_effect(self):
+        def prepare(root: Path, cycle: str, *, intent_state: str = "failed_clean"):
+            _create_trade_db(root / "live_trades.db")
+            raw = {
+                "cycle_id": cycle,
+                "status": "error",
+                "decision": "error",
+                "n_orders": 0,
+                "action_taken": "REJECT",
+                "trades": [],
+                "errors": ["clean reject"],
+                "reject_reason": "multitimeframe_context_mismatch",
+            }
+            with closing(sqlite3.connect(root / "live_trades.db")) as con:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 02:16:00", "live", "error",
+                     0, None, "", json.dumps(raw)),
+                )
+                con.commit()
+            with closing(sqlite3.connect(root / "ledger.db")) as con:
+                con.execute(
+                    "CREATE TABLE execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.execute(
+                    "INSERT INTO execution_intents VALUES(?,?,?,?,?,?)",
+                    ("live", cycle, intent_state, None, None, None),
+                )
+                con.commit()
+
+        for cycle, expected in (
+            ("2026-08-14T02:00", False),
+            (dispatcher.BUSINESS_ERROR_REPORTABLE_FROM, True),
+        ):
+            with self.subTest(cycle=cycle), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                prepare(root, cycle)
+                self.assertEqual(
+                    dispatcher.trade_error_reportable(root, "live", cycle),
+                    expected,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cycle = dispatcher.BUSINESS_ERROR_REPORTABLE_FROM
+            prepare(root, cycle, intent_state="submitted")
+            self.assertFalse(
+                dispatcher.trade_error_reportable(root, "live", cycle))
+
+    def test_forward_business_error_dispatches_full_report(self):
+        cycle = dispatcher.BUSINESS_ERROR_REPORTABLE_FROM
+        now = datetime(2026, 8, 14, 2, 35, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-14 02:16:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            raw = {
+                "cycle_id": cycle, "status": "error", "decision": "error",
+                "n_orders": 0, "action_taken": "REJECT", "trades": [],
+                "errors": ["clean reject"], "reject_reason": "data_not_ready",
+            }
+            with closing(sqlite3.connect(root / "live_trades.db")) as con:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 02:16:00", "live", "error",
+                     0, None, "", json.dumps(raw)),
+                )
+                con.commit()
+            # Keep the fixture compatible with both a base ledger that already
+            # owns the table and older isolated schemas that create it lazily.
+            with closing(sqlite3.connect(ledger_path)) as con:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.commit()
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual([("push", cycle, "full")], fired, (fired, out))
+
+    def test_reconciled_close_does_not_replace_scheduled_unified_analysis(self):
+        cycle = dispatcher.RECONCILE_ANALYSIS_TERMINAL_FROM
+        now = datetime(2026, 8, 14, 4, 6, tzinfo=CST)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            raw = {
+                "reconcile_source": "exchange_fills_exact",
+                "cycle_ts_source": "trusted_internal_override",
+                "symbol": "MU-USDT-SWAP",
+                "close_ts": "2026-08-14 03:45:04",
+            }
+            with closing(sqlite3.connect(root / "live_trades.db")) as con:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 03:45:04", "live", "traded",
+                     1, None, "reconcile close", json.dumps(raw)),
+                )
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,lev,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 03:45:04", "MU-USDT-SWAP",
+                     "close", "long", 0.5, 954.99, 10.0, -4.21, "{}"),
+                )
+                con.commit()
+
+            self.assertTrue(dispatcher.trade_written(root, "live", cycle))
+            self.assertTrue(dispatcher.trade_terminal_requires_analysis(
+                root, "live", cycle))
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "_collection_ready", return_value=True):
+                output = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *args, **kwargs: fired.append(args) or "card",
+                )
+            self.assertEqual([("live", cycle, "unified")], fired, output)
+            self.assertFalse(dispatcher.ledger.stage_dispatched(
+                ledger_path, cycle, "push"))
+
+    def test_current_agent_trade_terminal_still_pushes_without_analysis_row(self):
+        cycle = "2026-08-14T04:00"
+        now = datetime(2026, 8, 14, 4, 10, tzinfo=CST)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            raw = {
+                "status": "ok",
+                "decision": "traded",
+                "decision_protocol": "decision_card_v1",
+            }
+            with closing(sqlite3.connect(root / "live_trades.db")) as con:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 04:09:00", "live", "traded",
+                     1, 900.0, "agent open", json.dumps(raw)),
+                )
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,lev,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 04:09:00", "SOXL-USDT-SWAP",
+                     "open", "long", 3.0, 145.3, 10.0, 0.0, "{}"),
+                )
+                con.commit()
+
+            self.assertFalse(dispatcher.trade_terminal_requires_analysis(
+                root, "live", cycle))
+            fired: list = []
+            output = dispatcher.dispatch_cycle(
+                root, ledger_path, cycle, now=now,
+                fire_fn=lambda *args, **kwargs: fired.append(args) or "card",
+            )
+            self.assertEqual([("push", cycle, "full")], fired, output)
+
+    def test_same_cycle_live_lease_defers_push_until_runner_releases(self):
+        cycle = dispatcher.RECONCILE_ANALYSIS_TERMINAL_FROM
+        now = datetime(2026, 8, 14, 4, 10, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-14 04:08:00"}
+        # CI globally enables trigger dry-run, which intentionally never writes
+        # stage latches.  This case verifies the persistent lease/latch path
+        # with an injected fire function and isolated databases.
+        with mock.patch.dict(
+                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
+                tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            raw = {
+                "reconcile_source": "exchange_fills_exact",
+                "cycle_ts_source": "trusted_internal_override",
+                "symbol": "SOXL-USDT-SWAP",
+            }
+            with closing(sqlite3.connect(root / "live_trades.db")) as con:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 04:01:09", "live", "traded",
+                     1, None, "reconcile close", json.dumps(raw)),
+                )
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,lev,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (cycle, "2026-08-14 04:01:09", "SOXL-USDT-SWAP",
+                     "close", "long", 3.0, 143.91, 10.0, -4.17, "{}"),
+                )
+                con.commit()
+            self.assertTrue(dispatcher.ledger.try_stage(
+                ledger_path, cycle, "live"))
+            self.assertTrue(dispatcher.ledger.try_profile_lease(
+                ledger_path, "live", cycle, now=now))
+            self.assertTrue(dispatcher.live_cycle_in_progress(
+                ledger_path, cycle, now=now))
+
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis):
+                output = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *args, **kwargs: fired.append(args) or "card",
+                )
+            self.assertFalse(fired, (fired, output))
+            self.assertFalse(dispatcher.ledger.stage_dispatched(
+                ledger_path, cycle, "push"))
+
+            self.assertTrue(dispatcher.ledger.release_profile_lease(
+                ledger_path, "live", cycle))
+            self.assertFalse(dispatcher.live_cycle_in_progress(
+                ledger_path, cycle, now=now))
+            with mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis):
+                output = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *args, **kwargs: fired.append(args) or "card",
+                )
+            self.assertEqual([("push", cycle, "full")], fired, output)
+            self.assertTrue(dispatcher.ledger.stage_dispatched(
+                ledger_path, cycle, "push"))
 
     def test_push_fires_on_live_alone_without_demo(self):
         """2026-08-06 解耦：push 是纯汇报、一分钱不碰，不得被 demo 账本卡住
@@ -995,6 +1967,89 @@ class DispatcherHardeningTests(unittest.TestCase):
                     root, ledger_path, cycle, now=now,
                     fire_fn=lambda *a, **k: fired.append(a) or "card")
             self.assertFalse(fired, (fired, out))
+
+    def test_future_terminal_live_failure_fires_wait_report_only(self):
+        cycle = "2026-08-13T04:00"
+        now = datetime(2026, 8, 13, 4, 20, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-13 04:01:00"}
+        terminal = {
+            "stage": "live", "cycle_id": cycle, "status": "failed",
+            "failure_kind": "agent_idle_timeout",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            fired: list = []
+            with (
+                mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis),
+                mock.patch.object(
+                    dispatcher, "live_failure_terminal",
+                    return_value=terminal) as failure_probe,
+            ):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual(
+                [("push", cycle, "failure_report")], fired, (fired, out))
+            self.assertFalse(dispatcher.trade_written(root, "live", cycle))
+            failure_probe.assert_called_with(
+                cycle, now=now, db_root=root)
+
+    def test_valid_trade_terminal_precedes_failure_report(self):
+        cycle = "2026-08-13T04:00"
+        now = datetime(2026, 8, 13, 4, 20, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-13 04:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+            fired: list = []
+            with (
+                mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis),
+                mock.patch.object(
+                    dispatcher, "live_failure_terminal",
+                    return_value={"status": "failed"}),
+            ):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual([("push", cycle, "full")], fired, (fired, out))
+
+    def test_partial_trade_cycle_blocks_failure_report_without_taking_push_latch(self):
+        cycle = "2026-08-13T04:00"
+        now = datetime(2026, 8, 13, 4, 20, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-13 04:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "unknown", 0)
+            fired: list = []
+            with (
+                mock.patch.object(
+                    dispatcher, "analysis_row", return_value=analysis),
+                mock.patch.object(
+                    dispatcher, "live_failure_terminal",
+                    return_value={"status": "failed"}),
+            ):
+                out = dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertFalse(fired, (fired, out))
+            self.assertTrue(dispatcher.trade_cycle_present(
+                root, "live", cycle))
+            self.assertFalse(dispatcher.ledger.stage_dispatched(
+                ledger_path, cycle, "push"))
 
     def test_unknown_analysis_status_never_dispatches_downstream(self) -> None:
         fired: list[tuple] = []

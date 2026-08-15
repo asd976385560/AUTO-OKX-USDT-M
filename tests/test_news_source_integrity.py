@@ -16,6 +16,8 @@ if str(SOURCES) not in sys.path:
 import news_collect  # noqa: E402
 import news_geo  # noqa: E402
 import news_mxsearch  # noqa: E402
+import _news_http  # noqa: E402
+import news_jinse  # noqa: E402
 import news_odaily  # noqa: E402
 import news_okx  # noqa: E402
 import news_panews  # noqa: E402
@@ -23,6 +25,76 @@ import news_rss  # noqa: E402
 
 
 class NewsSourceIntegrityTests(unittest.TestCase):
+    def test_schannel_transport_keeps_proxy_tls_and_hard_timeout(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"<rss />", stderr=b"")
+        with mock.patch.object(
+            _news_http, "_native_curl_path", return_value=r"C:\Windows\System32\curl.exe",
+        ), mock.patch.object(
+            _news_http.subprocess, "run", return_value=completed,
+        ) as run:
+            text = _news_http._fetch_text_schannel(
+                "https://publisher.example/feed",
+                timeout=2.5,
+                headers={"Accept": "application/rss+xml"},
+                proxy="http://127.0.0.1:10080",
+            )
+
+        self.assertEqual(text, "<rss />")
+        args = run.call_args.args[0]
+        self.assertEqual(
+            args[args.index("--proxy") + 1], "http://127.0.0.1:10080")
+        self.assertNotIn("--insecure", args)
+        self.assertEqual(run.call_args.kwargs["timeout"], 2.5)
+
+    def test_alternate_http_uses_schannel_within_original_budget(self) -> None:
+        request = _news_http.httpx.Request(
+            "GET", "https://publisher.example/feed")
+        client = mock.MagicMock()
+        client.__enter__.return_value.get.side_effect = (
+            _news_http.httpx.ConnectError("tls eof", request=request))
+        with mock.patch.object(
+            _news_http.httpx, "Client", return_value=client,
+        ), mock.patch.object(
+            _news_http.time, "monotonic", side_effect=[100.0, 100.25],
+        ), mock.patch.object(
+            _news_http, "_fetch_text_schannel", return_value="<rss />",
+        ) as schannel:
+            text = _news_http.fetch_text(
+                "https://publisher.example/feed",
+                timeout=4.0,
+                headers={"Accept": "application/rss+xml"},
+            )
+
+        self.assertEqual(text, "<rss />")
+        self.assertAlmostEqual(
+            schannel.call_args.kwargs["timeout"], 3.75, places=6)
+        self.assertEqual(
+            schannel.call_args.kwargs["headers"],
+            {"Accept": "application/rss+xml"},
+        )
+        self.assertEqual(
+            schannel.call_args.kwargs["proxy"],
+            _news_http.os.environ.get("OKX_PROXY_URL")
+            or _news_http.os.environ.get("HTTPS_PROXY")
+            or _news_http.os.environ.get("HTTP_PROXY"),
+        )
+
+    def test_alternate_http_does_not_retry_authoritative_http_status(self) -> None:
+        request = _news_http.httpx.Request(
+            "GET", "https://publisher.example/feed")
+        response = _news_http.httpx.Response(503, request=request)
+        client = mock.MagicMock()
+        client.__enter__.return_value.get.return_value = response
+        with mock.patch.object(
+            _news_http.httpx, "Client", return_value=client,
+        ), mock.patch.object(
+            _news_http, "_fetch_text_schannel",
+        ) as schannel:
+            with self.assertRaises(_news_http.httpx.HTTPStatusError):
+                _news_http.fetch_text(
+                    "https://publisher.example/feed", timeout=4.0)
+        schannel.assert_not_called()
+
     def test_news_adapters_import_through_project_package(self) -> None:
         from collectors.sources import news_panews as packaged_panews
         from collectors.sources import news_rss as packaged_rss
@@ -70,8 +142,47 @@ class NewsSourceIntegrityTests(unittest.TestCase):
         self.assertEqual(items[0]["source"], "rss:good")
         self.assertEqual([row["status"] for row in outcomes], ["ok", "failed"])
         self.assertEqual(outcomes[1]["id"], "rss:bad")
-        self.assertEqual(outcomes[1]["attempts"], 2)
+        self.assertEqual(outcomes[1]["attempts"], 3)
+        self.assertTrue(outcomes[1]["cold_retry_requested"])
+        self.assertFalse(outcomes[1]["historical_retry"])
+        self.assertFalse(outcomes[1]["unbounded_retry"])
+        self.assertIn("hot=", outcomes[1]["err"])
+        self.assertIn("cold=", outcomes[1]["err"])
+        self.assertTrue(outcomes[1]["pre_cold_error"])
+        self.assertTrue(outcomes[1]["cold_retry_error"])
         self.assertTrue(errors)
+
+    def test_failed_rss_recovers_in_exact_delayed_cold_wave(self) -> None:
+        xml = "<rss><channel><item><title>BTC update</title></item></channel></rss>"
+        outcomes: list[dict] = []
+        with mock.patch.object(
+            news_rss, "_fetch", side_effect=urllib.error.URLError("tls eof"),
+        ), mock.patch.object(
+            news_rss, "_fetch_text_httpx",
+            side_effect=[TimeoutError("hot eof 1"),
+                         TimeoutError("hot eof 2"), xml],
+        ) as httpx_fetch, mock.patch.object(
+            news_rss.time, "sleep",
+        ) as sleep:
+            items = news_rss.fetch_rss_items(
+                feeds=[("Decrypt", "https://decrypt.co/feed")],
+                outcomes=outcomes,
+            )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(httpx_fetch.call_count, 3)
+        self.assertEqual(outcomes[0]["status"], "ok")
+        self.assertEqual(outcomes[0]["attempts"], 3)
+        self.assertEqual(outcomes[0]["transport_attempts"], 5)
+        self.assertTrue(outcomes[0]["recovered_after_cold_retry"])
+        self.assertEqual(outcomes[0]["transport"], "httpx_cold_new_client")
+        self.assertFalse(outcomes[0]["historical_retry"])
+        self.assertFalse(outcomes[0]["unbounded_retry"])
+        self.assertTrue(any(
+            call.args and call.args[0] ==
+            news_rss.RSS_COLD_RETRY_DELAY_SECONDS
+            for call in sleep.call_args_list
+        ))
 
     def test_failed_rss_urllib_recovers_via_same_url_httpx(self) -> None:
         xml = "<rss><channel><item><title>BTC update</title></item></channel></rss>"
@@ -210,8 +321,47 @@ class NewsSourceIntegrityTests(unittest.TestCase):
         self.assertEqual(stats, {
             "initial_failed": 1,
             "recovered_after_retry": 1,
+            "recovered_after_immediate_retry": 1,
+            "cold_retry_requested": 0,
+            "recovered_after_cold_retry": 0,
             "final_failed": 0,
+            "maximum_fetch_phases_per_endpoint": 3,
+            "cold_retry_delay_seconds": 3.0,
+            "cold_retry_timeout_seconds": 4.0,
+            "historical_retry": False,
+            "unbounded_retry": False,
         })
+        self.assertEqual({item["raw"]["id"] for item in items},
+                         {"important", "latest"})
+
+    def test_official_news_exact_endpoint_recovers_after_cold_delay(self) -> None:
+        calls: list[str] = []
+
+        def fake_okx_json(_group, kind, *_args, **_kwargs):
+            calls.append(kind)
+            if kind == "important" and calls.count(kind) < 3:
+                raise TimeoutError("transient")
+            return {"details": [{"id": kind, "title": f"{kind} update"}]}
+
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(
+            news_okx, "okx_json", side_effect=fake_okx_json,
+        ), mock.patch.object(news_okx.time, "sleep") as sleep:
+            items = news_okx.fetch_items(errors=errors, retry_stats=stats)
+
+        self.assertEqual(
+            calls, ["important", "latest", "important", "important"])
+        self.assertEqual(errors, [])
+        self.assertEqual(stats["cold_retry_requested"], 1)
+        self.assertEqual(stats["recovered_after_cold_retry"], 1)
+        self.assertEqual(stats["final_failed"], 0)
+        self.assertFalse(stats["historical_retry"])
+        self.assertFalse(stats["unbounded_retry"])
+        self.assertTrue(any(
+            call.args and call.args[0] == 3.0
+            for call in sleep.call_args_list
+        ))
         self.assertEqual({item["raw"]["id"] for item in items},
                          {"important", "latest"})
 
@@ -278,6 +428,9 @@ class NewsSourceIntegrityTests(unittest.TestCase):
         stats: dict = {}
         with mock.patch.object(
             news_odaily, "_fetch", return_value={"code": 200, "data": {}},
+        ), mock.patch.object(
+            news_odaily, "_fetch_alternate",
+            return_value={"code": 200, "data": {}},
         ), mock.patch.object(news_odaily.time, "sleep"):
             items = news_odaily.fetch_items(
                 errors=errors, retry_stats=stats)
@@ -286,6 +439,46 @@ class NewsSourceIntegrityTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertTrue(stats["final_failed"])
         self.assertEqual(stats["attempts"], 2)
+
+    def test_odaily_recovers_via_same_url_alternate_transport(self) -> None:
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(
+            news_odaily, "_fetch",
+            side_effect=urllib.error.URLError("tls eof"),
+        ) as primary, mock.patch.object(
+            news_odaily, "_fetch_alternate",
+            return_value={"code": 200, "data": {"list": []}},
+        ) as alternate, mock.patch.object(news_odaily.time, "sleep"):
+            items = news_odaily.fetch_items(
+                errors=errors, retry_stats=stats)
+
+        self.assertEqual(items, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(primary.call_count, 1)
+        self.assertEqual(alternate.call_count, 1)
+        self.assertTrue(stats["recovered_after_retry"])
+        self.assertEqual(stats["transport"], "alternate_http")
+
+    def test_jinse_recovers_via_same_url_alternate_transport(self) -> None:
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(
+            news_jinse, "_fetch",
+            side_effect=urllib.error.URLError("tls eof"),
+        ) as primary, mock.patch.object(
+            news_jinse, "_fetch_alternate",
+            return_value=json.dumps({"list": []}),
+        ) as alternate, mock.patch.object(news_jinse.time, "sleep"):
+            items = news_jinse.fetch_items(
+                errors=errors, retry_stats=stats)
+
+        self.assertEqual(items, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(primary.call_count, 1)
+        self.assertEqual(alternate.call_count, 1)
+        self.assertTrue(stats["recovered_after_retry"])
+        self.assertEqual(stats["transport"], "alternate_http")
 
     def test_mx_search_retries_once_without_duplicate_success(self) -> None:
         calls: list[float] = []

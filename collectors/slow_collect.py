@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """V2.0 慢采脚本（系统层，零 agent）。
 
-由聚合 runner `collect_cycle.py --tier hourly`（cron `okx-collect-hourly` 每小时 :00）
-作为末步串行调用，归入 :00 槽（2026-08-08 整并前：独立 cron `okx-slow-collect` 每小时 :02）。
+由聚合 runner `collect_cycle.py --tier hourly` 在 fast 完成后与 news 并行调用，
+归入显式 :00 槽；runner 等两条尾分支都收口后单次派发（2026-08-08 整并前：
+独立 cron `okx-slow-collect` 每小时 :02）。
 
 包装现有 collect_slow.py（**原样不改**），结尾：
   1. 写账本 collection_runs(cycle_id, 'slow', status)
   2. 写账本 collection_runs(cycle_id, 'regime', status)
-  3. 通过 _dispatch_nudge 通知 core/dispatcher.py；定时 dispatcher 负责兜底
+  3. 默认通过 _dispatch_nudge 通知 core/dispatcher.py；聚合 hourly runner 传
+     --defer-dispatch-nudge 时只落账，由 runner 等 news+slow 都收口后单次通知
 
-与生产隔离：默认 --db-root ./db；tmp 验证传临时目录。--dry-collect 跳过真采集
+与生产隔离：默认 --db-root .\\db；tmp 验证传临时目录。--dry-collect 跳过真采集
 （不联网、不写生产），只验账本+触发 plumbing。
 """
 from __future__ import annotations
@@ -23,7 +25,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r".\collectors")
 import ledger          # noqa: E402
 
 try:  # HANDOFF-4B 采集侧事件通知（可缺省，守卫式导入照 analyst_writer 惯例）
@@ -205,6 +207,11 @@ def main() -> int:
     ap.add_argument("--collect-timeout", type=int, default=450)
     ap.add_argument("--dry-collect", action="store_true",
                     help="跳过真采集（不联网/不写生产），只验账本+触发")
+    ap.add_argument(
+        "--defer-dispatch-nudge",
+        action="store_true",
+        help="落账后不自行 nudge；仅供 collect_cycle hourly 并行收口使用",
+    )
     # 生产 cron 仍可能携带该历史参数；保留为无副作用兼容参数，派发始终走 nudge+dispatcher。
     ap.add_argument("--no-dispatch", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -256,10 +263,18 @@ def main() -> int:
     # HANDOFF-4B（2026-07-17）：落账后事件通知 dispatcher（:00 槽 slow/regime 是 gate 必需源，
     # 本 nudge 是该槽的有效触发；fast 侧同款）。三道采集侧门 + nudge() 四道守护闸在
     # _dispatch_nudge 内；非致命，不改本脚本退出码。
-    if _nudge_mod is not None:
-        _nudge_mod.nudge_from_collector("slow_collect", args.db_root,
-                                        [slow_status, regime_status],
-                                        dry_collect=args.dry_collect)
+    if args.defer_dispatch_nudge:
+        dispatch_result = {
+            "nudged": False,
+            "reason": "deferred_to_collect_cycle",
+        }
+    elif _nudge_mod is not None:
+        dispatch_result = _nudge_mod.nudge_from_collector(
+            "slow_collect", args.db_root,
+            [slow_status, regime_status],
+            dry_collect=args.dry_collect)
+    else:
+        dispatch_result = {"nudged": False, "reason": "module_unavailable"}
 
     out = {"ok": slow_status in ledger.DONE_STATUS, "cycle": cycle,
            "status_slow": slow_status, "status_regime": regime_status,
@@ -268,7 +283,7 @@ def main() -> int:
            "steps": [{k: s[k] for k in (
                           "name", "ok", "rc", "dur_s", "warn_tail", "stderr_tail")
                       if k in s} for s in steps],
-           "dispatch": None}
+           "dispatch": dispatch_result}
     print(json.dumps(out, ensure_ascii=False))
     return 0 if slow_status in ledger.DONE_STATUS else 1
 

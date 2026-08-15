@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -41,9 +42,9 @@ from core.multitimeframe_gate import (  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 UTC = timezone.utc
-DEFAULT_MARKET_DB = Path(r"./db/market.db")
+DEFAULT_MARKET_DB = Path(r".\db\market.db")
 DEFAULT_OUTPUT = Path(
-    r"./reports/quality/multitimeframe-coverage-audit.json")
+    r".\reports\quality\multitimeframe-coverage-audit.json")
 def _parse_ts(value: str) -> datetime:
     text = str(value).strip().replace(" ", "T")
     if text.endswith("Z"):
@@ -113,6 +114,123 @@ def _history_counts(
     return {str(row["symbol"]): int(row["n"]) for row in rows}
 
 
+def _official_listing_times(
+    connection: sqlite3.Connection,
+    symbols: list[str],
+) -> dict[str, datetime]:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='instruments_cache'"
+    ).fetchone()
+    if table is None:
+        return {}
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(instruments_cache)")
+    }
+    if "list_time_utc" not in columns:
+        return {}
+    placeholders = ",".join("?" for _ in symbols)
+    rows = connection.execute(
+        "SELECT instId,list_time_utc FROM instruments_cache "
+        f"WHERE instId IN ({placeholders}) AND list_time_utc IS NOT NULL",
+        symbols,
+    ).fetchall()
+    output: dict[str, datetime] = {}
+    for row in rows:
+        try:
+            output[str(row["instId"])] = _parse_ts(str(row["list_time_utc"]))
+        except (TypeError, ValueError):
+            continue
+    return output
+
+
+def _listing_history_evidence(
+    listing_time: datetime | None,
+    timeframe: str,
+    expected_bar_ts: str,
+    bars_seen: int,
+) -> dict[str, Any]:
+    if listing_time is None:
+        return {
+            "history_semantics": "official_listing_time_unavailable",
+            "official_list_time_utc": None,
+            "maximum_possible_bars_since_listing": None,
+            "earliest_full_indicator_ready_at_utc": None,
+        }
+    seconds = TIMEFRAME_SECONDS[timeframe]
+    expected = _parse_ts(expected_bar_ts)
+    listing_epoch = int(listing_time.timestamp())
+    first_aligned_epoch = (listing_epoch // seconds) * seconds
+    expected_epoch = int(expected.timestamp())
+    maximum_possible = (
+        ((expected_epoch - first_aligned_epoch) // seconds) + 1
+        if expected_epoch >= first_aligned_epoch else 0
+    )
+    ready_at = datetime.fromtimestamp(
+        first_aligned_epoch + MINIMUM_BARS_FOR_FULL_INDICATORS * seconds,
+        tz=UTC,
+    )
+    if bars_seen >= MINIMUM_BARS_FOR_FULL_INDICATORS:
+        semantics = "history_sufficient"
+    elif maximum_possible < MINIMUM_BARS_FOR_FULL_INDICATORS:
+        semantics = "official_new_listing_warmup"
+    else:
+        semantics = "historical_collection_gap"
+    return {
+        "history_semantics": semantics,
+        "official_list_time_utc": _iso_utc(listing_time),
+        "maximum_possible_bars_since_listing": int(maximum_possible),
+        "earliest_full_indicator_ready_at_utc": _iso_utc(ready_at),
+    }
+
+
+def _readiness_projection(
+    gaps: list[dict[str, Any]],
+    *,
+    ready_symbols: int,
+    universe_symbols: int,
+    minimum_rate: float,
+) -> dict[str, Any]:
+    """Project the threshold only from deterministic official warm-up clocks."""
+    required = math.ceil(minimum_rate * universe_symbols - 1e-12)
+    additional = max(0, required - ready_symbols)
+    if additional == 0:
+        status = "ALREADY_MET"
+        projected = None
+    else:
+        warmup_times: list[datetime] = []
+        for gap in gaps:
+            if gap.get("history_semantics") != "official_new_listing_warmup":
+                continue
+            ready_at = gap.get("earliest_full_indicator_ready_at_utc")
+            if not ready_at:
+                continue
+            try:
+                warmup_times.append(_parse_ts(str(ready_at)))
+            except (TypeError, ValueError):
+                continue
+        warmup_times.sort()
+        if len(warmup_times) >= additional:
+            status = "PROJECTED_FROM_OFFICIAL_WARMUP"
+            projected = _iso_utc(warmup_times[additional - 1])
+        else:
+            status = "NO_DETERMINISTIC_PROJECTION"
+            projected = None
+    return {
+        "status": status,
+        "required_ready_symbols": required,
+        "current_ready_symbols": ready_symbols,
+        "additional_ready_symbols_needed": additional,
+        "projected_threshold_ready_at_utc": projected,
+        "projection_basis": (
+            "official listTime-aligned warm-up only; assumes the universe is "
+            "unchanged, currently ready symbols remain ready, and no future "
+            "source or indicator defect occurs"
+        ),
+    }
+
+
 def audit_multitimeframe_coverage(
     market_db: Path,
     *,
@@ -140,6 +258,7 @@ def audit_multitimeframe_coverage(
         ]
         if not symbols:
             raise ValueError(f"empty USDT linear SWAP universe at {latest_tick}")
+        listing_times = _official_listing_times(connection, symbols)
 
         timeframes: list[dict[str, Any]] = []
         for timeframe in TIMEFRAME_SECONDS:
@@ -177,6 +296,10 @@ def audit_multitimeframe_coverage(
                     "bars_seen": bars_seen,
                     "raw_errors": raw_errors,
                     "indicator_errors": indicator_errors,
+                    **_listing_history_evidence(
+                        listing_times.get(symbol), timeframe,
+                        expected_ts, bars_seen,
+                    ),
                 })
 
             denominator = len(symbols)
@@ -205,6 +328,24 @@ def audit_multitimeframe_coverage(
                         "indicator_invalid",
                     )
                 },
+                "history_semantic_counts": {
+                    semantics: sum(
+                        1 for gap in gaps
+                        if gap["history_semantics"] == semantics
+                    )
+                    for semantics in (
+                        "official_new_listing_warmup",
+                        "historical_collection_gap",
+                        "official_listing_time_unavailable",
+                        "history_sufficient",
+                    )
+                },
+                "analysis_readiness_projection": _readiness_projection(
+                    gaps,
+                    ready_symbols=len(ready),
+                    universe_symbols=denominator,
+                    minimum_rate=minimum_rate,
+                ),
                 "gaps": gaps,
             })
     finally:
@@ -215,7 +356,7 @@ def audit_multitimeframe_coverage(
     readiness_passed = all(
         row["analysis_ready_status"] == "PASSED" for row in timeframes)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "multitimeframe_closed_bar_coverage_audit",
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "generated_at_cst": datetime.now(UTC).astimezone(CST).isoformat(),
@@ -225,6 +366,12 @@ def audit_multitimeframe_coverage(
         "universe_symbols": len(symbols),
         "minimum_rate": minimum_rate,
         "minimum_bars_for_full_indicators": MINIMUM_BARS_FOR_FULL_INDICATORS,
+        "official_listing_metadata": {
+            "source": "OKX public instruments listTime via instruments_cache",
+            "covered_symbols": len(listing_times),
+            "universe_symbols": len(symbols),
+            "coverage_rate": round(len(listing_times) / len(symbols), 6),
+        },
         "contracts": {
             "universe": "latest ticker symbols ending -USDT-SWAP",
             "bar_selection": "exact latest fully closed UTC-aligned bar",
@@ -234,7 +381,8 @@ def audit_multitimeframe_coverage(
                 "/ full universe"),
             "new_listing_semantics": (
                 "insufficient history remains in denominator; indicators are "
-                "never fabricated"),
+                "never fabricated; official listTime separates unavoidable "
+                "warm-up from a local historical collection gap"),
         },
         "timeframes": timeframes,
         "data_completeness_status": "PASSED" if data_passed else "NOT_MET",

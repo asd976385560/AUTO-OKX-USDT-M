@@ -1,7 +1,7 @@
 -- OKX 永续合约自主交易系统 - 数据库 Schema
--- 导出时间: 2026-08-12 04:34:42 CST
+-- 导出时间: 2026-08-13 12:16:04 CST
 -- 版本: V2.0
--- 数据库目录: db\
+-- 数据库目录: .\db\
 -- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）
 -- 核心拆分库由 init_v20_dbs.py 初始化；增量变更走 apply_* 幂等迁移脚本
 
@@ -46,7 +46,7 @@ CREATE TABLE instruments_cache (
             instId    TEXT PRIMARY KEY,
             ctVal     REAL,
             lotSz     REAL
-        );
+        , list_time_utc TEXT, state TEXT, inst_category TEXT, metadata_updated_at TEXT);
 
 CREATE TABLE kline_cache (
     ts          TEXT NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE kline_cache (
     ma20        REAL,
     atr14       REAL,
     rsi14       REAL,
-    macd_hist   REAL,
+    macd_hist   REAL, boll20_mid REAL, boll20_up REAL, boll20_dn REAL, obv REAL,
     PRIMARY KEY (ts, symbol, tf)
 );
 
@@ -93,6 +93,26 @@ CREATE TABLE market_contract_statistics (
     PRIMARY KEY (cycle_id, symbol, timeframe, source)
 );
 
+CREATE TABLE market_feature_selection_rows(
+            cycle_id      TEXT NOT NULL,
+            selection_rank INTEGER NOT NULL,
+            symbol        TEXT NOT NULL,
+            PRIMARY KEY(cycle_id,symbol),
+            UNIQUE(cycle_id,selection_rank),
+            FOREIGN KEY(cycle_id)
+              REFERENCES market_feature_selection_runs(cycle_id)
+        );
+
+CREATE TABLE market_feature_selection_runs(
+            cycle_id         TEXT PRIMARY KEY,
+            collected_ts_utc TEXT NOT NULL,
+            selected_count   INTEGER NOT NULL,
+            max_symbols      INTEGER NOT NULL,
+            payload_sha256   TEXT NOT NULL,
+            complete         INTEGER NOT NULL CHECK(complete IN (0,1)),
+            source           TEXT NOT NULL
+        );
+
 CREATE TABLE market_microstructure (
     ts                       TEXT NOT NULL,
     cycle_id                 TEXT NOT NULL,
@@ -125,7 +145,7 @@ CREATE TABLE market_microstructure (
     PRIMARY KEY (ts, symbol)
 );
 
-CREATE TABLE market_positioning (
+CREATE TABLE "market_positioning" (
     ts               TEXT NOT NULL,
     collected_ts     TEXT NOT NULL,
     cycle_id         TEXT NOT NULL,
@@ -136,7 +156,7 @@ CREATE TABLE market_positioning (
     long_short_ratio REAL,
     raw              TEXT,
     source           TEXT NOT NULL DEFAULT 'okx_cli_top_long_short',
-    PRIMARY KEY (ts, symbol, timeframe)
+    PRIMARY KEY (cycle_id, symbol, timeframe, source)
 );
 
 CREATE TABLE market_trade_flow (
@@ -158,6 +178,30 @@ CREATE TABLE market_trade_flow (
     source             TEXT NOT NULL DEFAULT 'okx_recent_trades',
     PRIMARY KEY (ts, symbol)
 );
+
+CREATE TABLE official_instrument_snapshot_rows(
+            cycle_id      TEXT NOT NULL,
+            symbol        TEXT NOT NULL,
+            list_time_utc TEXT,
+            state         TEXT,
+            settle_ccy    TEXT,
+            ct_type       TEXT,
+            inst_category TEXT,
+            ct_val        REAL,
+            lot_sz        REAL,
+            PRIMARY KEY(cycle_id,symbol),
+            FOREIGN KEY(cycle_id)
+              REFERENCES official_instrument_snapshot_runs(cycle_id)
+        );
+
+CREATE TABLE official_instrument_snapshot_runs(
+            cycle_id         TEXT PRIMARY KEY,
+            collected_ts_utc TEXT NOT NULL,
+            symbol_count     INTEGER NOT NULL,
+            payload_sha256   TEXT NOT NULL,
+            complete         INTEGER NOT NULL CHECK(complete IN (0,1)),
+            source           TEXT NOT NULL
+        );
 
 CREATE TABLE tick_snapshots (
     ts          TEXT NOT NULL,
@@ -185,17 +229,21 @@ CREATE INDEX idx_flow_symbol_ts
 
 CREATE INDEX idx_kline_symbol_tf_ts ON kline_cache(symbol, tf, ts);
 
+CREATE INDEX idx_market_feature_selection_symbol
+          ON market_feature_selection_rows(symbol,cycle_id);
+
 CREATE INDEX idx_micro_cycle
     ON market_microstructure(cycle_id);
 
 CREATE INDEX idx_micro_symbol_ts
     ON market_microstructure(symbol, ts);
 
-CREATE INDEX idx_positioning_cycle
-    ON market_positioning(cycle_id);
+CREATE INDEX idx_official_instrument_snapshot_symbol
+          ON official_instrument_snapshot_rows(symbol,cycle_id);
 
-CREATE INDEX idx_positioning_symbol_ts
-    ON market_positioning(symbol, ts);
+CREATE INDEX idx_positioning_cycle ON market_positioning(cycle_id);
+
+CREATE INDEX idx_positioning_symbol_ts ON market_positioning(symbol, ts);
 
 CREATE INDEX idx_tick_symbol_ts ON tick_snapshots(symbol, ts);
 

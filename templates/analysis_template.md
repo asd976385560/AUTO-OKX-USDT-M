@@ -1,9 +1,9 @@
 <!--
 doc: analysis_template
 doc-version: V2.0-template
-last-updated: 2026-08-11
-updated-by: Claude
-change-summary: 增事件时效、setup/标的口径冻结及历史数字单一真源。
+last-updated: 2026-08-14
+updated-by: Codex
+change-summary: 说明 executor 的 writer 已验证三周期锚点与同槽后续行情修订审计语义。
 role: 分析回执模板（analyst -> analysis.db）
 权威: skill.md §8 + collectors/analyst_writer.py
 落点: <PROJECT_ROOT>\db\analysis.db（analysis_runs + analysis_signals）
@@ -114,7 +114,7 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
     "opposing_evidence": ["短周期接近局部阻力", "资金费率偏高"],
     "execution_conditions": {"liquidity": "可执行", "entry": "回踩 62000 附近承接"},
     "invalidation_point": {"condition": "4H 收盘跌破结构低点", "stop_price": 60800},
-    "risk_reward": {"entry": 62000, "target": 64500, "stop": 60800, "rr": 2.08, "ev_override": null},
+    "risk_reward": {"entry": 62000, "target": 64500, "stop": 60800, "rr": 2.08, "exit_mode": "dynamic_exit", "ev_override": null},
     "portfolio_impact": {"before": "已有两笔多仓", "after": "提高多头相关暴露", "cash": "可用USDT充足"},
     "multitimeframe_analysis": {
       "cycle_id": "2026-06-24T14:00",
@@ -153,18 +153,18 @@ writer: <PROJECT_ROOT>\collectors\analyst_writer.py（唯一通道，禁手写 I
 |---|---|---|---|
 | `symbol` | str | 是 | `'BTC-USDT-SWAP'` 等 OKX SWAP instId |
 | `dim1`..`dim5` / `total` / `confidence` | null | - | 旧协议兼容列。`decision_card_v1` 一律填 null；不用于排序、仓位或执行。 |
-| `action` | str | 是 | 仅允许 `'open_long'`/`'open_short'`/`'hold'`/`'close'`/`'wait'`。未知动作必须由 writer 拒绝，trader 不得猜测。 |
-| `side` | str 或 null | - | `open_long` 必须 `long`，`open_short` 必须 `short`；`hold` 必须 null（持有既有仓位，无方向）；**`wait` 可选 `long`/`short`/null**——能判方向就填，它是错失机会对照组的唯一输入；close 必须明确 `long` 或 `short`。 |
+| `action` | str | 是 | 仅允许 `'open_long'`/`'open_short'`/`'hold'`/`'close'`/`'reduce'`/`'adjust_protection'`/`'wait'`。未知动作必须由 writer 拒绝，trader 不得猜测。 |
+| `side` | str 或 null | - | `open_long` 必须 `long`，`open_short` 必须 `short`；`hold` 必须 null；**`wait` 可选 `long`/`short`/null**；`close/reduce/adjust_protection` 必须明确现仓方向 `long` 或 `short`。 |
 | `entry_hint` | num 或 null | - | 建议入场价（trader 参考，非硬约束）。 |
 | `stop_hint` | num 或 null | - | 建议止损价/技术失效点。分析阶段尚未生成 `live_decision_facts`，不得把本字段或 `invalidation_point.stop_price` 写成“当前交易所 live SL”。live trader 开仓必带方向正确的 SL：long 严格低于 mark、short 严格高于 mark，且偏离不超过 30%；最终实际保护单只认交易阶段 facts 与确定性风控回读。 |
-| `tp_hint` | num 或 null | - | 建议止盈价；open 时应与 `decision_card.risk_reward.target` 一致，交易阶段作为可选附挂 TP。 |
+| `tp_hint` | num 或 null | - | 建议/参考目标价。只有 `risk_reward.exit_mode=fixed_tp` 时交易阶段把 target 附挂为交易所 TP；`dynamic_exit|no_fixed_tp` 时 target 只用于 EV 与复盘。 |
 | `reasoning` | str 或 null | - | 人读决策依据（push「决策依据」段与复盘消费）。 |
-| `decision_card` | dict | 是 | 六项卡 + 历史经验取舍 + Agent 最终裁决；上述字段必须直接嵌在本 dict，禁止放到 signal 顶层，也禁止改名为 `rationale/final_judgement/overrides`，HOLD/WAIT 同样完整填写。`open_*` 另须完整 `multitimeframe_analysis`：只认固定 cycle 下 exact 已收盘 15m/1H/4H、至少 34 根历史、完整指标及工具原样 evidence_contract；三周期逐一给证据和唯一 rank 1/2/3，选择 rank=1 且方向匹配。relative rank 不是校准概率；独立 90% 门未过期间 `calibrated_confidence=null`、`confidence_claim_allowed=false`。**Wave1 序5（2026-08-10）对 `open_*` 卡新增算术契约**：`risk_reward` 必含数值 `entry/stop/target`（方向几何必须合法：long `stop<entry<target`、short `target<entry<stop`）；`rr` 字段若填必须与几何重算一致（±0.05）；writer 按 evidence_contract 首个 n≥5 具名 scope 的 wins/n 算 `ev_r`（净口径含 0.2% 摩擦），**ev_r<0 时必须带 `risk_reward.ev_override={reason, p_win_claim}`**——负 EV 不禁开，但要显式承认基线并给修正胜率；样本不足=indeterminate 无 EV 要求。canonical `ev_check` 块由 writer 注入落库卡，模型手写同名块会被覆盖，禁止引用自算 EV。 |
+| `decision_card` | dict | 是 | 六项卡 + 历史经验取舍 + Agent 最终裁决；上述字段必须直接嵌在本 dict，禁止放到 signal 顶层，也禁止改名为 `rationale/final_judgement/overrides`，所有动作（含 HOLD/WAIT/REDUCE/ADJUST_PROTECTION）同样完整填写。`open_*` 另须完整 `multitimeframe_analysis`：只认固定 cycle 下 exact 已收盘 15m/1H/4H、至少 34 根历史、完整指标及工具原样 evidence_contract；三周期逐一给证据和唯一 rank 1/2/3，选择 rank=1 且方向匹配。relative rank 不是校准概率；独立 90% 门未过期间 `calibrated_confidence=null`、`confidence_claim_allowed=false`。**Wave1 序5（2026-08-10）对 `open_*` 卡新增算术契约**：`risk_reward` 必含数值 `entry/stop/target`（方向几何必须合法：long `stop<entry<target`、short `target<entry<stop`）、显式 `exit_mode=fixed_tp|dynamic_exit|no_fixed_tp`；`rr` 字段若填必须与几何重算一致（±0.05）；writer 按 evidence_contract 首个 n≥5 具名 scope 的 wins/n 算 `ev_r`（净口径含 0.2% 摩擦），**ev_r<0 时必须带 `risk_reward.ev_override={reason, p_win_claim}`**——负 EV 不禁开，但要显式承认基线并给修正胜率；样本不足=indeterminate 无 EV 要求。canonical `ev_check` 块由 writer 注入落库卡，模型手写同名块会被覆盖，禁止引用自算 EV。 |
 | `raw` | 任意 JSON 值或 null | - | 调用方原始证据；writer 会统一封装成对象 JSON（含 `schema_version/source/input_kind/payload/canonical_signal`）写入 `analysis_signals.raw`，完整原回执仍保存在 `analysis_runs.raw`。 |
 
-> 先确定 entry/stop/target 并计算 `stop_distance_pct=abs(entry-stop)/entry`、`planned_rr=abs(target-entry)/abs(entry-stop)`，再对拟执行标的调用 `find_similar_experience.py --symbol <完整instId> --side <long|short> --regime <本轮regime> --action open --profile live --as-of <固定cycle> --stop-distance-pct <stop_distance_pct> --planned-rr <planned_rr> --compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`。读取 UTF-8 文件，把 `evidence_contract` 原样写入 `historical_experience`；其 `query.setup` 与 `query.instrument_context` 会被 writer 独立复算。历史数字只允许 writer 注入 `historical_experience.scope_counts`，模型的 reason、证据和最终判断禁止手写 n/W/L/WR/胜率；样例数组有截断，禁止数数组或混栏。禁止管道、重定向或内联解析器。统计只供参考。
+> 先确定 entry/stop/target，再对拟执行标的调用 `find_similar_experience.py --symbol <完整instId> --side <long|short> --regime <本轮regime> --action open --profile live --as-of <固定cycle> --entry <entry> --stop <stop> --target <target> --compact --out-file <PROJECT_ROOT>/tmp/findsim_<cycle>_<symbol>.json`；禁止自行换算百分比或 RR。读取 UTF-8 文件，把 `evidence_contract` 原样写入 `historical_experience`；工具与 writer 从同一组三价经共享函数生成 `query.setup`，并与 `query.instrument_context` 一起冻结。历史数字只允许 writer 注入 `historical_experience.scope_counts`，模型的 reason、证据和最终判断禁止手写 n/W/L/WR/胜率；样例数组有截断，禁止数数组或混栏。禁止管道、重定向或内联解析器。统计只供参考。
 
-> 对每个拟执行标的还须运行 `multitimeframe_decision_evidence.py --db-root <PROJECT_ROOT>/db --symbol <完整instId> --cycle-id <固定cycle> --out-file <PROJECT_ROOT>/tmp/mtf_<cycle>_<symbol>.json`。仅 `ok=true` 才能形成 open 卡；把文件中的完整 `evidence_contract` 对象原样替换上例占位对象。writer 校验 hash/身份/结构，executor 在任何交易所账户或订单 I/O 前按同 cycle 独立重读并逐字段比对；不得拿较旧 K 线补 exact 缺口。
+> 对每个拟执行标的还须运行 `multitimeframe_decision_evidence.py --db-root <PROJECT_ROOT>/db --symbol <完整instId> --cycle-id <固定cycle> --out-file <PROJECT_ROOT>/tmp/mtf_<cycle>_<symbol>.json`。仅 `ok=true` 才能形成 open 卡；把文件中的完整 `evidence_contract` 对象原样替换上例占位对象。writer 校验 hash/身份/结构。executor 在任何交易所账户或订单 I/O 前按同 cycle 独立重读：当前三周期必须仍 ready；完全一致走 `current_market_exact`。若同槽后续采集修订已收盘数据，只接受与同 cycle/symbol/side 的 `analysis.db` writer 已验证契约逐字段相同的 `analysis_db_writer_validated` 锚点，并留 `post_analysis_market_revision` 与 supplied/current/persisted hash；否则 fail-closed。不得拿较旧 K 线补 exact 缺口，持久化锚点也不得掩盖当前 readiness 缺失。
 
 ## 4. 写入路径与表落点
 

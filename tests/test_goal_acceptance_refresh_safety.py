@@ -1,5 +1,6 @@
 import copy
 import contextlib
+import copy
 import io
 import json
 import sys
@@ -18,6 +19,7 @@ from refresh_goal_acceptance_report import (  # noqa: E402
     refresh_asset_class_coverage,
     refresh_multitimeframe_coverage,
     refresh_news_source_health,
+    refresh_positioning_coverage,
     refresh_report_completeness,
     refresh_runtime_evidence,
 )
@@ -27,7 +29,7 @@ def coverage_artifact() -> dict:
     return {
         "surface": "report",
         "manifest": {
-            "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+            "title": ". 四项目标实施与前向验收（old）",
             "generatedAt": "old",
             "sources": [{
                 "id": "coverage_evidence",
@@ -57,6 +59,7 @@ def coverage_artifact() -> dict:
             "gates": [{"goal": "关键数据完善率", "current": "old"}],
             "fast_source_health": [{
                 "usable_rate": 0.95,
+                "forward_usable_rate": 1.0,
                 "forward_expected_slots": 4,
                 "forward_minimum_slots": 96,
             }],
@@ -68,7 +71,7 @@ def report_artifact() -> dict:
     return {
         "surface": "report",
         "manifest": {
-            "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+            "title": ". 四项目标实施与前向验收（old）",
             "generatedAt": "2026-08-12T00:00:00Z",
             "sources": [{"id": "report_quality", "query": {}}],
             "cards": [{"id": "push_card", "metrics": []}],
@@ -244,7 +247,132 @@ def push_report_audit(*, complete: int = 96) -> dict:
     return payload
 
 
+def positioning_audit() -> dict:
+    def window(*, schedule: int, minimum: int) -> dict:
+        slot = {
+            "cycle_id": "2026-08-13T03:00",
+            "official_instrument_snapshot": {
+                "status": "PASSED",
+                "metadata_coverage_rate": 1.0,
+            },
+            "expected_symbols": 3,
+            "valid_symbols": 3,
+            "coverage_rate": 1.0,
+            "batch_reasons": [],
+            "duplicate_symbols": [],
+            "extra_symbols": [],
+            "invalid_row_count": 0,
+            "status": "PASSED",
+        }
+        return {
+            "start_cst": "2026-08-13T03:00:00+08:00",
+            "schedule_minutes": schedule,
+            "minimum_slots": minimum,
+            "target_rate": 0.99,
+            "expected_slots": 1,
+            "passed_slots": 1,
+            "expected_symbol_rows": 3,
+            "valid_symbol_rows": 3,
+            "slot_pass_rate": 1.0,
+            "symbol_coverage_rate": 1.0,
+            "official_snapshot_slot_rate": 1.0,
+            "requirements": {
+                "minimum_slots_met": False,
+                "slot_pass_rate_at_least_target": True,
+                "symbol_coverage_rate_at_least_target": True,
+                "official_snapshot_slot_rate_at_least_target": True,
+            },
+            "status": "INSUFFICIENT_EVIDENCE",
+            "slots": [slot],
+        }
+
+    return {
+        "artifact_type": "positioning_coverage_audit",
+        "source": "okx_rest_contract_long_short_ratio",
+        "generated_at_utc": "2026-08-12T19:06:00Z",
+        "latest_batch_collected_ts": "2026-08-12T19:01:16Z",
+        "minimum_rate": 0.99,
+        "coverage_rate": 1.0,
+        "valid_symbols": 3,
+        "universe_symbols": 3,
+        "missing_symbols": [],
+        "extra_symbols": [],
+        "duplicate_symbols": [],
+        "invalid_rows": [],
+        "status": "PASSED",
+        "mode": "read_only",
+        "production_database_writes": 0,
+        "production_threshold_change_allowed": False,
+        "orders_placed": 0,
+        "storage_contract": {
+            "expected_primary_key": [
+                "cycle_id", "symbol", "timeframe", "source"],
+            "actual_primary_key": [
+                "cycle_id", "symbol", "timeframe", "source"],
+            "cross_cycle_upstream_ts_reuse_supported": True,
+            "status": "PASSED",
+        },
+        "forward_after_remediation": window(schedule=60, minimum=24),
+        "decision_availability_forward": window(
+            schedule=15, minimum=96),
+        "overall_status": "PENDING_FORWARD_EVIDENCE",
+    }
+
+
 class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
+    def test_positioning_latest_batch_never_substitutes_for_forward_windows(self):
+        natural = positioning_audit()
+        isolated = copy.deepcopy(natural)
+        result = refresh_positioning_coverage(
+            coverage_artifact(),
+            natural,
+            isolated,
+            natural_relative_path="positioning.json",
+            isolated_relative_path="positioning-isolated.json",
+        )
+        coverage = next(
+            row for row in result["snapshot"]["datasets"]["coverage"]
+            if row["data_family"] == "official_positioning_1H"
+        )
+        headline = result["snapshot"]["datasets"]["headline"][0]
+        self.assertEqual("达标", coverage["status"])
+        self.assertEqual("未达标", coverage["acceptance_status"])
+        self.assertEqual(
+            "PENDING_FORWARD_EVIDENCE", coverage["overall_status"])
+        self.assertEqual(1, headline["positioning_hourly_forward_expected_slots"])
+        self.assertEqual(
+            1, headline["positioning_availability_forward_expected_slots"])
+        data_block = next(
+            block for block in result["manifest"]["blocks"]
+            if block.get("id") == "data_section"
+        )
+        self.assertIn("1/24槽", data_block["body"])
+
+        tampered = copy.deepcopy(natural)
+        tampered["overall_status"] = "PASSED"
+        with self.assertRaisesRegex(ValueError, "overall status"):
+            refresh_positioning_coverage(
+                coverage_artifact(), tampered, isolated,
+                natural_relative_path="positioning.json",
+                isolated_relative_path="positioning-isolated.json",
+            )
+        tampered = copy.deepcopy(natural)
+        tampered["storage_contract"]["actual_primary_key"][0] = "ts"
+        with self.assertRaisesRegex(ValueError, "storage contract"):
+            refresh_positioning_coverage(
+                coverage_artifact(), tampered, isolated,
+                natural_relative_path="positioning.json",
+                isolated_relative_path="positioning-isolated.json",
+            )
+        tampered = copy.deepcopy(natural)
+        tampered["forward_after_remediation"]["passed_slots"] = 0
+        with self.assertRaisesRegex(ValueError, "aggregate counts"):
+            refresh_positioning_coverage(
+                coverage_artifact(), tampered, isolated,
+                natural_relative_path="positioning.json",
+                isolated_relative_path="positioning-isolated.json",
+            )
+
     def test_cli_dry_run_never_calls_artifact_writer(self):
         artifact = report_artifact()
         audit = daily_report_audit()
@@ -329,7 +457,7 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+                "title": ". 四项目标实施与前向验收（old）",
                 "sources": [],
                 "tables": [],
                 "blocks": [{"id": "data_section", "body": "old"}],
@@ -554,7 +682,7 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": "<PROJECT_ROOT> 四项目标实施与前向验收（2026-08-12 17:30）",
+                "title": ". 四项目标实施与前向验收（2026-08-12 17:30）",
                 "generatedAt": "2026-08-12T09:30:00Z",
                 "sources": [],
                 "charts": [{"id": "throughput_chart"}],

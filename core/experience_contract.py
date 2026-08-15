@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 
@@ -22,6 +23,53 @@ SUMMARY_SCOPES = {
     "same_symbol_similar": "same_symbol_similar",
     "cross_symbol_similar": "cross_symbol_similar",
 }
+
+
+def setup_from_metrics(
+    stop_distance_pct: Any,
+    planned_rr: Any,
+) -> dict[str, Any]:
+    """Return the canonical setup payload sealed by its content hash.
+
+    ``stop_distance_pct`` is the fractional distance (``0.01`` means 1%),
+    not a human percentage.  Keeping the rounding and hash construction in
+    one function prevents producers and validators from drifting.
+    """
+    try:
+        distance = float(stop_distance_pct)
+        rr = float(planned_rr)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("setup metrics must be numeric") from exc
+    if not math.isfinite(distance) or distance <= 0:
+        raise ValueError("stop_distance_pct must be finite and positive")
+    if not math.isfinite(rr) or rr <= 0:
+        raise ValueError("planned_rr must be finite and positive")
+    setup = {
+        "stop_distance_pct": round(distance, 8),
+        "planned_rr": round(rr, 8),
+    }
+    setup["setup_hash"] = _hash_payload(setup)
+    return setup
+
+
+def setup_from_prices(entry: Any, stop: Any, target: Any) -> dict[str, Any]:
+    """Derive one canonical setup from the card's exact price geometry."""
+    try:
+        entry_value = float(entry)
+        stop_value = float(stop)
+        target_value = float(target)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("entry, stop and target must be numeric") from exc
+    if not all(math.isfinite(value) and value > 0 for value in (
+            entry_value, stop_value, target_value)):
+        raise ValueError("entry, stop and target must be finite and positive")
+    risk = abs(entry_value - stop_value)
+    if risk <= 0:
+        raise ValueError("entry and stop must differ")
+    return setup_from_metrics(
+        risk / entry_value,
+        abs(target_value - entry_value) / risk,
+    )
 
 
 def normalize_symbol(value: Any) -> str:

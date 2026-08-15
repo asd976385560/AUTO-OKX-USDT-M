@@ -1,12 +1,12 @@
 <!--
 doc-name: news_scout
-doc-version: V2.1-role
+doc-version: V2.2-role
 role: okx-news-scout 隔离新闻取数与结构化入库
 trigger: 独立 cron 10,25,40,55 * * * *，best-effort（2026-08-08 挪槽避开聚合采集窗）
 session: 每轮独立，与交易主链解耦
-last-updated: 2026-08-11
+last-updated: 2026-08-13
 updated-by: Codex
-change-summary: 新增事件真实发生时间与一级源链接契约；writer 以官方域名白名单复核，禁止用媒体发布时间或观察首见冒充催化新鲜度。
+change-summary: 关注主题扩展：链上大额转账/巨鲸动向（tags=whale）与代币解锁排期（tags=unlock）；无确定性 API 期间 scout 是唯一覆盖面。
 -->
 
 # news_scout — 隔离新闻取数
@@ -48,18 +48,22 @@ change-summary: 新增事件真实发生时间与一级源链接契约；writer 
 1. X/社媒只使用配置的 `x_search`，无 API 快讯只使用统一 `web_search`。单轮 `x_search` 最多尝试 2 次，失败、超时或空返回均计次；第二次仍失败就转等价 web 查询并把本轮状态记为 degraded。外部检索工具不得换名试探。`allowed_x_handles` 最多 20 个。
 2. 来源优先级固定为：**OKX CLI 专用结构化接口 > X 官方/权威账号 > 指标所有者官方网页**。OKX 已有 funding、OI、多空比、经济日历、情绪排行和新闻等结构化数据时，scout 不生成同名权威数值。
 3. 当前每日权威补充只限 UTC+8 08:25 槽的 BTC 现货 ETF 日净流（2026-08-08 scout cron 挪槽 5,20,35,50→10,25,40,55，原 08:20 班次随之改 08:25）。Farside 与 SoSoValue 的交易日、范围、单位一致，且日合计差异不超过 `max(500万美元,1%)`，才写 `verification_status=cross_checked` 与单一 value；否则保留两源值和 URL，标 `verification_pending`，不得冒充确认值。恐慌贪婪已由 **Alternative.me API 直采**，**DXY 计算值已由 ECB 官方汇率直采**并按公式复算，日常不得重复搜索。
-4. 每条输出至少包含 `source="x_search",title,url,event_time,symbols,severity,tags,sentiment,raw`。时间统一为 UTC+8 `YYYY-MM-DD HH:MM:SS`；`event_time` 只表示来源给出的媒体发布时间，缺失保持 null，禁止填当前时间伪造新鲜度。标题或正文若明确写出事件日期，完整保留原文供 writer 提取 `event_occurred_at`；它才是下游催化新旧的时间依据，`first_seen_at` 仅表示系统何时首次观察。若已找到监管机构、发行方或交易所的原始文件，另填 `primary_source_url`；不得把媒体/社媒链接冒充一级源，writer 会按官方域名白名单复核，不合格值置空。多币写 `symbols[]`；severity 仅允许 `critical|high|medium|low`，它是结构化分类，不是交易判断。
-5. 使用已加载的**文件写入工具直接写 `tmp/*.json`**，固定目标：
+4. **关注主题（2026-08-13 扩展）**：在既有 KOL/cashtag/突发快讯之外，同等关注两类链上/事件信息（无确定性 API，registry `token_unlocks` 为 registered-only 占位，本角色是当前唯一覆盖面）：
+   - **大额转账 / 巨鲸动向**：链上追踪权威账号（Whale Alert、Lookonchain、spotonchain 类）报出的大额充提/巨鲸建减仓；`tags` 加 `whale`，金额、方向（充入交易所/提出）、币种进 title 原文与 `raw`；单条巨鲸转账 severity 通常 `medium`，多笔同向或涉及交易所储备异动才 `high`。
+   - **代币解锁**：解锁日历类权威账号（Tokenomist 等）公布的未来解锁排期；`tags` 加 `unlock`，标题保留解锁日期原文（供 writer 提取 `event_occurred_at`），涉及币写 `symbols[]`；解锁占流通比例大（≥5%）标 `high`，否则 `medium|low`。
+   仍只取数与结构化：金额/比例照抄来源原文，不换算、不判断多空影响；来源账号本身即证据链一环，`url` 必须是具体帖文链接。
+5. 每条输出至少包含 `source="x_search",title,url,event_time,symbols,severity,tags,sentiment,raw`。时间统一为 UTC+8 `YYYY-MM-DD HH:MM:SS`；`event_time` 只表示来源给出的媒体发布时间，缺失保持 null，禁止填当前时间伪造新鲜度。标题或正文若明确写出事件日期，完整保留原文供 writer 提取 `event_occurred_at`；它才是下游催化新旧的时间依据，`first_seen_at` 仅表示系统何时首次观察。若已找到监管机构、发行方或交易所的原始文件，另填 `primary_source_url`；不得把媒体/社媒链接冒充一级源，writer 会按官方域名白名单复核，不合格值置空。多币写 `symbols[]`；severity 仅允许 `critical|high|medium|low`，它是结构化分类，不是交易判断。
+6. 使用已加载的**文件写入工具直接写 `tmp/*.json`**，固定目标：
    ```
    write path=<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json
    ```
    不得用命令行、here-string、`Set-Content`、`Out-File`、`echo`、内联 Python 或临时 `tmp/*.py` 拼装帖子文本和 JSON。
-6. 文件写好后只运行：
+7. 文件写好后只运行：
    ```
    Get-Content -Raw <PROJECT_ROOT>/tmp/_xsearch_<cycle>.json | pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/news_writer.py --stdin --db <PROJECT_ROOT>/db/news.db
    ```
    以 writer 返回的 inserted 数为准；不得自行去重或补写表。
-7. 无论成功、降级、失败或安静期 0 条，结尾都经明确入口记一行：
+8. 无论成功、降级、失败或安静期 0 条，结尾都经明确入口记一行：
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/collectors/record_xsearch.py --status <ok|degraded|failed> --rows <inserted> [--err <短摘要>]
    ```

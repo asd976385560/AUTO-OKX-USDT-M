@@ -18,6 +18,8 @@ from typing import Any
 
 import trade_report_stats
 
+MISSED_OPPORTUNITY_OUTCOME_HOURS = 4
+
 
 def _open_ro(path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(
@@ -87,6 +89,19 @@ def _expected_window(kind: str, key: str) -> tuple[str, str]:
         start = (end - timedelta(days=1)).replace(day=1, hour=8)
     return start.strftime(trade_report_stats.TS_FMT), end.strftime(
         trade_report_stats.TS_FMT)
+
+
+def _expected_missed_candidate_window(
+    report_start: str,
+    report_end: str,
+) -> tuple[str, str]:
+    shift = timedelta(hours=MISSED_OPPORTUNITY_OUTCOME_HOURS)
+    start = trade_report_stats.parse_cst(report_start) - shift
+    end = trade_report_stats.parse_cst(report_end) - shift
+    return (
+        start.strftime(trade_report_stats.TS_FMT),
+        end.strftime(trade_report_stats.TS_FMT),
+    )
 
 
 def _parse_weekly_row(content: str) -> dict:
@@ -291,14 +306,46 @@ def validate_report(
         )):
             errors.append(f"facts: {side} direction detail differs")
 
-    missed = _missed_count(lessons_db, expected_start, expected_end)
+    matured_match = re.search(
+        r"已完整成熟4小时的错失机会记录[： :]\s*(\d+)\s*条"
+        r"（候选窗口 \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s*"
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\)",
+        content,
+    )
+    legacy_match = re.search(
+        r"本窗口错失机会记录[： :]\s*(\d+)\s*条", content)
+    if matured_match:
+        missed_start, missed_end = _expected_missed_candidate_window(
+            expected_start, expected_end)
+        if (matured_match.group(2), matured_match.group(3)) != (
+                missed_start, missed_end):
+            errors.append("facts: mature missed-opportunity window differs")
+        missed_match = matured_match
+    else:
+        # Preserve the historical format's original full-window meaning.
+        missed_start, missed_end = expected_start, expected_end
+        missed_match = legacy_match
+    missed = _missed_count(lessons_db, missed_start, missed_end)
     if missed is not None:
-        match = re.search(r"本窗口错失机会记录[： :]\s*(\d+)\s*条", content)
-        if not match:
+        if not missed_match:
             errors.append("facts: deterministic missed-opportunity count missing")
-        elif int(match.group(1)) != missed:
+        elif int(missed_match.group(1)) != missed:
             errors.append(
-                f"facts: missed-opportunity count {match.group(1)}!={missed}")
+                "facts: missed-opportunity count "
+                f"{missed_match.group(1)}!={missed}")
+    if matured_match:
+        embedded_missed = audit.get("missed_opportunity_metrics") or {}
+        if not all((
+            embedded_missed.get("candidate_window_start_ts") == missed_start,
+            embedded_missed.get("candidate_window_end_ts") == missed_end,
+            embedded_missed.get("candidate_window_end_exclusive") is True,
+            embedded_missed.get("outcome_horizon_hours")
+            == MISSED_OPPORTUNITY_OUTCOME_HOURS,
+            embedded_missed.get("required_15m_bars") == 16,
+            embedded_missed.get("count") == int(matured_match.group(1)),
+        )):
+            errors.append(
+                "facts: embedded mature missed-opportunity metrics differ")
 
     if kind == "weekly":
         if not all((
@@ -373,7 +420,7 @@ def main() -> int:
         description="read-only weekly/monthly report pre-send validator")
     parser.add_argument("--kind", choices=("weekly", "monthly"), required=True)
     parser.add_argument("--file", required=True)
-    parser.add_argument("--db-root", default=r"./db")
+    parser.add_argument("--db-root", default=r".\db")
     parser.add_argument("--account-db")
     parser.add_argument("--live-trades-db")
     parser.add_argument("--ledger-db")

@@ -19,12 +19,21 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
+from collections.abc import Callable
 
 # 子进程隐藏窗口：cron/detached 场景下 console 子进程默认会新开可见窗口。
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # 超时退出码，对齐 GNU timeout(1)。
 RC_TIMEOUT = 124
+# 子进程并非超时，而是监督器观察到确定性终态/协议违规后主动整树收口。
+# 调用方必须结合自己的 observer 证据把它映射成业务成功或失败，不能把 125
+# 直接当成普通子进程退出码。
+RC_OBSERVED_STOP = 125
+# Popen 已成功，但 communicate/监督/回收发生了非 timeout 异常。调用方可据此
+# 区分“命令根本没启动”和“子进程已启动后监督器失败”，并执行相应终态收口。
+RC_GUARD_ERROR = 126
 
 
 def terminate_process_tree(proc: subprocess.Popen) -> None:
@@ -59,6 +68,8 @@ def run_guarded(
     input_text: str | None = None,
     cwd: str | None = None,
     creationflags: int = CREATE_NO_WINDOW,
+    observer: Callable[[], object | None] | None = None,
+    observer_poll_seconds: float = 0.5,
 ) -> tuple[int, str, str, bool]:
     """跑子进程，超时整树杀。
 
@@ -80,8 +91,46 @@ def run_guarded(
         creationflags=creationflags,
     )
     try:
-        out, err = proc.communicate(input_text, timeout=timeout)
-        return proc.returncode, out or "", err or "", False
+        if observer is None:
+            out, err = proc.communicate(input_text, timeout=timeout)
+            return proc.returncode, out or "", err or "", False
+
+        # ``communicate`` 可以在 TimeoutExpired 后继续调用；这样既持续排空
+        # stdout/stderr（防 pipe 填满卡死），又能按短周期检查监督条件。
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        pending_input = input_text
+        poll = max(0.05, float(observer_poll_seconds))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                out, err = proc.communicate(
+                    pending_input,
+                    timeout=min(poll, remaining),
+                )
+                return proc.returncode, out or "", err or "", False
+            except subprocess.TimeoutExpired:
+                # input 只能在第一次 communicate 传入；后续调用继续回收输出。
+                pending_input = None
+                try:
+                    stop_reason = observer()
+                except Exception:  # noqa: BLE001 - observer 失效时保留原硬截止兜底
+                    stop_reason = None
+                if stop_reason is None:
+                    continue
+                terminate_process_tree(proc)
+                try:
+                    out, err = proc.communicate(timeout=1)
+                except Exception:  # noqa: BLE001
+                    out, err = "", ""
+                note = f"observer stop: {stop_reason}; process tree terminated"
+                return (
+                    RC_OBSERVED_STOP,
+                    str(out or ""),
+                    f"{note} | {err}" if err else note,
+                    False,
+                )
     except subprocess.TimeoutExpired as exc:
         partial_out, partial_err = exc.stdout or "", exc.stderr or ""
         terminate_process_tree(proc)
@@ -100,3 +149,30 @@ def run_guarded(
         note = f"timeout after {timeout}s; process tree terminated"
         return (RC_TIMEOUT, str(partial_out or ""),
                 (f"{note} | {partial_err}" if partial_err else note), True)
+    except Exception as exc:  # noqa: BLE001 - Popen 后必须转成有证据的终态
+        # Popen 已成功，因此这不是 started=False。无论异常来自 pipe、编码、
+        # observer 还是回收，先整树终止，再返回专用非零码，让 stage 保留
+        # child_started=true 并继续 stopping/Gateway abort 流程。
+        terminate_process_tree(proc)
+        try:
+            tail_out, tail_err = proc.communicate(timeout=1)
+        except Exception:  # noqa: BLE001
+            tail_out, tail_err = "", ""
+        note = (
+            f"guard error after process start: {type(exc).__name__}: {exc}; "
+            "process tree terminated"
+        )
+        return (
+            RC_GUARD_ERROR,
+            str(tail_out or ""),
+            f"{note} | {tail_err}" if tail_err else note,
+            False,
+        )
+    finally:
+        # Covers even BaseException while a child is live.  Successful/natural
+        # nonzero returns already have poll()!=None and are not touched.
+        try:
+            if proc.poll() is None:
+                terminate_process_tree(proc)
+        except Exception:  # noqa: BLE001 - do not mask the original failure
+            pass

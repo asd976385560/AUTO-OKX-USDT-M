@@ -41,10 +41,24 @@ class EvaluateUniverseJudgmentsTests(unittest.TestCase):
                         "uncalibrated_alignment_score": -0.75,
                         "execution_readiness": "shadow_candidate",
                     },
+                    {
+                        "symbol": "WAIT-USDT-SWAP",
+                        "judgment": "wait_mixed",
+                        "uncalibrated_alignment_score": 0.0,
+                        "execution_readiness": "no_direction",
+                    },
                 ],
             }
             (snapshots / "one.json").write_text(
                 json.dumps(artifact), encoding="utf-8"
+            )
+            future_artifact = {
+                **artifact,
+                "cycle_id": "2026-08-12T08:00",
+                "generated_at_utc": "2026-08-12T00:02:00Z",
+            }
+            (snapshots / "future.json").write_text(
+                json.dumps(future_artifact), encoding="utf-8"
             )
             db = root / "market.db"
             con = sqlite3.connect(db)
@@ -80,12 +94,40 @@ class EvaluateUniverseJudgmentsTests(unittest.TestCase):
             self.assertTrue(all(row["after_cost_hit"] for row in labels))
             self.assertEqual(payload["credibility_gate"]["status"], "NOT_MEASURABLE")
             self.assertFalse(payload["credibility_gate"]["production_threshold_change_allowed"])
+            self.assertEqual(payload["snapshots_loaded"], 2)
+            self.assertEqual(payload["snapshots_eligible_as_of"], 1)
+            self.assertEqual(
+                payload["snapshot_clock_quality"]["excluded"][
+                    "future_generated_at_utc"
+                ],
+                1,
+            )
+            self.assertEqual(payload["snapshot_clock_quality"]["status"], "DEGRADED")
             daily = payload["daily_throughput"]["latest_day"]
             self.assertEqual(daily["date"], "2026-08-11")
             self.assertEqual(daily["snapshots"], 1)
-            self.assertEqual(daily["judgment_records"], 2)
-            self.assertEqual(daily["unique_symbols"], 2)
+            self.assertEqual(daily["judgment_records"], 3)
+            self.assertEqual(daily["directional_judgment_records"], 2)
+            self.assertEqual(daily["long_bias_records"], 1)
+            self.assertEqual(daily["short_bias_records"], 1)
+            self.assertEqual(daily["minimum_directional_records_target"], 993)
+            self.assertFalse(daily["minimum_directional_records_met"])
+            self.assertFalse(daily["directional_daily_target_met"])
+            self.assertAlmostEqual(daily["directional_judgment_share"], 2 / 3)
+            self.assertTrue(daily["both_directional_sides_observed"])
+            self.assertEqual(daily["judgment_counts"]["wait_data"], 0)
+            self.assertEqual(daily["judgment_counts"]["wait_mixed"], 1)
+            self.assertIn(
+                "wait and unknown records remain visible but are excluded",
+                payload["daily_throughput"]["directional_metric"],
+            )
+            self.assertEqual(daily["unique_symbols"], 3)
             self.assertFalse(daily["daily_target_met"])
+            self.assertIsNone(payload["daily_throughput"]["latest_completed_day"])
+            self.assertEqual(
+                payload["daily_throughput"]["current_partial_day"]["date"],
+                "2026-08-11",
+            )
             self.assertTrue(payload["daily_throughput"]["real_fills_are_not_a_throughput_target"])
             for item in payload["horizons"]:
                 self.assertEqual(item["after_cost_precision_pct"], 100.0)

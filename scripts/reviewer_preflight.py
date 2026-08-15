@@ -18,15 +18,17 @@ from pathlib import Path
 
 CST = timezone(timedelta(hours=8))
 DEFAULT_READY_DIR = Path(os.environ.get(
-    "OKX_REVIEWER_READY_DIR", r"./reports/quality"))
+    "OKX_REVIEWER_READY_DIR", r".\reports\quality"))
 REQUIRED_CRITICAL_STEPS = frozenset({
     "reconcile",
     "account_bills",
+    "missed_opportunities",
     "quality_metrics",
 })
 ACCEPTED_RCS = {
     "reconcile": {0, 1},
     "account_bills": {0},
+    "missed_opportunities": {0},
     "quality_metrics": {0},
 }
 

@@ -10,9 +10,15 @@
            [--posSide long|short] [--tdMode cross|isolated] [--tgtCcy base_ccy|quote_ccy|margin]
            [--reduceOnly] [--slTriggerPx <px>] [--slOrdPx <px|-1>] [--slTriggerPxType last|index|mark]
            [--tpTriggerPx <px>] [--tpOrdPx <px|-1>] [--tpTriggerPxType last|index|mark]
-           （支持开仓附挂 TP/SL；两者同时提供时走交易所 attached OCO 语义）
+           （单腿兼容参数；生产 executor 不同时传 TP+SL，避免普通 conditional 忽略 TP）
   - algo place: okx swap algo place --instId --side --sz --ordType conditional
            --slTriggerPx <px> --slOrdPx -1 --slTriggerPxType mark [--posSide] [--tdMode] [--reduceOnly]
+           （同形支持单腿 TP；TP+SL 双腿必须用 ordType=oco，不能用 conditional）
+  - algo amend: okx swap algo amend --instId --algoId [--newSz <n>]
+           [--newSlTriggerPx <px>] [--newSlOrdPx <px|-1>] [--newTpTriggerPx <px>] [--newTpOrdPx <px|-1>]
+           （2026-08-13 主人核实 CLI 1.4.2 help；**含 attached TP/SL**，服务端原子改单——
+            移动止损/加仓后扩全仓的主路径，无「零张/两张止损」中间窗口）
+  - algo cancel: okx swap algo cancel --instId --algoId
   - close: okx swap close --instId <id> --mgnMode <cross|isolated> [--posSide net|long|short]
   - fills: okx swap fills [--instId <id>] [--ordId <id>] [--archive]
   - leverage: okx swap leverage --instId --lever --mgnMode <cross|isolated> [--posSide]
@@ -27,14 +33,12 @@
 """
 from __future__ import annotations
 
-import math
-
 import os
 import sys
 from typing import Any, Optional
 
 # 复用 scripts/_okxcli（CLI 调用 + 节流 + 崩溃重试）
-_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", r"./scripts")
+_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", r".\scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
@@ -144,9 +148,8 @@ def get_mark_price(inst_id: str, profile: str) -> Optional[float]:
     for row in r.get("data", []):
         if isinstance(row, dict) and row.get("markPx"):
             try:
-                value = float(row["markPx"])
-                return value if math.isfinite(value) else None
-            except (TypeError, ValueError, OverflowError):
+                return float(row["markPx"])
+            except (TypeError, ValueError):
                 return None
     return None
 
@@ -230,8 +233,20 @@ def place_market_open(inst_id: str, pos_side: str, sz: float, profile: str,
                       sl_trigger_px_type: str = "mark",
                       tp_trigger_px: Optional[float] = None,
                       tp_trigger_px_type: str = "mark") -> dict[str, Any]:
-    """市价开仓（long→buy / short→sell），可附挂 TP/SL。"""
+    """市价开仓（long→buy / short→sell），兼容单腿附挂 TP 或 SL。
+
+    生产 executor 只在此附挂 SL；fixed TP 随后以独立 reduceOnly algo 创建。
+    普通 conditional 同时给两腿时 OKX 会忽略 TP，调用方不得依赖该组合。
+    """
     side = "buy" if pos_side == "long" else "sell"
+    if sl_trigger_px is not None and tp_trigger_px is not None:
+        return {
+            "ok": False, "sCode": None,
+            "sMsg": "combined_tp_sl_unsupported_use_independent_tp",
+            "data": [], "raw": None,
+            "error": "combined_tp_sl_unsupported_use_independent_tp",
+            "sl_attached": False, "tp_attached": False,
+        }
     if is_dryrun():
         return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
                 "data": [{"ordId": "DRYRUN-OPEN", "sCode": "0"}], "dryrun": True,
@@ -270,6 +285,110 @@ def place_algo_sl(inst_id: str, pos_side: str, sz: float, sl_trigger_px: float,
             "--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",  # 等号形式，见 place_market_open 注释
             "--slTriggerPxType", sl_trigger_px_type, "--posSide", pos_side,
             "--tdMode", mgn_mode, "--reduceOnly"]
+    return _call(*args, profile=profile)
+
+
+def place_algo_tp(inst_id: str, pos_side: str, sz: float, tp_trigger_px: float,
+                  profile: str, mgn_mode: str = "cross",
+                  tp_trigger_px_type: str = "mark") -> dict[str, Any]:
+    """独立 reduceOnly 止盈 algo（与 place_algo_sl 同形，只换 tp 三参）。
+
+    止盈只减仓不增仓，无风险预算影响；缺失不构成裸仓。
+    """
+    close_side = "sell" if pos_side == "long" else "buy"
+    if is_dryrun():
+        return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
+                "data": [{"algoId": "DRYRUN-ALGO-TP", "sCode": "0"}], "dryrun": True}
+    args = ["swap", "algo", "place", "--instId", inst_id, "--side", close_side,
+            "--sz", str(sz), "--ordType", "conditional",
+            "--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",  # 等号形式，见 place_market_open 注释
+            "--tpTriggerPxType", tp_trigger_px_type, "--posSide", pos_side,
+            "--tdMode", mgn_mode, "--reduceOnly"]
+    return _call(*args, profile=profile)
+
+
+def place_algo_protection(
+    inst_id: str,
+    pos_side: str,
+    sz: float,
+    sl_trigger_px: float,
+    profile: str,
+    *,
+    tp_trigger_px: Optional[float] = None,
+    mgn_mode: str = "cross",
+    trigger_px_type: str = "mark",
+) -> dict[str, Any]:
+    """Place one reduce-only protection algo; use OCO when TP is requested."""
+    close_side = "sell" if pos_side == "long" else "buy"
+    if is_dryrun():
+        return {
+            "ok": True, "sCode": "0", "sMsg": "DRYRUN",
+            "data": [{"algoId": "DRYRUN-ALGO-PROTECTION", "sCode": "0"}],
+            "dryrun": True,
+            "ord_type": "oco" if tp_trigger_px is not None else "conditional",
+        }
+    args = [
+        "swap", "algo", "place", "--instId", inst_id, "--side", close_side,
+        "--sz", str(sz), "--ordType", (
+            "oco" if tp_trigger_px is not None else "conditional"),
+        "--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",
+        "--slTriggerPxType", trigger_px_type,
+        "--posSide", pos_side, "--tdMode", mgn_mode, "--reduceOnly",
+    ]
+    if tp_trigger_px is not None:
+        args += [
+            "--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",
+            "--tpTriggerPxType", trigger_px_type,
+        ]
+    return _call(*args, profile=profile)
+
+
+def amend_algo_protection(inst_id: str, algo_id: str, profile: str,
+                          new_sl_trigger_px: Optional[float] = None,
+                          new_tp_trigger_px: Optional[float] = None,
+                          new_sz: Optional[float] = None) -> dict[str, Any]:
+    """原子改单（CLI 1.4.2 `swap algo amend`，含 attached TP/SL）。
+
+    `okx swap algo amend --instId <id> --algoId <id> [--newSz <n>]
+     [--newSlTriggerPx <px>] [--newSlOrdPx=-1] [--newTpTriggerPx <px>] [--newTpOrdPx=-1]`
+
+    **这是移动止损/扩仓保护的主路径**：交易所服务端原子生效，全程不存在
+    「零张止损」或「两张止损」的中间窗口——严格优于「先挂新单再撤旧单」的替换法
+    （后者仅作 amend 失败，例如算法单已触发/已消失时的兜底）。
+
+    三个新值全为 None 时不下发（调用方逻辑错误）→ 直接返回 ok=False，不发空命令。
+    `--newSlOrdPx=-1`/`--newTpOrdPx=-1` 必须用等号形式：值以短横开头，空格分隔会被
+    commander.js 当成另一个 flag（见 place_market_open 里同款历史坑）。
+    """
+    if new_sl_trigger_px is None and new_tp_trigger_px is None and new_sz is None:
+        return {"ok": False, "sCode": None, "sMsg": "amend_no_change_requested",
+                "data": [], "raw": None, "error": "amend_no_change_requested"}
+    if is_dryrun():
+        return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
+                "data": [{"algoId": algo_id, "sCode": "0"}], "dryrun": True,
+                "amended": {"sl": new_sl_trigger_px, "tp": new_tp_trigger_px,
+                            "sz": new_sz}}
+    args = ["swap", "algo", "amend", "--instId", inst_id, "--algoId", str(algo_id)]
+    if new_sz is not None:
+        args += ["--newSz", str(new_sz)]
+    if new_sl_trigger_px is not None:
+        args += ["--newSlTriggerPx", str(new_sl_trigger_px), "--newSlOrdPx=-1"]
+    if new_tp_trigger_px is not None:
+        args += ["--newTpTriggerPx", str(new_tp_trigger_px), "--newTpOrdPx=-1"]
+    return _call(*args, profile=profile)
+
+
+def cancel_algo_order(inst_id: str, algo_id: str, profile: str) -> dict[str, Any]:
+    """撤单（`okx swap algo cancel --instId <id> --algoId <id>`）。
+
+    只用于两处：① amend 失败后的「挂新→撤旧」兜底；② 开仓未成交时清理悬挂保护单
+    （此前只能写 repair_queue 等人工）。**绝不用于让持仓变裸仓**——调用方必须
+    先确认另一张全仓止损已回读确认（主人拍板 2026-08-13：止损不可撤只能替换）。
+    """
+    if is_dryrun():
+        return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
+                "data": [{"algoId": algo_id, "sCode": "0"}], "dryrun": True}
+    args = ["swap", "algo", "cancel", "--instId", inst_id, "--algoId", str(algo_id)]
     return _call(*args, profile=profile)
 
 

@@ -5,6 +5,35 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Added
+
+- Added OKX announcement collection, official instrument and contract-history
+  snapshots, kline BOLL/OBV evidence, positioning batch identity, and bounded
+  recovery for incomplete market-feature collection.
+- Added complete-cycle SLA, market-field, market-feature, positioning, periodic
+  report, and delivery audits, plus deterministic live-position action handling
+  and explicit stage side-effect failure receipts.
+
+### Changed
+
+- Extended the live decision contract with REDUCE and ADJUST_PROTECTION,
+  explicit exit modes, exact multitimeframe selection evidence, deadline-aware
+  analysis writes, and stronger report-to-exchange attestations.
+- Updated collectors, writers, dispatcher, executor, report pipelines, role
+  manuals, templates, schema export, lifecycle metadata, and isolated tests to
+  the sanitized 2026-08-15 runtime snapshot.
+- Corrected the Push documentation to the current 16 static required sections;
+  versioned multitimeframe and execution evidence remain independent hard gates.
+
+### Security
+
+- Retained project-root portability, isolated database-root propagation,
+  fail-closed dry-run behavior, permanently read-only public autoheal, and
+  verified pre-write SQLite backups for the newly synchronized migrations.
+- Excluded credentials, routing destinations, host-specific scheduler helpers,
+  databases, logs, runtime state, real-order microtests, and incident-specific
+  repair utilities from the public synchronization.
+
 ## [1.1.0] - 2026-08-12
 
 ### Added

@@ -25,8 +25,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
-_SCRIPTS = str(Path(r"./scripts"))
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
+_SCRIPTS = str(Path(r".\scripts"))
 for _p in (_COLLECTORS, _SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -45,6 +45,9 @@ SOURCE_ID = "okx_news"
 _CLI_TIMEOUT = 12.0
 _DEFAULT_IMPORTANT_LIMIT = 20
 _DEFAULT_LATEST_LIMIT = 30
+_COLD_RETRY_DELAY_SECONDS = 3.0
+_COLD_RETRY_TIMEOUT_SECONDS = 4.0
+_MAX_FETCH_PHASES_PER_ENDPOINT = 3
 
 _COIN_TO_SWAP = {
     "BTC": "BTC-USDT-SWAP", "ETH": "ETH-USDT-SWAP", "SOL": "SOL-USDT-SWAP",
@@ -183,11 +186,13 @@ def fetch_items(important_limit: int = _DEFAULT_IMPORTANT_LIMIT,
     """拉 important + latest，失败端点在全部首轮结束后各重试一次。
 
     两遍式顺序避免 important 的长超时直接吃掉 latest 的机会。默认首轮8秒、
-    重试6秒，两个端点全失败最坏约28秒，仍在 registry 的30秒源预算内。
+    即时重试6秒，仍失败的端点冷却后各做一次4秒冷恢复；两端点全失败
+    最坏约40秒，仍在 registry 的45秒源预算内。
     """
     raw_items: list[dict] = []
     failed: list[tuple[str, int, str]] = []
-    recovered = 0
+    recovered_immediate = 0
+    recovered_cold = 0
     initial_timeout = max(1.0, min(float(timeout_sec), 8.0))
     retry_timeout = max(1.0, min(float(timeout_sec), 6.0))
     for kind, lim in (("important", important_limit), ("latest", latest_limit)):
@@ -203,7 +208,8 @@ def fetch_items(important_limit: int = _DEFAULT_IMPORTANT_LIMIT,
             print(f"[WARN] okx news initial {msg}; retrying", file=sys.stderr)
             failed.append((kind, lim, msg))
 
-    for index, (kind, lim, _initial_error) in enumerate(failed):
+    still_failed: list[tuple[str, int, str, str]] = []
+    for index, (kind, lim, initial_error) in enumerate(failed):
         if index == 0:
             time.sleep(0.5)
         try:
@@ -212,18 +218,53 @@ def fetch_items(important_limit: int = _DEFAULT_IMPORTANT_LIMIT,
                 timeout_sec=retry_timeout, retries=0,
             )
             raw_items.extend(_normalize_payload(payload))
-            recovered += 1
+            recovered_immediate += 1
         except Exception as e:  # noqa: BLE001
             msg = f"{kind}: {type(e).__name__}: {e}"[:150]
-            print(f"[WARN] okx news {msg}", file=sys.stderr)
+            print(f"[WARN] okx news hot retry {msg}", file=sys.stderr)
+            still_failed.append((kind, lim, initial_error, msg))
+
+    # A fresh CLI process is a distinct transport session.  Only endpoints
+    # still failed after both normal phases receive one delayed cold attempt;
+    # no cycle argument, loop, historical recollection or alternate source is
+    # available here.
+    final_failed: list[tuple[str, str]] = []
+    if still_failed:
+        time.sleep(_COLD_RETRY_DELAY_SECONDS)
+    for kind, lim, initial_error, hot_error in still_failed:
+        try:
+            payload = okx_json(
+                "news", kind, "--limit", str(lim),
+                timeout_sec=_COLD_RETRY_TIMEOUT_SECONDS, retries=0,
+            )
+            raw_items.extend(_normalize_payload(payload))
+            recovered_cold += 1
+        except Exception as e:  # noqa: BLE001
+            cold_error = f"{kind}: {type(e).__name__}: {e}"[:150]
+            detail = (
+                f"{kind}: initial={initial_error[len(kind) + 2:][:40]}; "
+                f"hot={hot_error[len(kind) + 2:][:40]}; "
+                f"cold={cold_error[len(kind) + 2:]}"
+            )[:150]
+            print(f"[WARN] okx news final {detail}", file=sys.stderr)
+            final_failed.append((kind, detail))
             if errors is not None:
-                errors.append(msg)
+                errors.append(detail)
 
     if retry_stats is not None:
         retry_stats.update({
             "initial_failed": len(failed),
-            "recovered_after_retry": recovered,
-            "final_failed": len(failed) - recovered,
+            "recovered_after_retry": recovered_immediate + recovered_cold,
+            "recovered_after_immediate_retry": recovered_immediate,
+            "cold_retry_requested": len(still_failed),
+            "recovered_after_cold_retry": recovered_cold,
+            "final_failed": len(final_failed),
+            "maximum_fetch_phases_per_endpoint": (
+                _MAX_FETCH_PHASES_PER_ENDPOINT),
+            "cold_retry_delay_seconds": _COLD_RETRY_DELAY_SECONDS,
+            "cold_retry_timeout_seconds": _COLD_RETRY_TIMEOUT_SECONDS,
+            "historical_retry": False,
+            "unbounded_retry": False,
         })
 
     seen_ids: set[str] = set()
@@ -286,7 +327,8 @@ def collect(db_path: str, apply: bool = False,
         return out
 
     if not items and err_txt:
-        return {"ok": False, "fetched": 0, "inserted": 0, "err": err_txt}
+        return {"ok": False, "fetched": 0, "inserted": 0,
+                "retry_stats": retry_stats, "err": err_txt}
 
     res = news_writer.write_news(items, db_path)
     res["fetched"] = len(items)

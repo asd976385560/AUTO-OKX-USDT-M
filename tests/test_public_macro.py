@@ -108,6 +108,31 @@ class PublicMacroTests(unittest.TestCase):
         self.assertEqual(snap["etf_confirmed"]["value"], -240100000)
         self.assertEqual(snap["etf_confirmed"]["status"], "cross_checked")
 
+    def test_fed_funds_rows_normalize_and_reach_snapshot(self):
+        rows = pm.fed_funds_rows(
+            "4.33", "2026-08-11", d1=0.0, collected_at="2026-08-13T00:00:00Z")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["metric"], pm.METRIC_FED_FUNDS)
+        self.assertEqual(rows[0]["source"], pm.SOURCE_FRED)
+        self.assertEqual(rows[0]["unit"], "percent_annual")
+        self.assertEqual(rows[0]["status"], "official_primary")
+        pm.upsert_observations(self.con, rows)
+        snap = pm.latest_snapshot(self.con)
+        self.assertEqual(snap["fed_funds"]["value"], 4.33)
+        self.assertEqual(snap["fed_funds"]["observation_date"], "2026-08-11")
+        dates = pm.source_dates(self.con)
+        self.assertEqual(dates["macro_fed_funds"], "2026-08-11")
+
+    def test_fed_funds_rows_reject_bad_value_or_date(self):
+        # 值/日期非法宁缺勿假；越界（负或 >30%）视为坏数据。
+        self.assertEqual(pm.fed_funds_rows(None, "2026-08-11"), [])
+        self.assertEqual(pm.fed_funds_rows("4.33", None), [])
+        self.assertEqual(pm.fed_funds_rows("4.33", "bad-date"), [])
+        self.assertEqual(pm.fed_funds_rows("-1", "2026-08-11"), [])
+        self.assertEqual(pm.fed_funds_rows("55", "2026-08-11"), [])
+        snap = pm.latest_snapshot(self.con)
+        self.assertIsNone(snap["fed_funds"])
+
     def test_conflicting_etf_sources_do_not_enter_hard_value(self):
         rows = [
             {

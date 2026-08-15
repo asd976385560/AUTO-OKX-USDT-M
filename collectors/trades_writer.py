@@ -84,6 +84,7 @@ live_trades.db 的 trade_cycles + trades 表。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -105,6 +106,9 @@ CST = timezone(timedelta(hours=8))
 _TS_ISO_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$"
 )
+RECONCILE_ANALYSIS_TERMINAL_FROM = "2026-08-14T04:00"
+LIVE_TERMINAL_DEADLINE_GUARD_FROM = "2026-08-15T09:15"
+LIVE_TERMINAL_DEADLINE_SECONDS = 13 * 60
 
 
 def normalize_ts(ts: str) -> str:
@@ -141,6 +145,76 @@ _CST_TS_RE = re.compile(
 
 def now_cst() -> str:
     return dt.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_cst_dt() -> dt:
+    return dt.now(CST)
+
+
+def _has_possible_exchange_side_effect(data: dict) -> bool:
+    """Keep late bookkeeping available whenever an exchange mutation may exist."""
+    trades = data.get("trades")
+    if isinstance(trades, list) and trades:
+        return True
+    try:
+        if int(data.get("n_orders") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        # Invalid receipts are rejected by the ordinary schema validation; do
+        # not let the deadline guard hide the more precise validation error.
+        return True
+    decision = str(data.get("decision") or "").strip().lower()
+    if decision not in {"hold", "skip"}:
+        return True
+    if data.get("protection_change") is not None or data.get("applied") is not None:
+        return True
+    action = str(data.get("action_taken") or "").strip().upper()
+    return action not in {
+        "", "HOLD", "WAIT", "REJECT", "ERROR", "NONE", "SKIP",
+    }
+
+
+def _late_no_side_effect_refusal(
+    data: dict,
+    *,
+    now: dt | None = None,
+) -> dict | None:
+    """Refuse only a late zero-side-effect terminal for active live cycles.
+
+    A Gateway turn can outlive a locally killed CLI on Windows.  After the
+    cycle+13:00 business deadline, a delayed HOLD/WAIT must not create a late
+    ``trade_cycles`` row that races the already-started failure report.  Any
+    receipt that may represent an order, fill, close, reduce, or protection
+    mutation remains writable so real exchange side effects are never hidden.
+    """
+    cycle_id = str(data.get("cycle_id") or "")
+    if cycle_id < LIVE_TERMINAL_DEADLINE_GUARD_FROM:
+        return None
+    try:
+        cycle_start = dt.strptime(
+            cycle_id, "%Y-%m-%dT%H:%M",
+        ).replace(tzinfo=CST)
+    except ValueError:
+        return None
+    if _has_possible_exchange_side_effect(data):
+        return None
+    current = now or _now_cst_dt()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=CST)
+    current = current.astimezone(CST)
+    deadline = cycle_start + timedelta(
+        seconds=LIVE_TERMINAL_DEADLINE_SECONDS)
+    if current < deadline:
+        return None
+    return {
+        "ok": False,
+        "refused": True,
+        "error": "cycle_deadline_exceeded_no_side_effect_terminal",
+        "cycle_id": cycle_id,
+        "deadline_at": deadline.strftime("%Y-%m-%d %H:%M:%S"),
+        "exchange_side_effect_may_exist": False,
+        "production_database_writes": 0,
+    }
 
 
 def strict_cst_ts(value: object) -> Optional[str]:
@@ -184,8 +258,6 @@ def _runtime_db_path(
     db_root: str | Path | None = None,
     specific_env: str | None = None,
 ) -> Path:
-    # An explicit root is an isolation boundary and wins over legacy per-DB
-    # environment overrides.
     if db_root is not None:
         return _runtime_db_root(db_root) / filename
     if specific_env and os.environ.get(specific_env):
@@ -208,8 +280,8 @@ DB_MAP = {"live": _trade_db_path("live")}
 # ---------------------------------------------------------------------------
 def connect(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(db_path), timeout=10)
-    con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA busy_timeout=5000;")
+    con.execute("PRAGMA journal_mode=WAL;")
     con.row_factory = sqlite3.Row
     return con
 
@@ -238,11 +310,15 @@ def normalize_decision(raw: Optional[str]) -> str:
 
 # ---------------------------------------------------------------------------
 # receipt 顶层缺 decision 时从 action_taken/trades 推导，保持 trade_cycles 与 trades 一致。
-# 映射：OPEN_*/CLOSE/STOP_LOSS/REDUCE/ADD → traded；ADJUST/HOLD/WAIT/NONE → hold；
+# 映射：OPEN_*/CLOSE/STOP_LOSS/REDUCE/ADD → traded；
+# ADJUST_PROTECTION/HOLD/WAIT/NONE → hold；历史 ADJUST 仅维护兼容，
+# 当前 Live 写入不得用这个无法证明交易所副作用的模糊别名。
 # 非空 trades[] 恒 traded；未知值 fail-safe 按 hold。已有 decision 值不覆盖。
 # ---------------------------------------------------------------------------
 _ACTION_TAKEN_TRADED = {"CLOSE", "STOP_LOSS", "REDUCE", "ADD"}
-_ACTION_TAKEN_NONTRADED = {"ADJUST", "HOLD", "WAIT", "NONE", "REJECT"}
+_ACTION_TAKEN_NONTRADED = {
+    "ADJUST", "ADJUST_PROTECTION", "HOLD", "WAIT", "NONE", "REJECT"
+}
 _ACTION_TAKEN_ALLOWED = (
     _ACTION_TAKEN_TRADED
     | _ACTION_TAKEN_NONTRADED
@@ -257,8 +333,143 @@ _ACTION_TAKEN_ALLOWED = (
 )
 CURRENT_RECEIPT_STATUSES = {"ok", "skipped", "degraded", "error"}
 CONFIRMED_FILL_SOURCES = {"fills", "order_status", "orders_history"}
+_SALVAGE_CLOSE_TS_SOURCES = {
+    "fills": {"fills.fillTime", "fills.ts"},
+    "order_status": {"order_status.fillTime", "order_status.uTime"},
+    "orders_history": {
+        "orders_history.fillTime", "orders_history.uTime",
+    },
+}
+_SALVAGE_CLOSE_WINDOW_SKEW_SECONDS = 5
 _CURRENT_WRITE_CAPABILITY = object()
 _MAINTENANCE_CAPABILITY = object()
+_SIDE_EFFECT_SALVAGE_CAPABILITY = object()
+
+
+def _position_action_from_receipt(action_taken: object) -> Optional[str]:
+    """Map receipt vocabulary to the deterministic facts-policy vocabulary."""
+    action = str(action_taken or "").strip().upper()
+    return {
+        "CLOSE": "close",
+        "CLOSE_LONG": "close",
+        "CLOSE_SHORT": "close",
+        "STOP_LOSS": "close",
+        "REDUCE": "reduce",
+        "ADJUST_PROTECTION": "adjust_protection",
+    }.get(action)
+
+
+_ADJUST_PROTECTION_PATHS = {
+    "amend",
+    "amend_consolidate",
+    "place_new",
+    "replace_fallback",
+    "oco_replace",
+}
+
+
+def _adjust_protection_evidence_errors(data: object) -> list[str]:
+    """Require exchange-readback evidence for a claimed protection change.
+
+    ``ADJUST`` used to be accepted as a free-form, zero-fill label.  That made
+    a plain HOLD look like an exchange side effect in the pushed report.  The
+    formal action is now only the executor's ``ADJUST_PROTECTION`` receipt, and
+    a successful Live write must retain the requested change, deterministic
+    execution path, final protection-state assertion and applied values.
+    """
+    if not isinstance(data, dict):
+        return []
+    action = str(data.get("action_taken") or "").strip().upper()
+    if action != "ADJUST_PROTECTION":
+        return []
+
+    errors: list[str] = []
+    if data.get("dryrun") is True:
+        errors.append("ADJUST_PROTECTION dry-run 计划不得写入 Live 交易账本")
+
+    change = data.get("protection_change")
+    if not isinstance(change, dict):
+        errors.append("ADJUST_PROTECTION 缺少 executor protection_change 回执")
+    else:
+        requested = (
+            change.get("requested_sl") is not None
+            or change.get("requested_tp") is not None
+            or change.get("resize_to_full_position") is True
+        )
+        if not requested:
+            errors.append("ADJUST_PROTECTION protection_change 未声明实际调整请求")
+
+    path = str(data.get("path") or "").strip()
+    if path not in _ADJUST_PROTECTION_PATHS:
+        errors.append("ADJUST_PROTECTION 缺少受支持的 executor path")
+
+    state = data.get("protection_state")
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        errors.append("ADJUST_PROTECTION 缺少 protection_state.ok=true 终局回读")
+
+    applied = data.get("applied")
+    if not isinstance(applied, dict):
+        errors.append("ADJUST_PROTECTION 缺少 applied 结果")
+    else:
+        for key in ("sl", "sz"):
+            value = _as_pos_float(applied.get(key))
+            if value is None:
+                errors.append(f"ADJUST_PROTECTION applied.{key} 必须是正数")
+
+    if not str(data.get("symbol") or "").strip():
+        errors.append("ADJUST_PROTECTION 缺少 symbol")
+    if str(data.get("pos_side") or "").strip().lower() not in {"long", "short"}:
+        errors.append("ADJUST_PROTECTION pos_side 必须是 long|short")
+    return errors
+
+
+def _facts_authorize_position_action(
+    facts: object,
+    action_taken: object,
+) -> bool:
+    """Check every position-management receipt against its facts whitelist."""
+    mapped = _position_action_from_receipt(action_taken)
+    if mapped is None or not isinstance(facts, dict):
+        return False
+    policy = facts.get("action_policy")
+    if not isinstance(policy, dict) or policy.get("position_truth_verified") is not True:
+        return False
+    allowed = policy.get("allowed_executor_actions")
+    return bool(isinstance(allowed, list) and mapped in allowed)
+
+
+def _position_action_policy_errors(
+    facts: object,
+    action_taken: object,
+) -> list[str]:
+    """Reject a claimed position action unless the exact facts package allows it."""
+    mapped = _position_action_from_receipt(action_taken)
+    if mapped is None or not isinstance(facts, dict):
+        return []
+    if _facts_authorize_position_action(facts, action_taken):
+        return []
+    return [
+        f"action_taken={str(action_taken or '').strip().upper()} 未获 "
+        f"live_facts.action_policy.allowed_executor_actions 授权 ({mapped})"
+    ]
+
+
+def _blocking_facts_authorize_action(
+    facts: object,
+    action_taken: object,
+) -> bool:
+    """Allow only an explicitly authorized position-management action.
+
+    A facts package may be blocking because balance/spec/protection inputs are
+    insufficient for OPEN/ADD while exchange position truth is still verified.
+    In that narrow case its deterministic action policy remains authoritative
+    for CLOSE/REDUCE/ADJUST_PROTECTION.
+    """
+    return bool(
+        isinstance(facts, dict)
+        and facts.get("status") == "blocking"
+        and _facts_authorize_position_action(facts, action_taken)
+    )
 
 
 def derive_cycle_decision(action_taken: Optional[str], incoming_trades: list) -> str:
@@ -448,6 +659,139 @@ def _rows_match(a: tuple, b: tuple) -> bool:
     return True
 
 
+def _consume_row_matches(old_keys: list[tuple], new_keys: list[tuple]) -> tuple[bool, set[int]]:
+    """Match old rows to distinct new rows (multiset coverage, never reuse)."""
+    unused = set(range(len(new_keys)))
+    matched: set[int] = set()
+    for old_key in old_keys:
+        found = next(
+            (index for index in sorted(unused)
+             if _rows_match(old_key, new_keys[index])),
+            None,
+        )
+        if found is None:
+            return False, matched
+        unused.remove(found)
+        matched.add(found)
+    return True, matched
+
+
+def _duplicate_new_trade_identity(keys: list[tuple]) -> bool:
+    for left in range(len(keys)):
+        for right in range(left + 1, len(keys)):
+            left_oid, left_fp = keys[left]
+            right_oid, right_fp = keys[right]
+            if left_oid and right_oid:
+                if left_oid == right_oid:
+                    return True
+                continue
+            if left_fp == right_fp:
+                return True
+    return False
+
+
+def _bounded_json(value: object, max_chars: int, label: str) -> str:
+    raw = json.dumps(value, ensure_ascii=False)
+    if len(raw) <= max_chars:
+        return raw
+    raw_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if not isinstance(value, dict):
+        return json.dumps({
+            "raw_structurally_truncated": True,
+            "raw_original_chars": len(raw),
+            "raw_original_sha256": raw_sha256,
+            "raw_value_type": type(value).__name__,
+        }, ensure_ascii=False)
+
+    critical_keys = (
+        "schema_version", "cycle_id", "profile", "mode", "status",
+        "decision", "action_taken", "batch_status", "batch_ok",
+        "runner_in_progress", "n_orders", "facts_hash", "plan_sha256",
+        "position_action_plan_hash",
+    )
+    authority_keys = ("live_facts", "trades", "decision_card")
+    priority = critical_keys + authority_keys + (
+        "errors",
+        "symbol", "action", "side", "pos_side", "sz", "fill_sz", "fill_px",
+        "fill_source", "fill_ts", "ts_source", "ordId", "ord_id", "algoId",
+        "pnl", "reasoning", "reject_reason", "reject_detail",
+        "position_action_plan_hash", "decision_protocol",
+    )
+    ordered_keys = list(dict.fromkeys(
+        [key for key in priority if key in value]
+        + sorted(str(key) for key in value if key not in priority)
+    ))
+    clipped: dict = {
+        "raw_structurally_truncated": True,
+        "raw_original_chars": len(raw),
+        "raw_original_sha256": raw_sha256,
+        "raw_truncated_fields": [],
+    }
+    # Terminal/binding fields must remain visible to the stage observer even
+    # when the authority payload itself exceeds the soft raw-size target.
+    # Authority-bearing inputs also stay full: the target is compaction, not
+    # permission to discard facts/fills/cards.
+    for key in critical_keys + authority_keys:
+        if key in value:
+            clipped[key] = value[key]
+    reserve = min(4000, max_chars // 4)
+    for key in ordered_keys:
+        if key in critical_keys or key in authority_keys:
+            continue
+        item = value.get(key)
+        if key in {"position_action_results", "position_action_failures"} \
+                and isinstance(item, list):
+            summaries = []
+            for row in item:
+                if not isinstance(row, dict):
+                    continue
+                result = row.get("result") if isinstance(row.get("result"), dict) else {}
+                identities = []
+                for trade in result.get("trades") or []:
+                    if isinstance(trade, dict):
+                        identities.append({
+                            name: trade.get(name)
+                            for name in (
+                                "ordId", "symbol", "action", "side", "sz",
+                                "fill_sz", "fill_px", "fill_source", "fill_ts",
+                            )
+                            if trade.get(name) is not None
+                        })
+                row_raw = json.dumps(row, ensure_ascii=False)
+                summaries.append({
+                    "request": row.get("request"),
+                    "problem": row.get("problem"),
+                    "trade_identities": identities,
+                    "row_sha256": hashlib.sha256(
+                        row_raw.encode("utf-8")
+                    ).hexdigest(),
+                })
+            clipped[key] = summaries
+            item_raw = json.dumps(item, ensure_ascii=False)
+            clipped["raw_truncated_fields"].append({
+                "field": key,
+                "chars": len(item_raw),
+                "sha256": hashlib.sha256(item_raw.encode("utf-8")).hexdigest(),
+                "replacement": "request_problem_trade_identities_and_row_hash",
+            })
+            continue
+        trial = {**clipped, key: item}
+        if len(json.dumps(trial, ensure_ascii=False)) <= max_chars - reserve:
+            clipped[key] = item
+            continue
+        item_raw = json.dumps(item, ensure_ascii=False)
+        clipped["raw_truncated_fields"].append({
+            "field": key,
+            "chars": len(item_raw),
+            "sha256": hashlib.sha256(item_raw.encode("utf-8")).hexdigest(),
+        })
+    bounded = json.dumps(clipped, ensure_ascii=False)
+    if len(bounded) > max_chars:
+        clipped["raw_size_target_exceeded_for_authority"] = True
+        bounded = json.dumps(clipped, ensure_ascii=False)
+    return bounded
+
+
 # ---------------------------------------------------------------------------
 # 验证
 # ---------------------------------------------------------------------------
@@ -519,6 +863,11 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
         errors.append(f"action_taken 不支持: {data.get('action_taken')!r}")
 
     if not maintenance:
+        if action_taken == "ADJUST":
+            errors.append(
+                "action_taken=ADJUST 是历史展示别名；真实保护调整必须使用 "
+                "executor 返回的 ADJUST_PROTECTION，无交易所副作用必须写 HOLD")
+        errors.extend(_adjust_protection_evidence_errors(data))
         status = str(data.get("status") or "").strip().lower()
         if status not in CURRENT_RECEIPT_STATUSES:
             errors.append(
@@ -551,11 +900,18 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
 
         live_facts = data.get("live_facts")
         if live_facts is not None:
+            errors.extend(_position_action_policy_errors(
+                live_facts, action_taken))
+            require_facts_ok = (
+                status == "ok"
+                and not _blocking_facts_authorize_action(
+                    live_facts, action_taken)
+            )
             errors.extend(validate_live_facts(
                 live_facts,
                 expected_cycle=str(data.get("cycle_id") or ""),
                 expected_profile=str(data.get("_profile") or "live"),
-                require_ok=status == "ok",
+                require_ok=require_facts_ok,
                 max_age_s=30 * 60,
             ))
 
@@ -722,6 +1078,11 @@ def validate_strict_live_receipt(data: dict) -> list[str]:
             errors.append(f"严格 Live 回执缺少 {key}")
     if not str(payload.get("action_taken") or "").strip():
         errors.append("严格 Live 回执 action_taken 不得为空")
+    if str(payload.get("action_taken") or "").strip().upper() == "ADJUST":
+        errors.append(
+            "严格 Live 回执不得使用模糊 ADJUST；真实调整写 "
+            "ADJUST_PROTECTION，否则写 HOLD")
+    errors.extend(_adjust_protection_evidence_errors(payload))
     if not str(payload.get("regime") or "").strip():
         errors.append("严格 Live 回执 regime 不得为空")
     if not isinstance(payload.get("trades"), list):
@@ -731,21 +1092,33 @@ def validate_strict_live_receipt(data: dict) -> list[str]:
 
     facts = payload.get("live_facts")
     if isinstance(facts, dict):
+        errors.extend(_position_action_policy_errors(
+            facts, payload.get("action_taken")))
         status = str(payload.get("status") or "").lower()
+        require_facts_ok = (
+            status == "ok"
+            and not _blocking_facts_authorize_action(
+                facts, payload.get("action_taken"))
+        )
         errors.extend(validate_live_facts(
             facts,
             expected_cycle=str(payload.get("cycle_id") or ""),
             expected_profile="live",
-            require_ok=status == "ok",
+            require_ok=require_facts_ok,
             max_age_s=30 * 60,
         ))
         fact_equity = (facts.get("balance") or {}).get("totalEq")
+        blocking_action_authorized = _blocking_facts_authorize_action(
+            facts, payload.get("action_taken"))
         if (
-            str(payload.get("status") or "").lower() == "error"
+            (
+                str(payload.get("status") or "").lower() == "error"
+                or blocking_action_authorized
+            )
             and fact_equity is None
             and payload.get("equity") is None
         ):
-            pass  # 余额查询本身 blocking 时仍允许终态错误回执留痕。
+            pass  # 余额 blocking 时仅终态错误或明确获准去风险动作可留痕。
         else:
             try:
                 receipt_equity = float(payload.get("equity"))
@@ -985,14 +1358,14 @@ def _write_trades(
     # 已备份的人工事实修复可通过维护专用入口保留历史 NULL，禁止用“修复执行时”
     # 的最新 account snapshot 污染旧 cycle；普通 receipt 字段无法开启该能力。
     if equity is None and not preserve_equity_none:
-        fb = _equity_snapshot_fallback(mode, db_root=db_path.parent)
+        fb = _equity_snapshot_fallback(mode, db_path.parent)
         if fb is not None:
             equity = fb[0]
             equity_fallback_mark = {"equity_source": "account_snapshot_fallback",
                                     "equity_source_ts": fb[1]}
     pnl_session = data.get("pnl_session", 0.0)
     pnl_open = data.get("pnl_open", 0.0)
-    ana_context = _analysis_context_for_cycle(cycle_id, db_root=db_path.parent)
+    ana_context = _analysis_context_for_cycle(cycle_id, db_path.parent)
     card_mode = (
         data.get("decision_protocol") == "decision_card_v1"
         or isinstance(data.get("decision_card"), dict)
@@ -1065,9 +1438,23 @@ def _write_trades(
         for canonical_key in (
             "live_facts",
             "action_taken",
+            "batch_status",
+            "batch_ok",
+            "runner_in_progress",
+            "position_action_plan_hash",
+            "facts_hash",
+            "plan_sha256",
+            "contract_quarantine",
+            "receipt_file_warning",
             "errors",
             "n_orders",
             "equity",
+            "protection_change",
+            "protection_state",
+            "applied",
+            "path",
+            "pos_side",
+            "symbol",
         ):
             if canonical_key in data:
                 raw_obj[canonical_key] = data[canonical_key]
@@ -1075,18 +1462,38 @@ def _write_trades(
         raw_obj = {**raw_obj, **equity_fallback_mark}
     if score_backfill_mark and isinstance(raw_obj, dict):
         raw_obj = {**raw_obj, **score_backfill_mark}
-    raw = json.dumps(raw_obj, ensure_ascii=False)[:100000]  # 截断防爆（§8.5：10KB→100KB，raw 作经验权威）
+    raw = _bounded_json(raw_obj, 100000, "trade_cycles.raw")
 
     con = connect(db_path)
     try:
+        # Serialize the full read/merge/delete/insert decision.  In WAL mode a
+        # deferred transaction can let two writers both read the same old row
+        # and then last-writer-win; BEGIN IMMEDIATE takes the write reservation
+        # before the old-cycle read.
+        con.execute("BEGIN IMMEDIATE")
         # 防降级覆盖闸：同 cycle 已有真实成交行（n_orders>0）时，禁止不带 trades
         # 的重写销毁成交账。traded→traded 幂等重写（重试带 trades）仍允许。
         # 拒绝时返回 ok:true+refused 标记
         # （账面状态良好，勿让 caller 当写失败重试/升级 P0）。
         old = con.execute(
-            "SELECT decision, n_orders, ts FROM trade_cycles WHERE cycle_id=?",
+            "SELECT decision, n_orders, ts, raw FROM trade_cycles WHERE cycle_id=?",
             (cycle_id,)).fetchone()
-        if old and (old["n_orders"] or 0) > 0 and not incoming_trades:
+        old_raw_obj = None
+        if old and old["raw"]:
+            try:
+                old_raw_obj = json.loads(old["raw"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                old_raw_obj = None
+        old_is_reconcile_only = bool(
+            not is_maintenance
+            and str(cycle_id) >= RECONCILE_ANALYSIS_TERMINAL_FROM
+            and isinstance(old_raw_obj, dict)
+            and str(old_raw_obj.get("reconcile_source") or "").strip()
+            and str(old_raw_obj.get("cycle_ts_source") or "").strip()
+            == "trusted_internal_override"
+        )
+        if (old and (old["n_orders"] or 0) > 0 and not incoming_trades
+                and not old_is_reconcile_only):
             print(f"[trades_writer] REFUSE downgrade overwrite: cycle={cycle_id} "
                   f"existing(decision={old['decision']},n_orders={old['n_orders']}) "
                   f"incoming(decision={decision},trades=0) — kept existing row",
@@ -1106,7 +1513,42 @@ def _write_trades(
         # "旧行匹配不到的新增行"；拒写分支为 []。
         new_trades: list = list(incoming_trades)
         merge_keep: list = []
+        # A same-slot exchange close reconciled before the scheduled Agent is
+        # a real transaction row, not the Agent's decision.  A subsequent
+        # HOLD/WAIT receipt therefore completes the business terminal while
+        # preserving the close.  The maintenance marker is private writer
+        # provenance; ordinary current receipts cannot manufacture it.
+        if old_is_reconcile_only and not incoming_trades:
+            merge_keep = list(con.execute(
+                "SELECT ts, symbol, action, side, sz, fill_px, lev, margin, "
+                "notional, score_total, reasoning, deviation, degradation, "
+                "pnl, raw FROM trades WHERE cycle_id=?", (cycle_id,)
+            ).fetchall())
+            n_orders = len(merge_keep)
+            decision = "traded"
+            note = (note + " | " if note else "") + \
+                f"[merge-guard: kept {len(merge_keep)} reconciled close rows]"
+            if isinstance(raw_obj, dict):
+                raw_obj = {
+                    **raw_obj,
+                    "merge_guard_kept_rows": len(merge_keep),
+                    "reconciled_close_preserved": True,
+                }
+                raw = _bounded_json(raw_obj, 100000, "trade_cycles.raw")
+            print(f"[trades_writer] MERGE guard: cycle={cycle_id} "
+                  f"current no-order receipt completed scheduled terminal and "
+                  f"kept {len(merge_keep)} reconciled close rows",
+                  file=sys.stderr)
         if incoming_trades:
+            new_keys = [_row_keys(t.get("symbol"), t.get("action"),
+                                  t.get("side"), t.get("sz"),
+                                  t.get("fill_px"), _extract_ordid(t))
+                        for t in incoming_trades]
+            if _duplicate_new_trade_identity(new_keys):
+                return {"ok": False, "cycle_id": cycle_id,
+                        "n_orders": (old["n_orders"] if old else None),
+                        "refused": "duplicate_trade_identity",
+                        "new_trades": []}
             old_trades = con.execute(
                 "SELECT ts, symbol, action, side, sz, fill_px, lev, margin, notional,"
                 " score_total, reasoning, deviation, degradation, pnl, raw"
@@ -1118,18 +1560,16 @@ def _write_trades(
                                       r["sz"], r["fill_px"],
                                       _extract_ordid(r["raw"]))
                             for r in old_trades]
-                new_keys = [_row_keys(t.get("symbol"), t.get("action"),
-                                      t.get("side"), t.get("sz"),
-                                      t.get("fill_px"), _extract_ordid(t))
-                            for t in incoming_trades]
-                covered = all(any(_rows_match(o, n) for n in new_keys)
-                              for o in old_keys)
+                covered, matched_new_indices = _consume_row_matches(
+                    old_keys, new_keys)
                 any_match = any(_rows_match(o, n)
                                 for o in old_keys for n in new_keys)
                 if covered:
                     # 新⊇旧：完整重发/扩充。new_trades 收敛为旧行匹配不到的净新增
-                    new_trades = [t for t, k in zip(incoming_trades, new_keys)
-                                  if not any(_rows_match(o, k) for o in old_keys)]
+                    new_trades = [
+                        trade for index, trade in enumerate(incoming_trades)
+                        if index not in matched_new_indices
+                    ]
                 elif not any_match:
                     merge_keep = list(old_trades)
                     n_orders = len(incoming_trades) + len(merge_keep)
@@ -1139,7 +1579,7 @@ def _write_trades(
                     if isinstance(raw_obj, dict):
                         raw_obj = {**raw_obj,
                                    "merge_guard_kept_rows": len(merge_keep)}
-                        raw = json.dumps(raw_obj, ensure_ascii=False)[:100000]
+                        raw = _bounded_json(raw_obj, 100000, "trade_cycles.raw")
                     print(f"[trades_writer] MERGE guard: cycle={cycle_id} "
                           f"incremental receipt disjoint with {len(merge_keep)} "
                           f"existing rows -> merged (kept prior rows)",
@@ -1187,8 +1627,8 @@ def _write_trades(
             missing_meta = []
             ctx = ana_context.get(_norm_symbol(str(symbol or ""))) or {}
             effective_card = (
-                data.get("decision_card")
-                or t.get("decision_card")
+                t.get("decision_card")
+                or data.get("decision_card")
                 or ctx.get("decision_card")
             )
             if card_mode and isinstance(effective_card, dict):
@@ -1242,7 +1682,7 @@ def _write_trades(
                     "decision_card": effective_card,
                     "decision_protocol": "decision_card_v1",
                 }
-            row_raw = json.dumps(row_raw_obj, ensure_ascii=False)[:20000]
+            row_raw = _bounded_json(row_raw_obj, 20000, "trades.raw")
             # margin/notional 缺失按 ctVal 公式补算（已有值不覆盖）
             margin = t.get("margin")
             notional = t.get("notional")
@@ -1256,8 +1696,7 @@ def _write_trades(
                     row_ctval = _as_pos_float(t.get("ct_val"))
                     base = px * sz * (row_ctval if row_ctval is not None
                                       else _ctval_for(
-                                          str(symbol), db_root=db_path.parent
-                                      ))
+                                          str(symbol), db_path.parent))
                     if notional is None:
                         notional = base
                     if margin is None:
@@ -1315,6 +1754,9 @@ def _write_trades(
             orders_written += 1
 
         con.commit()
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -1429,7 +1871,7 @@ def write_experiences(
                 # NULL，不用"当前 regime"顶替（那是后见之明，会污染历史样本）。
                 cycle_regime = data.get("regime")
                 if cycle_regime in (None, ""):
-                    cycle_regime = _regime_for_ts(experience_ts, db_root=db_root)
+                    cycle_regime = _regime_for_ts(experience_ts, db_root)
                 payload = {
                     "cycle_id": data.get("cycle_id"),
                     "profile": profile,
@@ -1617,7 +2059,8 @@ def replay_from_journal(args) -> int:
     if not jpath.exists():
         print(json.dumps({"ok": False, "error": f"journal 不存在: {jpath}"}, ensure_ascii=False))
         return 1
-    db_path = _trade_db_path(args.profile, getattr(args, "db_root", None))
+    db_path = _trade_db_path(
+        args.profile, getattr(args, "db_root", None))
     if not db_path or not db_path.exists():
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1
@@ -1648,8 +2091,6 @@ def replay_from_journal(args) -> int:
             if rec.get("profile") != args.profile:
                 continue
             if args.ordid:
-                # Apply authorization accepts only the exchange's real ordId;
-                # algoId/recovered-timeout fallbacks are diagnostic only.
                 strict_ordid = rec["trade"].get("ordId")
                 if not strict_ordid or str(strict_ordid) != str(args.ordid):
                     continue
@@ -1657,8 +2098,6 @@ def replay_from_journal(args) -> int:
                 continue  # 微单测试记录默认不重放（显式 --ordid 才碰）
             if not args.replay_dry_run and rec.get("unwind"):
                 # 核验修：unwind close（SL 失败平裸仓）回执 trades=[]、账本无对应 open——
-                # 直接重放=close-without-open 净仓错向。dry plan 保留并标注
-                # unwind；apply 即使给了 ordId 也继续硬阻断。
                 blocked_unwinds.append({
                     "ordId": rec["trade"].get("ordId") or None,
                     "cycle": rec.get("cycle_id"),
@@ -1795,8 +2234,7 @@ def replay_from_journal(args) -> int:
         exp_trades = res.pop("new_trades", None)
         exp_data = data if exp_trades is None else {**data, "trades": exp_trades}
         exp = write_experiences(
-            exp_data, args.profile, data.get("ts"), db_root=db_path.parent
-        )
+            exp_data, args.profile, data.get("ts"), db_root=db_path.parent)
         res["exp"] = exp.get("exp", 0)
         results.append(res)
         if not res.get("ok"):
@@ -1811,6 +2249,223 @@ def replay_from_journal(args) -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def commit_side_effect_salvage(
+    data: dict,
+    profile: str,
+    *,
+    validation_errors: list[str],
+    db_path: Path | None = None,
+    _capability: object | None = None,
+) -> dict:
+    """Persist trusted executor fills when the surrounding receipt is invalid.
+
+    This is deliberately narrower than ``commit_receipt``: it requires at
+    least one economically identifiable trade, marks the cycle quarantined,
+    bypasses experience generation, and never turns the failed contract into
+    an ``ok`` business decision.
+    """
+    if _capability is not _SIDE_EFFECT_SALVAGE_CAPABILITY:
+        return {"ok": False, "error": "missing side-effect salvage capability"}
+    if profile not in DB_MAP or not isinstance(data, dict):
+        return {"ok": False, "error": "invalid salvage profile/payload"}
+    target = Path(db_path or _trade_db_path(profile))
+    if not target.exists():
+        return {"ok": False, "error": f"DB 不存在: {target}"}
+    payload = normalize_receipt(data)
+    source_candidates = [
+        row for row in (payload.get("trades") or []) if isinstance(row, dict)
+    ]
+    trades: list[dict] = []
+    size_mismatches: list[dict] = []
+    imprecise_identities: list[dict] = []
+    timestamp_fallbacks: list[dict] = []
+    rejected_candidates: list[dict] = []
+    for raw_trade in source_candidates:
+        trade = dict(raw_trade)
+        action = str(trade.get("action") or "").strip().lower()
+        side = str(trade.get("side") or "").strip().lower()
+        fill_source = str(trade.get("fill_source") or "").strip().lower()
+        fill_size = _as_pos_float(trade.get("fill_sz"))
+        fill_px = _as_pos_float(trade.get("fill_px"))
+        # _extract_ordid intentionally accepts algoId for historical merge
+        # consumption.  Salvage needs the market-order identity itself: a
+        # protection algoId cannot prove that this position fill occurred.
+        ord_id = str(trade.get("ordId") or trade.get("ord_id") or "").strip()
+        normalized_fill_ts = strict_cst_ts(trade.get("fill_ts"))
+        ts_source = str(trade.get("ts_source") or "").strip()
+        reject_reasons: list[str] = []
+        if not str(trade.get("symbol") or "").strip():
+            reject_reasons.append("symbol_missing")
+        if action not in {"open", "add", "close", "reduce"}:
+            reject_reasons.append("action_invalid")
+        if side not in {"long", "short"}:
+            reject_reasons.append("side_invalid")
+        if fill_source not in CONFIRMED_FILL_SOURCES:
+            reject_reasons.append("fill_source_not_confirmed")
+        if fill_size is None:
+            reject_reasons.append("fill_sz_invalid")
+        if fill_px is None:
+            reject_reasons.append("fill_px_invalid")
+        if action in {"open", "add", "reduce"} and not ord_id:
+            reject_reasons.append("direct_ord_id_missing")
+        # Direct ordId gives a precise identity even if a peripheral timestamp
+        # field drifted; the writer commit time is then explicit quarantine
+        # precision.  A close without ordId only has a time-window identity and
+        # therefore still requires strict fill time provenance.
+        if action == "close" and not ord_id:
+            if normalized_fill_ts is None:
+                reject_reasons.append("time_window_fill_ts_missing")
+            allowed_ts_sources = _SALVAGE_CLOSE_TS_SOURCES.get(
+                fill_source, set())
+            if not ts_source:
+                reject_reasons.append("time_window_ts_source_missing")
+            elif ts_source not in allowed_ts_sources:
+                reject_reasons.append("time_window_ts_source_untrusted")
+            cycle_id = str(payload.get("cycle_id") or "").strip()
+            try:
+                cycle_start = dt.strptime(
+                    cycle_id, "%Y-%m-%dT%H:%M",
+                ).replace(tzinfo=CST)
+            except ValueError:
+                cycle_start = None
+                reject_reasons.append("time_window_cycle_id_invalid")
+            if normalized_fill_ts is not None and cycle_start is not None:
+                fill_time = dt.strptime(
+                    normalized_fill_ts, "%Y-%m-%d %H:%M:%S",
+                ).replace(tzinfo=CST)
+                window_start = cycle_start - timedelta(
+                    seconds=_SALVAGE_CLOSE_WINDOW_SKEW_SECONDS)
+                window_end = cycle_start + timedelta(
+                    seconds=(
+                        LIVE_TERMINAL_DEADLINE_SECONDS
+                        + _SALVAGE_CLOSE_WINDOW_SKEW_SECONDS
+                    ),
+                )
+                current = _now_cst_dt()
+                if current.tzinfo is None:
+                    current = current.replace(tzinfo=CST)
+                current = current.astimezone(CST)
+                if fill_time < window_start or fill_time > window_end:
+                    reject_reasons.append("time_window_fill_ts_outside_cycle")
+                if fill_time > current + timedelta(
+                    seconds=_SALVAGE_CLOSE_WINDOW_SKEW_SECONDS
+                ):
+                    reject_reasons.append("time_window_fill_ts_in_future")
+        if reject_reasons:
+            encoded = json.dumps(
+                raw_trade, ensure_ascii=False, sort_keys=True, default=str
+            ).encode("utf-8")
+            rejected_candidates.append({
+                "trade_sha256": hashlib.sha256(encoded).hexdigest(),
+                "symbol": trade.get("symbol"),
+                "action": action or None,
+                "side": side or None,
+                "reasons": reject_reasons,
+            })
+            continue
+        if action == "close" and not ord_id:
+            trade["identity_precision"] = "time_window"
+            trade["identity_window"] = {
+                "cycle_id": str(payload.get("cycle_id") or ""),
+                "window_start": window_start.strftime(
+                    "%Y-%m-%d %H:%M:%S"),
+                "window_end": window_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "ts_source": ts_source,
+            }
+            imprecise_identities.append({
+                "symbol": trade.get("symbol"),
+                "side": side,
+                "fill_ts": normalized_fill_ts,
+                "fill_sz": fill_size,
+                "fill_px": fill_px,
+            })
+        elif normalized_fill_ts is None or not ts_source:
+            # _write_trades already has a structured writer_commit_fallback.
+            trade["fill_ts"] = None
+            trade["timestamp_precision"] = "writer_commit"
+            timestamp_fallbacks.append({
+                "ordId": ord_id,
+                "symbol": trade.get("symbol"),
+                "missing": [
+                    name for name, missing in (
+                        ("fill_ts", normalized_fill_ts is None),
+                        ("ts_source", not ts_source),
+                    ) if missing
+                ],
+            })
+        requested_size = _as_pos_float(trade.get("sz"))
+        if requested_size is not None and abs(requested_size - fill_size) > max(
+            1e-9, fill_size * 1e-8
+        ):
+            size_mismatches.append({
+                "ordId": ord_id or None,
+                "requested_sz": requested_size,
+                "authoritative_fill_sz": fill_size,
+            })
+        trade["sz"] = fill_size
+        trade["fill_sz"] = fill_size
+        trades.append(trade)
+    if not trades:
+        return {
+            "ok": False,
+            "error": "side_effect_salvage 缺可识别成交核心事实",
+        }
+    payload.update({
+        "_profile": profile,
+        "profile": profile,
+        "mode": profile,
+        "status": "error",
+        "decision": "traded",
+        "n_orders": len(trades),
+        "trades": trades,
+        "batch_status": "partial",
+        "batch_ok": False,
+        "runner_in_progress": False,
+        "contract_quarantine": {
+            "kind": "confirmed_trade_receipt_contract_invalid",
+            "validation_errors": list(dict.fromkeys(validation_errors)),
+            "candidate_count": len(source_candidates),
+            "side_effect_trades_preserved": len(trades),
+            "rejected_count": len(rejected_candidates),
+            "rejected_candidates": rejected_candidates,
+            "experience_write_skipped": True,
+            "size_mismatches": size_mismatches,
+            "imprecise_identities": imprecise_identities,
+            "timestamp_fallbacks": timestamp_fallbacks,
+        },
+    })
+    try:
+        result = _write_trades(
+            payload,
+            target,
+            _capability=_CURRENT_WRITE_CAPABILITY,
+        )
+    except Exception as exc:  # noqa: BLE001 - structured failure to runner
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    result["quarantined"] = True
+    result["exp"] = 0
+    if rejected_candidates:
+        persisted = (
+            result.get("ok") is True and not result.get("refused")
+        )
+        result.update({
+            "partial_persisted": persisted,
+            "candidate_count": len(source_candidates),
+            "preserved_count": len(trades) if persisted else 0,
+            "accepted_candidate_count": len(trades),
+            "rejected_count": len(rejected_candidates),
+        })
+        if persisted:
+            result.update({
+                "ok": False,
+                "error": (
+                    "部分 side-effect candidate 缺少可信成交身份；"
+                    "已保全可证成交并保留隔离证据"
+                ),
+            })
+    return result
+
+
 def commit_receipt(data: dict, profile: str,
                    db_path: Path | None = None,
                    nudge: bool = True,
@@ -1838,6 +2493,9 @@ def commit_receipt(data: dict, profile: str,
             ),
         }
     payload["_profile"] = profile
+    deadline_refusal = _late_no_side_effect_refusal(payload)
+    if deadline_refusal is not None:
+        return deadline_refusal
     if require_live_facts:
         strict_errors = validate_strict_live_receipt(payload)
         if strict_errors:
@@ -1862,8 +2520,7 @@ def commit_receipt(data: dict, profile: str,
             and _nudge_mod is not None):
         try:
             _nudge_mod.nudge(
-                f"trades_writer:{profile}", db_root=target.parent
-            )
+                f"trades_writer:{profile}", db_root=target.parent)
         except Exception as exc:  # nudge 永不反向拖垮已提交的账本
             sys.stderr.write(
                 f"[trades_writer][WARN] dispatcher nudge 跳过（非致命）: {exc}\n")
@@ -1877,8 +2534,8 @@ def main() -> int:
     parser.add_argument("--cycle-id", type=str, help="cycle_id")
     parser.add_argument("--profile", type=str, choices=["live"], required=True)
     parser.add_argument(
-        "--db-root", type=str,
-        help="运行时数据库目录（缺省读取 OKX_DB_ROOT，再回退项目 db）",
+        "--db-root", default=str(_runtime_db_root()),
+        help="runtime database root; all writer and auxiliary DB access stays here",
     )
     parser.add_argument(
         "--facts-file",

@@ -322,20 +322,17 @@ class EvOverrideV2Tests(unittest.TestCase):
 
 
 class OptionalTakeProfitV2Tests(unittest.TestCase):
-    def test_okx_cli_receives_tp_and_sl_as_market_triggers(self) -> None:
+    def test_market_open_rejects_combined_tp_sl_before_cli(self) -> None:
         with mock.patch.object(_okxorder, "is_dryrun", return_value=False), \
-             mock.patch.object(_okxorder, "_call",
-                               return_value={"ok": True, "data": []}) as call:
+             mock.patch.object(_okxorder, "_call") as call:
             result = _okxorder.place_market_open(
                 "BTC-USDT-SWAP", "long", 1.0, "live",
                 sl_trigger_px=95.0, tp_trigger_px=110.0)
-        args = list(call.call_args.args)
-        self.assertIn("--slTriggerPx", args)
-        self.assertIn("--slOrdPx=-1", args)
-        self.assertIn("--tpTriggerPx", args)
-        self.assertIn("--tpOrdPx=-1", args)
-        self.assertTrue(result["sl_attached"])
-        self.assertTrue(result["tp_attached"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["error"],
+            "combined_tp_sl_unsupported_use_independent_tp")
+        call.assert_not_called()
 
 
 if __name__ == "__main__":

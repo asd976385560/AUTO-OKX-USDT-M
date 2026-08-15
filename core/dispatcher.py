@@ -11,8 +11,13 @@ unified-live/push 的幂等统一使用（demo stage 已于 2026-08-06 下线，
         → 抢 live 闩锁 → 起 okx-live-trader，一次完成分析+实盘；每 tick 至多派 1 个。
   - stage demo：**2026-08-06 全量下线**，stage 已从 trigger_agent 的路由表移除，
         手动也起不了。人工回滚 analyst 写入 analysis 后，仍补派 full live。
-  - stage push：**live** 的 `trade_cycles[cycle]` 已写、push 未派 → 抢锁 → fire。
-        demo 未落库不阻断（2026-08-06 解耦），payload 侧标 PENDING。
+  - stage push：**live** 的有效业务终态已写、且同 cycle live profile 租约已释放、
+        push 未派 → 抢锁 → fire。业务终态
+        包括成交/HOLD，也包括可证明零交易所副作用的显式 REJECT/ERROR；后者按
+        原始错误事实出报告，绝不伪造成 WAIT。
+        从 2026-08-13T04:00 起，若监督器已证明 live 失败、租约已释放且仍无有效
+        trade terminal，则仅派发 `failure_report`（WAIT/零新增风险）；不补写业务库、
+        不重起 Agent。有效 trade terminal 永远优先于失败报告。
   - **过窗处置**：过窗仍无 analysis / 采集未齐 → **不空起、不补派**，仅 WARN（alert-only，交 on-demand collection_monitor / failureAlert 巡检）。
   - push 送达核验：派发 15-40min 窗内 qq_push_dedupe 无送达记录 → WARN
         （alert-only，不补派不重试）。
@@ -48,6 +53,9 @@ def _project_path(*parts: str) -> str:
 _COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _project_path("collectors"))
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
+_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", _project_path("scripts"))
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -56,6 +64,11 @@ if hasattr(sys.stdout, "reconfigure"):
 import ledger          # noqa: E402  connect/cycle_id_for/try_stage/stage_dispatched
 import trigger_agent   # noqa: E402  fire 适配层
 from cycle_contract import validate_cycle_id  # noqa: E402
+from stage_failure_contract import (  # noqa: E402
+    load_live_failure,
+    load_live_report_barrier,
+    load_upstream_failure,
+)
 
 CST = timezone(timedelta(hours=8))
 MAX_AGE_SEC = 900  # analysis 写出 ≤15min 内仍可起 trader；超过视陈旧不追
@@ -64,7 +77,14 @@ LOOKBACK_SLOTS = 4  # P4b：dispatch_once 回扫最近 N+1 个 15min 槽，给 p
 PUSH_VERIFY_MIN_SEC = 900   # push 派发后给足 15min 送达，再核验
 PUSH_VERIFY_MAX_SEC = 2400  # 只核验最近 40min 内派发的 push；窗口自然滚动即幂等，无需去重状态
 PUSH_EVENT_LOG = Path(_project_path("logs", "push", "qq_push_dedupe.jsonl"))
+STAGE_STATUS_DIR = Path(os.environ.get(
+    "OKX_STAGE_STATUS_DIR", _project_path("logs", "stage-status")))
 CANONICAL_DB_ROOT = Path(_project_path("db")).resolve()
+BUSINESS_ERROR_REPORTABLE_FROM = "2026-08-14T02:15"
+# Same-slot reconciled closes before this boundary keep their historical
+# dispatch/report treatment.  This prevents deployment from chasing a slot
+# whose legacy close report may already have been delivered.
+RECONCILE_ANALYSIS_TERMINAL_FROM = "2026-08-14T04:00"
 
 
 def _root_namespace(db_root: Path | str) -> str:
@@ -127,6 +147,266 @@ def trade_written(db_root: Path, profile: str, cycle: str) -> bool:
         )
     finally:
         con.close()
+
+
+def trade_cycle_present(db_root: Path, profile: str, cycle: str) -> bool:
+    """Return whether any cycle row exists, including malformed/partial rows.
+
+    A partial business row is not a valid push terminal, but it is also too
+    authoritative to replace with a synthetic failure WAIT report.  Keeping
+    its push latch free lets a later controlled correction become reportable.
+    """
+    db = db_root / f"{profile}_trades.db"
+    if not db.exists():
+        return False
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        return con.execute(
+            "SELECT 1 FROM trade_cycles WHERE cycle_id=? LIMIT 1",
+            (cycle,),
+        ).fetchone() is not None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        con.close()
+
+
+def trade_terminal_requires_analysis(db_root: Path, profile: str,
+                                     cycle: str) -> bool:
+    """Return whether a trade row is maintenance evidence, not an Agent terminal.
+
+    Exchange-triggered closes can be reconciled while the scheduled unified
+    Agent for the same 15-minute slot is still waiting on the profile lease.
+    Those rows are authoritative transaction facts, but they must not satisfy
+    the scheduled analysis/trade terminal by themselves.  Otherwise the
+    dispatcher sends a legacy close report and silently skips that slot's
+    full analysis.  The marker is read only from the maintenance raw payload;
+    ordinary current receipts never gain this bypass.
+    """
+    if str(cycle) < RECONCILE_ANALYSIS_TERMINAL_FROM:
+        return False
+    db = db_root / f"{profile}_trades.db"
+    if not db.exists():
+        return False
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{db.resolve().as_posix()}?mode=ro", uri=True, timeout=5)
+        row = connection.execute(
+            "SELECT raw FROM trade_cycles WHERE cycle_id=?", (cycle,)
+        ).fetchone()
+        if row is None:
+            return False
+        raw = json.loads(row[0] or "")
+        return (
+            isinstance(raw, dict)
+            and bool(str(raw.get("reconcile_source") or "").strip())
+            and str(raw.get("cycle_ts_source") or "").strip()
+            == "trusted_internal_override"
+        )
+    except (sqlite3.Error, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def live_cycle_in_progress(ledger_path: Path, cycle: str,
+                           now: Optional[datetime] = None) -> bool:
+    """Return whether the same cycle still owns the live profile lease.
+
+    ``trades_writer`` and ``analyst_writer`` both nudge the dispatcher before
+    the supervising stage runner has finished.  A same-slot reconciled close
+    may therefore already look like a valid trade terminal while the Agent is
+    still deciding or executing another action.  The profile lease is the
+    authoritative cross-process lifetime marker: defer push until the runner
+    releases it, so the one-shot push latch cannot capture a partial cycle.
+
+    Probe errors fail closed for this tick.  The dispatcher is periodic, so a
+    later tick can safely retry without ever sending an early report.
+    """
+    at = now or datetime.now(CST)
+    at_text = at.astimezone(CST).strftime("%Y-%m-%d %H:%M:%S")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = ledger.connect(ledger_path, readonly=True)
+        row = connection.execute(
+            "SELECT cycle_id,expires_at FROM stage_profile_leases "
+            "WHERE profile='live'"
+        ).fetchone()
+        if row is None:
+            return False
+        return (
+            str(row["cycle_id"] or "") == str(cycle)
+            and str(row["expires_at"] or "") > at_text
+        )
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        log(f"{cycle}: live profile lease probe error (defer push): {exc}")
+        return True
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _live_lease_blocks_push(
+    ledger_path: Path,
+    cycle: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Apply the live-lease push barrier only to its forward activation set.
+
+    Older cycles retain their historical dispatch treatment.  For activated
+    cycles, ``live_cycle_in_progress`` remains fail-closed on probe errors so a
+    partial same-cycle terminal can never consume the push latch early.
+    """
+    if str(cycle) < RECONCILE_ANALYSIS_TERMINAL_FROM:
+        return False
+    return live_cycle_in_progress(ledger_path, cycle, now=now)
+
+
+def trade_error_reportable(db_root: Path, profile: str, cycle: str) -> bool:
+    """Prove an explicit business error is safe to report as itself.
+
+    A persisted error is reportable only when both ledgers prove there was no
+    exchange side effect: zero order/trade rows and either no execution intent
+    or only pristine ``failed_clean`` intents.  Unknown/partial rows remain
+    fail-closed and keep the push latch free for controlled correction.
+    """
+    if str(cycle) < BUSINESS_ERROR_REPORTABLE_FROM:
+        return False
+    trade_db = db_root / f"{profile}_trades.db"
+    intent_db = db_root / "ledger.db"
+    if not trade_db.is_file() or not intent_db.is_file():
+        return False
+    trade_connection: sqlite3.Connection | None = None
+    intent_connection: sqlite3.Connection | None = None
+    try:
+        trade_connection = sqlite3.connect(
+            f"file:{trade_db.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        trade_connection.row_factory = sqlite3.Row
+        row = trade_connection.execute(
+            "SELECT decision,n_orders,raw FROM trade_cycles WHERE cycle_id=?",
+            (cycle,),
+        ).fetchone()
+        if row is None:
+            return False
+        decision = str(row["decision"] or "").strip().lower()
+        try:
+            n_orders = int(row["n_orders"])
+        except (TypeError, ValueError):
+            return False
+        if decision not in {"error", "degraded"} or n_orders != 0:
+            return False
+        trade_count = int(trade_connection.execute(
+            "SELECT COUNT(*) FROM trades WHERE cycle_id=?", (cycle,)
+        ).fetchone()[0])
+        if trade_count != 0:
+            return False
+        try:
+            raw = json.loads(row["raw"] or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        if str(raw.get("status") or "").strip().lower() != decision:
+            return False
+        try:
+            if int(raw.get("n_orders")) != 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        raw_action = str(raw.get("action_taken") or "").strip().upper()
+        allowed_actions = (
+            {"REJECT"} if decision == "error"
+            else {"REJECT", "WAIT", "HOLD"}
+        )
+        if raw_action not in allowed_actions:
+            return False
+        raw_trades = raw.get("trades")
+        if not isinstance(raw_trades, list) or raw_trades:
+            return False
+        reason = (
+            raw.get("reject_reason")
+            or next((item for item in raw.get("errors") or [] if item), None)
+        )
+        if not reason:
+            return False
+
+        intent_connection = sqlite3.connect(
+            f"file:{intent_db.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        intent_connection.row_factory = sqlite3.Row
+        intents = intent_connection.execute(
+            "SELECT state,ord_id,submitted_at,completed_at "
+            "FROM execution_intents WHERE profile=? AND cycle_id=?",
+            (profile, cycle),
+        ).fetchall()
+        return all(
+            str(item["state"] or "").strip().lower() == "failed_clean"
+            and item["ord_id"] in (None, "")
+            and item["submitted_at"] in (None, "")
+            and item["completed_at"] in (None, "")
+            for item in intents
+        )
+    except (sqlite3.Error, OSError):
+        return False
+    finally:
+        if trade_connection is not None:
+            trade_connection.close()
+        if intent_connection is not None:
+            intent_connection.close()
+
+
+def live_failure_terminal(
+    cycle: str, now: Optional[datetime] = None,
+    db_root: Optional[Path] = None,
+) -> Optional[dict]:
+    """Return a future-activated, redacted, immutable upstream failure.
+
+    ``db_root=None`` preserves the historical live-only probe used by isolated
+    callers.  The dispatcher supplies the root so an explicit collection
+    terminal can be considered only after execution-path absence is proved.
+    """
+    if db_root is not None and _root_namespace(db_root):
+        # The shared failure-contract helper uses canonical status filenames.
+        # Never let an isolated tree consume a production Agent terminal.
+        return None
+    if db_root is not None:
+        return load_upstream_failure(
+            cycle,
+            db_root=db_root,
+            status_dir=STAGE_STATUS_DIR,
+            now=now,
+        )
+    return load_live_failure(
+        cycle, status_dir=STAGE_STATUS_DIR, now=now)
+
+
+def live_report_barrier_ready(
+    cycle: str,
+    db_root: Path | str | None = None,
+) -> bool:
+    """Require the post-Agent exchange/ledger read before future push slots."""
+    try:
+        barrier = load_live_report_barrier(
+            cycle, status_dir=STAGE_STATUS_DIR)
+    except Exception as exc:
+        log(f"{cycle}: report reconcile barrier probe error (defer push): {exc}")
+        return False
+    if barrier is None:
+        log(f"{cycle}: report reconcile barrier missing/unsafe (defer push)")
+        return False
+    if (db_root is not None and _root_namespace(db_root)
+            and barrier.get("required") is not False):
+        log(f"{cycle}: isolated db_root has no canonical report barrier (defer push)")
+        return False
+    return True
 
 
 def _age_sec(ts_str: str, now: Optional[datetime] = None) -> int:
@@ -262,18 +542,46 @@ def _unified_live_candidate(db_root: Path, ledger_path, cycles: list,
     return cand, deferred, expired
 
 
+def _fire_failure_report_if_terminal(
+    ledger_path: Path,
+    cycle: str,
+    now: Optional[datetime],
+    fire_fn: Callable,
+    out: list,
+) -> bool:
+    """Fire one future-only WAIT report after a proved upstream failure.
+
+    This never releases/retries the live latch and never writes an analysis or
+    trade terminal.  The push process independently revalidates the same live
+    status or collection receipt plus execution-path absence before build/send.
+    """
+    try:
+        terminal = live_failure_terminal(
+            cycle, now=now, db_root=ledger_path.parent)
+    except Exception as exc:
+        log(f"{cycle}: live failure report probe error (skip): {exc}")
+        return False
+    if terminal is None:
+        return False
+    _fire_stage(
+        ledger_path, cycle, "push", "failure_report", fire_fn, out)
+    return True
+
+
 def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
                    max_age: int = MAX_AGE_SEC, now: Optional[datetime] = None,
                    fire_fn: Callable = trigger_agent.fire,
                    allow_unified_live: bool = True,
                    allow_agent_stages: Optional[bool] = None) -> list:
     cycle = validate_cycle_id(cycle)
+    trigger_db_root = Path(db_root)
+    db_root = Path(db_root).resolve()
     out: list = []
     default_trigger = fire_fn is trigger_agent.fire
     effective_fire = fire_fn
     if default_trigger:
         effective_fire = lambda stage, dispatch_cycle_id, mode: trigger_agent.fire(
-            stage, dispatch_cycle_id, mode, db_root=db_root
+            stage, dispatch_cycle_id, mode, db_root=trigger_db_root
         )
     if allow_agent_stages is None:
         allow_agent_stages = (
@@ -283,14 +591,34 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
         )
     a = analysis_row(db_root, cycle)
     if not a:
+        # 极端顺序下即使 analysis 行不可见，有效 trade terminal 仍是最高权威，
+        # 绝不能被失败报告覆盖。唯一例外是同槽自动对账 close：它是权威成交
+        # 事实，却不能取代本槽 scheduled unified Agent 的完整分析终态。
+        maintenance_only = trade_terminal_requires_analysis(
+            db_root, "live", cycle)
+        if (not maintenance_only and (
+                trade_written(db_root, "live", cycle)
+                or trade_error_reportable(db_root, "live", cycle))):
+            if not _live_lease_blocks_push(ledger_path, cycle, now=now):
+                if live_report_barrier_ready(cycle, db_root):
+                    _fire_stage(
+                        ledger_path, cycle, "push", "full", effective_fire, out)
+            return out
+        if trade_cycle_present(db_root, "live", cycle) and not maintenance_only:
+            # 行已出现但不是合法终态：保留 push 闩锁，既不伪造失败报告，
+            # 也不重复启动统一 Agent；等待受控纠正后下一 tick 自然放行。
+            return out
+        if _fire_failure_report_if_terminal(
+                ledger_path, cycle, now, effective_fire, out):
+            return out
         # 采集齐且新鲜后直接起 unified live（分析+实盘同一 Agent）。
         # 人工回滚 analyst 槽由 candidate 跳过，待其写 analysis 后走 full live。
         try:
             if allow_unified_live and _collection_ready(ledger_path, cycle):
                 if allow_agent_stages:
                     _fire_stage(
-                        ledger_path, cycle, "live", "unified", effective_fire, out
-                    )
+                        ledger_path, cycle, "live", "unified",
+                        effective_fire, out)
                 else:
                     out.append(
                         f"blocked live/demo {cycle}: non-default db_root requires dry-run"
@@ -312,6 +640,10 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # mode 固定为 full；是否允许下游仅由 analysis status 决定。
     # WARN 防刷屏：stage_dispatch 哨兵行 (cycle,'skip_warn') 唯一约束保每 cycle 只打一次。
     if status != "ok" or mode != "full":
+        if (not trade_cycle_present(db_root, "live", cycle)
+                and _fire_failure_report_if_terminal(
+                ledger_path, cycle, now, effective_fire, out)):
+            return out
         reason = f"status={status or '<missing>'},mode={mode or '<missing>'}"
         if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
             out.append(f"dry_run skip {cycle} analysis {reason}, no latch written")
@@ -336,7 +668,8 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # order_executor 现以 _require_live_profile() 硬拒任何非 live profile。
     if age <= max_age:
         if allow_agent_stages:
-            _fire_stage(ledger_path, cycle, "live", mode, effective_fire, out)
+            _fire_stage(
+                ledger_path, cycle, "live", mode, effective_fire, out)
         else:
             out.append(
                 f"blocked live/demo {cycle}: non-default db_root requires dry-run"
@@ -346,13 +679,21 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
             out.append(f"stale {cycle} age={age}s>{max_age}s skip trader")
             log(f"{cycle}: analysis 陈旧 age={age}s，不追起 trader (status={status})")
 
-    # stage push：live trade_cycles 已写 → 抢锁起 push（独立于 analysis 新鲜度）。
+    # stage push：有效 live trade_cycles 永远优先；否则仅在未来激活边界后，
+    # 监督器已证明 live 失败时，生成 WAIT/零新增风险的失败报告。
     # 2026-08-06 解耦：push 是纯汇报、一分钱不碰，不得被 demo 账本卡住（8-05 一个
     # 自愈范围内的 demo 幽灵仓曾让 demo+push 死锁 2h14m）——与 trigger_agent 对
     # autoheal blocking「只告警不停 stage」同一条边界，真正的防线在 executor pretrade。
     # demo 停自动派发后本就不落库，故不再为此告警；payload 侧仍把该盘标 PENDING。
-    if trade_written(db_root, "live", cycle):
-        _fire_stage(ledger_path, cycle, "push", mode, effective_fire, out)
+    if (trade_written(db_root, "live", cycle)
+            or trade_error_reportable(db_root, "live", cycle)):
+        if not _live_lease_blocks_push(ledger_path, cycle, now=now):
+            if live_report_barrier_ready(cycle, db_root):
+                _fire_stage(
+                    ledger_path, cycle, "push", mode, effective_fire, out)
+    elif not trade_cycle_present(db_root, "live", cycle):
+        _fire_failure_report_if_terminal(
+            ledger_path, cycle, now, effective_fire, out)
     return out
 
 
@@ -454,6 +795,7 @@ def dispatch_once(db_root: Path, ledger_path=None, max_age: int = MAX_AGE_SEC,
     拉宽回扫窗让 push 多轮补派；stage_dispatch UNIQUE(cycle_id,stage) 闩锁保幂等，已派 stage
     再扫一律静默跳过、绝不重复起棒；live 另有 age<=max_age 新鲜度闸挡住旧轮（不会迟起 trader）。
     """
+    db_root = Path(db_root).resolve()
     if ledger_path is None:
         ledger_path = db_root / "ledger.db"
     effective_fire = fire_fn
@@ -498,7 +840,7 @@ def main() -> int:
     ap.add_argument("--db-root", required=True)
     ap.add_argument("--max-age", type=int, default=MAX_AGE_SEC)
     args = ap.parse_args()
-    db_root = Path(args.db_root)
+    db_root = Path(args.db_root).resolve()
     ledger.init_ledger(db_root / "ledger.db")  # 幂等保 stage_dispatch 存在
     actions = dispatch_once(db_root, max_age=args.max_age)
     if not actions:
