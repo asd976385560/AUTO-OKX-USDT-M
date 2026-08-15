@@ -213,6 +213,72 @@ class PushMultitimeframeReportTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertIn("非OPEN/ADD，本轮不适用", rendered["content"])
 
+    def test_upstream_failure_wait_report_is_explicit_and_valid(self):
+        failure = {
+            "failure_kind": "agent_idle_timeout",
+        }
+        payload = _payload(
+            action="WAIT",
+            card=build_push_payload._upstream_failure_card(failure),
+        )
+        payload["decision"]["origin"] = "system_failure_fallback"
+        payload["decision"]["summary"] = (
+            "上游失败，未形成交易业务终态；禁止下单，零新增风险")
+        payload["decision"]["reason"] = (
+            "Agent 未形成当轮判断；系统只生成失败闭环报告")
+        payload["risk"]["status"] = "BLOCKED_UPSTREAM_FAILURE"
+        payload["exceptions"] = [{
+            "name": "live_trader",
+            "status": "failed",
+            "detail": "agent_idle_timeout；未补写 trade_cycles",
+        }]
+
+        rendered = _render(payload)
+        result = validate_push_format.validate(
+            rendered["content"], cycle_id=CYCLE)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("系统失败闭环", rendered["content"])
+        self.assertIn("Agent 未形成当轮判断", rendered["content"])
+        self.assertIn("非OPEN/ADD，本轮不适用", rendered["content"])
+        self.assertNotIn("Agent自主裁决 |", rendered["content"])
+
+    def test_versioned_adjust_and_error_execution_audits(self):
+        cycle = validate_push_format.EXECUTION_AUDIT_REQUIRED_FROM
+        adjust = _payload(action="ADJUST", card={})
+        adjust["cycle_id"] = cycle
+        adjust["hhmm"] = "02:15"
+        adjust["execution"]["result"] = (
+            "ADJUST_PROTECTION LINK-USDT-SWAP no_fill path=amend sz=100 "
+            "SL=8.5 TP=- algoId=A1 readback=verified/live "
+            "exchange_side_effect=protection_only")
+        adjust_result = validate_push_format.validate(
+            _render(adjust)["content"], cycle_id=cycle)
+        self.assertTrue(adjust_result["ok"], adjust_result)
+
+        broken_adjust = copy.deepcopy(adjust)
+        broken_adjust["execution"]["result"] = "ADJUST LINK fill=- stop=-"
+        broken_result = validate_push_format.validate(
+            _render(broken_adjust)["content"], cycle_id=cycle)
+        self.assertFalse(broken_result["ok"], broken_result)
+        self.assertIn("调保护回读状态", broken_result["missing_fields"])
+
+        error = _payload(action="ERROR", card={})
+        error["cycle_id"] = cycle
+        error["hhmm"] = "02:15"
+        error["execution"]["result"] = (
+            "REJECT INTC no_fill orders=0 exchange_side_effect=none "
+            "reason=data_not_ready detail=exact evidence missing")
+        error_result = validate_push_format.validate(
+            _render(error)["content"], cycle_id=cycle)
+        self.assertTrue(error_result["ok"], error_result)
+
+        historical = copy.deepcopy(broken_adjust)
+        historical["cycle_id"] = "2026-08-14T02:00"
+        historical_result = validate_push_format.validate(
+            _render(historical)["content"], cycle_id="2026-08-14T02:00")
+        self.assertTrue(historical_result["ok"], historical_result)
+
     def test_historical_archive_is_not_retroactively_failed(self):
         content = _render(_payload(action="HOLD", card={}))["content"]
         stripped = "\n".join(

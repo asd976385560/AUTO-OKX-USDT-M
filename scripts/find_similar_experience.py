@@ -23,7 +23,6 @@ cred<0.2 标 low_credibility（briefing 显式标，禁凭单条低相似锁决�
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -43,13 +42,15 @@ from core.experience_contract import (  # noqa: E402
     build_contract,
     normalize_symbol,
     normalize_token,
+    setup_from_metrics,
+    setup_from_prices,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_DB_ROOT = Path(r"./db")
+DEFAULT_DB_ROOT = Path(r".\db")
 _LEGACY_SCORE_MARKERS = (
     re.compile(
         r"[\"']?(?:score(?:_total)?|total|conf(?:idence)?)[\"']?"
@@ -263,6 +264,9 @@ def find_similar_experience(
     now: Optional[datetime] = None,
     stop_distance_pct: Optional[float] = None,
     planned_rr: Optional[float] = None,
+    entry: Optional[float] = None,
+    stop: Optional[float] = None,
+    target: Optional[float] = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(CST)
     if now.tzinfo is None:
@@ -285,10 +289,31 @@ def find_similar_experience(
         # Wave2 序9：相似度版本与查询特征进契约（随 evidence_hash 冻结）
         "similarity_version": _simutil.SIMILARITY_VERSION,
     }
+    price_geometry = (entry, stop, target)
+    price_fields_supplied = sum(value is not None for value in price_geometry)
+    legacy_fields_supplied = sum(
+        value is not None for value in (stop_distance_pct, planned_rr))
+    if price_fields_supplied not in (0, 3):
+        raise ValueError("entry, stop and target must be supplied together")
+    if legacy_fields_supplied not in (0, 2):
+        raise ValueError(
+            "stop_distance_pct and planned_rr must be supplied together")
+    if price_fields_supplied and legacy_fields_supplied:
+        raise ValueError(
+            "use entry/stop/target or legacy setup metrics, not both")
+    setup = None
+    if price_fields_supplied:
+        setup = setup_from_prices(entry, stop, target)
+    elif legacy_fields_supplied:
+        setup = setup_from_metrics(stop_distance_pct, planned_rr)
+
     account = Path(db_root) / "account.db"
+    feature_distance = (
+        setup.get("stop_distance_pct") if setup else None)
+    feature_rr = setup.get("planned_rr") if setup else None
     query_vec = _query_features_v2(
         query_symbol, query_side, query_regime, query_action,
-        query["as_of"], Path(db_root), stop_distance_pct, planned_rr)
+        query["as_of"], Path(db_root), feature_distance, feature_rr)
     query["query_features"] = query_vec
     try:
         from core.instrument_context import build_instrument_context
@@ -304,14 +329,7 @@ def find_similar_experience(
             "instrument_regime": "not_available",
             "error": type(exc).__name__,
         }
-    if stop_distance_pct is not None and planned_rr is not None:
-        setup = {
-            "stop_distance_pct": round(float(stop_distance_pct), 8),
-            "planned_rr": round(float(planned_rr), 8),
-        }
-        setup["setup_hash"] = hashlib.sha256(json.dumps(
-            setup, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")).hexdigest()
+    if setup is not None:
         query["setup"] = setup
     empty_exact = _experience_summary(
         [], now, scope="same_symbol_side_action_regime")
@@ -623,11 +641,17 @@ def main() -> int:
             "如 2026-08-10T08:00"
         ),
     )
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--stop-distance-pct", type=float, default=None,
                     help="拟用止损距离（0.04=4%%）；action=open 时必填")
     ap.add_argument("--planned-rr", type=float, default=None,
-                    help="计划盈亏比；action=open 时必填")
+                    help="兼容参数：计划盈亏比；须与 --stop-distance-pct 同传")
+    ap.add_argument("--entry", type=float, default=None,
+                    help="拟用入场价；与 --stop/--target 同传（open 推荐）")
+    ap.add_argument("--stop", type=float, default=None,
+                    help="拟用止损价；与 --entry/--target 同传（open 推荐）")
+    ap.add_argument("--target", type=float, default=None,
+                    help="拟用目标价；与 --entry/--stop 同传（open 推荐）")
     ap.add_argument("--pretty", action="store_true")
     ap.add_argument(
         "--compact",
@@ -643,17 +667,31 @@ def main() -> int:
         as_of = _parse_as_of(args.as_of)
     except ValueError as exc:
         ap.error(str(exc))
-    if args.action == "open" and (
-            args.stop_distance_pct is None or args.planned_rr is None):
+    price_count = sum(
+        value is not None for value in (args.entry, args.stop, args.target))
+    legacy_count = sum(value is not None for value in (
+        args.stop_distance_pct, args.planned_rr))
+    if price_count not in (0, 3):
+        ap.error("--entry/--stop/--target 必须三项同传")
+    if legacy_count not in (0, 2):
+        ap.error("--stop-distance-pct/--planned-rr 必须两项同传")
+    if price_count and legacy_count:
+        ap.error("新价格参数与兼容比例参数不可同时使用")
+    if args.action == "open" and not (price_count == 3 or legacy_count == 2):
         ap.error(
-            "open 检索必须同时提供 --stop-distance-pct 与 --planned-rr；"
-            "计划参数会冻结进 evidence_contract.setup"
+            "open 检索必须传 --entry/--stop/--target；兼容旧调用也可同时传 "
+            "--stop-distance-pct/--planned-rr"
         )
-    res = find_similar_experience(
-        args.symbol, args.side, args.regime, args.action, top_k=args.top_k,
-        min_sim=args.min_sim, profile_filter=args.profile,
-        db_root=Path(args.db_root), now=as_of,
-        stop_distance_pct=args.stop_distance_pct, planned_rr=args.planned_rr)
+    try:
+        res = find_similar_experience(
+            args.symbol, args.side, args.regime, args.action, top_k=args.top_k,
+            min_sim=args.min_sim, profile_filter=args.profile,
+            db_root=Path(args.db_root), now=as_of,
+            stop_distance_pct=args.stop_distance_pct,
+            planned_rr=args.planned_rr,
+            entry=args.entry, stop=args.stop, target=args.target)
+    except ValueError as exc:
+        ap.error(str(exc))
     output = compact_result(res) if args.compact else res
     if args.out_file:
         path = Path(args.out_file)

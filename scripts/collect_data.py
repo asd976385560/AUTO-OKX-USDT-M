@@ -91,6 +91,7 @@ from __future__ import annotations
 
 
 import argparse
+import hashlib
 
 
 
@@ -136,6 +137,11 @@ from pathlib import Path
 
 from _okxcli import okx_json
 
+from _kline_indicators import (
+    extend_with_boll_obv,
+    extended_row_tail,
+    kline_insert_plan,
+)
 from _okx_http import (
 
     fetch_tickers_all_sync,
@@ -147,7 +153,29 @@ from _okx_http import (
     fetch_open_interest_all_sync,
 
 )
+from _okx_ticker_fallback import (
+    fetch_tickers_all_schannel_sync,
+    fetch_tickers_batch_sync,
+)
 from asset_class_sync import sync_asset_classes
+
+
+# The all-market ticker call is a single point of failure for every symbol.
+# Keep its first connection bounded, then (only before any market write) give
+# an incomplete/failed response one cold retry through a newly-created client.
+# If both aggregate phases still miss the 99% contract, use the remaining
+# current-cycle budget for one rate-limited official single-ticker pass over
+# only missing symbols. Funding runs in parallel so recovery cannot consume
+# its coverage budget. No phase reads or repairs a historical slot.
+TICKER_INITIAL_TIMEOUT_SECONDS = 40.0
+TICKER_COLD_RETRY_TIMEOUT_SECONDS = 25.0
+TICKER_INITIAL_BUDGET_SHARE = 0.35
+TICKER_COLD_RETRY_BUDGET_SHARE = 0.27
+TICKER_COLD_RETRY_DELAY_SECONDS = 0.75
+TICKER_SINGLE_FALLBACK_TIMEOUT_SECONDS = 60.0
+TICKER_SCHANNEL_RESERVE_SECONDS = 6.0
+TICKER_COMPLETE_COVERAGE = 0.99
+TICKER_MAX_FETCH_PHASES = 3
 
 
 
@@ -211,6 +239,172 @@ def _fetch_all_swap_symbols(cli_global_args: list[str]) -> list[str]:
     ]
 
 
+def discover_live_swap_instruments(
+    cli_global_args: list[str],
+) -> tuple[list[dict], str | None]:
+    """Discover the live universe while preserving the transport root cause.
+
+    The caller still fails closed on an empty result.  Returning an explicit
+    empty list and diagnostic keeps a network failure from being replaced by a
+    secondary uninitialized-local exception in snapshot and asset-class paths.
+    """
+    try:
+        return _fetch_all_swap_instruments(cli_global_args), None
+    except Exception as exc:  # noqa: BLE001 - boundary preserves provider error
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def _normalize_instrument_snapshot_row(instrument: dict) -> dict:
+    return {
+        "symbol": str(instrument.get("instId") or "").strip().upper(),
+        "list_time_utc": ms_to_iso(instrument.get("listTime")),
+        "state": str(instrument.get("state") or "").strip() or None,
+        "settle_ccy": str(instrument.get("settleCcy") or "").strip() or None,
+        "ct_type": str(instrument.get("ctType") or "").strip() or None,
+        "inst_category": (
+            str(instrument.get("instCategory") or "").strip() or None
+        ),
+        "ct_val": to_float(instrument.get("ctVal")),
+        "lot_sz": to_float(instrument.get("lotSz")),
+    }
+
+
+def _instrument_snapshot_hash(rows: list[dict]) -> str:
+    encoded = json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def freeze_official_instrument_snapshot(
+    connection: sqlite3.Connection,
+    instruments: list[dict],
+    *,
+    cycle_id: str,
+    collected_ts_utc: str,
+) -> dict:
+    """Freeze the exact official live universe once per natural slot."""
+    parsed_cycle = datetime.strptime(cycle_id, "%Y-%m-%dT%H:%M")
+    if parsed_cycle.minute not in (0, 15, 30, 45):
+        raise ValueError("cycle_id must align to a 15-minute slot")
+    rows = sorted(
+        (_normalize_instrument_snapshot_row(item) for item in instruments),
+        key=lambda row: row["symbol"],
+    )
+    symbols = [row["symbol"] for row in rows]
+    if not rows or any(not symbol for symbol in symbols):
+        raise ValueError("official instrument snapshot is empty or invalid")
+    if len(symbols) != len(set(symbols)):
+        raise ValueError("official instrument snapshot contains duplicate symbols")
+    payload_hash = _instrument_snapshot_hash(rows)
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS official_instrument_snapshot_runs(
+            cycle_id         TEXT PRIMARY KEY,
+            collected_ts_utc TEXT NOT NULL,
+            symbol_count     INTEGER NOT NULL,
+            payload_sha256   TEXT NOT NULL,
+            complete         INTEGER NOT NULL CHECK(complete IN (0,1)),
+            source           TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS official_instrument_snapshot_rows(
+            cycle_id      TEXT NOT NULL,
+            symbol        TEXT NOT NULL,
+            list_time_utc TEXT,
+            state         TEXT,
+            settle_ccy    TEXT,
+            ct_type       TEXT,
+            inst_category TEXT,
+            ct_val        REAL,
+            lot_sz        REAL,
+            PRIMARY KEY(cycle_id,symbol),
+            FOREIGN KEY(cycle_id)
+              REFERENCES official_instrument_snapshot_runs(cycle_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_official_instrument_snapshot_symbol
+          ON official_instrument_snapshot_rows(symbol,cycle_id);
+    """)
+    existing = connection.execute(
+        "SELECT symbol_count,payload_sha256,complete "
+        "FROM official_instrument_snapshot_runs WHERE cycle_id=?",
+        (cycle_id,),
+    ).fetchone()
+    if existing is not None:
+        existing_count = int(existing[0])
+        existing_hash = str(existing[1])
+        stored_payload = [
+            {
+                "symbol": str(row[0] or "").strip().upper(),
+                "list_time_utc": row[1],
+                "state": row[2],
+                "settle_ccy": row[3],
+                "ct_type": row[4],
+                "inst_category": row[5],
+                "ct_val": row[6],
+                "lot_sz": row[7],
+            }
+            for row in connection.execute(
+                "SELECT symbol,list_time_utc,state,settle_ccy,ct_type,"
+                "inst_category,ct_val,lot_sz "
+                "FROM official_instrument_snapshot_rows WHERE cycle_id=? "
+                "ORDER BY symbol",
+                (cycle_id,),
+            ).fetchall()
+        ]
+        stored_rows = len(stored_payload)
+        stored_observed_hash = _instrument_snapshot_hash(stored_payload)
+        identical = (
+            int(existing[2]) == 1
+            and existing_count == len(rows)
+            and stored_rows == len(rows)
+            and existing_hash == stored_observed_hash
+            and existing_hash == payload_hash
+        )
+        return {
+            "status": "reused" if identical else "conflict",
+            "cycle_id": cycle_id,
+            "symbol_count": len(rows),
+            "payload_sha256": payload_hash,
+            "stored_symbol_count": existing_count,
+            "stored_payload_sha256": existing_hash,
+            "stored_observed_payload_sha256": stored_observed_hash,
+            "complete": identical,
+        }
+    try:
+        connection.execute("SAVEPOINT freeze_official_instruments")
+        connection.execute(
+            "INSERT INTO official_instrument_snapshot_runs VALUES(?,?,?,?,?,?)",
+            (
+                cycle_id, collected_ts_utc, len(rows), payload_hash, 1,
+                "okx_public_instruments_live_usdt_linear_swap",
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO official_instrument_snapshot_rows VALUES(?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    cycle_id, row["symbol"], row["list_time_utc"],
+                    row["state"], row["settle_ccy"], row["ct_type"],
+                    row["inst_category"], row["ct_val"], row["lot_sz"],
+                )
+                for row in rows
+            ],
+        )
+        connection.execute("RELEASE SAVEPOINT freeze_official_instruments")
+        connection.commit()
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT freeze_official_instruments")
+        connection.execute("RELEASE SAVEPOINT freeze_official_instruments")
+        raise
+    return {
+        "status": "inserted",
+        "cycle_id": cycle_id,
+        "symbol_count": len(rows),
+        "payload_sha256": payload_hash,
+        "complete": True,
+    }
+
+
 
 
 
@@ -234,7 +428,7 @@ COIN_TO_SYMBOL: dict[str, str] = {}
 
 
 
-DEFAULT_DB_ROOT = Path(r"./db")
+DEFAULT_DB_ROOT = Path(r".\db")
 
 
 
@@ -727,11 +921,261 @@ def compute_indicators(candles: list[dict]) -> list[dict]:
 
 
 
+def _ticker_row_usable(row: object) -> bool:
+    if not isinstance(row, dict) or not str(row.get("instId") or ""):
+        return False
+    last_price = to_float(row.get("last"))
+    return last_price is not None and last_price > 0
+
+
+def _ticker_symbol_coverage(rows: list[dict]) -> float:
+    """Coverage of expected symbols with a usable official last price."""
+    expected = set(SYMBOLS)
+    if not expected:
+        return 1.0 if rows else 0.0
+    observed = {
+        str(row.get("instId") or "")
+        for row in rows
+        if _ticker_row_usable(row)
+    }
+    return len(expected & observed) / len(expected)
+
+
+def _fetch_tickers_with_cold_retry(
+    deadline: float,
+) -> tuple[list[dict], dict[str, object]]:
+    """Fetch current tickers with one bounded pre-write cold retry.
+
+    Calling ``fetch_tickers_all_sync`` again creates a fresh HTTP client.  A
+    partial first response is retained if the retry is worse, and two failed
+    transports still fail closed.  No historical slot or persisted row is
+    touched by this helper.
+    """
+    first_rows: list[dict] = []
+    first_error: Exception | None = None
+    schannel_transport: dict[str, object] = {}
+
+    def aggregate_fetch(timeout_seconds: float) -> list[dict]:
+        return fetch_tickers_all_sync(
+            timeout_seconds,
+            transport_fallback=lambda url, params, timeout: (
+                fetch_tickers_all_schannel_sync(
+                    url,
+                    params,
+                    timeout,
+                    transport=schannel_transport,
+                )
+            ),
+            transport_fallback_reserve_s=min(
+                TICKER_SCHANNEL_RESERVE_SECONDS,
+                max(0.0, timeout_seconds / 3.0),
+            ),
+        )
+
+    remaining = max(0.1, deadline - time.monotonic())
+    first_budget = min(
+        TICKER_INITIAL_TIMEOUT_SECONDS,
+        max(0.1, remaining * TICKER_INITIAL_BUDGET_SHARE),
+    )
+    try:
+        first_rows = aggregate_fetch(first_budget)
+        if not isinstance(first_rows, list):
+            raise TypeError("official ticker response is not a list")
+    except Exception as exc:  # noqa: BLE001
+        first_error = exc
+        first_rows = []
+
+    first_coverage = _ticker_symbol_coverage(first_rows)
+    needs_retry = first_error is not None or first_coverage < TICKER_COMPLETE_COVERAGE
+    stats: dict[str, object] = {
+        "contract_version": 3,
+        "attempts": 1,
+        "maximum_fetch_phases": TICKER_MAX_FETCH_PHASES,
+        "historical_retry": False,
+        "unbounded_retry": False,
+        "initial_timeout_seconds": round(first_budget, 3),
+        "initial_coverage_rate": round(first_coverage, 6),
+        "initial_error_type": type(first_error).__name__ if first_error else None,
+        "cold_retry_requested": bool(needs_retry),
+        "cold_retry_timeout_seconds": 0.0,
+        "cold_retry_error_type": None,
+        "recovered_after_cold_retry": False,
+        "single_ticker_fallback_requested": False,
+        "single_ticker_fallback_symbols": 0,
+        "single_ticker_fallback_timeout_seconds": 0.0,
+        "single_ticker_fallback_usable": 0,
+        "single_ticker_fallback_transport_failures": 0,
+        "single_ticker_fallback_error_type": None,
+        "single_ticker_fallback_selected_base": None,
+        "single_ticker_fallback_probe_attempts": 0,
+        "recovered_after_single_ticker_fallback": False,
+        "schannel_fallback_requested": int(
+            schannel_transport.get("schannel_fallback_requested", 0)
+        ),
+        "schannel_fallback_successes": int(
+            schannel_transport.get("schannel_fallback_successes", 0)
+        ),
+        "schannel_fallback_error_types": list(
+            schannel_transport.get("schannel_fallback_error_types", [])
+        ),
+        "recovered_after_schannel_fallback": bool(
+            schannel_transport.get("schannel_fallback_successes", 0)
+            and first_coverage >= TICKER_COMPLETE_COVERAGE
+        ),
+    }
+    if not needs_retry:
+        stats["selected_coverage_rate"] = round(first_coverage, 6)
+        return first_rows, stats
+
+    delay = min(
+        TICKER_COLD_RETRY_DELAY_SECONDS,
+        max(0.0, deadline - time.monotonic() - 0.2),
+    )
+    if delay > 0:
+        time.sleep(delay)
+    remaining = max(0.1, deadline - time.monotonic())
+    retry_budget = min(
+        TICKER_COLD_RETRY_TIMEOUT_SECONDS,
+        max(0.1, remaining * TICKER_COLD_RETRY_BUDGET_SHARE),
+    )
+    stats["attempts"] = 2
+    stats["cold_retry_timeout_seconds"] = round(retry_budget, 3)
+    retry_rows: list[dict] = []
+    retry_error: Exception | None = None
+    try:
+        retry_rows = aggregate_fetch(retry_budget)
+        if not isinstance(retry_rows, list):
+            raise TypeError("official ticker cold retry response is not a list")
+    except Exception as exc:  # noqa: BLE001
+        retry_error = exc
+        retry_rows = []
+    retry_coverage = _ticker_symbol_coverage(retry_rows)
+    stats["cold_retry_coverage_rate"] = round(retry_coverage, 6)
+    stats["cold_retry_error_type"] = (
+        type(retry_error).__name__ if retry_error else None
+    )
+    stats["schannel_fallback_requested"] = int(
+        schannel_transport.get("schannel_fallback_requested", 0)
+    )
+    stats["schannel_fallback_successes"] = int(
+        schannel_transport.get("schannel_fallback_successes", 0)
+    )
+    stats["schannel_fallback_error_types"] = list(
+        schannel_transport.get("schannel_fallback_error_types", [])
+    )
+
+    # Combine the two same-slot official responses per symbol.  Prefer a valid
+    # fresh retry row, but never let an empty retry erase a valid first row.
+    by_symbol = {
+        str(row.get("instId") or ""): row
+        for row in first_rows
+        if isinstance(row, dict) and row.get("instId")
+    }
+    for row in retry_rows:
+        if not isinstance(row, dict) or not row.get("instId"):
+            continue
+        symbol = str(row["instId"])
+        if _ticker_row_usable(row) or not _ticker_row_usable(
+                by_symbol.get(symbol)):
+            by_symbol[symbol] = row
+    selected_rows = list(by_symbol.values())
+    selected_coverage = _ticker_symbol_coverage(selected_rows)
+    stats["selected_coverage_rate"] = round(selected_coverage, 6)
+    stats["recovered_after_cold_retry"] = bool(
+        selected_coverage >= TICKER_COMPLETE_COVERAGE
+        and first_coverage < TICKER_COMPLETE_COVERAGE
+    )
+    stats["recovered_after_schannel_fallback"] = bool(
+        stats["schannel_fallback_successes"]
+        and selected_coverage >= TICKER_COMPLETE_COVERAGE
+    )
+
+    if selected_coverage < TICKER_COMPLETE_COVERAGE:
+        missing_symbols = [
+            symbol for symbol in SYMBOLS
+            if not _ticker_row_usable(by_symbol.get(symbol))
+        ]
+        fallback_budget = min(
+            TICKER_SINGLE_FALLBACK_TIMEOUT_SECONDS,
+            max(0.0, deadline - time.monotonic() - 1.0),
+        )
+        stats["attempts"] = 3
+        stats["single_ticker_fallback_requested"] = True
+        stats["single_ticker_fallback_symbols"] = len(missing_symbols)
+        stats["single_ticker_fallback_timeout_seconds"] = round(
+            fallback_budget, 3
+        )
+        fallback_map: dict[str, dict] = {}
+        fallback_outcomes: dict[str, dict] = {}
+        fallback_transport: dict[str, object] = {}
+        fallback_error: Exception | None = None
+        if fallback_budget > 0.1:
+            try:
+                fallback_map = fetch_tickers_batch_sync(
+                    missing_symbols,
+                    batch_timeout_s=fallback_budget,
+                    outcomes=fallback_outcomes,
+                    transport=fallback_transport,
+                )
+            except Exception as exc:  # noqa: BLE001
+                fallback_error = exc
+        else:
+            fallback_error = TimeoutError(
+                "no current-cycle budget for official single-ticker fallback"
+            )
+
+        usable_fallback = 0
+        for symbol in missing_symbols:
+            row = fallback_map.get(symbol)
+            if _ticker_row_usable(row):
+                by_symbol[symbol] = row
+                usable_fallback += 1
+        stats["single_ticker_fallback_usable"] = usable_fallback
+        stats["single_ticker_fallback_transport_failures"] = sum(
+            1 for outcome in fallback_outcomes.values()
+            if not bool(outcome.get("ok"))
+        )
+        stats["single_ticker_fallback_error_type"] = (
+            type(fallback_error).__name__ if fallback_error else None
+        )
+        stats["single_ticker_fallback_selected_base"] = (
+            fallback_transport.get("selected_base")
+        )
+        stats["single_ticker_fallback_probe_attempts"] = int(
+            fallback_transport.get("probe_attempts") or 0
+        )
+        selected_rows = list(by_symbol.values())
+        selected_coverage = _ticker_symbol_coverage(selected_rows)
+        stats["selected_coverage_rate"] = round(selected_coverage, 6)
+        stats["recovered_after_single_ticker_fallback"] = bool(
+            selected_coverage >= TICKER_COMPLETE_COVERAGE
+        )
+    if selected_rows:
+        return selected_rows, stats
+
+    first_detail = (
+        f"{type(first_error).__name__}: {first_error}"
+        if first_error else "empty official ticker response"
+    )
+    retry_detail = (
+        f"{type(retry_error).__name__}: {retry_error}"
+        if retry_error else "empty official ticker response"
+    )
+    raise RuntimeError(
+        "official ticker fetch failed after bounded cold retry and "
+        "single-ticker fallback: "
+        f"initial=({first_detail}); retry=({retry_detail}); "
+        "single_ticker=(usable="
+        f"{stats['single_ticker_fallback_usable']}, "
+        f"error={stats['single_ticker_fallback_error_type']})"
+    )
+
+
 def collect_tickers(
     market_con: sqlite3.Connection,
     ts: str,
     batch_timeout_s: float = 135.0,
-) -> tuple[int, dict[str, dict], dict[str, int | float]]:
+) -> tuple[int, dict[str, dict], dict[str, object]]:
 
 
 
@@ -742,22 +1186,22 @@ def collect_tickers(
     def remaining() -> float:
         return max(0.1, deadline - time.monotonic())
 
-    all_tickers_raw = fetch_tickers_all_sync(remaining())
-
-
+    # Funding uses a distinct official endpoint/rate bucket. Start it before
+    # ticker recovery so a rare per-instrument ticker fallback cannot consume
+    # the funding completeness budget.
+    with ThreadPoolExecutor(max_workers=1) as funding_executor:
+        funding_future = funding_executor.submit(
+            fetch_funding_rates_batch_sync,
+            SYMBOLS,
+            batch_timeout_s=remaining(),
+        )
+        all_tickers_raw, ticker_transport = (
+            _fetch_tickers_with_cold_retry(deadline)
+        )
+        funding_map: dict[str, dict] = funding_future.result()
 
     # Index by instId for O(1) lookup
-
     ticker_map = {item.get("instId"): item for item in all_tickers_raw}
-
-
-
-    # Funding rates: HTTP batch concurrent (was 292 CLI subprocess calls)
-
-    funding_map: dict[str, dict] = fetch_funding_rates_batch_sync(
-        SYMBOLS,
-        batch_timeout_s=remaining(),
-    )
 
     # OI：公共端点支持 instType=SWAP 一次取全量，供分析观察 OI 24h 变化。
     official_instruments: list[dict] = []
@@ -886,6 +1330,7 @@ def collect_tickers(
             1 for value in snapshot.values()
             if value.get("oiUsd") is not None
         ),
+        "ticker_transport": ticker_transport,
     }
     return len(tick_rows), snapshot, quality
 
@@ -929,6 +1374,14 @@ def collect_klines(market_con: sqlite3.Connection, kline_symbols: list[str], pre
 
 
     rows_to_write: list[tuple] = []
+    # 2026-08-13 BOLL/OBV 扩展列 migration-aware：迁移未跑按旧列写（零行为变化）。
+    insert_plan = kline_insert_plan(market_con)
+    if not insert_plan["extended"]:
+        print(
+            "[collect_data][WARN] kline_cache 缺 BOLL/OBV 扩展列"
+            "（apply_kline_indicator_schema 未跑），按旧列写入",
+            flush=True,
+        )
 
 
 
@@ -958,57 +1411,32 @@ def collect_klines(market_con: sqlite3.Connection, kline_symbols: list[str], pre
 
         ]
 
-        enriched = compute_indicators(candles)
+        enriched = extend_with_boll_obv(compute_indicators(candles))
 
         for item in enriched:
 
-            rows_to_write.append(
-
-                (
-
-                    item["ts"],
-
-                    symbol,
-
-                    TIMEFRAME_TO_BAR["15m"],
-
-                    item["o"],
-
-                    item["h"],
-
-                    item["l"],
-
-                    item["c"],
-
-                    item["v"],
-
-                    item["ma5"],
-
-                    item["ma20"],
-
-                    item["atr14"],
-
-                    item["rsi14"],
-
-                    item["macd_hist"],
-
-                )
-
+            base_row = (
+                item["ts"],
+                symbol,
+                TIMEFRAME_TO_BAR["15m"],
+                item["o"],
+                item["h"],
+                item["l"],
+                item["c"],
+                item["v"],
+                item["ma5"],
+                item["ma20"],
+                item["atr14"],
+                item["rsi14"],
+                item["macd_hist"],
             )
+            if insert_plan["extended"]:
+                base_row += extended_row_tail(item)
+            rows_to_write.append(base_row)
 
 
 
-    market_con.executemany(
-
-        "INSERT OR REPLACE INTO kline_cache "
-
-        "(ts, symbol, tf, o, h, l, c, v, ma5, ma20, atr14, rsi14, macd_hist) "
-
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-
-        rows_to_write,
-
-    )
+    market_con.executemany(insert_plan["sql"], rows_to_write)
 
     market_con.commit()
 
@@ -1236,7 +1664,7 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
         from _regime_read import latest_cross_market as _lcm
         _main = next((r[2] for r in market_con.execute("PRAGMA database_list").fetchall()
                       if r[1] == "main"), None)
-        _db_root = _os.path.dirname(_main) if _main else r"./db"
+        _db_root = _os.path.dirname(_main) if _main else r".\db"
         row = _lcm(_db_root)
     except Exception:
         row = None
@@ -1412,6 +1840,12 @@ def main() -> int:
 
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help="记录在 cycle_runs/profile 与 summary/profile 中的执行 profile")
 
+    parser.add_argument(
+        "--cycle",
+        default=None,
+        help="北京时间15分钟自然槽 YYYY-MM-DDTHH:MM；默认按启动时刻归槽",
+    )
+
 
 
     # 兼容解析后硬拒绝，给旧 cron/人工命令明确错误；绝不把 --demo 映射成 --live。
@@ -1455,6 +1889,23 @@ def main() -> int:
 
     ts_start = utc_now_iso()
 
+    if args.cycle:
+        try:
+            parsed_cycle = datetime.strptime(args.cycle, "%Y-%m-%dT%H:%M")
+        except ValueError as exc:
+            parser.error(f"--cycle 格式无效: {exc}")
+        if parsed_cycle.minute not in (0, 15, 30, 45):
+            parser.error("--cycle 必须对齐北京时间15分钟自然槽")
+        cycle_id = args.cycle
+    else:
+        started = datetime.fromisoformat(ts_start.replace("Z", "+00:00"))
+        local = started.astimezone(_CST_TZ)
+        cycle_id = local.replace(
+            minute=(local.minute // 15) * 15,
+            second=0,
+            microsecond=0,
+        ).strftime("%Y-%m-%dT%H:%M")
+
 
 
     public_cli_global_args: list[str] = []
@@ -1477,39 +1928,20 @@ def main() -> int:
 
 
 
-    try:
-
-
-
-        official_instruments = _fetch_all_swap_instruments(
-            public_cli_global_args)
-
-
-
+    official_instruments, instrument_discovery_error = (
+        discover_live_swap_instruments(public_cli_global_args)
+    )
+    if instrument_discovery_error is None:
         SYMBOLS = sorted(str(inst["instId"]) for inst in official_instruments)
-
-
-
         COIN_TO_SYMBOL = {s.split("-")[0]: s for s in SYMBOLS}
-
-
-
         print(f"[collect_data] Discovered {len(SYMBOLS)} USDT-M SWAP contracts", file=sys.stderr)
-
-
-
-    except Exception as sym_exc:
-
-
-
-        print(f"[collect_data] WARNING: Could not fetch dynamic symbols ({sym_exc}); using empty list", file=sys.stderr)
-
-
-
+    else:
+        print(
+            "[collect_data] WARNING: Could not fetch dynamic symbols "
+            f"({instrument_discovery_error}); using empty list",
+            file=sys.stderr,
+        )
         SYMBOLS = []
-
-
-
         COIN_TO_SYMBOL = {}
 
 
@@ -1524,6 +1956,7 @@ def main() -> int:
 
     summary = {
         "profile": args.profile,
+        "cycle_id": cycle_id,
         "ts_start": ts_start,
         "symbols_count": len(SYMBOLS),
         "wrote": {},
@@ -1541,6 +1974,8 @@ def main() -> int:
     # 让 fast_collect 判为 error 并阻止分析使用陈旧行情。
     if not SYMBOLS:
         error = "instruments_empty: 未取到任何 SWAP symbols，本轮无市场数据（fail-safe 阻止陈旧行情当新鲜）"
+        if instrument_discovery_error is not None:
+            error += f"; discovery_error={instrument_discovery_error}"
 
 
 
@@ -1553,6 +1988,32 @@ def main() -> int:
 
 
         market_con = open_db(db_root, "market.db")
+
+        instrument_snapshot_failed = False
+        try:
+            official_snapshot = freeze_official_instrument_snapshot(
+                market_con,
+                official_instruments,
+                cycle_id=cycle_id,
+                collected_ts_utc=ts_start,
+            )
+            summary["official_instrument_snapshot"] = official_snapshot
+            if official_snapshot["status"] == "conflict":
+                instrument_snapshot_failed = True
+                warnings.append(
+                    "official_instrument_snapshot_conflict=" + cycle_id
+                )
+        except (sqlite3.Error, ValueError) as snapshot_exc:
+            instrument_snapshot_failed = True
+            summary["official_instrument_snapshot"] = {
+                "status": "failed",
+                "cycle_id": cycle_id,
+                "error": f"{type(snapshot_exc).__name__}: {snapshot_exc}",
+            }
+            warnings.append(
+                "official_instrument_snapshot_failed: "
+                f"{type(snapshot_exc).__name__}: {snapshot_exc}"
+            )
 
         # OKX official ``instCategory`` is the authority for broad asset type.
         # The existing market writer only fills/corrects non-manual rows; manual
@@ -1678,6 +2139,12 @@ def main() -> int:
             error = "market_quality_fail_closed: " + "; ".join(quality_errors)
 
         degraded_reasons: list[str] = []
+        if instrument_snapshot_failed:
+            degraded_reasons.append("official_instrument_snapshot_incomplete")
+        if quality["ticker_coverage"] < TICKER_COMPLETE_COVERAGE:
+            degraded_reasons.append(
+                f"ticker_coverage={quality['ticker_coverage']:.1%}<99%"
+            )
         if quality["candle_coverage"] < 0.95:
             degraded_reasons.append(
                 f"candle_coverage={quality['candle_coverage']:.1%}<95%"
@@ -1751,8 +2218,8 @@ def main() -> int:
         try:
             _pnow = datetime.now(timezone(timedelta(hours=8)))
             if (market_con is not None and _pnow.hour == 4 and 30 <= _pnow.minute < 45):
-                if r"./scripts" not in sys.path:
-                    sys.path.insert(0, r"./scripts")
+                if r".\scripts" not in sys.path:
+                    sys.path.insert(0, r".\scripts")
                 import market_prune
                 _pstat = market_prune.prune(market_con, retention_days=45, apply=True)
                 print(f"[collect_data] market.db prune: {_pstat}", file=sys.stderr)

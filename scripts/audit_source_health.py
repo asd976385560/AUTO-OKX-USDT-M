@@ -22,13 +22,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import _acceptance_thresholds as thresholds
+
 
 CST = timezone(timedelta(hours=8))
 SLOT_MINUTES = 15
 COMPLETE_STATUSES = frozenset({"ok"})
 AVAILABLE_STATUSES = frozenset({"ok", "degraded"})
-DEFAULT_LEDGER = Path(r"./db/ledger.db")
-DEFAULT_OUTPUT = Path(r"./reports/quality/source-health-audit.json")
+DEFAULT_LEDGER = Path(r".\db\ledger.db")
+DEFAULT_OUTPUT = Path(r".\reports\quality\source-health-audit.json")
 DEFAULT_FORWARD_START = "2026-08-12T16:00:00+08:00"
 
 
@@ -225,13 +227,16 @@ def audit_source_health(
     as_of: datetime,
     forward_start: datetime,
     rolling_days: int = 14,
-    target_rate: float = 0.99,
+    target_rate: float | None = None,
     forward_minimum_slots: int = 96,
     grace_minutes: int = 5,
     source: str = "fast",
 ) -> dict[str, Any]:
     if rolling_days <= 0:
         raise ValueError("rolling_days must be positive")
+    # None = 按预注册激活边界解析（边界前 0.99、边界起 0.95）；显式传值仍照传。
+    if target_rate is None:
+        target_rate = thresholds.coverage_target_rate(as_of)
     if not 0 < target_rate <= 1:
         raise ValueError("target_rate must be in (0,1]")
     if forward_minimum_slots <= 0:
@@ -287,6 +292,17 @@ def audit_source_health(
         "available_semantics": "status_ok_or_degraded; diagnostic_only",
         "missing_slot_semantics": "incomplete_unavailable_and_in_denominator",
         "target_rate": target_rate,
+        "target_rate_migration": thresholds.coverage_migration_facts(as_of),
+        "legacy_target_diagnostics": {
+            "rolling": thresholds.legacy_rate_diagnostics({
+                "complete_rate": rolling["complete_rate"],
+                "available_rate": rolling["available_rate"],
+            }),
+            "forward_after_remediation": thresholds.legacy_rate_diagnostics({
+                "complete_rate": forward["complete_rate"],
+                "available_rate": forward["available_rate"],
+            }),
+        },
         "rolling": rolling,
         "forward_after_remediation": forward,
         "overall_status": overall,
@@ -331,7 +347,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--as-of", default=None, help="CST/ISO timestamp; default now")
     parser.add_argument("--forward-start", default=DEFAULT_FORWARD_START)
     parser.add_argument("--rolling-days", type=int, default=14)
-    parser.add_argument("--target-rate", type=float, default=0.99)
+    parser.add_argument(
+        "--target-rate", type=float, default=None,
+        help="default: resolved from the pre-registered activation boundary")
     parser.add_argument("--forward-minimum-slots", type=int, default=96)
     parser.add_argument("--grace-minutes", type=int, default=5)
     return parser.parse_args(argv)

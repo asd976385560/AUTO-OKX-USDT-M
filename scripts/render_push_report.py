@@ -44,12 +44,9 @@ if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 
-# QQ 单条消息上限约 3700 字（主人 2026-06-26 实测）；留余量到 3500，超则裁剪 verbose 段。
-# 完整报告始终落 reports/ 归档，QQ 只发可读摘要（决策依据/异常裁剪后标"详情见归档"）。
-MAX_CONTENT_CHARS = 3500
-DECISION_REASON_MAX = 1300
-EXCEPTIONS_MAX = 800
-SUMMARY_MAX = 250
+# 2026-08-14（主人拍板）：渲染端全量输出，不再做任何字数压缩/段内截断；
+# 发送端（qq_push_raw）整条全量单发、不做本地分段——超长消息 QQ 收到后自行分段。
+# 完整报告仍先落 reports/ 归档（push_archive 硬闸在 send 之前）。
 
 
 def fail(message: str, code: int = 2) -> None:
@@ -166,16 +163,11 @@ def first_nonempty(*values: Any, default: str = "-") -> str:
     return default
 
 
-def clip(value: Any, limit: int, tail: str = "…（详情见归档）") -> str:
-    """裁剪长文到 limit 字以内，超出补尾标。用于把 verbose 段压进 QQ 单条上限。"""
-    s = text(value)
-    if len(s) <= limit:
-        return s
-    return s[: max(0, limit - len(tail))].rstrip() + tail
+def card_text(value: Any) -> str:
+    """Flatten one decision-card field without exposing raw JSON blobs.
 
-
-def card_text(value: Any, limit: int = 150) -> str:
-    """Compact one decision-card field without exposing raw JSON blobs."""
+    2026-08-14 起不限字数（全量发送）：只做结构展平与空白归一，不裁剪。
+    """
     if isinstance(value, str):
         raw = value
     elif isinstance(value, list):
@@ -198,7 +190,7 @@ def card_text(value: Any, limit: int = 150) -> str:
         )
     else:
         raw = str(value or "-")
-    return clip(" ".join(raw.replace("\r", " ").replace("\n", " ").split()), limit)
+    return " ".join(raw.replace("\r", " ").replace("\n", " ").split())
 
 
 def format_multitimeframe_analysis(
@@ -208,8 +200,6 @@ def format_multitimeframe_analysis(
     decision: dict[str, Any] | None = None,
     cycle_id: str | None = None,
     fallback_symbol: str | None = None,
-    evidence_limit: int = 110,
-    reason_limit: int = 140,
 ) -> str:
     """Render every actual OPEN/ADD leg without inventing confidence.
 
@@ -287,14 +277,14 @@ def format_multitimeframe_analysis(
                 f"{timeframe} rank={row['relative_rank']} "
                 f"direction={str(row['direction']).lower()} "
                 f"exact={evidence_row['observed_bar_ts']} | "
-                f"{card_text(row['evidence'], evidence_limit)}"
+                f"{card_text(row['evidence'])}"
             )
         group_lines.append(
             f"选择={block['selected_timeframe']}/"
             f"{str(block['selected_direction']).lower()} rank=1 | "
             f"symbol={contract['symbol']} | "
             "方法=三周期相对最优（非概率） | "
-            f"理由={card_text(block['selection_reason'], reason_limit)} | "
+            f"理由={card_text(block['selection_reason'])} | "
             "校准可信度=未通过 | 可信度声明=禁止 | "
             f"evidence_hash={contract['evidence_hash']}"
         )
@@ -463,14 +453,29 @@ def format_position(position: dict[str, Any]) -> str:
     profile = first_nonempty(position.get("profile"), position.get("channel"), default="-")
     # L2 (2026-06-14): SL 距离取绝对值——LONG 仓 sl<mark 算出负号无意义（"SL距-3.6%"误导），
     # 距离本身是无符号量，方向由 side 已表达。
+    # 2026-08-13 双口径（主人指认「SL距恒定」歧义后拍板）：
+    #   计划距(开仓) = |sl−avgPx|/avgPx —— entry 与 SL 冻结，随价格不变（语义即如此）；
+    #   SL缓冲(现价) = 方向感知 mark→SL 距离（build 侧 _sl_buffer_pct），随行情变动，
+    #   ≤0 表示价格已到触发边界（瞬时状态），显式标注不吞；缓冲不可得只显计划口径。
     if str(stop_distance) not in ("", "-"):
         _sd = strip_pct(stop_distance)
         try:
             _v = abs(float(_sd))
             # N3 (2026-06-14): SL 距离 >30% 几乎必是填值错误（sl_pct 口径混乱），标注核对而非显示误导值。
-            sl_txt = f"SL距{_v:.1f}%" if _v <= 30 else f"SL距{_v:.0f}%(值异常,核对slTriggerPx)"
+            planned_core = f"{_v:.1f}%" if _v <= 30 else f"{_v:.0f}%(值异常,核对slTriggerPx)"
         except (TypeError, ValueError):
-            sl_txt = f"SL距{_sd}%"
+            planned_core = f"{_sd}%"
+        buffer_val = position.get("sl_buffer_pct")
+        if isinstance(buffer_val, (int, float)) and not isinstance(buffer_val, bool):
+            if buffer_val <= 0:
+                buffer_txt = "SL缓冲(现价)≤0(已到触发边界)"
+            elif buffer_val > 50:
+                buffer_txt = f"SL缓冲(现价){buffer_val:.0f}%(值异常,核对markPx)"
+            else:
+                buffer_txt = f"SL缓冲(现价){buffer_val:.1f}%"
+            sl_txt = f"{buffer_txt}|计划距(开仓){planned_core}"
+        else:
+            sl_txt = f"计划SL距(开仓){planned_core}"
     else:
         sl_txt = "SL未挂"
     # 2026-07-15 主人要求：补保证金 USD + 占净值%（payload margin_usd/margin_pct，
@@ -480,7 +485,23 @@ def format_position(position: dict[str, Any]) -> str:
         margin_txt = f"保证金≈${_mu}" + (f"/{_mp}%净值" if isinstance(_mp, (int, float)) else "") + " | "
     else:
         margin_txt = ""
-    return f"{profile} {symbol} {side} {size}张 @{avg_price} {leverage}x | {margin_txt}{hold_disp} | 浮盈{upl} | {sl_txt}"
+    upl_pct = position.get("upl_pct_initial_margin")
+    if isinstance(upl_pct, (int, float)) and not isinstance(upl_pct, bool):
+        upl_txt = f"浮盈{upl}（保证金收益率{float(upl_pct):+.1f}%）"
+    else:
+        upl_txt = f"浮盈{upl}"
+    secured = position.get("secured_profit_at_stop_usdt")
+    giveback = position.get("giveback_to_stop_pct_of_current_upl")
+    if (
+        isinstance(secured, (int, float)) and not isinstance(secured, bool)
+        and float(secured) > 0
+    ):
+        lock_txt = f" | SL锁盈≈${float(secured):.2f}"
+        if isinstance(giveback, (int, float)) and not isinstance(giveback, bool):
+            lock_txt += f"（到SL将回吐当前浮盈{float(giveback):.1f}%）"
+    else:
+        lock_txt = ""
+    return f"{profile} {symbol} {side} {size}张 @{avg_price} {leverage}x | {margin_txt}{hold_disp} | {upl_txt} | {sl_txt}{lock_txt}"
 
 
 def format_positions(positions: list[Any]) -> str:
@@ -778,7 +799,16 @@ def validate_input(payload: dict[str, Any]) -> None:
         fail("assets.live 必为 dict，包括 equity/totalEq", 3)
 
     market = section(payload, "market")
-    if market.get("btc") is None and market.get("btc_price") is None:
+    collection_failure = (
+        payload.get("report_mode") == "upstream_failure"
+        and section(payload, "upstream_failure").get("stage") == "collection"
+        and str(action_taken).strip().upper() == "WAIT"
+    )
+    if (
+        market.get("btc") is None
+        and market.get("btc_price") is None
+        and not collection_failure
+    ):
         fail("market.btc 或 market.btc_price 必填", 3)
 
     # decision_card_v1 不使用 confidence；仅兼容格式缺失时保留告警。
@@ -844,8 +874,8 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     # validate_push_format 的 \b 枚举校验必挂（_ 是 word char，\bHOLD\b 匹配不到 HOLD_NONE）。
     # 无裸枚举词时确定性提取首个内嵌枚举词；完全无枚举词的自由文本保持原值——让 validate 照旧拦截，不静默臆造动作。
     import re as _re_act
-    if not _re_act.search(r"\b(OPEN_LONG|OPEN_SHORT|CLOSE|STOP_LOSS|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD)\b", action):
-        _m_act = _re_act.search(r"OPEN_LONG|OPEN_SHORT|STOP_LOSS|CLOSE|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD", action)
+    if not _re_act.search(r"\b(OPEN_LONG|OPEN_SHORT|CLOSE|STOP_LOSS|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD|ERROR|DEGRADED)\b", action):
+        _m_act = _re_act.search(r"OPEN_LONG|OPEN_SHORT|STOP_LOSS|CLOSE|ADJUST|HOLD|WAIT|NONE|REDUCE|ADD|ERROR|DEGRADED", action)
         if _m_act:
             action = _m_act.group(0)
     symbol = first_nonempty(payload.get("symbol"), decision.get("symbol"), execution.get("symbol"), default="UNKNOWN")
@@ -861,6 +891,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             pass
     confidence = first_nonempty(payload.get("confidence"), decision.get("confidence"), default="-")
     action_summary = first_nonempty(decision.get("summary"), execution.get("summary"), payload.get("action_summary"), default="")
+    decision_origin = str(decision.get("origin") or "").strip().lower()
 
     live = section(assets, "live")
     # positions dict 形态兼容：{live:[...],demo:[...]} 合并展开为 list（各项补 profile）。
@@ -955,15 +986,23 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     if not str(action_summary).strip() or str(action_summary).strip() == "-":
         # 兜底摘要复用已做过 dict 防御的 btc，防 JSON 字面量直出。
         action_summary = f"{action} @ regime={regime} BTC ${btc if btc != '-' else '?'}（摘要缺失补位）"
-    action_summary = clip(action_summary, SUMMARY_MAX)
+    action_summary = text(action_summary)
 
-    decision_reason = clip(
-        first_nonempty(decision.get("reason"), decision.get("rationale"),
-                       default="regime、技术指标、新闻事件、历史相似度与 playbook 综合确认。"),
-        DECISION_REASON_MAX)
+    decision_reason = first_nonempty(
+        decision.get("reason"), decision.get("rationale"),
+        default="regime、技术指标、新闻事件、历史相似度与 playbook 综合确认。")
     decision_card = decision.get("decision_card")
     if not isinstance(decision_card, dict):
         decision_card = {}
+    decision_banner = (
+        "系统失败闭环"
+        if decision_origin == "system_failure_fallback"
+        else "Agent裁决后交易所成交"
+        if decision_origin == "exchange_reconcile_after_business_terminal"
+        else "Agent自主裁决"
+        if decision_card
+        else f"兼容格式置信度 {confidence}"
+    )
     historical = decision_card.get("historical_experience")
     if not isinstance(historical, dict):
         historical = {}
@@ -991,7 +1030,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
                 moved_lines.append(text(item))
         if moved_lines:
             moved_text = " | ".join(moved_lines)
-            decision_reason = clip(f"{decision_reason} | {moved_text}", DECISION_REASON_MAX)
+            decision_reason = f"{decision_reason} | {moved_text}"
     play_id = first_nonempty(decision.get("play_id"), decision.get("playbook_id"), default="-")
     play_title = first_nonempty(decision.get("play_title"), decision.get("playbook_title"), default="-")
     hit_rate = strip_pct(first_nonempty(decision.get("hit_rate"), decision.get("similar_hit_rate"), default="-"))
@@ -1007,6 +1046,61 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         exec_meta = "落库 live=-笔"
     else:
         exec_meta = f"落库 live={_dbl}笔"
+    business_attestation_meta = ""
+    _attestation = payload.get("business_report_attestation")
+    if isinstance(_attestation, dict):
+        _att_count = _attestation.get("trade_count")
+        _att_hash = str(_attestation.get("sha256") or "")
+        if _att_count is not None:
+            business_attestation_meta = f"账实成交={_att_count}笔"
+        if len(_att_hash) == 64:
+            business_attestation_meta += (
+                (" | " if business_attestation_meta else "")
+                + f"业务指纹={_att_hash}"
+            )
+    inter_report_exchange_meta = ""
+    _interval_attestation = payload.get(
+        "inter_report_exchange_attestation")
+    if isinstance(_interval_attestation, dict):
+        _interval_count = _interval_attestation.get("fill_count")
+        _interval_hash = str(_interval_attestation.get("sha256") or "")
+        if _interval_count is not None:
+            inter_report_exchange_meta = (
+                f"报告间交易所成交={_interval_count}笔")
+        _interval_details = []
+        for _fill in (_interval_attestation.get("fills") or [])[:3]:
+            if not isinstance(_fill, dict):
+                continue
+            _detail = " ".join(part for part in (
+                str(_fill.get("action") or "").upper(),
+                str(_fill.get("side") or "").upper(),
+                text(first_nonempty(_fill.get("symbol"), default="-")),
+            ) if part)
+            _detail += (
+                f" {text(first_nonempty(_fill.get('sz'), default='-'))}"
+                f"@{text(first_nonempty(_fill.get('fill_px'), default='-'))}"
+            )
+            if _fill.get("pnl") not in (None, ""):
+                try:
+                    _detail += f" pnl={float(_fill['pnl']):+g}"
+                except (TypeError, ValueError):
+                    _detail += f" pnl={text(_fill.get('pnl'))}"
+            _ord_ids = _fill.get("ord_ids")
+            if isinstance(_ord_ids, list) and _ord_ids:
+                _detail += f" ordId={text(_ord_ids[0])}"
+            _interval_details.append(_detail)
+        if _interval_details:
+            inter_report_exchange_meta += " | " + " | ".join(
+                _interval_details)
+        _interval_fills = _interval_attestation.get("fills") or []
+        if isinstance(_interval_fills, list) and len(_interval_fills) > 3:
+            inter_report_exchange_meta += (
+                f" | …另{len(_interval_fills) - 3}笔见区间证明")
+        if len(_interval_hash) == 64:
+            inter_report_exchange_meta += (
+                (" | " if inter_report_exchange_meta else "")
+                + f"区间指纹={_interval_hash}"
+            )
     execution_result = first_nonempty(execution.get("result"), default=f"{action} {symbol} fill={fill_price} stop={stop_price}")
     # 执行段回退：execution.* 全缺而 payload.trades 有内容时，
     # 从 trades 逐笔拼
@@ -1047,8 +1141,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
 
     content_parts = [
         f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
-        (f"Agent自主裁决 | {action_summary}" if decision_card
-         else f"兼容格式置信度 {confidence} | {action_summary}"),
+        f"{decision_banner} | {action_summary}",
         "",
         "📊 资产",
         f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益(交易PnL·未扣费) {live_pnl} USDT | {live_positions}仓",
@@ -1085,7 +1178,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
             f"亏损样本 {len(historical.get('matched_losses') or [])} | "
             f"错失机会 {len(historical.get('missed_opportunities') or [])} | "
             f"取舍={historical.get('usage') or 'none'}："
-            f"{card_text(historical.get('reason'), 220)}"
+            f"{card_text(historical.get('reason'))}"
             if historical else
             f"兼容格式 play_id={play_id} \"{play_title}\" | "
             f"hit_rate={with_pct(hit_rate)} / avg_return={with_pct(avg_return)} "
@@ -1093,13 +1186,17 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "",
         "⚙️ 执行",
-        f"{execution_result}\n{exec_meta}",
+        f"{execution_result}\n{exec_meta}"
+        + (f"\n{business_attestation_meta}"
+           if business_attestation_meta else "")
+        + (f"\n{inter_report_exchange_meta}"
+           if inter_report_exchange_meta else ""),
         "",
         "⏰ 时间线",
         f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
         "",
         "⚠️ 异常",
-        clip(format_exceptions(exceptions), EXCEPTIONS_MAX, tail="…（更多异常见归档）"),
+        format_exceptions(exceptions),
     ]
 
     include_macro = bool(payload.get("is_hh01")) or bool(macro.get("enabled"))
@@ -1125,138 +1222,8 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
 
     content_body = "\n".join(content_parts).strip()
     content = qq_markdown_hardbreak(content_body)
-    # 单条上限闸：禁止再整体从尾部裁剪。时间线/决策卡等必填段位于后半部，
-    # 旧逻辑会把它们一起裁掉，导致 validator 在发送前拦截整轮推送。
-    # 超长时改用结构化压缩版：缩正文，不删除任何必填段标题。
-    if len(content) > MAX_CONTENT_CHARS:
-        compact_card = (
-            f"方向：{card_text(decision_card.get('direction_evidence'), 80)}\n"
-            f"反对：{card_text(decision_card.get('opposing_evidence'), 80)}\n"
-            f"执行：{card_text(decision_card.get('execution_conditions'), 80)}\n"
-            f"失效：{card_text(decision_card.get('invalidation_point'), 80)}\n"
-            f"风险收益：{card_text(decision_card.get('risk_reward'), 80)}\n"
-            f"组合：{card_text(decision_card.get('portfolio_impact'), 80)}"
-            if decision_card else "旧轮次无 decision_card_v1"
-        )
-        compact_history = (
-            f"盈利样本 {len(historical.get('matched_wins') or [])} | "
-            f"亏损样本 {len(historical.get('matched_losses') or [])} | "
-            f"错失机会 {len(historical.get('missed_opportunities') or [])} | "
-            f"取舍={historical.get('usage') or 'none'}："
-            f"{card_text(historical.get('reason'), 100)}"
-            if historical else
-            f"兼容格式 play_id={play_id} \"{clip(play_title, 50)}\" | "
-            f"hit_rate={with_pct(hit_rate)} / avg_return={with_pct(avg_return)} "
-            f"| 不确定性={uncertainty}"
-        )
-        compact_parts = [
-            f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
-            (f"Agent自主裁决 | {clip(action_summary, 140)}" if decision_card
-             else f"兼容格式置信度 {confidence} | {clip(action_summary, 140)}"),
-            "",
-            "📊 资产",
-            f"🟢 实盘：资金 ${live_equity} | 可用USDT ${live_available} | 累计收益 {live_pnl} USDT | {live_positions}仓",
-            "",
-            "💼 持仓详情",
-            clip(format_positions(positions), 520, tail="\n…（其余持仓见账本）"),
-            "",
-            "🛡 风控",
-            clip(
-                f"Live组合保证金 {margin_display} | 杠杆 {leverage}x / {MAX_LEVERAGE:g}x | "
-                f"同侧 {with_pct(side_pct)}(观察) | 持仓 live {position_count} / "
-                f"{risk_status}",
-                210,
-            ),
-            "",
-            "🌍 行情",
-            f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | "
-            f"regime={regime} | USD_BROAD {dxy}",
-            "",
-            "🎯 Agent裁决",
-            clip(decision_reason, 180),
-            "",
-            "🧩 三周期判断",
-            multitimeframe_report,
-            "",
-            "🧭 六项决策卡",
-            compact_card,
-            "",
-            "📚 历史经验",
-            compact_history,
-            "",
-            "⚙️ 执行",
-            clip(f"{execution_result}\n{exec_meta}", 180),
-            "",
-            "⏰ 时间线",
-            f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
-            "",
-            "⚠️ 异常",
-            clip(format_exceptions(exceptions), 120, tail="…（更多异常见账本）"),
-        ]
-        if include_macro:
-            compact_parts.extend([
-                "",
-                "🌐 宏观 HH:00",
-                clip(
-                    f"USD_BROAD {first_nonempty(macro.get('dxy'), dxy)} "
-                    f"({with_pct(macro.get('dxy_d1'))}) | "
-                    f"DXY_CALC_ECB {first_nonempty(macro.get('dxy_calc_ecb'), default='-')} "
-                    f"({with_pct(macro.get('dxy_calc_ecb_d1'))}, 非ICE官方报价) | "
-                    f"Fear&Greed {first_nonempty(macro.get('fear_greed'), default='-')}/"
-                    f"{first_nonempty(macro.get('fear_greed_label'), default='-')}",
-                    260,
-                ),
-                f"BTC ETF净流 {first_nonempty(macro.get('btc_etf_net_flow_usd'), default='-')} | "
-                f"状态 {first_nonempty(macro.get('btc_etf_flow_status'), default='missing')} | "
-                f"as_of {first_nonempty(macro.get('btc_etf_flow_as_of'), default='-')}",
-            ])
-        compact_parts.extend(["", "…（推送过长已结构化压缩，完整事实以账本和分析归档为准）"])
-        content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
-        # 极端兜底仍按“逐段再压缩”而非裁尾，保证所有必填段存在。
-        if len(content) > MAX_CONTENT_CHARS:
-            compact_parts[7] = clip(
-                format_positions(positions), 260,
-                tail="\n…（其余持仓见账本）")
-            compact_parts[16] = clip(decision_reason, 100)
-            compact_parts[22] = clip(compact_card, 360)
-            compact_parts[25] = clip(compact_history, 90)
-            compact_parts[28] = clip(
-                f"{execution_result}\n{exec_meta}", 100)
-            compact_parts[34] = clip(format_exceptions(exceptions), 60)
-            content = qq_markdown_hardbreak("\n".join(compact_parts).strip())
-        if len(content) > MAX_CONTENT_CHARS:
-            minimal_card = (
-                f"方向：{card_text(decision_card.get('direction_evidence'), 30)}\n"
-                f"反对：{card_text(decision_card.get('opposing_evidence'), 30)}\n"
-                f"执行：{card_text(decision_card.get('execution_conditions'), 30)}\n"
-                f"失效：{card_text(decision_card.get('invalidation_point'), 30)}\n"
-                f"风险收益：{card_text(decision_card.get('risk_reward'), 30)}\n"
-                f"组合：{card_text(decision_card.get('portfolio_impact'), 30)}"
-                if decision_card else "旧轮次无 decision_card_v1"
-            )
-            minimal_parts = [
-                f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
-                f"Agent自主裁决 | {clip(action_summary, 80)}",
-                "", "📊 资产",
-                f"🟢 实盘：资金 ${live_equity} | 可用 ${live_available} | "
-                f"累计收益 {live_pnl} USDT | {live_positions}仓",
-                "", "💼 持仓详情",
-                clip(format_positions(positions), 120, tail="\n…（其余见账本）"),
-                "", "🛡 风控",
-                clip(f"Live组合保证金 {margin_display} | 杠杆 {leverage}x | {risk_status}", 120),
-                "", "🌍 行情",
-                f"BTC ${btc} | ETH ${eth} | regime={regime} | USD_BROAD {dxy}",
-                 "", "🎯 Agent裁决", clip(decision_reason, 70),
-                 "", "🧩 三周期判断", multitimeframe_report,
-                 "", "🧭 六项决策卡", minimal_card,
-                "", "📚 历史经验", clip(compact_history, 60),
-                "", "⚙️ 执行", clip(f"{execution_result}\n{exec_meta}", 70),
-                "", "⏰ 时间线",
-                f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
-                "", "⚠️ 异常", clip(format_exceptions(exceptions), 40),
-                "", "…（推送过长已最小化，完整事实以账本和分析归档为准）",
-            ]
-            content = qq_markdown_hardbreak("\n".join(minimal_parts).strip())
+    # 2026-08-14 起：不再做整体压缩/最小化回退——全量内容原样返回整条外发，
+    # 超长消息由 QQ 侧自行分段展示（主人拍板，本地禁止再加截断/分段）。
     title = first_nonempty(payload.get("title"), default=f"【{hhmm}】{action} {symbol}")
     return {
         "ok": True,

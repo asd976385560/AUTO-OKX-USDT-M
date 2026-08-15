@@ -25,10 +25,67 @@ import _okxcli  # noqa: E402
 import find_similar_experience  # noqa: E402
 import stage_runner  # noqa: E402
 import trigger_agent  # noqa: E402
-from core.experience_contract import validate_contract  # noqa: E402
+from core.experience_contract import (  # noqa: E402
+    setup_from_prices,
+    validate_contract,
+)
 
 
 class SimilarExperienceOutputTests(unittest.TestCase):
+    def test_price_geometry_uses_fractional_distance_and_one_canonical_hash(self):
+        setup = setup_from_prices(0.0698, 0.0705, 0.0685)
+
+        self.assertEqual(setup["stop_distance_pct"], 0.01002865)
+        self.assertEqual(setup["planned_rr"], 1.85714286)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = find_similar_experience.find_similar_experience(
+                "DOGE-USDT-SWAP",
+                "short",
+                "range",
+                "open",
+                profile_filter="live",
+                db_root=Path(tmp),
+                now=datetime(2026, 8, 14, 0, 30,
+                             tzinfo=find_similar_experience.CST),
+                entry=0.0698,
+                stop=0.0705,
+                target=0.0685,
+            )
+
+        self.assertEqual(result["evidence_contract"]["query"]["setup"], setup)
+        self.assertEqual(
+            result["query"]["query_features"]["stop_distance_pct"],
+            setup["stop_distance_pct"],
+        )
+        self.assertEqual(
+            result["query"]["query_features"]["planned_rr"],
+            setup["planned_rr"],
+        )
+
+    def test_price_geometry_rejects_partial_or_mixed_setup_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            common = {
+                "symbol": "DOGE-USDT-SWAP",
+                "side": "short",
+                "regime": "range",
+                "action": "open",
+                "db_root": Path(tmp),
+                "now": datetime(2026, 8, 14, 0, 30,
+                                tzinfo=find_similar_experience.CST),
+            }
+            with self.assertRaisesRegex(ValueError, "supplied together"):
+                find_similar_experience.find_similar_experience(
+                    **common, entry=0.0698, stop=0.0705)
+            with self.assertRaisesRegex(ValueError, "not both"):
+                find_similar_experience.find_similar_experience(
+                    **common,
+                    entry=0.0698,
+                    stop=0.0705,
+                    target=0.0685,
+                    stop_distance_pct=0.01002865,
+                    planned_rr=1.85714286,
+                )
+
     def test_same_symbol_statistics_are_separate_from_cross_symbol_analogues(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -269,15 +326,19 @@ class SimilarExperienceOutputTests(unittest.TestCase):
 
 class AgentCommandAndAlertContractTests(unittest.TestCase):
     def test_unified_prompt_separates_route_mode_from_writer_mode(self):
-        message = trigger_agent._unified_live_message(
-            "2026-08-11T18:30", "briefing marker")
+        with mock.patch.object(trigger_agent, "_PROJECT_ROOT", ROOT):
+            message = trigger_agent._unified_live_message(
+                "2026-08-11T18:30", "briefing marker",
+                now=datetime(2026, 8, 11, 18, 31,
+                             tzinfo=trigger_agent.CST),
+                db_root=ROOT / "db")
 
         self.assertIn("dispatch_mode=unified", message)
         self.assertIn("analysis_receipt_mode=full", message)
         self.assertIn("顶层 mode 必须固定为 full", message)
         self.assertIn("market_summary 必须直接包含", message)
         self.assertIn("signals[].decision_card 必须直接包含", message)
-        self.assertIn("HOLD/WAIT 同样必须给完整卡", message)
+        self.assertIn("HOLD/WAIT 若写入同样必须给完整卡", message)
         self.assertIn("不得改名为 rationale/final_judgement/overrides", message)
         self.assertIn("【trade writer 契约】", message)
         self.assertIn("cycle 顶层 decision_card 不是摘要容器", message)
@@ -288,7 +349,7 @@ class AgentCommandAndAlertContractTests(unittest.TestCase):
         self.assertIn("confidence_claim_allowed=false", message)
         self.assertIn("【交易阶段终止契约】", message)
         self.assertIn("禁止再读取 trades_writer.py 源码", message)
-        self.assertIn("trade_cycles 成功终态存在前", message)
+        self.assertIn("stage_runner 会独立核验", message)
         self.assertIn("禁止无内容 stop", message)
         self.assertIn("零成交，HOLD 也必须先落库", message)
         self.assertIn("2026-08-11T18:30", message)
@@ -303,7 +364,7 @@ class AgentCommandAndAlertContractTests(unittest.TestCase):
 
         for text in (trigger, live):
             self.assertIn("run_okx_python.ps1", text)
-            self.assertIn("scripts/live_decision_facts.py", text)
+            self.assertIn("live_decision_facts.py", text)
             self.assertIn("--cycle-id", text)
             self.assertIn("--out-file", text)
             self.assertIn("trade_cycles", text)
@@ -319,13 +380,16 @@ class AgentCommandAndAlertContractTests(unittest.TestCase):
         with mock.patch.object(trigger_agent, "_ro_db",
                                side_effect=OSError("isolated test")), \
                 mock.patch.object(trigger_agent, "_briefing_for_traders",
-                                  return_value=""):
+                                  return_value=""), \
+                mock.patch.object(trigger_agent, "_PROJECT_ROOT", ROOT):
             message = trigger_agent._trader_preload(
-                "2026-07-29T00:15", "live")
+                "2026-07-29T00:15", "live", db_root=ROOT / "db")
 
-        facts = "<PROJECT_ROOT>/tmp/live_facts_2026-07-29T00-15.json"
+        project = ROOT.as_posix()
+        facts = f"{project}/tmp/live_facts_2026-07-29T00-15.json"
         self.assertIn(
-            "<PROJECT_ROOT>/scripts/live_decision_facts.py --profile live "
+            f"{project}/scripts/live_decision_facts.py "
+            f"--db-root {project}/db --profile live "
             f"--cycle-id 2026-07-29T00:15 --out-file {facts}",
             message,
         )

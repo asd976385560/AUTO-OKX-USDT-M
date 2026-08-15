@@ -30,16 +30,24 @@ import tempfile
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from stage_failure_contract import REPORT_RECONCILE_BARRIER_FROM
 from typing import Callable
 
+import _acceptance_thresholds as thresholds
 import validate_push_format
 
 
 CST = timezone(timedelta(hours=8))
-TARGET_RATE = 0.99
+# 闸门数值由预注册激活边界解析（边界前 0.99、边界起 0.95）；这两个常量只是
+# 迁移登记的显式化，实际判定一律走 thresholds.coverage_target_rate(as_of)。
+TARGET_RATE = thresholds.COVERAGE_TARGET_RATE
+LEGACY_TARGET_RATE = thresholds.COVERAGE_LEGACY_TARGET_RATE
 SCHEDULE_MINUTES = 15
 SLOTS_PER_DAY = 24 * 60 // SCHEDULE_MINUTES
 DEFAULT_FORWARD_START = "2026-08-12T16:00:00+08:00"
+BUSINESS_ATTESTATION_REQUIRED_FROM = "2026-08-14T07:00"
+INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = "2026-08-15T08:00"
 _CYCLE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:(?:00|15|30|45)$")
 
 
@@ -234,6 +242,165 @@ def _validate_archive_attempt(
         reasons.append("archive hard check is not true")
     if archive.get("degraded"):
         reasons.append("archive is degraded")
+
+    # From the pre-registered forward boundary, a visually complete archive is
+    # not sufficient evidence.  The production run must also prove that the
+    # same-cycle live runner was immutable/released and that the business
+    # terminal/fill set was re-read both before archive and immediately before
+    # the irreversible external send.  This is intentionally versioned so
+    # historical reports are not judged by a contract that did not exist.
+    if cycle >= BUSINESS_ATTESTATION_REQUIRED_FROM:
+        pre_archive = (
+            steps.get("business_attestation_pre_archive")
+            if isinstance(steps.get("business_attestation_pre_archive"), dict)
+            else {}
+        )
+        pre_send = (
+            steps.get("business_attestation_pre_send")
+            if isinstance(steps.get("business_attestation_pre_send"), dict)
+            else {}
+        )
+        for label, attestation in (
+            ("pre-archive", pre_archive), ("pre-send", pre_send)
+        ):
+            if (
+                attestation.get("ok") is not True
+                or attestation.get("required") is not True
+            ):
+                reasons.append(f"business attestation {label} missing or failed")
+            stage = attestation.get("live_stage_terminal")
+            if not isinstance(stage, dict) or (
+                stage.get("profile_lease_released") is not True
+                or stage.get("same_cycle_active_lease") is not False
+                or not str(stage.get("finished_at") or "").strip()
+            ):
+                reasons.append(f"live terminal proof {label} incomplete")
+            if cycle >= REPORT_RECONCILE_BARRIER_FROM:
+                barrier = (
+                    stage.get("report_reconcile_barrier")
+                    if isinstance(stage, dict)
+                    and isinstance(
+                        stage.get("report_reconcile_barrier"), dict)
+                    else {}
+                )
+                if (
+                    barrier.get("required") is not True
+                    or barrier.get("report_safe") is not True
+                    or barrier.get("status") not in {"ok", "applied"}
+                    or barrier.get("rc") != 0
+                    or barrier.get("blocking") is not False
+                ):
+                    reasons.append(
+                        f"report reconcile barrier {label} incomplete")
+        common_fields = ("mode", "trade_count")
+        for field in common_fields:
+            if pre_archive.get(field) != pre_send.get(field):
+                reasons.append(
+                    f"business attestation {field} drifted before send")
+        if pre_archive.get("mode") == "business_terminal":
+            for field in ("decision", "n_orders", "sha256"):
+                if pre_archive.get(field) != pre_send.get(field):
+                    reasons.append(
+                        f"business attestation {field} drifted before send")
+            if not re.fullmatch(
+                r"[0-9a-f]{64}", str(pre_archive.get("sha256") or "")
+            ):
+                reasons.append("business attestation sha256 is invalid")
+        elif pre_archive.get("mode") == "upstream_failure":
+            failure_fields = (
+                "schema_version", "profile", "cycle_id", "terminal",
+                "trade_count", "failure_kind", "intent_rows",
+                "failed_clean_rows", "unsafe_rows", "sha256",
+            )
+            for field in failure_fields:
+                if pre_archive.get(field) != pre_send.get(field):
+                    reasons.append(
+                        f"failure attestation {field} drifted before send")
+            if (
+                pre_archive.get("schema_version") != 1
+                or pre_archive.get("profile") != "live"
+                or pre_archive.get("cycle_id") != cycle
+                or pre_archive.get("terminal") != "absent"
+                or pre_archive.get("trade_count") != 0
+                or not str(pre_archive.get("failure_kind") or "").strip()
+                or pre_archive.get("unsafe_rows") != 0
+                or pre_archive.get("intent_rows")
+                != pre_archive.get("failed_clean_rows")
+            ):
+                reasons.append("failure report business absence proof is invalid")
+            failure_body = {
+                field: pre_archive.get(field)
+                for field in failure_fields if field != "sha256"
+            }
+            canonical = json.dumps(
+                failure_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            expected_sha = hashlib.sha256(
+                canonical.encode("utf-8")).hexdigest()
+            if (
+                not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(pre_archive.get("sha256") or ""),
+                )
+                or pre_archive.get("sha256") != expected_sha
+            ):
+                reasons.append("failure attestation sha256 is invalid")
+        else:
+            reasons.append("business attestation mode is invalid")
+
+        if cycle >= INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM:
+            interval_fields = (
+                "inter_report_exchange_schema_version",
+                "inter_report_fill_count",
+                "inter_report_sha256",
+                "inter_report_window_start_exclusive_cst",
+                "inter_report_window_end_inclusive_cst",
+            )
+            for label, attestation in (
+                ("pre-archive", pre_archive), ("pre-send", pre_send)
+            ):
+                if attestation.get(
+                        "inter_report_exchange_required") is not True:
+                    reasons.append(
+                        f"inter-report exchange attestation {label} missing")
+            for field in interval_fields:
+                if pre_archive.get(field) != pre_send.get(field):
+                    reasons.append(
+                        f"inter-report exchange attestation {field} drifted "
+                        "before send")
+            try:
+                interval_end = datetime.strptime(cycle, "%Y-%m-%dT%H:%M")
+                interval_start = interval_end - timedelta(minutes=15)
+            except ValueError:
+                reasons.append("inter-report exchange interval cycle invalid")
+            else:
+                if (
+                    pre_archive.get(
+                        "inter_report_window_start_exclusive_cst")
+                    != interval_start.strftime("%Y-%m-%d %H:%M:%S")
+                    or pre_archive.get(
+                        "inter_report_window_end_inclusive_cst")
+                    != interval_end.strftime("%Y-%m-%d %H:%M:%S")
+                ):
+                    reasons.append(
+                        "inter-report exchange interval boundaries invalid")
+            interval_count = pre_archive.get("inter_report_fill_count")
+            if (
+                pre_archive.get(
+                    "inter_report_exchange_schema_version") != 1
+                or not isinstance(interval_count, int)
+                or isinstance(interval_count, bool)
+                or interval_count < 0
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(pre_archive.get("inter_report_sha256") or ""),
+                )
+            ):
+                reasons.append(
+                    "inter-report exchange attestation summary invalid")
 
     archive_text = str(archive.get("path") or "").strip()
     if not archive_text:
@@ -558,14 +725,15 @@ def audit_push_completeness(
     finality_grace_minutes: int = 45,
 ) -> dict:
     """Return strict report and exact-delivery rates for every planned slot."""
-    if not 0 < TARGET_RATE <= 1:
-        raise ValueError("target rate must be in (0,1]")
     if forward_minimum_slots <= 0:
         raise ValueError("forward_minimum_slots must be positive")
     if finality_grace_minutes < 15:
         raise ValueError("finality_grace_minutes must be at least 15")
     rolling_cycles = _expected_cycles(start, end)
     effective_as_of = (as_of or datetime.now(CST)).astimezone(CST)
+    target_rate = thresholds.coverage_target_rate(effective_as_of)
+    if not 0 < target_rate <= 1:
+        raise ValueError("target rate must be in (0,1]")
     forward_cycles: list[str] = []
     forward_end_exclusive: datetime | None = None
     if forward_start is not None:
@@ -593,7 +761,7 @@ def audit_push_completeness(
         receipts=receipts,
         reports_dir=reports_dir,
         archive_validator=archive_validator,
-        target_rate=TARGET_RATE,
+        target_rate=target_rate,
         minimum_slots=len(rolling_cycles),
     )
     payload = {
@@ -617,7 +785,13 @@ def audit_push_completeness(
                 "planned slot has a production archive whose logged build, "
                 "render, validate and archive hard checks pass, whose path and "
                 "byte count are valid, and whose Markdown independently "
-                "passes the pure format validator"
+                "passes the pure format validator; from "
+                f"{BUSINESS_ATTESTATION_REQUIRED_FROM}, both pre-archive and "
+                "pre-send live-terminal/business attestations must also pass "
+                "and agree; from "
+                f"{INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM}, both "
+                "attestations must additionally agree on the half-open "
+                "inter-report exchange-fill interval, count, and SHA-256"
             ),
             "delivery_confirmed": (
                 "exact sha256(default|push:{cycle}) identity has an explicit "
@@ -629,7 +803,11 @@ def audit_push_completeness(
                 "production archive for the same planned cycle"
             ),
         },
-        "target_rate": TARGET_RATE,
+        "target_rate": target_rate,
+        "target_rate_migration": thresholds.coverage_migration_facts(
+            effective_as_of),
+        "legacy_target_diagnostics": thresholds.legacy_rate_diagnostics(
+            dict(rolling["rates"])),
         "counts": rolling["counts"],
         "rates": rolling["rates"],
         "statuses": rolling["statuses"],
@@ -663,12 +841,14 @@ def audit_push_completeness(
             receipts=receipts,
             reports_dir=reports_dir,
             archive_validator=archive_validator,
-            target_rate=TARGET_RATE,
+            target_rate=target_rate,
             minimum_slots=forward_minimum_slots,
         )
         payload["as_of_cst"] = effective_as_of.isoformat()
         payload["forward_start_cst"] = forward_start.isoformat()
         payload["slot_finality_grace_minutes"] = finality_grace_minutes
+        payload["forward_legacy_target_diagnostics"] = (
+            thresholds.legacy_rate_diagnostics(dict(forward["rates"])))
         payload["forward_after_remediation"] = {
             "start_cst": forward_start.isoformat(),
             "end_exclusive_cst": max(
@@ -725,16 +905,16 @@ def parse_args(argv=None):
     dates.add_argument("--start", type=_parse_day)
     parser.add_argument("--end", type=_parse_day)
     parser.add_argument(
-        "--pipeline-log", default=r"./logs/push/pipeline_runs.jsonl"
+        "--pipeline-log", default=r".\logs\push\pipeline_runs.jsonl"
     )
     parser.add_argument(
-        "--event-log", default=r"./logs/push/qq_push_dedupe.jsonl"
+        "--event-log", default=r".\logs\push\qq_push_dedupe.jsonl"
     )
     parser.add_argument(
-        "--dedupe-db", default=r"./db/qq_push_dedupe.db"
+        "--dedupe-db", default=r".\db\qq_push_dedupe.db"
     )
     parser.add_argument(
-        "--reports-dir", default=r"./reports/agents"
+        "--reports-dir", default=r".\reports\agents"
     )
     parser.add_argument(
         "--forward-start",
@@ -750,7 +930,7 @@ def parse_args(argv=None):
     parser.add_argument("--finality-grace-minutes", type=int, default=45)
     parser.add_argument(
         "--json-out",
-        default=r"./reports/quality/push-completeness-audit.json",
+        default=r".\reports\quality\push-completeness-audit.json",
     )
     args = parser.parse_args(argv)
     if args.start is None and args.end is not None:

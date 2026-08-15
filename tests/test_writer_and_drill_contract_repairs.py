@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for writer ownership and controlled drill maintenance."""
+"""Regression tests for public writer ownership and collection status."""
 from __future__ import annotations
 
 import io
@@ -36,6 +36,8 @@ class WriterOwnershipTests(unittest.TestCase):
         self.assertIn("jobb_live_account_check.py", fast)
         self.assertIn('"contract_statistics"', fast)
         self.assertIn('"--contract-stats-only"', fast)
+        self.assertIn('"official_positioning"', fast)
+        self.assertIn('collect_positioning_current.py', fast)
         # 2026-08-06 demo 全量下线：快采不得再**调用**任何 demo 步骤。
         # 断言针对调用形态而非文件名字样——注释里提历史沿革是允许的。
         self.assertNotIn('run_step("demo_position_check"', fast)
@@ -65,6 +67,7 @@ class FastCollectionStatusTests(unittest.TestCase):
             "collect_data": True,
             "market_features": True,
             "contract_statistics": True,
+            "official_positioning": True,
             "live_account_check": True,
             "demo_account_check": True,
             "demo_position_check": True,
@@ -94,6 +97,13 @@ class FastCollectionStatusTests(unittest.TestCase):
             ),
         )
 
+    def test_ticker_below_goal_quality_marks_collect_data_degraded(self) -> None:
+        steps = self._steps()
+        for step in steps:
+            if step["name"] == "collect_data":
+                step["payload"] = {"degraded": True}
+        self.assertEqual("degraded", fast_collect._collection_status(steps))
+
     def test_only_enrichment_may_degrade(self) -> None:
         self.assertEqual(
             "degraded",
@@ -105,6 +115,12 @@ class FastCollectionStatusTests(unittest.TestCase):
             "degraded",
             fast_collect._collection_status(
                 self._steps(contract_statistics=False)
+            ),
+        )
+        self.assertEqual(
+            "degraded",
+            fast_collect._collection_status(
+                self._steps(official_positioning=False)
             ),
         )
         self.assertEqual(
@@ -141,6 +157,25 @@ class FastCollectionStatusTests(unittest.TestCase):
             step for step in steps if step["name"] == "contract_statistics")
         warning = fast_collect._step_degraded_warning(contract_step)
         self.assertIn("unresolved=2", warning)
+
+    def test_positioning_degraded_warning_keeps_failure_counts(self) -> None:
+        step = {
+            "name": "official_positioning",
+            "ok": False,
+            "rc": 1,
+            "payload": {
+                "degraded": True,
+                "positioning_coverage_rate": 237 / 431,
+                "retry": {
+                    "initial_invalid_symbols": 431,
+                    "retry_recovered_symbols": 237,
+                    "final_failed_symbols": 194,
+                },
+            },
+        }
+        warning = fast_collect._step_degraded_warning(step)
+        self.assertIn("coverage=0.549884", warning)
+        self.assertIn("final_failed=194", warning)
 
     def test_main_records_error_when_live_snapshot_writer_fails(self) -> None:
         # 原用 demo_position_check 打这条链；2026-08-06 demo 下线后它不再是必需源，

@@ -134,6 +134,112 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
         self.assertEqual(result["status"], "NOT_MET")
         self.assertFalse(result["checks"]["acceptance_thresholds_not_weakened"])
 
+    def test_tampered_side_diagnostic_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["models"][0]["diagnostics"]["by_side"][0][
+                "precision_after_cost"
+            ] = 0.0
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["aggregate_metrics_match_labels"])
+
+    def test_tampered_cross_section_rank_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            with labels.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+                fieldnames = reader.fieldnames
+            rows[0]["selected_probability_rank"] = "2"
+            with labels.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["all_label_fields_match_raw_evidence"])
+
+    def test_tampered_candidate_probability_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            with labels.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+                fieldnames = reader.fieldnames
+            rows[0]["candidate_probability_1H_long"] = "0.01"
+            with labels.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["all_label_fields_match_raw_evidence"])
+
+    def test_tampered_feature_diagnostic_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["models"][0]["diagnostics"]["by_asset_class"][0][
+                "n_labeled"] = 99
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["aggregate_metrics_match_labels"])
+
+    def test_missing_preregistered_day_slice_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["models"][0].pop("by_day")
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["aggregate_metrics_match_labels"])
+
+    def test_duplicate_preregistered_day_slice_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["models"][0]["by_day"].append(
+                dict(payload["models"][0]["by_day"][0]))
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(result["checks"]["aggregate_metrics_match_labels"])
+
     def test_stricter_acceptance_thresholds_are_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             evaluation, labels, shadow, market = _fixture(Path(temp))
@@ -147,6 +253,21 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
             contract["minimum_distinct_cycles"] = 200
             # Recompute the reported metrics under the stricter gates so only
             # the non-weakening contract itself is under test.
+            def tighten_requirements(value):
+                if isinstance(value, dict):
+                    requirements = value.get("requirements")
+                    if isinstance(requirements, dict):
+                        requirements.update({
+                            "minimum_sample_met": False,
+                            "minimum_days_met": False,
+                            "minimum_cycles_met": False,
+                        })
+                    for child in value.values():
+                        tighten_requirements(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        tighten_requirements(child)
+
             for model in payload["models"]:
                 model["overall"]["requirements"].update({
                     "minimum_sample_met": False,
@@ -159,6 +280,13 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
                         "minimum_days_met": False,
                         "minimum_cycles_met": False,
                     })
+                for day in model["by_day"]:
+                    day["requirements"].update({
+                        "minimum_sample_met": False,
+                        "minimum_days_met": False,
+                        "minimum_cycles_met": False,
+                    })
+                tighten_requirements(model["diagnostics"])
             evaluation.write_text(json.dumps(payload), encoding="utf-8")
             result = auditor.audit(
                 evaluation_path=evaluation,
@@ -168,6 +296,22 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
             )
         self.assertTrue(result["checks"]["acceptance_thresholds_not_weakened"])
         self.assertEqual(result["status"], "PASSED")
+
+    def test_side_diversity_threshold_cannot_be_weakened(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["acceptance_contract"]["minimum_short_labels"] = 29
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertFalse(
+            result["checks"]["acceptance_thresholds_not_weakened"])
+        self.assertEqual(result["status"], "NOT_MET")
 
 
 if __name__ == "__main__":

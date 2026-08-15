@@ -4,6 +4,8 @@ r"""V2.0 §6 —— 源时效审计（registry-aware staleness，根治稀疏源
 把 `_registry.freshness_report` 接上真实数据：从各数据表**推导**每个 registry 源的真·last_seen
 （ledger.collection_runs 只到采集器粒度、data_source_quality 不每轮更新，故按数据表推导才准），
 再按源 native_cadence 判 stale——周更/工作日更源周末无更新**不算 stale**。
+全宇宙批次源以最新精确批次里的最老真实观察时间判鲜，禁止用请求完成时间
+或单个较新币掩盖其余币的过期值。
 
 **只读**（不写任何库），供主人触发的 on-demand 维护会话审源健康 / 决定是否灰度改
 registry.json。
@@ -20,8 +22,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, r"./collectors/sources")
-sys.path.insert(0, r"./scripts")
+sys.path.insert(0, r".\collectors\sources")
+sys.path.insert(0, r".\scripts")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -105,6 +107,7 @@ def _macro_source_timestamps(
         "macro_dxy_calc_ecb",
         "macro_etf_flow",
         "macro_fear_greed",
+        "macro_fed_funds",
     ):
         observed = str(public_dates.get(source_id) or "").strip()
         out[source_id] = (
@@ -137,8 +140,17 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
             mkt, "SELECT MAX(ts) FROM market_microstructure"))
         ls["okx_recent_trades"] = _to_cst_str(_max_ts(
             mkt, "SELECT MAX(ts) FROM market_trade_flow"))
+        # A new request completion or one fresh symbol must not make an old
+        # whole-universe batch look fresh.  Use the oldest observation inside
+        # the latest exact official batch, matching the decision gate.
         ls["okx_top_long_short"] = _to_cst_str(_max_ts(
-            mkt, "SELECT MAX(collected_ts) FROM market_positioning"))
+            mkt,
+            "SELECT MIN(ts) FROM market_positioning "
+            "WHERE source='okx_rest_contract_long_short_ratio' "
+            "AND collected_ts=(SELECT MAX(collected_ts) "
+            "FROM market_positioning WHERE "
+            "source='okx_rest_contract_long_short_ratio')",
+        ))
         # 合约统计可能包含受限的 previous-batch carry-forward；源新鲜度必须
         # 取原始 observation ``ts``，绝不能用每轮重写的 collected_ts 掩盖老化。
         contract_statistics_source_ts = _to_cst_str(_max_ts(
@@ -195,6 +207,11 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
             "WHERE source='x_search' AND tags LIKE '%authoritative_data%'"))
         ls["okx_news"] = _to_cst_str(_max_ts(
             news, f"SELECT MAX({_n}) FROM news_items WHERE source='okx_news'"))
+        # 2026-08-13 官方公告源：公告可数日无更新（staleness=48h 已放宽），
+        # 时效按最近入库公告行判；从未采到 → missing_optional（不阻断）。
+        ls["okx_announcements"] = _to_cst_str(_max_ts(
+            news,
+            f"SELECT MAX({_n}) FROM news_items WHERE source='okx_announcements'"))
     finally:
         for c in (mkt, reg, news):
             if c:
@@ -204,7 +221,7 @@ def derive_last_seen(db_root: Path) -> dict[str, Optional[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="registry-aware 源时效审计（只读）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--registry", default=None)
     args = ap.parse_args()
     reg = _registry.load_registry(args.registry) if args.registry else _registry.load_registry()

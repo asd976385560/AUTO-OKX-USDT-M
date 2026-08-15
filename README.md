@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-12
+last-updated: 2026-08-16
 updated-by: Codex
-change-summary: Sync the live-only runtime, consolidated collection, multitimeframe evidence and public safety boundary.
+change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidence, action contracts and public safety gates.
 -->
 
 <p align="center">
@@ -69,13 +69,14 @@ GitHub Release 名称统一为 `v<VERSION>`。每次发布的非空说明及版�
 
 ## 本次同步
 
-2026-08-12 的同步以实际运行代码为来源，并在进入公开项目时重新应用可移植与安全边界：
+本分支同步截至 2026-08-15 的实际运行代码，并在进入公开项目时重新应用可移植与安全边界：
 
 - Demo 运行能力、角色和数据库初始化目标已经下线，主链收敛为 unified live → push；
-- `collect_cycle.py` 将整点 fast → news → slow 与每刻钟 fast → news 聚合运行，逐步记录结果并隔离失败；
-- OPEN/ADD 必须绑定同一 cycle 的 exact 已收盘 15m/1H/4H 证据，writer 与 executor 独立重验；新闻时间层、资产类别、经验契约和模型影子评估同步纳入；
+- `collect_cycle.py` 将整点 fast → news → slow 与每刻钟 fast → news 聚合运行，逐步记录结果、绝对截止时间和副作用失败；
+- 新增 OKX 公告、官方合约历史、BOLL/OBV、仓位批次与有界市场特征恢复，并用完整轮 SLA、字段覆盖和周期报告审计核验采集结果；
+- OPEN/ADD 必须绑定同一 cycle 的 exact 已收盘 15m/1H/4H 证据，REDUCE/ADJUST_PROTECTION 也进入明确动作契约，writer 与 executor 独立重验；
 - Live 风控同时执行组合 IMR 66.6%、单笔增量 IMR 15%、单笔止损风险 5%、可用保证金、有限数值、账仓一致和 actor attestation 闸；
-- Push 使用 17 项完整报告契约，并对计划槽、归档和精确送达分别审计；
+- Push 使用 16 项静态必含段，三周期、执行审计和业务证明由独立版本化硬闸校验，并对计划槽、归档和精确送达分别审计；
 - 所有公开路径使用项目根或占位符，迁移默认 dry-run 且写入必须显式授权和验证备份；公开 `ledger_autoheal.py` 永久只读；
 - 业务推送与告警目标分离，只从 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 读取；真实凭证、目标、主机状态、数据库、日志和修复工具均不进入仓库。
 

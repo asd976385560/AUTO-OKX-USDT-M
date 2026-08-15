@@ -18,15 +18,18 @@ analyst 已写进 analysis.db 的产出，本脚本 verbatim 取用而非复述�
   ledger.db    collection_runs（本 cycle status!=ok → 运行故障进异常段）
   cum_pnl.py   累计收益兜底（render 另有权威覆盖）
 
-资金/持仓数/累计收益/轮次/耗时/channel 由 render 权威覆盖，本脚本填真兜底值即可。
+资金/累计收益/轮次/耗时/channel 由 render 权威覆盖。本脚本优先用同 cycle
+live_facts 的交易前快照作基线，只投影 facts.as_of 后至构建时点的账本成交；payload
+带同 cycle positions_projected_cycle 时，render 不再用较旧 position_snapshots 覆盖持仓数。
 
 用法:
-  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root ./db] [--out-file x.json]
+  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root .\\db] [--out-file x.json]
   缺 --cycle 时取 analysis_runs 最新 cycle。
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 import sys
@@ -45,7 +48,16 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_DB = r"./db"
+DEFAULT_DB = r".\db"
+BUSINESS_ERROR_REPORTABLE_FROM = "2026-08-14T02:15"
+INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = "2026-08-15T08:00"
+INTER_REPORT_WINDOW_MINUTES = 15
+INTER_REPORT_RECONCILE_SOURCES = {
+    "exchange_fills_reconcile",
+    "execution_journal_recovery",
+}
+INTER_REPORT_DIRECT_FILL_SOURCE = "fills"
+INTER_REPORT_DIRECT_TS_SOURCE = "fills.fillTime"
 
 # trades.action(+side) → 标准枚举（render/validate 只认单枚举，禁复合标签）
 _OPEN = {"open", "add"}
@@ -113,22 +125,76 @@ def _hold_min(db_root, prof, symbol, now):
     return m if m >= 0 else None
 
 
-def _open_sl_pct(db_root, prof, symbol, avg_px):
-    """当前持仓的 SL 距离%（从建仓 open trade 的 `raw.sl_trigger_px` 确定性读，**不查 API**）。
+def _sl_buffer_pct(side, mark_px, sl_px):
+    """现价→SL 触发价的方向感知缓冲%（2026-08-13 双口径显示）。
+
+    long: (mark−sl)/mark；short: (sl−mark)/mark；×100 保留 1 位。
+    可为 ≤0（价格已到/越过触发边界的瞬时状态），render 显式标注不吞。
+    任一输入缺失/非法 → None（render 回退只显计划口径，绝不伪造）。
+    """
+    try:
+        mark = float(mark_px)
+        sl = float(sl_px)
+    except (TypeError, ValueError):
+        return None
+    if mark <= 0 or sl <= 0:
+        return None
+    s = str(side or "").lower()
+    if s == "long":
+        return round((mark - sl) / mark * 100, 1)
+    if s == "short":
+        return round((sl - mark) / mark * 100, 1)
+    return None
+
+
+def _latest_fresh_last(db_root, symbol, as_of, max_age_min=30):
+    """as_of 前最近且不早于 max_age_min 的 tick last（market.db，UTC-Z ts）。
+
+    fallback 持仓路径的现价来源；过旧/缺失 → None（宁缺勿假，
+    render 回退只显计划口径）。canonical live_facts 路径直接用同轮 markPx，不走这里。
+    """
+    as_of_dt = _as_cst_datetime(as_of)
+    if as_of_dt is None:
+        return None
+    # 归一为 naive UTC 墙钟，与 tick_snapshots 的 UTC-Z 字符串同域比较。
+    as_of_utc = as_of_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    row = _one(
+        db_root, "market.db",
+        "SELECT ts,last FROM tick_snapshots WHERE symbol=? "
+        "AND last IS NOT NULL AND ts<=? ORDER BY ts DESC LIMIT 1",
+        (symbol, as_of_utc.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    if not row or row["last"] is None:
+        return None
+    try:
+        tick_dt = datetime.strptime(str(row["ts"]), "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+    if (as_of_utc - tick_dt).total_seconds() > max_age_min * 60:
+        return None
+    try:
+        return float(row["last"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _open_sl_info(db_root, prof, symbol, avg_px):
+    """当前持仓的 SL 计划口径（从建仓 open trade 的 `raw.sl_trigger_px` 确定性读，**不查 API**）。
     根治「SL未挂」误导缺口（2026-07-09）：position_snapshots 不带 SL，render 恒显 SL未挂——
     但 order_executor 开仓时已把附挂 SL 的 slTriggerPx 记进 open trade 的 raw（含 sl_verified）。
     entry 定位同 _hold_min（最后全平后的 open/add）；取最近一笔合格 open 的 sl_trigger_px。
-    距离% = |sl_trigger − avg_px| / avg_px × 100；无 SL 记录 → None（render 显真『SL未挂』=真裸仓）。"""
+    返回 (sl_pct, sl_px)：sl_pct = |sl_trigger − avg_px| / avg_px × 100 —— 这是
+    **开仓口径的计划止损距离**（entry 与 SL 均冻结，随价格不变，语义即如此）；
+    现价缓冲另由 _sl_buffer_pct 计算。无 SL 记录 → (None, None)（render 显真『SL未挂』）。"""
     try:
         ap = float(avg_px)
     except (TypeError, ValueError):
-        return None
+        return None, None
     if not ap:
-        return None
+        return None, None
     rows = _rows(db_root, f"{prof}_trades.db",
                  "SELECT ts, action, raw FROM trades WHERE symbol=? ORDER BY ts", (symbol,))
     if not rows:
-        return None
+        return None, None
     closes = [str(r["ts"]) for r in rows
               if str(r.get("action") or "").lower() in ("close", "stop_loss")]
     last_close = max(closes) if closes else ""
@@ -142,7 +208,8 @@ def _open_sl_pct(db_root, prof, symbol, avg_px):
         except (TypeError, ValueError):
             slt = None
         if slt:
-            return round(abs(slt - ap) / ap * 100, 1)
+            return round(abs(slt - ap) / ap * 100, 1), slt
+    return None, None
     return None
 
 
@@ -352,6 +419,8 @@ def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts, as_of=
                 current = {
                     "symbol": symbol, "side": side, "sz": qty,
                     "avgPx": trade.get("fill_px"), "lev": trade.get("lev"), "upl": 0.0,
+                    "_projected_after_baseline": True,
+                    "_projected_open_after_baseline": True,
                 }
                 positions[key] = current
                 order.append(key)
@@ -367,6 +436,8 @@ def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts, as_of=
             current["sz"] = new_qty
             if trade.get("lev") not in (None, ""):
                 current["lev"] = trade.get("lev")
+            current["_projected_after_baseline"] = True
+            current["_projected_open_after_baseline"] = True
         elif action in _CLOSE:
             current = positions.get(key)
             if current is None:
@@ -380,6 +451,7 @@ def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts, as_of=
                 old_upl = _float_or_none(current.get("upl"))
                 if old_upl is not None and old_qty > 0:
                     current["upl"] = old_upl * new_qty / old_qty
+                current["_projected_after_baseline"] = True
 
     return [positions[key] for key in order if key in positions]
 
@@ -522,15 +594,514 @@ def _action_from_trades(trades: list) -> str | None:
     return "/".join(actions)
 
 
+def _trade_business_identity(row: dict) -> dict:
+    """Return the stable business identity of one persisted fill row.
+
+    Reports use this identity for a fail-closed build/send attestation.  The
+    fields are deliberately limited to immutable execution facts; display-only
+    reasoning and optional risk annotations must not make an otherwise
+    unchanged report look stale.
+    """
+    return {
+        "id": _ledger_order(row.get("id"), 0),
+        "ts": str(row.get("ts") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "action": str(row.get("action") or "").lower(),
+        "side": str(row.get("side") or "").lower(),
+        "sz": _float_or_none(row.get("sz")),
+        "fill_px": _float_or_none(row.get("fill_px")),
+        "pnl": _float_or_none(row.get("pnl")),
+    }
+
+
+def _business_report_attestation(
+    cycle: str, tc: dict, trades: list[dict], *, profile: str = "live"
+) -> dict:
+    """Seal the exact terminal and fill set represented by this payload."""
+    identities = [_trade_business_identity(row) for row in trades]
+    body = {
+        "schema_version": 1,
+        "profile": profile,
+        "cycle_id": str(cycle),
+        "decision": str(tc.get("decision") or "").strip().lower(),
+        "n_orders": int(tc.get("n_orders")),
+        "trade_count": len(identities),
+        "trades": identities,
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    body["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return body
+
+
+def _inter_report_window(cycle: str) -> tuple[str, str]:
+    """Return the half-open CST report interval ``(cycle-15m, cycle]``."""
+    try:
+        end = datetime.strptime(str(cycle), "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid report cycle for inter-report fills") from exc
+    start = end - timedelta(minutes=INTER_REPORT_WINDOW_MINUTES)
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _inter_report_exchange_identity(row: dict) -> dict | None:
+    """Return a stable identity for an exchange-proved prior-cycle fill.
+
+    Besides reconciliation rows, a normal executor receipt can land after its
+    own cycle's report path has already failed. Such a row is authoritative
+    only when it keeps both the OKX fills endpoint provenance and a unique
+    order id; otherwise it remains outside the interval attestation.
+    """
+    raw = _loads(row.get("raw"))
+    if not isinstance(raw, dict):
+        return None
+    ord_ids = []
+    candidates = raw.get("ord_ids")
+    if not isinstance(candidates, list):
+        candidates = []
+    candidates = [
+        *candidates,
+        raw.get("ord_id"),
+        raw.get("ordId"),
+        *[
+            fill.get("ordId") or fill.get("ord_id")
+            for fill in (raw.get("fills") or [])
+            if isinstance(fill, dict)
+        ],
+    ]
+    for value in candidates:
+        token = str(value or "").strip()
+        if token and token not in ord_ids:
+            ord_ids.append(token)
+    reconcile_source = str(raw.get("reconcile_source") or "").strip()
+    if reconcile_source in INTER_REPORT_RECONCILE_SOURCES:
+        proof_source = reconcile_source
+    elif (
+        str(raw.get("fill_source") or "").strip()
+        == INTER_REPORT_DIRECT_FILL_SOURCE
+        and str(raw.get("ts_source") or "").strip()
+        == INTER_REPORT_DIRECT_TS_SOURCE
+        and ord_ids
+    ):
+        proof_source = INTER_REPORT_DIRECT_FILL_SOURCE
+    else:
+        return None
+    return {
+        "id": _ledger_order(row.get("id"), 0),
+        "original_cycle_id": str(row.get("cycle_id") or ""),
+        "ts": str(row.get("ts") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "action": str(row.get("action") or "").lower(),
+        "side": str(row.get("side") or "").lower(),
+        "sz": _float_or_none(row.get("sz")),
+        "fill_px": _float_or_none(row.get("fill_px")),
+        "pnl": _float_or_none(row.get("pnl")),
+        "reconcile_source": proof_source,
+        "ord_ids": sorted(ord_ids),
+    }
+
+
+def _inter_report_exchange_attestation(
+    db_root: str, cycle: str, *, profile: str = "live"
+) -> dict:
+    """Seal exchange-proved fills omitted from the current-cycle trade set.
+
+    A fill keeps its original business cycle for ledger attribution. Reporting
+    it separately in ``(cycle-15m, cycle]`` preserves that truth while ensuring
+    a late normal executor receipt or protective/external recovery is visible
+    exactly once.
+    """
+    start, end = _inter_report_window(cycle)
+    rows = _rows(
+        db_root,
+        f"{profile}_trades.db",
+        "SELECT id,cycle_id,ts,symbol,action,side,sz,fill_px,pnl,raw "
+        "FROM trades WHERE ts>? AND ts<=? "
+        "AND (cycle_id IS NULL OR cycle_id!=?) ORDER BY ts,id",
+        (start, end, cycle),
+    )
+    identities = []
+    for row in rows:
+        identity = _inter_report_exchange_identity(row)
+        if identity is not None:
+            identities.append(identity)
+    body = {
+        "schema_version": 1,
+        "profile": profile,
+        "cycle_id": str(cycle),
+        "window_start_exclusive_cst": start,
+        "window_end_inclusive_cst": end,
+        "fill_count": len(identities),
+        "fills": identities,
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    body["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return body
+
+
+def _failure_report_attestation(
+    cycle: str, context: dict, intent_safety: dict, *, profile: str = "live"
+) -> dict:
+    """Seal the proved absence of a business terminal for a failure report."""
+    body = {
+        "schema_version": 1,
+        "profile": profile,
+        "cycle_id": str(cycle),
+        "terminal": "absent",
+        "trade_count": 0,
+        "failure_kind": str(
+            context.get("failure_kind") or "agent_process_failed"),
+        "intent_rows": int(intent_safety.get("intent_rows") or 0),
+        "failed_clean_rows": int(
+            intent_safety.get("failed_clean_rows") or 0),
+        "unsafe_rows": int(intent_safety.get("unsafe_rows") or 0),
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    body["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return body
+
+
 def _map_decision(dec: str) -> str:
     d = str(dec or "").lower()
     return {"traded": "TRADED", "hold": "HOLD", "skip": "WAIT",
             "degraded": "DEGRADED", "error": "ERROR"}.get(d, "UNKNOWN")
 
 
-def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
+def _verified_adjustment_item(raw: object) -> dict | None:
+    """Return normalized protection evidence only after full readback checks."""
+    if not isinstance(raw, dict) or raw.get("dryrun") is True:
+        return None
+    change = raw.get("protection_change")
+    state = raw.get("protection_state")
+    applied = raw.get("applied")
+    path = str(raw.get("path") or "").strip()
+    requested = bool(
+        isinstance(change, dict)
+        and (
+            change.get("requested_sl") is not None
+            or change.get("requested_tp") is not None
+            or change.get("resize_to_full_position") is True
+        )
+    )
+    sl = _float_or_none(applied.get("sl")) if isinstance(applied, dict) else None
+    sz = _float_or_none(applied.get("sz")) if isinstance(applied, dict) else None
+    if not (
+        requested
+        and isinstance(state, dict)
+        and state.get("ok") is True
+        and sl is not None and sl > 0
+        and sz is not None and sz > 0
+        and path in {
+            "amend", "amend_consolidate", "place_new",
+            "replace_fallback", "oco_replace",
+        }
+    ):
+        return None
+    return raw
+
+
+def _action_from_cycle(raw: dict, decision: str) -> str:
+    """Prefer only a verified executor side effect over the coarse decision."""
+    action = str((raw or {}).get("action_taken") or "").strip().upper()
+    if action == "ADJUST_PROTECTION":
+        if _verified_adjustment_item(raw) is not None:
+            return "ADJUST"
+        return _map_decision(decision)
+    if action == "ADJUST":
+        # Historical free-form alias: without executor readback it is a HOLD,
+        # not evidence that an exchange protection order changed.
+        return _map_decision(decision)
+    allowed = {
+        "OPEN_LONG", "OPEN_SHORT", "CLOSE", "STOP_LOSS",
+        "HOLD", "WAIT", "NONE", "REDUCE", "ADD",
+    }
+    return action if action in allowed else _map_decision(decision)
+
+
+def _upstream_failure_card(context: dict) -> dict:
+    kind = str(context.get("failure_kind") or "agent_process_failed")
+    if context.get("stage") == "collection":
+        missing = ",".join(
+            str(item) for item in (
+                context.get("missing_required_sources") or [])) or "unknown"
+        return {
+            "direction_evidence": [
+                f"必需采集源未齐（{missing}），没有完整的当轮市场方向证据"
+            ],
+            "opposing_evidence": [
+                "Agent 与 executor 路径均未启动，禁止用旧数据推断方向或成交"
+            ],
+            "execution_conditions": "fail-closed：本轮禁止 OPEN/ADD/下单",
+            "invalidation_point": "不适用；该卡只记录采集失败闭环，不构成交易判断",
+            "risk_reward": "不适用；零新增敞口",
+            "portfolio_impact": "零新增风险；既有仓位事实仅作只读展示",
+            "historical_experience": {
+                "matched_wins": [],
+                "matched_losses": [],
+                "missed_opportunities": [],
+                "usage": "not_used",
+                "reason": "采集闸失败时禁止用历史经验替代当轮市场证据",
+            },
+            "agent_judgement": (
+                f"Agent 未启动；系统按 fail-closed 记 WAIT（{kind}）"),
+            "reference_overrides": [],
+        }
+    checks = (
+        (context.get("business_check") or {}).get("checks")
+        if isinstance(context.get("business_check"), dict) else []
+    )
+    checks = checks if isinstance(checks, list) else []
+    analysis_found = any(
+        isinstance(item, dict)
+        and item.get("db") == "analysis.db"
+        and item.get("table") == "analysis_runs"
+        and item.get("found") is True
+        for item in checks
+    )
+    if analysis_found:
+        direction_evidence = [
+            "analysis.db 已形成分析证据，但分析候选不等于交易执行裁决"
+        ]
+        opposing_evidence = [
+            "live_trades.db.trade_cycles 交易终态缺失，禁止推断已 HOLD 或已执行"
+        ]
+        judgement = (
+            f"Agent 已形成分析，但未形成交易终态；系统按 fail-closed 记 WAIT（{kind}）")
+    else:
+        direction_evidence = ["上游 live 阶段失败，未形成可执行方向证据"]
+        opposing_evidence = ["缺少有效分析/交易业务终态，禁止推断方向"]
+        judgement = (
+            f"Agent 未形成当轮判断；系统按 fail-closed 记 WAIT（{kind}）")
+    return {
+        "direction_evidence": direction_evidence,
+        "opposing_evidence": opposing_evidence,
+        "execution_conditions": "fail-closed：本轮禁止 OPEN/ADD/下单",
+        "invalidation_point": "不适用；该卡只记录失败闭环，不构成交易判断",
+        "risk_reward": "不适用；零新增敞口",
+        "portfolio_impact": "零新增风险；既有仓位事实仅作只读展示",
+        "historical_experience": {
+            "matched_wins": [],
+            "matched_losses": [],
+            "missed_opportunities": [],
+            "usage": "not_used",
+            "reason": "上游失败时禁止用历史经验替代当轮分析",
+        },
+        "agent_judgement": judgement,
+        "reference_overrides": [],
+    }
+
+
+def _trade_terminal_valid(tc: dict) -> bool:
+    decision = str(tc.get("decision") or "").strip().lower()
+    try:
+        n_orders = int(tc.get("n_orders"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        (decision == "traded" and n_orders > 0)
+        or (decision in {"hold", "skip"} and n_orders == 0)
+    )
+
+
+def _compact_execution_token(value, limit: int = 180) -> str:
+    rendered = " ".join(str(value or "-").replace("\r", " ")
+                        .replace("\n", " ").split())
+    return rendered[:limit]
+
+
+def _verified_adjustment_execution(raw: dict, decision: str) -> dict | None:
+    """Render only executor-verified protection changes as an execution fact."""
+    batch = raw.get("protection_changes") if isinstance(raw, dict) else None
+    if isinstance(batch, list) and batch:
+        candidates = batch
+    elif _action_from_cycle(raw, decision) == "ADJUST":
+        candidates = [raw]
+    else:
+        return None
+    verified = [_verified_adjustment_item(item) for item in candidates]
+    if any(item is None for item in verified):
+        return None
+    segments = []
+    first_sl = "-"
+    for item in verified:
+        assert isinstance(item, dict)
+        applied = item.get("applied") if isinstance(item.get("applied"), dict) else {}
+        state = item.get("protection_state") \
+            if isinstance(item.get("protection_state"), dict) else {}
+        rows = [row for row in state.get("rows") or [] if isinstance(row, dict)]
+        readback_state = next(
+            (str(row.get("state")) for row in rows if row.get("state")),
+            "verified",
+        )
+        symbol = str(item.get("symbol") or "-")
+        path = str(item.get("path") or "-")
+        sl = _px(applied.get("sl"))
+        first_sl = sl if first_sl == "-" else first_sl
+        tp = _px(applied.get("tp")) if applied.get("tp") is not None else "-"
+        sz = _num_or_dash(applied.get("sz"))
+        algo_id = str(applied.get("algoId") or "-")
+        segments.append(
+            f"{symbol} path={path} sz={sz} SL={sl} TP={tp} "
+            f"algoId={algo_id} readback=verified/{readback_state}"
+        )
+    shown = "; ".join(segments[:4])
+    if len(segments) > 4:
+        shown += f"; +{len(segments) - 4} more"
+    return {
+        "result": (
+            f"ADJUST_PROTECTION batch={len(segments)} no_fill {shown} "
+            "exchange_side_effect=protection_only"
+        ),
+        "fill_px": "no_fill",
+        "stop_px": first_sl,
+    }
+
+
+def _require_business_error_terminal(
+    db_root: str,
+    cycle: str,
+    tc: dict,
+    raw: dict,
+    trades: list[dict],
+) -> dict:
+    """Validate a zero-side-effect ERROR/DEGRADED terminal for reporting."""
+    if str(cycle) < BUSINESS_ERROR_REPORTABLE_FROM:
+        raise ValueError("business error reporting not active for this cycle")
+    decision = str(tc.get("decision") or "").strip().lower()
+    try:
+        n_orders = int(tc.get("n_orders"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("business error terminal n_orders invalid") from exc
+    if decision not in {"error", "degraded"} or n_orders != 0 or trades:
+        raise ValueError("business error report requires zero orders/trades")
+    if str(raw.get("status") or "").strip().lower() != decision:
+        raise ValueError("business error raw status mismatch")
+    try:
+        if int(raw.get("n_orders")) != 0:
+            raise ValueError("business error raw n_orders must be zero")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("business error raw n_orders must be zero") from exc
+    action = str(raw.get("action_taken") or "").strip().upper()
+    allowed = {"REJECT"} if decision == "error" else {"REJECT", "WAIT", "HOLD"}
+    if action not in allowed:
+        raise ValueError("business error raw action is not reportable")
+    raw_trades = raw.get("trades")
+    if not isinstance(raw_trades, list) or raw_trades:
+        raise ValueError("business error raw trades must be an empty list")
+    reason = (
+        raw.get("reject_reason")
+        or next((item for item in raw.get("errors") or [] if item), None)
+        or tc.get("note")
+    )
+    if not reason:
+        raise ValueError("business error terminal missing reason")
+    intent_safety = _require_failure_intents_clean(db_root, cycle)
+    return {
+        **intent_safety,
+        "decision": decision,
+        "raw_action": action,
+        "reason": str(reason),
+    }
+
+
+def _business_error_execution(
+    raw: dict,
+    decision: str,
+    symbol: str,
+    safety: dict,
+) -> dict:
+    reason = _compact_execution_token(
+        raw.get("reject_reason") or safety.get("reason"), 90)
+    detail = _compact_execution_token(
+        raw.get("reject_detail")
+        or next((item for item in raw.get("errors") or [] if item), "-"),
+        180,
+    )
+    return {
+        "result": (
+            f"{str(raw.get('action_taken') or 'REJECT').upper()} {symbol} "
+            f"no_fill orders=0 exchange_side_effect=none "
+            f"reason={reason} detail={detail}"
+        ),
+        "fill_px": "no_fill",
+        "stop_px": "-",
+    }
+
+
+def _require_failure_intents_clean(db_root: str, cycle: str) -> dict:
+    """Prove no exchange-submitted intent can be hidden by a WAIT report."""
+    try:
+        con = connect(db_root, "ledger.db")
+        try:
+            rows = [dict(row) for row in con.execute(
+                "SELECT state,ord_id,submitted_at,completed_at "
+                "FROM execution_intents WHERE profile='live' AND cycle_id=?",
+                (cycle,),
+            )]
+        finally:
+            con.close()
+    except Exception as exc:
+        raise ValueError(
+            "failure report requires readable execution_intents") from exc
+    unsafe = [
+        row for row in rows
+        if (
+            str(row.get("state") or "").strip().lower() != "failed_clean"
+            or row.get("ord_id") not in (None, "")
+            or row.get("submitted_at") not in (None, "")
+            or row.get("completed_at") not in (None, "")
+        )
+    ]
+    if unsafe:
+        states = sorted({
+            str(row.get("state") or "<missing>") for row in unsafe})
+        raise ValueError(
+            "failure report blocked by non-clean execution intents: "
+            + ",".join(states))
+    return {
+        "intent_rows": len(rows),
+        "failed_clean_rows": len(rows),
+        "unsafe_rows": 0,
+        "status": "PASSED",
+    }
+
+
+def build(
+    db_root: str,
+    cycle: str,
+    now: datetime | None = None,
+    upstream_failure: dict | None = None,
+) -> dict:
     now = now or datetime.now(CST)
     hhmm = cycle.split("T")[1] if "T" in cycle else now.strftime("%H:%M")
+    failure_report = upstream_failure is not None
+    if failure_report:
+        valid_stage = (
+            isinstance(upstream_failure, dict)
+            and upstream_failure.get("stage") in {"live", "collection"}
+            and upstream_failure.get("cycle_id") == cycle
+            and upstream_failure.get("status") == "failed"
+            and upstream_failure.get("profile_lease_released") is True
+            and int(upstream_failure.get("returncode") or 0) != 0
+        )
+        collection_safe = (
+            upstream_failure.get("stage") != "collection"
+            or (
+                upstream_failure.get("same_cycle_live_dispatched") is False
+                and bool(upstream_failure.get("missing_required_sources"))
+                and bool(upstream_failure.get("collection_receipt_sha256"))
+            )
+        )
+        if not valid_stage or not collection_safe:
+            raise ValueError("invalid upstream failure contract")
 
     # ── analyst 产出 ──────────────────────────────────────
     ar = _one(db_root, "analysis.db",
@@ -546,7 +1117,8 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     sigs = _rows(db_root, "analysis.db",
                  "SELECT symbol,total,action,side,confidence,reasoning,decision_card "
                  "FROM analysis_signals WHERE cycle_id=? "
-                 "ORDER BY CASE action WHEN 'close' THEN 0 WHEN 'open_long' THEN 1 "
+                 "ORDER BY CASE action WHEN 'close' THEN 0 WHEN 'reduce' THEN 0 "
+                 "WHEN 'adjust_protection' THEN 0 WHEN 'open_long' THEN 1 "
                  "WHEN 'open_short' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END,rowid",
                  (cycle,))
     top_sig = sigs[0] if sigs else {}
@@ -561,7 +1133,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                       (cycle,))
         tc = tc_row or {}
         tr = _rows(db_root, f"{prof}_trades.db",
-                   "SELECT ts,symbol,action,side,sz,fill_px,lev,margin,notional,pnl,reasoning,raw "
+                   "SELECT id,ts,symbol,action,side,sz,fill_px,lev,margin,notional,pnl,reasoning,raw "
                    "FROM trades WHERE cycle_id=? ORDER BY id", (cycle,))
         tc_raw = _loads(tc.get("raw"))
         # 2026-08-08 单笔保证金闸：从回执 raw.trades 透传单笔审计字段
@@ -589,16 +1161,52 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                        "present": tc_row is not None}
 
     all_trades = books["live"]["trades"]
+    inter_report_exchange_attestation = _inter_report_exchange_attestation(
+        db_root, cycle)
+    business_report_attestation = (
+        _business_report_attestation(
+            cycle, books["live"]["tc"], all_trades)
+        if books["live"]["present"]
+        else None
+    )
+    live_decision = str(
+        books["live"]["tc"].get("decision") or "").strip().lower()
+    business_error_safety = None
+    if live_decision in {"error", "degraded"}:
+        business_error_safety = _require_business_error_terminal(
+            db_root,
+            cycle,
+            books["live"]["tc"],
+            books["live"]["raw"],
+            all_trades,
+        )
+    failure_intent_safety = None
+    if failure_report:
+        if books["live"]["present"]:
+            # Any persisted business-cycle row is more authoritative than a
+            # synthetic runner-failure report.  Invalid/partial rows remain an
+            # explicit fail-closed gap and must not be relabelled as WAIT.
+            raise ValueError(
+                "upstream failure report forbidden when live trade terminal exists")
+        if all_trades:
+            raise ValueError(
+                "upstream failure report blocked by persisted trade rows")
+        failure_intent_safety = _require_failure_intents_clean(db_root, cycle)
+        business_report_attestation = _failure_report_attestation(
+            cycle, upstream_failure, failure_intent_safety)
 
     # ── headline action / symbol / confidence ─────────────
     action = _action_from_trades(all_trades)
     if action in (None, "TRADED"):
         # 只由已落库的盘推导头条动作：未落库的盘没有动作可言，拿它顶 UNKNOWN
         # 会把一轮干净的 live HOLD 报成未知。
-        decs = [_map_decision(books[p]["tc"].get("decision"))
+        decs = [_action_from_cycle(
+                    books[p]["raw"], books[p]["tc"].get("decision"))
                 for p in ("live",) if books[p]["present"]]
         action = next(
-            (label for label in ("ERROR", "DEGRADED", "UNKNOWN", "HOLD", "WAIT", "TRADED")
+            (label for label in (
+                "ERROR", "DEGRADED", "UNKNOWN", "ADJUST", "HOLD", "WAIT",
+                "NONE", "TRADED")
              if label in decs),
             "UNKNOWN",
         )
@@ -630,6 +1238,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     card = open_trade_card or _loads(conf_sig.get("decision_card"))
     if not isinstance(card, dict):
         card = {}
+    if failure_report:
+        action = "WAIT"
+        card = _upstream_failure_card(upstream_failure)
     confidence = "-"  # 旧推送键保留；新协议不显示或消费评分
 
     # ── summary（确定性组装，含市场实质）────────────────
@@ -648,7 +1259,9 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     book_acts = {"live": (
         "PENDING" if not books["live"]["present"]
         else (_action_from_trades(books["live"]["trades"])
-              or _map_decision(books["live"]["tc"].get("decision"))))}
+              or _action_from_cycle(
+                  books["live"]["raw"],
+                  books["live"]["tc"].get("decision"))))}
     head_cn = f"实盘{action_cn}"
     news_evts = news.get("events", []) if isinstance(news, dict) else []
     top_news = ""
@@ -660,6 +1273,42 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         top_news = f"；{str(news['summary'])[:36]}"
     summary = (f"{head_cn}：regime={regime}，{_usd_broad_summary(macro)}，"
                f"{len(open_cands)} 个 open 候选{top_news}")
+    if failure_report:
+        kind = upstream_failure["failure_kind"]
+        failure_stage = upstream_failure.get("stage")
+        failure_checks = (
+            (upstream_failure.get("business_check") or {}).get("checks")
+            if isinstance(upstream_failure.get("business_check"), dict)
+            else []
+        )
+        failure_checks = failure_checks if isinstance(
+            failure_checks, list) else []
+        failure_analysis_found = any(
+            isinstance(item, dict)
+            and item.get("db") == "analysis.db"
+            and item.get("table") == "analysis_runs"
+            and item.get("found") is True
+            for item in failure_checks
+        )
+        if failure_stage == "collection":
+            missing = ",".join(
+                str(item) for item in (
+                    upstream_failure.get("missing_required_sources") or []))
+            summary = (
+                f"实盘WAIT：采集闸失败（{kind}，缺失={missing or 'unknown'}），"
+                "Agent/执行器未启动；禁止用旧数据形成交易判断，零新增风险")
+        elif failure_analysis_found:
+            summary = (
+                f"实盘WAIT：上游 live 阶段失败（{kind}），分析已落库但交易业务终态"
+                "缺失；禁止把分析候选冒充执行裁决，零新增风险")
+        else:
+            summary = (
+                f"实盘WAIT：上游 live 阶段失败（{kind}），本轮未形成有效分析/"
+                "交易业务终态；禁止下单，零新增风险")
+    elif business_error_safety is not None:
+        summary = (
+            f"实盘{action}：本轮形成显式业务拒绝/错误终态，"
+            "orders=0、exchange_side_effect=none；保留原始失败原因并继续报告")
 
     # ── decision.reason（主体=headline 币 analyst 理由，恒在且最相关；叠成交理由+宏观+校准+教训）──
     live_raw = books["live"]["raw"]
@@ -732,6 +1381,30 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     if lesson_strs:
         reason_bits.append("教训：" + "；".join(lesson_strs))
     reason = " | ".join(reason_bits) or "regime、技术面、新闻、经验库综合确认。"
+    if failure_report:
+        if upstream_failure.get("stage") == "collection":
+            reason = (
+                "采集器已形成唯一失败终局，必需源账本仍未齐；系统独立确认 Agent/"
+                "executor 未启动，且分析、交易周期、成交均不存在。"
+                f"failure_kind={upstream_failure['failure_kind']}，"
+                "只生成失败闭环报告，不补采、不补写业务账本、不重派、不下单。")
+        elif failure_analysis_found:
+            reason = (
+                "Agent 分析已落库，但交易终态未形成；监督器已确认 live failed 且租约释放。"
+                f"failure_kind={upstream_failure['failure_kind']}，"
+                "系统只生成失败闭环报告，不补写交易账本、不重派、不下单。")
+        else:
+            reason = (
+                "Agent 未形成当轮判断；监督器已确认 live failed 且租约释放。"
+                f"failure_kind={upstream_failure['failure_kind']}，"
+                "系统只生成失败闭环报告，不补写分析/交易账本、不重派、不下单。")
+    elif business_error_safety is not None:
+        reason_bits.append(
+            "业务错误闭环："
+            f"action={business_error_safety['raw_action']}，"
+            f"reason={business_error_safety['reason']}，"
+            "execution intents 已验证无交易所提交或完成痕迹。")
+        reason = " | ".join(reason_bits)
 
     # ── 经验引用（market_summary.quant.playbook_matches 主源；experiences_cited 兜底）──
     play = {"play_id": "-", "play_title": "-", "hit_rate": "-",
@@ -786,6 +1459,11 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         facts = books["live"].get("raw", {}).get("live_facts")
         if not isinstance(facts, dict) or facts.get("status") != "ok":
             return None
+        if str(facts.get("cycle_id") or "") != str(cycle):
+            return None
+        facts_as_of = str(facts.get("as_of") or "")
+        if _as_cst_datetime(facts_as_of) is None:
+            return None
         fact_positions = facts.get("positions")
         if not isinstance(fact_positions, list):
             return None
@@ -805,6 +1483,13 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             sl_pct = None
             if avg_px and sl_px:
                 sl_pct = round(abs(sl_px - avg_px) / avg_px * 100, 1)
+            # 2026-08-13 双口径：facts 同轮 markPx 直接给现价缓冲（零额外 I/O）；
+            # markPx 缺失才回退最近 fresh tick，仍取不到 → None（只显计划口径）。
+            mark_px = _float_or_none(item.get("markPx"))
+            if mark_px is None and sl_px is not None:
+                mark_px = _latest_fresh_last(db_root, item.get("instId"), now)
+            sl_buffer = _sl_buffer_pct(item.get("posSide"), mark_px, sl_px) \
+                if sl_px is not None else None
             out.append({
                 "symbol": item.get("instId"),
                 "side": item.get("posSide"),
@@ -812,6 +1497,18 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                 "avgPx": _px(avg_px),
                 "lev": item.get("lever"),
                 "upl": _r2(item.get("upl")),
+                "upl_pct_initial_margin": _float_or_none(
+                    item.get("upl_pct_initial_margin")),
+                "margin_return_review_at_or_above_50pct": bool(
+                    item.get("margin_return_review_at_or_above_50pct")),
+                "secured_profit_at_stop_usdt": _r2(
+                    item.get("secured_profit_at_stop_usdt")),
+                "profit_retention_at_stop_pct_of_current_upl": (
+                    _float_or_none(item.get(
+                        "profit_retention_at_stop_pct_of_current_upl"))
+                ),
+                "giveback_to_stop_pct_of_current_upl": _float_or_none(
+                    item.get("giveback_to_stop_pct_of_current_upl")),
                 "notional_usd": _r2(item.get("mark_notional_usdt")),
                 "margin_usd": _r2(imr),
                 "margin_pct": (
@@ -819,24 +1516,96 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                     if imr is not None and equity else None
                 ),
                 "hold_min": round(age * 60) if age is not None else None,
-                "sl_pct": sl_pct,
+                "sl_pct": sl_pct, "sl_px": _px(sl_px),
+                "sl_buffer_pct": sl_buffer,
                 "profile": "live",
+            })
+        return {"rows": out, "as_of": facts_as_of}
+
+    def _complete_projected_fact_rows(rows, prof):
+        """Complete only rows changed after the immutable live-facts snapshot."""
+        eqr = _one(
+            db_root, "account.db",
+            "SELECT totalEq FROM account_snapshots WHERE profile=? "
+            "ORDER BY ts DESC,rowid DESC LIMIT 1", (prof,))
+        eq = _float_or_none((eqr or {}).get("totalEq"))
+        out = []
+        for source in rows:
+            row = dict(source)
+            projected = row.pop("_projected_after_baseline", False) is True
+            projected_open = row.pop(
+                "_projected_open_after_baseline", False) is True
+            if not projected:
+                out.append(row)
+                continue
+            symbol = str(row.get("symbol") or "")
+            side = str(row.get("side") or "").lower()
+            qty = _float_or_none(row.get("sz"))
+            avg_px = _float_or_none(row.get("avgPx"))
+            lev = _float_or_none(row.get("lev"))
+            mark_px = _latest_fresh_last(db_root, symbol, now)
+            ctv = _one(
+                db_root, "market.db",
+                "SELECT ctVal FROM instruments_cache WHERE instId=?", (symbol,))
+            ct_val = _float_or_none((ctv or {}).get("ctVal"))
+            reference_px = mark_px if mark_px is not None else avg_px
+            notional = (
+                qty * ct_val * reference_px
+                if qty is not None and ct_val is not None
+                and reference_px is not None else None
+            )
+            margin = notional / lev if notional is not None and lev else None
+            upl = _float_or_none(row.get("upl"))
+            if (
+                mark_px is not None and avg_px is not None
+                and qty is not None and ct_val is not None
+                and side in {"long", "short"}
+            ):
+                signed_move = mark_px - avg_px
+                upl = signed_move * qty * ct_val * (1 if side == "long" else -1)
+            sl_px = _float_or_none(row.get("sl_px"))
+            sl_pct = _float_or_none(row.get("sl_pct"))
+            if projected_open or sl_px is None:
+                sl_pct, sl_px = _open_sl_info(
+                    db_root, prof, symbol, avg_px)
+            out.append({
+                "symbol": symbol,
+                "side": side,
+                "sz": qty,
+                "avgPx": _px(avg_px),
+                "lev": lev,
+                "upl": _r2(upl),
+                "notional_usd": _r2(notional),
+                "margin_usd": _r2(margin),
+                "margin_pct": (
+                    round(margin / eq * 100, 1)
+                    if margin is not None and eq else None
+                ),
+                "hold_min": _hold_min(db_root, prof, symbol, now),
+                "sl_pct": sl_pct,
+                "sl_px": _px(sl_px),
+                "sl_buffer_pct": _sl_buffer_pct(side, mark_px, sl_px)
+                if sl_px is not None else None,
+                "profile": prof,
             })
         return out
 
     def _positions(prof):
-        if prof == "live":
-            canonical = _positions_from_live_facts()
-            if canonical is not None:
-                return canonical
-        snapshot_ts, rows = _latest_position_snapshot(db_root, prof, now)
-        # 只把这些行用于持仓内存投影；headline / execution / trades 段仍严格展示
-        # 当前 cycle，避免把交错 cycle 的成交误报为本轮执行。
         ledger_trades = _rows(
             db_root, f"{prof}_trades.db",
             "SELECT id AS ledger_rowid,ts,cycle_id,symbol,action,side,sz,fill_px,lev "
             "FROM trades ORDER BY id",
         )
+        if prof == "live":
+            canonical = _positions_from_live_facts()
+            if canonical is not None:
+                rows = _project_positions_through_trades(
+                    canonical["rows"], ledger_trades,
+                    canonical["as_of"], as_of=now)
+                return _complete_projected_fact_rows(rows, prof)
+        snapshot_ts, rows = _latest_position_snapshot(db_root, prof, now)
+        # 只把这些行用于持仓内存投影；headline / execution / trades 段仍严格展示
+        # 当前 cycle，避免把交错 cycle 的成交误报为本轮执行。
         rows = _project_positions_through_trades(
             rows, ledger_trades, snapshot_ts, as_of=now
         )
@@ -861,12 +1630,19 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                     margin_pct = round(margin / eq * 100, 1) if eq else None
             except (TypeError, ValueError, ZeroDivisionError):
                 notional = margin = margin_pct = None
+            sl_pct, sl_px = _open_sl_info(db_root, prof, r["symbol"], r["avgPx"])
+            sl_buffer = _sl_buffer_pct(
+                r["side"],
+                _latest_fresh_last(db_root, r["symbol"], now),
+                sl_px,
+            ) if sl_px else None
             out.append({"symbol": r["symbol"], "side": r["side"], "sz": r["sz"],
                         "avgPx": _px(r["avgPx"]), "lev": r["lev"], "upl": _r2(r["upl"]),
                         "notional_usd": _r2(notional), "margin_usd": _r2(margin),
                         "margin_pct": margin_pct,
                         "hold_min": _hold_min(db_root, prof, r["symbol"], now),
-                        "sl_pct": _open_sl_pct(db_root, prof, r["symbol"], r["avgPx"]),
+                        "sl_pct": sl_pct, "sl_px": _px(sl_px),
+                        "sl_buffer_pct": sl_buffer,
                         "profile": prof})
         return out
 
@@ -881,7 +1657,7 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                  (prof,)) or {}
         cum = None
         try:
-            sys.path.insert(0, r"./scripts")
+            sys.path.insert(0, r".\scripts")
             import cum_pnl
             info = cum_pnl.cum_for(db_root, prof)
             cum = info.get("cum_pnl") if info.get("ok") else None
@@ -1001,12 +1777,16 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         "side_pct": _side_pct(live_pos),
         "position_count": len(live_pos),
         "status": (
-            "PASS"
-            if str(books["live"]["tc"].get("decision") or "").lower()
-            in {"traded", "hold", "skip"}
-            else str(
-                books["live"]["tc"].get("decision") or "UNKNOWN"
-            ).upper()
+            "BLOCKED_UPSTREAM_FAILURE"
+            if failure_report
+            else (
+                "PASS"
+                if str(books["live"]["tc"].get("decision") or "").lower()
+                in {"traded", "hold", "skip"}
+                else str(
+                    books["live"]["tc"].get("decision") or "UNKNOWN"
+                ).upper()
+            )
         ),
     }
 
@@ -1035,11 +1815,34 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
                    "detail": (f["err"] or "-")[:120]} for f in faults]
     for p in ("live",):
         if not books[p]["present"]:
-            # push 闸要求 live 落库，缺行出现即为真异常。
-            exceptions.append({
-                "name": f"{p}_trader", "status": "pending",
-                "detail": "本轮 trade_cycles 未落库——push 闸要求 live 落库，"
-                          "出现即为异常"})
+            if failure_report:
+                if upstream_failure.get("stage") == "collection":
+                    exceptions.append({
+                        "name": "collection_gate",
+                        "status": "failed",
+                        "detail": (
+                            "采集失败终态："
+                            f"{upstream_failure['failure_kind']}；缺失必需源="
+                            + ",".join(
+                                str(item) for item in upstream_failure.get(
+                                    "missing_required_sources") or [])
+                            + "；Agent 未派发，报告按 WAIT/零新增风险闭环"),
+                    })
+                else:
+                    exceptions.append({
+                        "name": f"{p}_trader",
+                        "status": "failed",
+                        "detail": (
+                            "监督器失败终态："
+                            f"{upstream_failure['failure_kind']}；"
+                            "未补写 trade_cycles，报告按 WAIT/零新增风险闭环"),
+                    })
+            else:
+                # 正常报告路径仍把缺行视为异常，绝不静默降级。
+                exceptions.append({
+                    "name": f"{p}_trader", "status": "pending",
+                    "detail": "本轮 trade_cycles 未落库——push 闸要求 live 落库，"
+                              "出现即为异常"})
             continue
         decision = str(books[p]["tc"].get("decision") or "").lower()
         if decision in {"degraded", "error"}:
@@ -1145,6 +1948,19 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
     mins_hh01 = (61 - now.minute) % 60 or 60
     timeline = {"next_hh01_min": mins_hh01, "next_review_time": "08:05"}
 
+    execution = {
+        "result": "", "fill_px": "-", "stop_px": "-",
+        "db_rows_live": len(books["live"]["trades"]),
+    }
+    adjustment_execution = _verified_adjustment_execution(
+        books["live"]["raw"], books["live"]["tc"].get("decision"))
+    if adjustment_execution is not None:
+        execution.update(adjustment_execution)
+    if business_error_safety is not None:
+        execution.update(_business_error_execution(
+            books["live"]["raw"], live_decision, symbol,
+            business_error_safety))
+
     return {
         "cycle_id": cycle,
         "hhmm": hhmm,
@@ -1158,6 +1974,20 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         "decision": {
             "summary": summary,
             "reason": reason,
+            "origin": (
+                "system_failure_fallback" if failure_report
+                else "business_error_terminal"
+                if business_error_safety is not None
+                else "exchange_reconcile_after_business_terminal"
+                if (
+                    card
+                    and live_raw.get("business_context_preserved") is True
+                    and live_raw.get("reconcile_source") in {
+                        "exchange_fills_reconcile",
+                        "execution_journal_recovery",
+                    }
+                )
+                else "business_terminal"),
             "decision_protocol": "decision_card_v1" if card else "legacy_score",
             "decision_card": card,
             "multitimeframe_analysis": (
@@ -1172,14 +2002,14 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
             "multitimeframe_analyses": open_trade_decisions,
             **play,
         },
-        "execution": {
-            "result": "", "fill_px": "-", "stop_px": "-",
-            # 报 build 真读到的双盘 trades 落库行数（0 是合法值），
-            # 不使用与 cycle 无法可靠关联的代理值。
-            "db_rows_live": len(books["live"]["trades"]),
-        },
+        "execution": execution,
         "risk": risk,
         "trades": {"live": _fmt_trades(books["live"]["trades"])},
+        **({
+            "business_report_attestation": business_report_attestation,
+        } if business_report_attestation is not None else {}),
+        "inter_report_exchange_attestation": (
+            inter_report_exchange_attestation),
         "assets": assets,
         "market": market,
         "positions": positions,
@@ -1192,6 +2022,19 @@ def build(db_root: str, cycle: str, now: datetime | None = None) -> dict:
         "is_hh01": is_hh01,
         "macro": macro_block,
         "title": f"【{hhmm}】{action} {symbol}",
+        **({
+            "report_mode": "upstream_failure",
+            "upstream_failure": dict(upstream_failure),
+            "execution_intent_safety": failure_intent_safety,
+            "production_database_writes": 0,
+            "orders_placed": 0,
+        } if failure_report else {}),
+        **({
+            "report_mode": "business_error",
+            "execution_intent_safety": business_error_safety,
+            "production_database_writes": 0,
+            "orders_placed": 0,
+        } if business_error_safety is not None else {}),
     }
 
 

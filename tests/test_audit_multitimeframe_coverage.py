@@ -31,6 +31,18 @@ class MultitimeframeCoverageAuditTests(unittest.TestCase):
         path = Path(root) / "market.db"
         con = sqlite3.connect(path)
         con.execute("CREATE TABLE tick_snapshots(ts TEXT,symbol TEXT)")
+        con.execute(
+            "CREATE TABLE instruments_cache("
+            "instId TEXT PRIMARY KEY,list_time_utc TEXT)"
+        )
+        con.executemany(
+            "INSERT INTO instruments_cache VALUES(?,?)",
+            [
+                ("A-USDT-SWAP", "2026-07-01T00:00:00Z"),
+                ("B-USDT-SWAP", "2026-07-01T00:00:00Z"),
+                ("C-USDT-SWAP", "2026-08-12T05:45:00Z"),
+            ],
+        )
         con.execute(KLINE_DDL)
         con.executemany(
             "INSERT INTO tick_snapshots VALUES(?,?)",
@@ -99,8 +111,18 @@ class MultitimeframeCoverageAuditTests(unittest.TestCase):
         for row in payload["timeframes"]:
             self.assertEqual(1.0, row["raw_ohlcv_coverage_rate"])
             self.assertEqual(0.666667, row["analysis_ready_rate"])
+            projection = row["analysis_readiness_projection"]
+            self.assertEqual(
+                "PROJECTED_FROM_OFFICIAL_WARMUP", projection["status"])
+            self.assertEqual(3, projection["required_ready_symbols"])
+            self.assertEqual(1, projection["additional_ready_symbols_needed"])
+            self.assertIsNotNone(
+                projection["projected_threshold_ready_at_utc"])
             gap = next(g for g in row["gaps"] if g["symbol"] == "C-USDT-SWAP")
             self.assertEqual("insufficient_history", gap["classification"])
+            self.assertEqual(
+                "official_new_listing_warmup", gap["history_semantics"])
+            self.assertIsNotNone(gap["earliest_full_indicator_ready_at_utc"])
 
     def test_exact_closed_bar_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -182,6 +204,11 @@ class MultitimeframeCoverageAuditTests(unittest.TestCase):
             if item["symbol"] == "A-USDT-SWAP")
         self.assertEqual("insufficient_history", gap["classification"])
         self.assertEqual(1, gap["bars_seen"])
+        self.assertEqual("historical_collection_gap", gap["history_semantics"])
+        self.assertEqual(
+            "NO_DETERMINISTIC_PROJECTION",
+            four_hour["analysis_readiness_projection"]["status"],
+        )
 
 
 if __name__ == "__main__":

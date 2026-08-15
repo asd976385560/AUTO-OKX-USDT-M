@@ -32,6 +32,7 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import exit_quality
 import trade_report_stats
 
 
@@ -42,16 +43,17 @@ def sanitize_text(value: str) -> str:
 
 CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
-DB_PATH = Path(os.environ.get('OKX_ACCOUNT_DB', r'./db/account.db'))
-REPORTS_DIR = Path(os.environ.get('OKX_DAILY_REPORTS_DIR', r'./reports/daily-reports'))
+DB_PATH = Path(os.environ.get('OKX_ACCOUNT_DB', r'.\db\account.db'))
+REPORTS_DIR = Path(os.environ.get('OKX_DAILY_REPORTS_DIR', r'.\reports\daily-reports'))
 WEEKLY_REPORTS_DIR = Path(os.environ.get(
-    'OKX_WEEKLY_REPORTS_DIR', r'./reports/weekly'))
+    'OKX_WEEKLY_REPORTS_DIR', r'.\reports\weekly'))
 MONTHLY_REPORTS_DIR = Path(os.environ.get(
-    'OKX_MONTHLY_REPORTS_DIR', r'./reports/monthly'))
+    'OKX_MONTHLY_REPORTS_DIR', r'.\reports\monthly'))
 LIVE_TRADES_DB = Path(os.environ.get(
-    'OKX_LIVE_TRADES_DB', r'./db/live_trades.db'))
-LEDGER_DB = Path(os.environ.get('OKX_LEDGER_DB', r'./db/ledger.db'))
-LESSONS_DB = Path(os.environ.get('OKX_LESSONS_DB', r'./db/lessons.db'))
+    'OKX_LIVE_TRADES_DB', r'.\db\live_trades.db'))
+LEDGER_DB = Path(os.environ.get('OKX_LEDGER_DB', r'.\db\ledger.db'))
+LESSONS_DB = Path(os.environ.get('OKX_LESSONS_DB', r'.\db\lessons.db'))
+MISSED_OPPORTUNITY_OUTCOME_HOURS = 4
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -140,6 +142,248 @@ def _fmt_num(value):
         return f"{float(value):g}"
     except (TypeError, ValueError):
         return "-"
+
+
+# ── 2026-08-13 规格书四段（确定性 writer 侧回读；reviewer 只判断不加工） ────
+# 全部按 _snapshot_equity 同款降级契约：库缺/锁/异常 → 显式"不可用"文案，
+# 不抛、不拖垮日报渲染；绝不伪造数值。市场三表/cross_market 为 UTC-Z 时间，
+# 比较前先由报告 CST ts 归一（红线：跨表比较先归一）。
+
+SPEC_SECTIONS_ACTIVATION_TS = "2026-08-14 00:00:00"  # 与 validator 同源激活边界
+# 退出质量段（浮盈峰值回吐分布、≥50% 保证金收益率复核率与处置、错失止盈池）：
+# 预注册激活边界起的日报必须带；边界前的历史归档不反向加责。与 validator 同源。
+EXIT_QUALITY_ACTIVATION_TS = "2026-08-16 08:00:00"
+
+
+def _cst_to_utc_z(ts_cst: str) -> str | None:
+    try:
+        dt = datetime.strptime(str(ts_cst)[:19], TS_FMT)
+        return (dt - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def _ro_connect(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(
+        f"file:{Path(path).resolve().as_posix()}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _market_overview_block(db_root: Path, ts: str) -> str:
+    """市场总览（BTC/ETH·总市值·BTC.D·恐贪·regime·TVL），按报告时点回读。"""
+    ts_utc = _cst_to_utc_z(ts)
+    if ts_utc is None:
+        return "市场总览不可用（报告时间无法解析）"
+    lines: list[str] = []
+    try:
+        con = _ro_connect(Path(db_root) / "market.db")
+        try:
+            snap_ts = con.execute(
+                "SELECT MAX(ts) FROM tick_snapshots WHERE ts<=?", (ts_utc,)
+            ).fetchone()[0]
+            if snap_ts:
+                pair_bits = []
+                for sym in ("BTC-USDT-SWAP", "ETH-USDT-SWAP"):
+                    r = con.execute(
+                        "SELECT last, chg24h FROM tick_snapshots "
+                        "WHERE ts=? AND symbol=?", (snap_ts, sym)).fetchone()
+                    if r and r["last"] is not None:
+                        chg = (f"{r['chg24h']:+.2f}%"
+                               if r["chg24h"] is not None else "?")
+                        pair_bits.append(
+                            f"{sym.split('-')[0]} ${r['last']:,.0f}（24h {chg}）")
+                if pair_bits:
+                    lines.append(
+                        "- " + " | ".join(pair_bits)
+                        + f"（快照 {snap_ts}，UTC）")
+        finally:
+            con.close()
+    except Exception:
+        lines.append("- BTC/ETH 快照不可用（market.db 缺失或不可读）")
+    try:
+        con = _ro_connect(Path(db_root) / "regime.db")
+        try:
+            r = con.execute(
+                "SELECT * FROM cross_market WHERE ts<=? "
+                "ORDER BY ts DESC LIMIT 1", (ts_utc,)).fetchone()
+        finally:
+            con.close()
+        if r is not None:
+            keys = r.keys()
+
+            def val(col):
+                return r[col] if col in keys else None
+
+            mcap = val("total_mcap_usd")
+            dom = val("btc_dominance")
+            fear = val("fear_greed")
+            fear_label = val("fear_greed_label")
+            tvl = val("defillama_tvl_total")
+            lines.append(
+                "- 总市值 "
+                + (f"${mcap/1e12:.2f}T" if isinstance(mcap, (int, float)) else "未采到")
+                + " | BTC.D "
+                + (f"{dom:.2f}%" if isinstance(dom, (int, float)) else "未采到")
+                + " | 恐贪指数 "
+                + (f"{fear:.0f}/{fear_label or '?'}（Alternative.me）"
+                   if isinstance(fear, (int, float)) else "未采到")
+                + " | TVL "
+                + (f"${tvl/1e9:.1f}B" if isinstance(tvl, (int, float)) else "未采到"))
+            regime = val("regime")
+            if regime:
+                lines.append(
+                    f"- regime={regime}（事实标签，仅参考；行 ts={r['ts']} UTC）")
+        else:
+            lines.append("- cross_market 在报告时点前无行（宏观总览未采到）")
+    except Exception:
+        lines.append("- 宏观总览不可用（regime.db 缺失或不可读）")
+    return "\n".join(lines) if lines else "市场总览数据不可用"
+
+
+def _cycle_bounds_for_window(start_ts: str, end_ts: str) -> tuple[str, str]:
+    """CST 窗口 'YYYY-MM-DD HH:MM:SS' → cycle_id 界 'YYYY-MM-DDTHH:MM'（右开）。"""
+    return (
+        str(start_ts)[:16].replace(" ", "T"),
+        str(end_ts)[:16].replace(" ", "T"),
+    )
+
+
+def _universe_scan_block(db_root: Path, start_ts: str, end_ts: str) -> str:
+    """全市场扫描结果：宇宙规模 + 窗口内 analysis 覆盖 + 判断吞吐影子计数。
+
+    相对 rank/候选只是三周期相对选择，非校准概率——本段只给计数与覆盖，
+    不显示任何"可信度分值"（独立前向门未过时 confidence_claim_allowed=false）。
+    """
+    lines: list[str] = []
+    ts_utc = _cst_to_utc_z(end_ts)
+    try:
+        con = _ro_connect(Path(db_root) / "market.db")
+        try:
+            snap_ts = con.execute(
+                "SELECT MAX(ts) FROM tick_snapshots WHERE ts<=?",
+                (ts_utc,)).fetchone()[0] if ts_utc else None
+            if snap_ts:
+                n_universe = con.execute(
+                    "SELECT COUNT(DISTINCT symbol) FROM tick_snapshots "
+                    "WHERE ts=?", (snap_ts,)).fetchone()[0]
+                lines.append(
+                    f"- 采集宇宙：{int(n_universe)} 个 USDT 线性永续"
+                    f"（快照 {snap_ts}，UTC；全宇宙无白名单）")
+        finally:
+            con.close()
+    except Exception:
+        lines.append("- 采集宇宙规模不可用（market.db 缺失或不可读）")
+    c_start, c_end = _cycle_bounds_for_window(start_ts, end_ts)
+    try:
+        con = _ro_connect(Path(db_root) / "analysis.db")
+        try:
+            runs = con.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN status IN ('skipped','stale') "
+                "THEN 1 ELSE 0 END) FROM analysis_runs "
+                "WHERE cycle_id>=? AND cycle_id<?", (c_start, c_end)).fetchone()
+            sig = con.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT symbol) FROM analysis_signals "
+                "WHERE cycle_id>=? AND cycle_id<?", (c_start, c_end)).fetchone()
+            actions = con.execute(
+                "SELECT COALESCE(action,'null') a, COUNT(*) n "
+                "FROM analysis_signals WHERE cycle_id>=? AND cycle_id<? "
+                "GROUP BY a ORDER BY n DESC", (c_start, c_end)).fetchall()
+        finally:
+            con.close()
+        total_runs = int(runs[0] or 0)
+        skip_stale = int(runs[1] or 0)
+        lines.append(
+            f"- 分析轮次：{total_runs} 轮（skip/stale {skip_stale}）；"
+            f"信号 {int(sig[0] or 0)} 条 / 覆盖 {int(sig[1] or 0)} 个标的")
+        if actions:
+            dist = " ".join(f"{row['a']}={row['n']}" for row in actions[:6])
+            lines.append(f"- 动作分布：{dist}")
+    except Exception:
+        lines.append("- 窗口内 analysis 统计不可用（analysis.db 缺失或不可读）")
+    try:
+        shadow_root = Path(os.environ.get(
+            "OKX_QUALITY_REPORT_DIR", r".\reports\quality"))
+        shadow_root = shadow_root / "universe-shadow"
+        dates = {str(start_ts)[:10], str(end_ts)[:10]}
+        n_files = 0
+        seen_dirs = 0
+        for d in sorted(dates):
+            day_dir = shadow_root / d
+            if day_dir.is_dir():
+                seen_dirs += 1
+                n_files += sum(1 for p in day_dir.glob("*.json"))
+        if seen_dirs:
+            lines.append(
+                f"- 全宇宙判断吞吐影子：窗口两日目录共 {n_files} 份快照"
+                "（00/08/16 三次自然调度口径；只读影子，不下单）")
+        else:
+            lines.append("- 全宇宙判断吞吐影子：窗口内无快照目录（未生成或路径不可达）")
+    except Exception:
+        lines.append("- 全宇宙判断吞吐影子计数不可用")
+    lines.append(
+        "- 口径：三周期 rank 为相对选择、非校准概率；独立前向门未通过期间"
+        "禁止显示任何可信度分值。")
+    return "\n".join(lines)
+
+
+def _data_completeness_block(db_root: Path, start_ts: str, end_ts: str) -> str:
+    """数据完善率统计（复盘窗口）：ledger.collection_runs 逐源完成率。
+
+    完善率=(ok+degraded)/应记录运行；达标率=ok/应记录运行。缺失/失败源逐条
+    列出（≤8 条），与 ⚠️ 异常段互补；分母只计窗口内实际记账运行，不虚构计划槽。
+    """
+    c_start, c_end = _cycle_bounds_for_window(start_ts, end_ts)
+    try:
+        con = _ro_connect(Path(db_root) / "ledger.db")
+        try:
+            rows = con.execute(
+                "SELECT source, status, COUNT(*) n FROM collection_runs "
+                "WHERE cycle_id>=? AND cycle_id<? GROUP BY source, status",
+                (c_start, c_end)).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return ("数据完善率不可用（ledger.db 缺失或不可读）；"
+                "采集账本是完善率唯一权威，缺账本即无法声明完善率。")
+    if not rows:
+        return "窗口内无采集账本行（停机或窗口异常）；不虚构完善率。"
+    per: dict[str, dict[str, int]] = {}
+    for r in rows:
+        d = per.setdefault(str(r["source"]), {"ok": 0, "degraded": 0, "other": 0})
+        status = str(r["status"] or "").lower()
+        if status == "ok":
+            d["ok"] += int(r["n"])
+        elif status == "degraded":
+            d["degraded"] += int(r["n"])
+        else:
+            d["other"] += int(r["n"])
+    total = sum(sum(d.values()) for d in per.values())
+    good = sum(d["ok"] + d["degraded"] for d in per.values())
+    ok_only = sum(d["ok"] for d in per.values())
+    lines = [
+        f"- 总体：完善率 {good}/{total}={good / total * 100:.1f}%"
+        f"（ok+degraded）；纯 ok 达标率 {ok_only / total * 100:.1f}%"
+        "（分母=窗口内账本记录的采集运行）",
+    ]
+    offenders = []
+    for source, d in sorted(per.items()):
+        t = sum(d.values())
+        bad = d["other"]
+        if bad:
+            offenders.append((bad / t, source, bad, t))
+    offenders.sort(reverse=True)
+    if offenders:
+        for _rate, source, bad, t in offenders[:8]:
+            lines.append(f"- ⚠️ {source}: 失败/超时 {bad}/{t} 次")
+        if len(offenders) > 8:
+            lines.append(f"- …另有 {len(offenders) - 8} 个源存在失败（详见账本）")
+    else:
+        lines.append("- 窗口内无失败/超时源")
+    lines.append(
+        "- 规格线：≥99% 为目标；本段是复盘窗口运行完善率，"
+        "字段级 99% 验收另由预注册审计（audit_market_field_coverage 等）前向累计。")
+    return "\n".join(lines)
 
 
 def _snapshot_positions_summary(db_path, profile: str, as_of_ts: str | None = None,
@@ -587,6 +831,64 @@ def create_daily_revision_backup(
     }
 
 
+def _exit_quality_block(payload: dict) -> str:
+    """退出质量段：只渲染确定性统计，未知一律写「未知」不写 0。"""
+    block = payload.get("exit_quality")
+    if not isinstance(block, dict):
+        return (
+            "## 🚪 退出质量\n\n"
+            "退出质量统计不可用（如实留空，不以 0 冒充无回吐/无错失）。\n"
+        )
+    window = block.get("candidate_window") or {}
+    giveback = block.get("peak_giveback") or {}
+    review = block.get("margin_return_review") or {}
+    pool = giveback.get("missed_take_profit_pool") or []
+    buckets = giveback.get("profitable_peak_giveback_buckets_r") or {}
+    bucket_text = "、".join(
+        f"{label} {count}笔" for label, count in buckets.items()
+    ) or "无样本"
+    rate = review.get("explicit_review_rate")
+    rate_text = "无被标记仓位" if rate is None else f"{float(rate):.1%}"
+    dispositions = review.get("disposition_counts") or {}
+    disposition_text = "、".join(
+        f"{name} {count}次" for name, count in dispositions.items()
+    ) or "无"
+    lines = [
+        "## 🚪 退出质量",
+        "",
+        f"> 后验窗固化: 候选窗口 [{window.get('start_ts')}, "
+        f"{window.get('end_ts')})，UTC+8；报告窗整体前移 "
+        f"{block.get('outcome_horizon_hours')} 小时，只统计结果已成熟的平仓；"
+        "Reviewer 不重跑周期、不扩窗。",
+        "",
+        f"- 已成熟平仓: {giveback.get('closed_rows')} 笔（路径可测 "
+        f"{giveback.get('measured_rows')} 笔，覆盖不足按未知计 "
+        f"{giveback.get('unknown_path_rows')} 笔）",
+        f"- 浮盈峰值回吐分布（峰值≥"
+        f"{giveback.get('profitable_peak_threshold_r')}R 的 "
+        f"{giveback.get('profitable_peak_rows')} 笔）: {bucket_text}；"
+        f"中位回吐 {giveback.get('profitable_peak_giveback_median_r')}R，"
+        f"峰值留存中位 {giveback.get('peak_retention_median')}",
+        f"- 曾达1R: {giveback.get('reached_1r')} 笔，平仓仍≥1R: "
+        f"{giveback.get('closed_at_or_above_1r')} 笔",
+        f"- 错失止盈池: {giveback.get('missed_take_profit_pool_size')} 笔"
+        "（曾达1R 但平仓低于 1R）",
+        f"- 保证金收益率≥{float(review.get('threshold_fraction') or 0.5):.0%} "
+        f"被标记仓位-周期: {review.get('flagged_position_cycles')} 次，"
+        f"决策卡显式复核 {review.get('explicitly_reviewed')} 次"
+        f"（复核率 {rate_text}）；处置分布: {disposition_text}",
+    ]
+    for item in pool[:10]:
+        lines.append(
+            f"  - {item.get('symbol')} {item.get('side')} 峰值 "
+            f"{item.get('peak_r')}R → 平仓 {item.get('realized_r_net')}R"
+            f"（回吐 {item.get('giveback_r')}R，出口 "
+            f"{item.get('exit_category')}）"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _report_state(payload: dict) -> dict:
     """Classify a report without blocking publication on live reconcile drift."""
     raw_status = str(payload.get("live_reconcile_status") or "").strip().lower()
@@ -685,10 +987,23 @@ def _numeric_diff(left, right, tolerance: float = 1e-9) -> bool:
         return True
 
 
+def _missed_opps_candidate_window(
+    start_ts: str,
+    end_ts: str,
+) -> tuple[str, str]:
+    """Return the continuous 24H candidate window with mature 4H outcomes."""
+    shift = timedelta(hours=MISSED_OPPORTUNITY_OUTCOME_HOURS)
+    start = trade_report_stats.parse_cst(start_ts) - shift
+    end = trade_report_stats.parse_cst(end_ts) - shift
+    return start.strftime(TS_FMT), end.strftime(TS_FMT)
+
+
 def _missed_opps_window_count(start_ts: str, end_ts: str) -> int | None:
-    """lessons.db 窗口内错失机会权威计数；库/表缺失返回 None（未知≠0）。"""
+    """Count the shifted, fully matured outcome window; unknown is not zero."""
     if not LESSONS_DB.exists():
         return None
+    candidate_start, candidate_end = _missed_opps_candidate_window(
+        start_ts, end_ts)
     try:
         con = sqlite3.connect(f"file:{LESSONS_DB}?mode=ro", uri=True, timeout=5)
         try:
@@ -700,7 +1015,7 @@ def _missed_opps_window_count(start_ts: str, end_ts: str) -> int | None:
                 "SELECT COUNT(*) FROM missed_opportunities "
                 "WHERE ts LIKE '202%' AND datetime(ts)>=datetime(?) "
                 "AND datetime(ts)<datetime(?)",
-                (start_ts, end_ts)).fetchone()[0])
+                (candidate_start, candidate_end)).fetchone()[0])
         finally:
             con.close()
     except sqlite3.Error:
@@ -849,6 +1164,27 @@ def _prepare_trade_payload(
     missed_count = _missed_opps_window_count(
         out["period_start_ts"], out["period_end_ts"])
     out["missed_opps_window_count"] = missed_count
+    (
+        out["missed_opps_candidate_start_ts"],
+        out["missed_opps_candidate_end_ts"],
+    ) = _missed_opps_candidate_window(
+        out["period_start_ts"], out["period_end_ts"])
+    out["missed_opps_outcome_horizon_hours"] = (
+        MISSED_OPPORTUNITY_OUTCOME_HOURS)
+
+    if period_kind == "daily":
+        try:
+            out["exit_quality"] = exit_quality.compute(
+                account_db=DB_PATH,
+                live_trades_db=DB_PATH.parent / "live_trades.db",
+                report_start_ts=out["period_start_ts"],
+                report_end_ts=out["period_end_ts"],
+            )
+        except sqlite3.Error as error:
+            # 退出质量是复盘统计，不是资金路径：读不到就如实置空并告警，
+            # 绝不用 0 冒充「没有回吐、没有错失」。
+            out["exit_quality"] = None
+            _append_anomaly(out, f"退出质量统计不可用（如实留空）: {error}")
 
     lint_problems: list[str] = []
     for stats in stats_by_profile.values():
@@ -871,6 +1207,18 @@ def _prepare_trade_payload(
         "trade_metrics": {
             profile: _compact_trade_metrics(stats)
             for profile, stats in stats_by_profile.items()
+        },
+        "exit_quality": out.get("exit_quality"),
+        "missed_opportunity_metrics": {
+            "source": str(LESSONS_DB),
+            "candidate_window_start_ts": out[
+                "missed_opps_candidate_start_ts"],
+            "candidate_window_end_ts": out[
+                "missed_opps_candidate_end_ts"],
+            "candidate_window_end_exclusive": True,
+            "outcome_horizon_hours": MISSED_OPPORTUNITY_OUTCOME_HOURS,
+            "required_15m_bars": 16,
+            "count": missed_count,
         },
     }
     if period_kind == "daily":
@@ -1090,7 +1438,7 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:
-        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 ./tmp//*.json 再用 --json-file")
+        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 .\\tmp\\*.json 再用 --json-file")
 
 
 def next_trade_day_num(con, report_ts: str | None = None) -> int:
@@ -1577,9 +1925,14 @@ def write_markdown(payload: dict, apply: bool) -> str:
     else:
         live_side_line = ""
     _missed = payload.get('missed_opps_window_count')
+    _missed_start = payload.get('missed_opps_candidate_start_ts')
+    _missed_end = payload.get('missed_opps_candidate_end_ts')
     missed_line = (
-        f"- 本窗口错失机会记录: {int(_missed)} 条（lessons.db 权威计数）\n"
-        if _missed is not None else "")
+        "- 已完整成熟4小时的错失机会记录: "
+        f"{int(_missed)} 条（候选窗口 [{_missed_start}, {_missed_end})，"
+        "UTC+8；lessons.db 权威计数）\n"
+        if _missed is not None and _missed_start and _missed_end else "")
+    exit_quality_block = _exit_quality_block(payload)
     report_state = _report_state(payload)
     if report_state["status"] == "final":
         report_banner = f"最终报告｜{report_state['reason']}"
@@ -1646,13 +1999,32 @@ def write_markdown(payload: dict, apply: bool) -> str:
 - 手续费: ${float(live_fees):.2f}
 - 最佳: {live_best} | 最差: {live_worst}
 
+{exit_quality_block}
 ## ⚠️ 异常 / 🛠 自修
 
 {payload.get('anomalies', '无')}
 
+## 🛰 全市场扫描
+
+{_universe_scan_block(DB_PATH.parent, period_start_ts, period_end_ts)}
+
+## 📡 数据完善率
+
+{_data_completeness_block(DB_PATH.parent, period_start_ts, period_end_ts)}
+
 ## 🌍 市场
 
+### 市场总览（writer 权威回读）
+
+{_market_overview_block(DB_PATH.parent, ts)}
+
+### 复盘观察
+
 {payload.get('market', '见 push_archive latest')}
+
+## 🔭 次日关注
+
+{payload.get('focus_next_day', '未填写（激活边界后 validator 将拒绝外发）')}
 
 ## 🧠 教训
 
@@ -1745,7 +2117,11 @@ def write_weekly_markdown(payload: dict, apply: bool) -> str:
     if _wl is not None and _ws is not None:
         _facts_bits.append(f"平仓方向: 多 {int(_wl)} / 空 {int(_ws)}")
     if _wm is not None:
-        _facts_bits.append(f"本窗口错失机会记录 {int(_wm)} 条")
+        _facts_bits.append(
+            "已完整成熟4小时的错失机会记录 "
+            f"{int(_wm)} 条（候选窗口 "
+            f"[{payload.get('missed_opps_candidate_start_ts')}, "
+            f"{payload.get('missed_opps_candidate_end_ts')})）")
     side_facts_line = (
         "> 确定性事实：" + "；".join(_facts_bits) + "（文字段与此冲突以本行为准）\n"
         if _facts_bits else "")
@@ -1872,7 +2248,10 @@ def write_monthly_markdown(payload: dict, apply: bool) -> str:
         )
     missed = payload.get("missed_opps_window_count")
     missed_line = (
-        f"> 本窗口错失机会记录：{int(missed)} 条\n"
+        "> 已完整成熟4小时的错失机会记录："
+        f"{int(missed)} 条（候选窗口 "
+        f"[{payload.get('missed_opps_candidate_start_ts')}, "
+        f"{payload.get('missed_opps_candidate_end_ts')})，UTC+8）\n"
         if missed is not None else ""
     )
     content = f"""# 小灵月报 {month_key[:10]}
@@ -2070,7 +2449,7 @@ def main():
                     help="报告类型：daily=daily_reports（默认）；weekly=weekly_reports（需 week_start_ts）；monthly=monthly_reports（需 month_start_ts）")
     ap.add_argument("--profiles", choices=("live",), default="live",
                     help="写入 profile 范围（2026-08-06 demo 下线后只剩 live）")
-    ap.add_argument("--db-path", default=str(DB_PATH), help="account.db 路径（默认 ./db//account.db；测试可传临时库）")
+    ap.add_argument("--db-path", default=str(DB_PATH), help="account.db 路径（默认 .\\db\\account.db；测试可传临时库）")
     ap.add_argument("--reports-dir", default=str(REPORTS_DIR), help="日报 markdown 输出目录")
     ap.add_argument(
         "--weekly-reports-dir",

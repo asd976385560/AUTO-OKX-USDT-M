@@ -4,9 +4,10 @@
 背景：该表曾停更，导致压制策略缺少对照组——
 「不开仓」的机会成本无人量化，压制经验只能自证。本脚本按日回填：
 
-  取窗口内 decision_card_v1 中 **action=wait 且带方向** 的候选；
+  取报告交易窗口整体前移4小时后的、已经完整成熟的24小时候选窗口中，
+  decision_card_v1 **action=wait 且带方向** 的候选；
   无 decision_card 的兼容记录仍按 total/confidence 阈值读取，
-  剔除同 cycle 同 symbol 已真实成交的行，按 15m kline 计算其后 4h 实际走幅与
+  剔除同 cycle 同 symbol 已真实成交的行，严格要求连续16根15m kline，计算其后4h实际走幅与
   would_hit_1r_fixed2pct（**固定 ±2% 代理口径**：-2% SL 的对称目标 +2%；与候选
   真实计划止损无关，列名 2026-08-10 由 would_hit_1R 更名以杜绝口径混用；side
   缺失按 long 惯例并在 notes 标注），幂等写入 missed_opportunities（同 ts+symbol
@@ -21,8 +22,9 @@
 本脚本会打 [WARN] 而不是静默写 0 —— 2026-07-29~31 的两天空窗就是这么被漏掉的。
 
 调度：reviewer 每日复盘（08:05）跑 `--as-of "<日报 ts>"`；也可手动补历史窗。
-事实窗与日报同源：`trade_report_stats.daily_window` 给出 `[前一日 08:00, 当日 08:00)`，
-按 cycle_id 半开过滤（cycle_id 为 'YYYY-MM-DDTHH:MM'，字典序即时序）。
+事实窗由日报窗确定性派生：日报交易窗 `[前一日08:00,当日08:00)` 对应已经
+完整成熟的错失机会候选窗 `[前一日04:00,当日04:00)`；相邻日报连续平铺、无遗漏，
+且每个候选在报告生成前都有完整4小时后验。按 cycle_id 半开过滤。
 2026-07-31 前本脚本按自然日 `LIKE 'YYYY-MM-DD%'` 取数，与日报成交窗差 8 小时，
 同一份日报里"错失机会"和"成交统计"覆盖不同时段；现已统一。
 写库纪律：lessons.db writer=复盘链路，本脚本是该链路的确定性组件。
@@ -35,10 +37,11 @@ ts 写 CST 'YYYY-MM-DD HH:MM:SS'（禁 JobB-/UTC-Z 混入——该表 ts 已有�
 """
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trade_report_stats  # noqa: E402  日报事实窗唯一定义源
@@ -48,11 +51,67 @@ sys.stdout.reconfigure(encoding="utf-8")
 TOTAL_MIN = 45
 CONF_MIN = 0.40
 R_PCT = 2.0  # 兼容记录无失效距离时的后验评估兜底
+OUTCOME_HOURS = 4
+EXPECTED_15M_BARS = 16
 
 
 def _utcz_from_cst(cst_str: str) -> str:
     dt = datetime.strptime(cst_str, "%Y-%m-%d %H:%M:%S") - timedelta(hours=8)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _matured_candidate_window(
+    report_window_start: str,
+    report_window_end: str,
+) -> tuple[str, str]:
+    """Shift the whole report window back by the fixed outcome horizon."""
+    start = datetime.strptime(report_window_start, "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(report_window_end, "%Y-%m-%d %H:%M:%S")
+    shift = timedelta(hours=OUTCOME_HOURS)
+    return (
+        (start - shift).strftime("%Y-%m-%d %H:%M:%S"),
+        (end - shift).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    text = str(value).strip().replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _complete_four_hour_rows(rows: list[tuple], start_utc: str) -> bool:
+    """Accept exact consecutive starts and valid positive OHLC in the 4H horizon."""
+    if len(rows) != EXPECTED_15M_BARS:
+        return False
+    try:
+        start = _parse_utc_timestamp(start_utc)
+        observed = [_parse_utc_timestamp(row[0]) for row in rows]
+    except (TypeError, ValueError):
+        return False
+    expected = [start + timedelta(minutes=15 * i)
+                for i in range(EXPECTED_15M_BARS)]
+    if observed != expected:
+        return False
+    for row in rows:
+        try:
+            open_px, high_px, low_px, close_px = map(float, row[1:5])
+        except (TypeError, ValueError):
+            return False
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (open_px, high_px, low_px, close_px)
+        ):
+            return False
+        if high_px < max(open_px, low_px, close_px):
+            return False
+        if low_px > min(open_px, high_px, close_px):
+            return False
+    return True
 
 
 def main() -> int:
@@ -61,7 +120,7 @@ def main() -> int:
                     help="日报 ts（CST）；窗口取 [前一日 08:00, 当日 08:00)")
     ap.add_argument("--date", default=None,
                     help="兼容入口：YYYY-MM-DD 或 'yesterday'，等价 --as-of 该日 08:05")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -73,11 +132,17 @@ def main() -> int:
             if (args.date or "yesterday") == "yesterday" else args.date
         )
         as_of = f"{anchor_day} 08:05:00"
-    start_ts, end_ts = trade_report_stats.daily_window(as_of)
-    # cycle_id 是 'YYYY-MM-DDTHH:MM'，字典序即时序，半开区间与日报成交窗一致。
+    report_start_ts, report_end_ts = trade_report_stats.daily_window(as_of)
+    start_ts, end_ts = _matured_candidate_window(
+        report_start_ts, report_end_ts)
+    # cycle_id 是 'YYYY-MM-DDTHH:MM'，字典序即时序；候选窗整体前移4小时，
+    # 保证相邻日报仍连续平铺且所有候选已有完整后验。
     start_cyc = start_ts[:16].replace(" ", "T")
     end_cyc = end_ts[:16].replace(" ", "T")
-    print(f"[window] cycle_id ∈ [{start_cyc}, {end_cyc})  (as-of {as_of})")
+    print(
+        f"[window] matured candidate cycle_id ∈ [{start_cyc}, {end_cyc}) "
+        f"(report=[{report_start_ts}, {report_end_ts}), as-of {as_of})"
+    )
     root = args.db_root
 
     ana = sqlite3.connect(f"file:{root}\\analysis.db?mode=ro", uri=True)
@@ -147,7 +212,7 @@ def main() -> int:
                 "AND ts>=? AND ts<? ORDER BY ts",
                 (sym, t0, t4),
             ).fetchall()
-            if len(rows) < 8:  # 4h 窗至少要 8 根 15m 才算数据可用
+            if not _complete_four_hour_rows(rows, t0):
                 nodata += 1
                 continue
             px0 = rows[0][1]
@@ -199,6 +264,12 @@ def main() -> int:
             "side=long|short（见 agents/analyst.md action/side 契约）。",
             file=sys.stderr,
         )
+    if nodata:
+        print(
+            f"[ERROR] {nodata} 个已成熟候选缺少精确连续{EXPECTED_15M_BARS}根15m K线",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -40,7 +40,11 @@ from typing import Any, Optional
 
 _CORE = os.path.dirname(os.path.abspath(__file__))
 _CORE_LIB = os.path.join(_CORE, "lib")
-_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", r"./collectors")
+_PROJECT_ROOT = Path(
+    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
+).resolve()
+_COLLECTORS = os.environ.get(
+    "OKX_COLLECTORS_DIR", str(_PROJECT_ROOT / "collectors"))
 for _p in (_CORE, _CORE_LIB, _COLLECTORS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -55,13 +59,18 @@ import ledger                        # noqa: E402  collectors/ledger.py（connec
 import execution_intent as ei         # noqa: E402  core/execution_intent.py
 from core import actor_attestation as actor_att  # noqa: E402
 from decision_card import (  # noqa: E402
+    EXIT_MODES,
     validate_card,
     validate_multitimeframe_analysis,
 )
 from experience_contract import validate_contract as validate_experience_contract  # noqa: E402
-from multitimeframe_gate import check_multitimeframe_readiness  # noqa: E402
+from multitimeframe_gate import (  # noqa: E402
+    check_multitimeframe_readiness,
+    resolve_execution_evidence_anchor,
+)
 
-DEFAULT_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", r"./db"))
+DEFAULT_DB_ROOT = Path(
+    os.environ.get("OKX_DB_ROOT", str(_PROJECT_ROOT / "db")))
 FILLS_RETRY = 3
 FILLS_RETRY_WAIT = 1.5
 # 2026-07-03：订单状态第二权威源（demo fills 端点延迟 6-52s，订单状态端点即时）。
@@ -73,6 +82,67 @@ _FILL_TS_SKEW_MS = 60000  # 本地/交易所时钟偏差容差（fills 时间窗
 _CONFIRMED_OPEN_FILL_SOURCES = frozenset(
     {"fills", "order_status", "orders_history"})
 _CST = timezone(timedelta(hours=8))
+_LIVE_CYCLE_SIDE_EFFECT_DEADLINE_SECONDS = 13 * 60
+
+
+def _cycle_side_effect_reject(
+    cycle_id: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[dict[str, Any]]:
+    """Reject a new live exchange side effect after the natural-cycle cutoff.
+
+    Killing the local ``openclaw agent`` client does not necessarily cancel the
+    already-dispatched gateway turn.  A late turn must therefore be unable to
+    start an order or a standalone protection change after ``cycle+13:00``.
+    Protective continuation for an order already submitted (SL verification,
+    emergency unwind, post-add/post-reduce resize) is deliberately not routed
+    through this start gate: once exposure exists, safety completion wins over
+    the clock.
+    """
+    raw_cycle = str(cycle_id or "").strip()
+    try:
+        cycle_start = datetime.strptime(
+            raw_cycle, "%Y-%m-%dT%H:%M").replace(tzinfo=_CST)
+    except (TypeError, ValueError):
+        return {
+            "action_taken": "REJECT",
+            "reject_reason": "cycle_id_invalid",
+            "reject_detail": (
+                "非 dry-run 交易副作用要求 cycle_id 严格为 YYYY-MM-DDTHH:MM；"
+                f"当前值={raw_cycle!r}，未触发交易所写入"),
+            "side_effect_deadline": {
+                "cycle_id": raw_cycle or None,
+                "deadline_at": None,
+                "checked_at": None,
+                "comparison": ">=",
+            },
+        }
+
+    checked_at = now or datetime.now(_CST)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=_CST)
+    else:
+        checked_at = checked_at.astimezone(_CST)
+    deadline = cycle_start + timedelta(
+        seconds=_LIVE_CYCLE_SIDE_EFFECT_DEADLINE_SECONDS)
+    if checked_at < deadline:
+        return None
+    deadline_text = deadline.strftime("%Y-%m-%d %H:%M:%S")
+    checked_text = checked_at.strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "action_taken": "REJECT",
+        "reject_reason": "cycle_side_effect_deadline_exceeded",
+        "reject_detail": (
+            f"本轮交易副作用硬截止为 {deadline_text} UTC+8；"
+            f"检查时刻 {checked_text} 已到或超过截止，未触发新的交易所写入"),
+        "side_effect_deadline": {
+            "cycle_id": raw_cycle,
+            "deadline_at": deadline_text,
+            "checked_at": checked_text,
+            "comparison": ">=",
+        },
+    }
 
 
 class PositionsUnavailable(RuntimeError):
@@ -90,10 +160,9 @@ def _to_float(v: Any) -> Optional[float]:
     if v is None or v == "":
         return None
     try:
-        value = float(v)
-    except (TypeError, ValueError, OverflowError):
+        return float(v)
+    except (TypeError, ValueError):
         return None
-    return value if math.isfinite(value) else None
 
 
 def _exchange_fill_time(
@@ -287,6 +356,8 @@ def fetch_open_positions(profile: str) -> list[dict[str, Any]]:
             "symbol": item.get("instId"),
             "side": pos_side,
             "sz": abs(sz),
+            "posId": str(item.get("posId") or "") or None,
+            "cTime": str(item.get("cTime") or "") or None,
             "notional": _to_float(item.get("notionalUsd")),
             "lev": _to_float(item.get("lever")),
             "avgPx": _to_float(item.get("avgPx") or item.get("markPx")),
@@ -643,6 +714,42 @@ def _position_size(positions: list[dict[str, Any]], symbol: str, side: str) -> f
     return 0.0
 
 
+def _position_fingerprint_error(
+    actual: Optional[dict[str, Any]],
+    *,
+    expected_exists: Optional[bool],
+    expected_sz: Optional[float],
+    expected_pos_id: Optional[str],
+    expected_c_time: Optional[str],
+) -> Optional[str]:
+    if expected_exists is None:
+        return None
+    if not isinstance(expected_exists, bool):
+        return "expected_exists_not_bool"
+    actual_exists = actual is not None
+    if actual_exists != expected_exists:
+        return f"exists expected={expected_exists} actual={actual_exists}"
+    if not expected_exists:
+        return None
+    expected_size = _to_float(expected_sz)
+    actual_size = _to_float((actual or {}).get("sz"))
+    if expected_size is None or expected_size <= 0:
+        return "expected_sz_invalid"
+    if actual_size is None or actual_size <= 0:
+        return "actual_sz_invalid"
+    if abs(actual_size - expected_size) > max(_EPS, expected_size * 1e-8):
+        return f"sz expected={expected_size} actual={actual_size}"
+    if expected_pos_id not in (None, ""):
+        actual_pos_id = str((actual or {}).get("posId") or "")
+        if actual_pos_id != str(expected_pos_id):
+            return f"posId expected={expected_pos_id} actual={actual_pos_id or None}"
+    if expected_c_time not in (None, ""):
+        actual_c_time = str((actual or {}).get("cTime") or "")
+        if actual_c_time != str(expected_c_time):
+            return f"cTime expected={expected_c_time} actual={actual_c_time or None}"
+    return None
+
+
 def _verify_open_settled(symbol: str, side: str, profile: str, pre_sz: float,
                          wait: float = 2.0, tries: int = 3) -> Optional[bool]:
     """S2b（2026-07-02）：下单写超时后判定是否真成交——重拉现仓比对 symbol+side 张数。
@@ -663,7 +770,8 @@ def _verify_open_settled(symbol: str, side: str, profile: str, pre_sz: float,
     return None
 
 
-_SCRIPTS_DIR = os.environ.get("OKX_SCRIPTS_DIR", r"./scripts")
+_SCRIPTS_DIR = os.environ.get(
+    "OKX_SCRIPTS_DIR", str(_PROJECT_ROOT / "scripts"))
 _AUTOHEAL_TIMEOUT_SEC = 180
 _AUTOHEAL_CONTRACT_VERSION = 1
 
@@ -798,6 +906,8 @@ def _try_autoheal_ledger(profile: str, db_root,
         cmd = [sys.executable, heal_py, "--profile", str(profile),
                "--db-root", str(resolved_db_root),
                "--request-id", request_id, "--json-out", str(out_json)]
+        # Public-release boundary: never append --apply or
+        # --enable-unrecorded, regardless of inherited environment values.
         if cycle_id:
             cmd += ["--self-cycle", str(cycle_id)]
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -1121,6 +1231,11 @@ def open_position(
     receipt_context: Optional[dict[str, Any]] = None,
     account_imr: Optional[float] = None,
     tp_trigger_px: Optional[float] = None,
+    expected_pre_position_exists: Optional[bool] = None,
+    expected_pre_position_sz: Optional[float] = None,
+    expected_pre_position_pos_id: Optional[str] = None,
+    expected_pre_position_c_time: Optional[str] = None,
+    target_stop_risk_pct_equity: Optional[float] = None,
 ) -> dict[str, Any]:
     _require_live_profile(profile, "open_position")
     profile_label = "live"
@@ -1129,6 +1244,7 @@ def open_position(
     capacity_audit: Optional[dict[str, Any]] = None
     position_reconciliation_audit: Optional[dict[str, Any]] = None
     multitimeframe_readiness_audit: Optional[dict[str, Any]] = None
+    multitimeframe_evidence_anchor_audit: Optional[dict[str, Any]] = None
     intent_path = Path(db_root) / "ledger.db"
     intent_fingerprint: Optional[str] = None
     intent_ord_id: Optional[str] = None
@@ -1148,6 +1264,9 @@ def open_position(
         if multitimeframe_readiness_audit is not None:
             base["multitimeframe_readiness"] = dict(
                 multitimeframe_readiness_audit)
+        if multitimeframe_evidence_anchor_audit is not None:
+            base["multitimeframe_evidence_anchor"] = dict(
+                multitimeframe_evidence_anchor_audit)
         base.update(kw)
         return base
 
@@ -1251,10 +1370,42 @@ def open_position(
             False, action_taken="REJECT",
             reject_reason="receipt_context_invalid",
             reject_detail="；".join(ctx_errors))
+    card = (receipt_context or {}).get("decision_card") or {}
+    rr = card.get("risk_reward") if isinstance(card, dict) else None
+    exit_mode = None
+    if isinstance(rr, dict) and "exit_mode" in rr:
+        exit_mode = str(rr.get("exit_mode") or "").strip().lower()
+        if exit_mode not in EXIT_MODES:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="exit_mode_invalid",
+                reject_detail=(
+                    "risk_reward.exit_mode 必须是 "
+                    "fixed_tp|dynamic_exit|no_fixed_tp"),
+            )
+        if exit_mode == "fixed_tp" and tp_trigger_px is None:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="fixed_tp_required",
+                reject_detail="exit_mode=fixed_tp 必须传 tp_trigger_px",
+            )
+        if exit_mode in {"dynamic_exit", "no_fixed_tp"} \
+                and tp_trigger_px is not None:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="tp_not_allowed_for_exit_mode",
+                reject_detail=(
+                    f"exit_mode={exit_mode} 时开仓不得附挂固定 TP；"
+                    "卡内 target 仅作 EV/参考目标"),
+            )
     if not ox.is_dryrun() and not cycle_id:
         return receipt(
             False, action_taken="REJECT", reject_reason="cycle_id_required",
             reject_detail="非 dry-run 开仓必须提供调度 cycle_id")
+    if not ox.is_dryrun():
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return receipt(False, **deadline_reject)
 
     # Wave1 序6 接管闸（终稿边界表 #3 / T4）：分析与执行 actor epoch 不同
     # （overloaded 切换等）时，OPEN/ADD 必须携带确定性重验凭证；同 actor
@@ -1323,6 +1474,11 @@ def open_position(
             "sl_trigger_px": sl_trigger_px,
             "tp_trigger_px": tp_trigger_px,
             "mgn_mode": mgn_mode,
+            "expected_pre_position_exists": expected_pre_position_exists,
+            "expected_pre_position_sz": expected_pre_position_sz,
+            "expected_pre_position_pos_id": expected_pre_position_pos_id,
+            "expected_pre_position_c_time": expected_pre_position_c_time,
+            "target_stop_risk_pct_equity": target_stop_risk_pct_equity,
         }
         try:
             reserved = ei.reserve(
@@ -1417,15 +1573,24 @@ def open_position(
         if isinstance(card_multitimeframe, dict) else None
     )
     actual_contract = multitimeframe_readiness_audit.get("evidence_contract")
-    if supplied_contract != actual_contract:
+    multitimeframe_evidence_anchor_audit = resolve_execution_evidence_anchor(
+        db_root,
+        symbol,
+        str(cycle_id),
+        side,
+        supplied_contract,
+        actual_contract,
+    )
+    if not multitimeframe_evidence_anchor_audit.get("ok"):
         return _finish_clean(
             receipt(
                 False,
                 action_taken="REJECT",
                 reject_reason="multitimeframe_context_mismatch",
                 reject_detail=(
-                    "决策卡三周期证据与 market.db 本 cycle 精确闭合真值不一致；"
-                    "拒绝使用旧周期、篡改或非权威证据开仓"
+                    "决策卡三周期证据既不等于 market.db 当前精确闭合真值，"
+                    "也不等于 analysis.db 中本 cycle 经 writer 验证的持久化证据；"
+                    "拒绝使用旧周期、篡改或未持久化证据开仓"
                 ),
             ),
             "multitimeframe_context_mismatch",
@@ -1709,6 +1874,39 @@ def open_position(
                 open_positions = []
         if mark_px is None:
             mark_px = ox.get_mark_price(symbol, profile)
+    # 开仓前同标的同侧张数：>0 即本次是**加仓**，成交后须把止损收敛并扩到全仓。
+    # 取自已核对过的 open_positions（非快照），成交后不再重取以免与 fill 竞态。
+    pre_position_sz = _position_size(open_positions or [], symbol, side)
+    actual_pre_position = next((
+        row for row in (open_positions or [])
+        if row.get("symbol") == symbol
+        and str(row.get("side") or "").lower() == side
+    ), None)
+    fingerprint_error = _position_fingerprint_error(
+        actual_pre_position,
+        expected_exists=expected_pre_position_exists,
+        expected_sz=expected_pre_position_sz,
+        expected_pos_id=expected_pre_position_pos_id,
+        expected_c_time=expected_pre_position_c_time,
+    )
+    if fingerprint_error:
+        return _finish_clean(receipt(
+            False,
+            action_taken="REJECT",
+            reject_reason="pre_position_semantics_changed",
+            reject_detail=(
+                "执行时同 symbol/side 仓位与 plan/facts 指纹不一致；"
+                "已在 set_leverage/order I/O 前 clean reject: "
+                + fingerprint_error
+            ),
+            expected_pre_position={
+                "exists": expected_pre_position_exists,
+                "sz": expected_pre_position_sz,
+                "posId": expected_pre_position_pos_id,
+                "cTime": expected_pre_position_c_time,
+            },
+            actual_pre_position=actual_pre_position,
+        ), "pre_position_semantics_changed")
     if tp_trigger_px is not None:
         mark_for_tp = _to_float(mark_px)
         if mark_for_tp is None or not math.isfinite(mark_for_tp) or mark_for_tp <= 0:
@@ -1727,8 +1925,6 @@ def open_position(
                 reject_detail=(
                     f"止盈方向非法: side={side} mark={mark_px} tp={tp_trigger_px}"),
             ), "bad_tp_geometry")
-        card = (receipt_context or {}).get("decision_card") or {}
-        rr = card.get("risk_reward") if isinstance(card, dict) else None
         target = _to_float(rr.get("target")) if isinstance(rr, dict) else None
         if (target is None
                 or abs(target - tp_trigger_px) / tp_trigger_px > 0.001):
@@ -1742,6 +1938,29 @@ def open_position(
     ct_val = specs.get("ct_val")
     lot_sz = specs.get("lot_sz")
     min_sz = specs.get("min_sz")
+    authoritative_target_sizing: Optional[dict[str, Any]] = None
+    if target_stop_risk_pct_equity is not None:
+        authoritative_target_sizing = rv.size_for_target_stop_risk(
+            mark_px=mark_px,
+            ct_val=ct_val,
+            lot_sz=lot_sz,
+            min_order_size=min_sz,
+            equity=equity,
+            sl_trigger_px=sl_trigger_px,
+            target_risk_pct_equity=target_stop_risk_pct_equity,
+        )
+        if authoritative_target_sizing.get("ok") is not True:
+            return _finish_clean(receipt(
+                False,
+                action_taken="REJECT",
+                reject_reason="authoritative_target_sizing_failed",
+                reject_detail=str(
+                    authoritative_target_sizing.get("error")
+                    or "unknown_target_sizing_error"
+                ),
+                authoritative_target_sizing=authoritative_target_sizing,
+            ), "authoritative_target_sizing_failed")
+        intended_sz = authoritative_target_sizing["intended_sz"]
     new_open = not any(
         (p.get("symbol") == symbol and str(p.get("side", "")).lower() == side)
         for p in open_positions)
@@ -1750,24 +1969,13 @@ def open_position(
     # demo 的两阶段 max-size 定仓分支（预检 → set_leverage → account max-size →
     # 按 minSz/lotSz 收敛）随 2026-08-06 全量下线移除；只剩 live 的完整预算闸。
     # Live 保持 1% 名义下限、可用保证金×98% 与组合 IMR 66.6% 整单拒绝规则。
-    try:
-        v = rv.validate(
-            symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
-            mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
-            open_positions=open_positions, sl_trigger_px=sl_trigger_px,
-            profile="live", available_margin=available_margin,
-            account_imr=account_imr,
-        )
-    except Exception as exc:  # fail closed before leverage/order mutation
-        return _finish_clean(receipt(
-            False, action_taken="REJECT",
-            reject_reason="risk_validation_exception",
-            reject_detail=(
-                "Live 风控异常，订单尚未提交并已清理执行意图: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-            p0=True,
-        ), f"risk_validation_exception:{type(exc).__name__}")
+    v = rv.validate(
+        symbol=symbol, side=side, intended_sz=intended_sz, lev=lev,
+        mark_px=mark_px, ct_val=ct_val, lot_sz=lot_sz, equity=equity,
+        open_positions=open_positions, sl_trigger_px=sl_trigger_px,
+        profile="live", available_margin=available_margin,
+        account_imr=account_imr,
+    )
 
     if not v["approved"]:
         return _finish_clean(receipt(
@@ -1780,7 +1988,15 @@ def open_position(
     effective_lev = (_to_float((v.get("math") or {}).get("effective_lev"))
                      or lev)
 
-    # live 在完整预算闸通过后才设杠杆。
+    # live 在完整预算闸通过后才设杠杆。前面的分析、现场读取和风控可能
+    # 消耗较久，因此在首次交易所写前再次检查自然轮硬截止。
+    if not ox.is_dryrun():
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return _finish_clean(
+                receipt(False, risk=v, **deadline_reject),
+                str(deadline_reject["reject_reason"]),
+            )
     if new_open:
         lr = ox.set_leverage(symbol, lev, mgn_mode, profile)
         if not lr.get("ok"):
@@ -1791,7 +2007,69 @@ def open_position(
                 risk=v,
             ), "set_leverage_failed")
 
-    # ── 市价开仓（附挂 SL，原子）──
+    # ── 市价开仓（只附挂 SL）──
+    # OKX 的普通 conditional algo 同时给 TP+SL 时只执行 SL 逻辑；因此 executor
+    # 不把 fixed TP 混进主单参数。SL 先成为硬保护，TP 随后以独立 reduceOnly
+    # conditional 单挂出并按精确 algoId 回读。
+    # set_leverage 是独立写请求；它返回后若刚好跨过硬截止，仍不得再开仓。
+    if not ox.is_dryrun():
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return _finish_clean(
+                receipt(False, risk=v, **deadline_reject),
+                str(deadline_reject["reject_reason"]),
+            )
+    # The first fingerprint check deliberately precedes set_leverage so a
+    # stale OPEN/ADD plan cannot mutate exchange state.  Specs, sizing, risk
+    # checks, and set_leverage can still take long enough for the position to
+    # change underneath us, so bind the order itself to one final API read.
+    # Unified-runner calls always provide ``expected_*``; legacy internal
+    # callers without an expected fingerprint keep their existing I/O shape.
+    if (not ox.is_dryrun()
+            and expected_pre_position_exists is not None):
+        try:
+            latest_positions = fetch_open_positions(profile)
+        except PositionsUnavailable as exc:
+            return _finish_clean(receipt(
+                False,
+                action_taken="REJECT",
+                reject_reason="pre_order_positions_unavailable",
+                reject_detail=(
+                    "订单紧前现仓 API 不可用，无法确认 OPEN/ADD 语义；"
+                    f"已 fail-closed，未下单: {exc}"
+                ),
+                risk=v,
+            ), "pre_order_positions_unavailable")
+        latest_pre_position = next((
+            row for row in latest_positions
+            if row.get("symbol") == symbol
+            and str(row.get("side") or "").lower() == side
+        ), None)
+        late_fingerprint_error = _position_fingerprint_error(
+            latest_pre_position,
+            expected_exists=expected_pre_position_exists,
+            expected_sz=expected_pre_position_sz,
+            expected_pos_id=expected_pre_position_pos_id,
+            expected_c_time=expected_pre_position_c_time,
+        )
+        if late_fingerprint_error:
+            return _finish_clean(receipt(
+                False,
+                action_taken="REJECT",
+                reject_reason="pre_position_semantics_changed",
+                reject_detail=(
+                    "订单紧前同 symbol/side 仓位已不同于 plan/facts；"
+                    "已 clean reject，未下单: " + late_fingerprint_error
+                ),
+                expected_pre_position={
+                    "exists": expected_pre_position_exists,
+                    "sz": expected_pre_position_sz,
+                    "posId": expected_pre_position_pos_id,
+                    "cTime": expected_pre_position_c_time,
+                },
+                actual_pre_position=latest_pre_position,
+                risk=v,
+            ), "pre_position_semantics_changed")
     pre_sz = _position_size(open_positions, symbol, side)
     pre_place_ms = int(time.time() * 1000)
     if intent_fingerprint:
@@ -1807,7 +2085,7 @@ def open_position(
     try:
         pr = ox.place_market_open(
             symbol, side, approved_sz, profile, mgn_mode=mgn_mode,
-            sl_trigger_px=sl_trigger_px, tp_trigger_px=tp_trigger_px)
+            sl_trigger_px=sl_trigger_px, tp_trigger_px=None)
     except Exception as exc:
         _enqueue_repair(profile_label, symbol, None,
                         "place_exception_ambiguous", db_root)
@@ -1992,12 +2270,16 @@ def open_position(
             "algo_id": algo_id0, "sl_mode": sl_mode0,
             "sl_verified": sl_verified0, "fill_source": fill_source0,
             "tp_trigger_px": tp_trigger_px, "tp_mode": tp_mode0,
+            "tp_algo_id": tp_algo_id,
+            "exit_mode": exit_mode or ("fixed_tp" if tp_trigger_px is not None
+                                        else "legacy_optional_tp"),
             "tp_verified": tp_verified0,
             "fill_ts": fa0.get("fill_ts"),
             "ts_source": fa0.get("ts_source"),
             # 回执带本环境真实 ct_val，writer 补算优先用行内值。
             "ct_val": ct_val, "ordId": ord_id,
-            # 单笔保证金审计（push/复盘直读；HOLD/ADJUST 无 trade 行天然无此字段）
+            # 单笔保证金审计（push/复盘直读；HOLD/WAIT/ADJUST_PROTECTION
+            # 无 open/reduce/close 成交行，天然无此字段）
             "single_order_imr_ratio": so_ratio,
             "max_single_order_imr_ratio": rv.MAX_SINGLE_ORDER_IMR_RATIO,
             "single_order_cap_breached": so_breached,
@@ -2025,6 +2307,7 @@ def open_position(
     #   algo：独立 reduceOnly algo，返回 algoId 后仍须 pending 回读通过才算 verified。
     #   超时恢复路径 attached 状态未知 → 不采信附挂，强制走独立 algo 补挂（belt）。
     algo_id = None
+    tp_algo_id = None
     tp_mode = "none"
     tp_verified = False
     tp_warning = None
@@ -2142,39 +2425,6 @@ def open_position(
                            reject_detail="附挂+独立 SL 均失败，已市价平掉裸仓",
                            risk=v, unwind=unwind, p0=True))
 
-    # ── 可选止盈验证 ──
-    # TP 缺失不等于裸仓：SL 已安全确认时不平仓，只把未兑现的止盈保护写 repair。
-    tp_attached_ok = (
-        bool(pr.get("tp_attached")) and tp_trigger_px is not None
-        and not recovered_timeout
-    )
-    if tp_trigger_px is not None and ox.is_dryrun():
-        # DRYRUN 只证明参数已进入确定性下单装配，不伪称交易所已回读确认，
-        # 也绝不能向生产 repair_queue 写一条虚假的 TP 缺失告警。
-        tp_mode, tp_verified = "dryrun_simulated", False
-    elif tp_attached_ok:
-        try:
-            _vtp = _verify_tp_placed(
-                symbol, side, profile, tp_trigger_px,
-                expected_sz=approved_sz, since_ms=pre_place_ms,
-                expected_ord_id=ord_id)
-        except Exception as exc:
-            _vtp = {"verified": False, "found": [],
-                    "error": f"verify_exception:{type(exc).__name__}"}
-        if _vtp.get("verified"):
-            tp_mode, tp_verified = "attached", True
-        else:
-            tp_warning = "tp_unsecured"
-    elif tp_trigger_px is not None:
-        tp_warning = "tp_unsecured"
-    if tp_warning:
-        _enqueue_repair(profile, symbol, ord_id, "tp_unsecured_after_open", db_root)
-        print(
-            f"[order_executor] WARN 可选 TP 未回读确认 {symbol}；SL 已保护，"
-            "不 unwind，已入 repair_queue",
-            file=sys.stderr,
-        )
-
     # ── 回读真实成交（ord_id 缺失=超时恢复路径 → 用下单时刻做时间窗，防历史成交混入）──
     fa, fill_source = resolve_open_fill()
     if fa.get("state") == "canceled":
@@ -2183,6 +2433,9 @@ def open_position(
         if algo_id:
             _enqueue_repair(profile, symbol, ord_id,
                             "open_canceled_dangling_algo_sl", db_root)
+        if tp_algo_id:
+            _enqueue_repair(profile, symbol, ord_id,
+                            "open_canceled_dangling_algo_tp", db_root)
         return _finish_clean(receipt(False, action_taken="REJECT",
                        reject_reason="open_not_filled",
                        reject_detail="订单状态确认未成交（canceled, accFillSz=0）",
@@ -2195,16 +2448,128 @@ def open_position(
                        reject_detail="开仓后 fills/订单状态均拉不到，已写 repair_queue",
                        risk=v, ord_id=ord_id, p0=True), "open_fills_missing")
 
-    # 从这里开始已是权威确认的成交，立即落一次 journal；后面只组回执，
-    # 不再进入任何 SL I/O，故 SL 回读/补挂异常无法跳过此留痕。
+    # 从这里开始已是权威确认的成交，立即落一次 journal。固定 TP 是非关键腿，
+    # 必须在这条成交真值留痕之后才尝试，且只按实际 fill_sz 挂，不能拿 approved_sz
+    # 覆盖部分成交后的真实仓位。
     trade = make_open_trade(
         fa, fill_source, sl_mode, sl_verified, algo_id, tp_mode, tp_verified)
     journal_open_once(trade)
+
+    # ── 可选止盈：独立 reduceOnly conditional 单 ──
+    # TP 缺失不等于裸仓：SL 已安全确认时不平仓，只把未兑现的止盈保护写 repair。
+    tp_size = _to_float(fa.get("fill_sz"))
+    if tp_size is None and ox.is_dryrun():
+        tp_size = approved_sz
+    if tp_trigger_px is not None and ox.is_dryrun():
+        # DRYRUN 只证明 fixed-TP 分支进入独立保护计划，不伪称交易所已回读确认，
+        # 也绝不能向生产 repair_queue 写一条虚假的 TP 缺失告警。
+        tp_mode, tp_verified = "dryrun_simulated", False
+    elif tp_trigger_px is not None and tp_size is not None and tp_size > 0:
+        tp_place_ms = int(time.time() * 1000)
+        try:
+            tp_place = ox.place_algo_tp(
+                symbol, side, tp_size, tp_trigger_px, profile,
+                mgn_mode=mgn_mode)
+        except Exception as exc:
+            tp_place = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "data": [],
+            }
+        if tp_place.get("ok"):
+            tp_algo_id = next((
+                str(row.get("algoId"))
+                for row in tp_place.get("data", [])
+                if isinstance(row, dict) and row.get("algoId")
+            ), None)
+            if not tp_algo_id:
+                _vtp = {
+                    "verified": False, "found": [],
+                    "error": "tp_algo_id_missing",
+                }
+            else:
+                try:
+                    _vtp = _verify_tp_placed(
+                        symbol, side, profile, tp_trigger_px,
+                        expected_sz=tp_size, since_ms=tp_place_ms,
+                        expected_algo_id=tp_algo_id)
+                except Exception as exc:
+                    _vtp = {
+                        "verified": False, "found": [],
+                        "error": f"verify_exception:{type(exc).__name__}",
+                    }
+        else:
+            _vtp = {
+                "verified": False, "found": [],
+                "error": str(tp_place.get("sMsg") or tp_place.get("error")),
+            }
+        if _vtp.get("verified"):
+            tp_mode, tp_verified = "independent_algo", True
+        else:
+            tp_warning = "tp_unsecured"
+    elif tp_trigger_px is not None:
+        tp_warning = "tp_unsecured"
+    if tp_warning:
+        _enqueue_repair(profile, symbol, ord_id, "tp_unsecured_after_open", db_root)
+        print(
+            f"[order_executor] WARN 可选 TP 未回读确认 {symbol}；SL 已保护，"
+            "不 unwind，已入 repair_queue",
+            file=sys.stderr,
+        )
+    trade["tp_mode"] = tp_mode
+    trade["tp_verified"] = tp_verified
+    trade["tp_algo_id"] = tp_algo_id
+
+    # ── 加仓后收敛并扩到全仓（主人 2026-08-13 授权「加仓后自动扩到全仓」）────────
+    # 加仓**必然**留下第二张分档止损：本函数每笔成交都自挂 approved_sz 大小的
+    # reduceOnly SL，而 _verify_sl_placed 要求 cTime >= 本次请求时刻，命中的必是新单。
+    # 不收敛就长期停在「两张分档单」——总覆盖达全仓（非裸仓），但不满足终局唯一契约，
+    # 且此后任何**不带** consolidate_extra_sl 的改单都会被 duplicate_sl_before_change 硬拒。
+    # 与 reduce_position 的 post_reduce_resize 完全对称：失败只外显 + 入 repair，
+    # **绝不反向抹掉已确认的成交**，也绝不为了「改单成功」去撤止损制造裸仓。
+    # 阶段3 真单验证见 docs/protection_amend_stage3_acceptance_20260813.md。
+    protection_sync: Optional[dict[str, Any]] = None
+    protection_p0 = False
+    is_add = pre_position_sz > _EPS
+    if is_add and sl_trigger_px is not None and ox.is_dryrun():
+        protection_sync = {"ok": True, "dryrun": True,
+                           "planned_full_sz": pre_position_sz + approved_sz}
+    elif is_add and sl_trigger_px is not None:
+        sync = adjust_protection(
+            symbol, profile, pos_side=side, resize_to_full_position=True,
+            consolidate_extra_sl=True,
+            reasoning=reasoning or "加仓后收敛并同步全仓止损数量",
+            db_root=db_root, cycle_id=cycle_id,
+            receipt_context=receipt_context,
+            reason_code="post_add_resize",
+        )
+        protection_sync = {
+            key: sync.get(key) for key in (
+                "ok", "action_taken", "reject_reason", "reject_detail",
+                "p0", "path", "protection_state", "applied", "consolidated_from")
+            if sync.get(key) is not None
+        }
+        if not sync.get("ok"):
+            _enqueue_repair(
+                profile, symbol, ord_id,
+                f"add_protection_sync_failed:{sync.get('reject_reason')}", db_root)
+            protection_p0 = bool(
+                sync.get("p0")
+                or sync.get("reject_reason") in {
+                    "no_sl_to_preserve", "naked_after_change"})
+            print(f"[order_executor] WARN 加仓后扩全仓止损失败 {symbol}: "
+                  f"{sync.get('reject_reason')}；成交已确认不回滚，已入 repair_queue",
+                  file=sys.stderr)
+
     return _finish_completed(receipt(True, trades=[trade], risk=v, ord_id=ord_id,
+                   is_add=is_add, pre_position_sz=pre_position_sz,
+                   authoritative_target_sizing=authoritative_target_sizing,
+                   protection_sync=protection_sync, p0=protection_p0,
                    clamped=v.get("clamped"), adjustments=v.get("adjustments"),
                    lev_warn=lev_warn,
                    sl_mode=sl_mode, sl_verified=sl_verified,
                    tp_mode=tp_mode, tp_verified=tp_verified,
+                   tp_algo_id=tp_algo_id,
                    tp_warning=tp_warning,
                    recovered_timeout=recovered_timeout,
                    fill_source=fill_source,
@@ -2225,6 +2590,10 @@ def close_position(
     cycle_id: Optional[str] = None,
     _unwind: bool = False,
     receipt_context: Optional[dict[str, Any]] = None,
+    expected_pre_position_exists: Optional[bool] = None,
+    expected_pre_position_sz: Optional[float] = None,
+    expected_pre_position_pos_id: Optional[str] = None,
+    expected_pre_position_c_time: Optional[str] = None,
 ) -> dict[str, Any]:
     _require_live_profile(profile, "close_position")
     resolved_side = pos_side
@@ -2256,6 +2625,10 @@ def close_position(
         return receipt(
             False, action_taken="REJECT", reject_reason="cycle_id_required",
             reject_detail="非 dry-run 平仓必须提供调度 cycle_id")
+    if not ox.is_dryrun() and not _unwind:
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return receipt(False, **deadline_reject)
 
     # ── OKX API 现仓确认 posSide（S2a：API 失败 → 拒，禁当"无仓已平"假成功）──
     try:
@@ -2268,6 +2641,30 @@ def close_position(
         if p["symbol"] == symbol and (pos_side is None or p["side"] == pos_side):
             match = p
             break
+    fingerprint_error = _position_fingerprint_error(
+        match,
+        expected_exists=expected_pre_position_exists,
+        expected_sz=expected_pre_position_sz,
+        expected_pos_id=expected_pre_position_pos_id,
+        expected_c_time=expected_pre_position_c_time,
+    )
+    if fingerprint_error:
+        return receipt(
+            False,
+            action_taken="REJECT",
+            reject_reason="pre_position_fingerprint_changed",
+            reject_detail=(
+                "执行时平仓目标已不同于 plan/facts；未发送订单: "
+                + fingerprint_error
+            ),
+            expected_pre_position={
+                "exists": expected_pre_position_exists,
+                "sz": expected_pre_position_sz,
+                "posId": expected_pre_position_pos_id,
+                "cTime": expected_pre_position_c_time,
+            },
+            actual_pre_position=match,
+        )
     if match is None:
         return receipt(True, action_taken="CLOSE", note="no_open_position",
                        reject_detail=f"{symbol} 无对应现仓（可能已平）")
@@ -2287,6 +2684,10 @@ def close_position(
     # 确认成交/pnl（旧「全量聚合 approx」被历史成交污染 fill_px 的根因）。交易所侧
     # swap close 本就生成一张 reduceOnly 市价单——改为显式下 reduceOnly 单拿到 ordId
     # （per-order GET 实测即时 134ms）；reduceOnly 语义保证绝不翻反向仓。
+    if not ox.is_dryrun() and not _unwind:
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return receipt(False, **deadline_reject)
     close_start_ms = int(time.time() * 1000)
     used_reduce_only = True
     reduce_ord_id = None
@@ -2460,6 +2861,492 @@ def close_position(
 
 
 # ---------------------------------------------------------------------------
+# REDUCE（Agent 自主部分减仓；绝不静默升级为全平）
+# ---------------------------------------------------------------------------
+def reduce_position(
+    symbol: str,
+    profile: str,
+    reduce_sz: float,
+    *,
+    pos_side: str,
+    mgn_mode: str = "cross",
+    reasoning: str = "",
+    db_root: Path = DEFAULT_DB_ROOT,
+    cycle_id: Optional[str] = None,
+    receipt_context: Optional[dict[str, Any]] = None,
+    expected_pre_position_exists: Optional[bool] = None,
+    expected_pre_position_sz: Optional[float] = None,
+    expected_pre_position_pos_id: Optional[str] = None,
+    expected_pre_position_c_time: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reduce part of one live position with an exact reduce-only market order.
+
+    This is deliberately separate from close_position: requested size
+    must remain strictly below the current position, and every order failure is
+    returned as-is.  There is no server-side full-close fallback, so a failed
+    partial reduction can never silently become a complete exit.
+    """
+    _require_live_profile(profile, "reduce_position")
+    side = str(pos_side or "").strip().lower()
+    intent_path = Path(db_root) / "ledger.db"
+    intent_fingerprint: Optional[str] = None
+    intent_ord_id: Optional[str] = None
+
+    def receipt(ok: bool, **kw) -> dict[str, Any]:
+        base = dict(receipt_context or {})
+        base.update({
+            "profile": "live",
+            "ok": ok,
+            "cycle_id": cycle_id,
+            "action_taken": kw.pop("action_taken", "REDUCE"),
+            "symbol": symbol,
+            "side": side or None,
+            "trades": kw.pop("trades", []),
+            "p0": kw.pop("p0", False),
+        })
+        base.update(kw)
+        return base
+
+    requested_sz = _to_float(reduce_sz)
+    if requested_sz is None or not math.isfinite(requested_sz) or requested_sz <= 0:
+        return receipt(
+            False, action_taken="REJECT", reject_reason="bad_reduce_sz",
+            reject_detail=f"部分减仓张数必须是有限正数: {reduce_sz!r}")
+    if side not in {"long", "short"}:
+        return receipt(
+            False, action_taken="REJECT", reject_reason="pos_side_required",
+            reject_detail="部分减仓必须显式指定 pos_side=long|short")
+
+    # 与 CLOSE 一样不启用 OPEN/ADD 的多周期和 actor 闸；但完整决策卡与 cycle
+    # 仍在任何交易所 I/O 前验证，保证 Agent 裁决可追溯。
+    ctx_errors = validate_receipt_context(
+        receipt_context, cycle_id=cycle_id, required=not ox.is_dryrun())
+    if ctx_errors:
+        return receipt(
+            False, action_taken="REJECT",
+            reject_reason="receipt_context_invalid",
+            reject_detail="；".join(ctx_errors))
+    if not ox.is_dryrun() and not cycle_id:
+        return receipt(
+            False, action_taken="REJECT", reject_reason="cycle_id_required",
+            reject_detail="非 dry-run 部分减仓必须提供调度 cycle_id")
+    if not ox.is_dryrun():
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return receipt(False, **deadline_reject)
+
+    def _intent_kwargs(now_ts: Optional[str] = None) -> dict[str, Any]:
+        return {
+            "profile": "live",
+            "cycle_id": str(cycle_id),
+            "symbol": symbol,
+            "side": side,
+            "action": "reduce",
+            "fingerprint": str(intent_fingerprint),
+            "now_ts": now_ts or ledger.now_cst(),
+        }
+
+    def _finish_clean(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_failed_clean(intent_path, error=error, **_intent_kwargs())
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    f"failed_clean transition failed: {type(exc).__name__}: {exc}")
+                result["p0"] = True
+        return result
+
+    def _finish_uncertain(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_uncertain(
+                    intent_path, ord_id=intent_ord_id, error=error,
+                    **_intent_kwargs())
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    f"uncertain transition failed: {type(exc).__name__}: {exc}")
+        result["p0"] = True
+        return result
+
+    def _finish_completed(result: dict[str, Any]) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_completed(
+                    intent_path, ord_id=intent_ord_id, receipt=result,
+                    error=None, **_intent_kwargs())
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    f"completed transition failed: {type(exc).__name__}: {exc}")
+                result["p0"] = True
+                _enqueue_repair(
+                    "live", symbol, intent_ord_id,
+                    "reduce_execution_intent_complete_failed", db_root)
+        return result
+
+    # 独立 action=reduce 键保留 OPEN 历史键不变，同时为重复部分减仓提供持久幂等。
+    if not ox.is_dryrun():
+        request = {
+            "profile": "live", "cycle_id": cycle_id, "symbol": symbol,
+            "action": "reduce", "side": side, "reduce_sz": requested_sz,
+            "mgn_mode": mgn_mode,
+            "expected_pre_position_exists": expected_pre_position_exists,
+            "expected_pre_position_sz": expected_pre_position_sz,
+            "expected_pre_position_pos_id": expected_pre_position_pos_id,
+            "expected_pre_position_c_time": expected_pre_position_c_time,
+        }
+        try:
+            reserved = ei.reserve(
+                intent_path, profile="live", cycle_id=str(cycle_id),
+                symbol=symbol, side=side, action="reduce", request=request,
+                now_ts=ledger.now_cst())
+        except Exception as exc:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="execution_intent_store_failed",
+                reject_detail=(
+                    "减仓幂等意图库不可用，未发送订单: "
+                    f"{type(exc).__name__}: {exc}"), p0=True)
+        if reserved.get("status") == "replay":
+            cached = dict(reserved["receipt"])
+            cached["idempotent_replay"] = True
+            cached["intent_state"] = "completed"
+            return cached
+        if reserved.get("status") != "reserved":
+            blocker = reserved.get("blocking_intent") or {}
+            _enqueue_repair(
+                "live", symbol, reserved.get("ord_id"),
+                "reduce_execution_intent_blocked:"
+                f"{reserved.get('reason')}:{blocker}", db_root)
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="execution_intent_blocked",
+                reject_detail=(
+                    "存在未确认的执行意图，部分减仓未发送；"
+                    "可在核实当前仓位后选择完整 close 去风险"),
+            )
+        intent_fingerprint = str(reserved["fingerprint"])
+
+    # 现仓真值与规格只在 intent 预留后读取。
+    try:
+        positions = fetch_open_positions(profile)
+    except PositionsUnavailable as exc:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="positions_fetch_failed",
+            reject_detail=f"现仓 API 失败，无法确认部分减仓目标: {exc}", p0=True,
+        ), "positions_fetch_failed")
+    match = next((
+        row for row in positions
+        if row.get("symbol") == symbol
+        and str(row.get("side") or "").lower() == side
+    ), None)
+    fingerprint_error = _position_fingerprint_error(
+        match,
+        expected_exists=expected_pre_position_exists,
+        expected_sz=expected_pre_position_sz,
+        expected_pos_id=expected_pre_position_pos_id,
+        expected_c_time=expected_pre_position_c_time,
+    )
+    if fingerprint_error:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="pre_position_fingerprint_changed",
+            reject_detail=(
+                "执行时减仓目标已不同于 plan/facts；未发送订单: "
+                + fingerprint_error
+            ),
+            expected_pre_position={
+                "exists": expected_pre_position_exists,
+                "sz": expected_pre_position_sz,
+                "posId": expected_pre_position_pos_id,
+                "cTime": expected_pre_position_c_time,
+            },
+            actual_pre_position=match,
+        ), "pre_position_fingerprint_changed")
+    if match is None:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT", reject_reason="no_position",
+            reject_detail=f"{symbol} 当前无 {side} live 持仓，未发送减仓单",
+        ), "no_position")
+    pre_position_sz = _to_float(match.get("sz"))
+    if (pre_position_sz is None or not math.isfinite(pre_position_sz)
+            or pre_position_sz <= 0):
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="invalid_position_size",
+            reject_detail=f"OKX 现仓数量非法: {match.get('sz')!r}", p0=True,
+        ), "invalid_position_size")
+
+    specs = fetch_instrument_specs(symbol, profile, db_root)
+    lot_sz = _to_float(specs.get("lot_sz"))
+    min_sz = _to_float(specs.get("min_sz")) or lot_sz
+    if (lot_sz is None or not math.isfinite(lot_sz) or lot_sz <= 0
+            or min_sz is None or not math.isfinite(min_sz) or min_sz <= 0):
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="instrument_specs_missing",
+            reject_detail=(
+                f"部分减仓需要有效 lotSz/minSz，当前 lotSz={lot_sz} "
+                f"minSz={min_sz}"),
+        ), "instrument_specs_missing")
+    approved_sz = rv._round_down_to_step(requested_sz, lot_sz)
+    if approved_sz < min_sz - _EPS:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT", reject_reason="reduce_below_min_sz",
+            reject_detail=(
+                f"请求 {requested_sz} 按 lotSz={lot_sz} 向下取整为 {approved_sz}，"
+                f"低于 minSz={min_sz}"),
+        ), "reduce_below_min_sz")
+    size_tol = max(_EPS, pre_position_sz * 1e-9)
+    if approved_sz >= pre_position_sz - size_tol:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="partial_reduce_requires_less_than_position",
+            reject_detail=(
+                f"部分减仓 approved_sz={approved_sz} 必须严格小于现仓 "
+                f"{pre_position_sz}；完整退出请调用 close_position"),
+        ), "partial_reduce_requires_less_than_position")
+    planned_remaining = pre_position_sz - approved_sz
+    if planned_remaining < min_sz - size_tol:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT", reject_reason="reduce_would_leave_dust",
+            reject_detail=(
+                f"减仓后计划剩余 {planned_remaining} 小于 minSz={min_sz}；"
+                "请选择更小减仓量或完整 close"),
+        ), "reduce_would_leave_dust")
+
+    if not ox.is_dryrun():
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return _finish_clean(
+                receipt(False, **deadline_reject),
+                str(deadline_reject["reject_reason"]),
+            )
+    if intent_fingerprint:
+        try:
+            ei.mark_submitting(intent_path, error=None, **_intent_kwargs())
+        except Exception as exc:
+            return receipt(
+                False, action_taken="REJECT",
+                reject_reason="execution_intent_transition_failed",
+                reject_detail=(
+                    "订单前幂等状态无法固化，未发送减仓单: "
+                    f"{type(exc).__name__}: {exc}"), p0=True)
+
+    reduce_start_ms = int(time.time() * 1000)
+    try:
+        placed = ox.place_reduce_only_market(
+            symbol, side, approved_sz, profile, mgn_mode=mgn_mode)
+    except Exception as exc:
+        _enqueue_repair(
+            "live", symbol, None, "reduce_place_exception_ambiguous", db_root)
+        return _finish_uncertain(receipt(
+            False, action_taken="REJECT",
+            reject_reason="reduce_place_exception_ambiguous",
+            reject_detail=(
+                "部分减仓调用异常，是否到达交易所未知；未重试、未升级全平，"
+                f"已入 repair_queue: {type(exc).__name__}: {exc}"),
+        ), "reduce_place_exception_ambiguous")
+    if not placed.get("ok"):
+        sc = placed.get("sCode")
+        ambiguous = not sc and bool(placed.get("error"))
+        if ambiguous and not ox.is_dryrun():
+            _enqueue_repair(
+                "live", symbol, None, "reduce_place_ambiguous", db_root)
+            return _finish_uncertain(receipt(
+                False, action_taken="REJECT",
+                reject_reason="reduce_place_ambiguous",
+                reject_detail=(
+                    "部分减仓写入结果不明；未重试、未升级全平，已入 repair_queue"),
+            ), "reduce_place_ambiguous")
+        reason = (
+            "delisted" if sc == ox.SCODE_DELISTED
+            else "instrument_not_exist" if sc == ox.SCODE_NOT_EXIST
+            else "reduce_place_failed")
+        return _finish_clean(receipt(
+            False, action_taken="REJECT", reject_reason=reason,
+            reject_detail=f"sCode={sc} {placed.get('sMsg') or placed.get('error')}",
+        ), f"reduce_place_rejected:{reason}")
+
+    ord_id = next((
+        str(row.get("ordId")) for row in placed.get("data", [])
+        if isinstance(row, dict) and row.get("ordId")
+    ), None)
+    intent_ord_id = ord_id
+    if not ord_id and not ox.is_dryrun():
+        _enqueue_repair("live", symbol, None, "reduce_ord_id_missing", db_root)
+        return _finish_uncertain(receipt(
+            False, action_taken="REJECT", reject_reason="reduce_ord_id_missing",
+            reject_detail=(
+                "交易所接受部分减仓但未返回唯一 ordId；禁止模糊归因，已入 repair_queue"),
+        ), "reduce_ord_id_missing")
+    if intent_fingerprint:
+        try:
+            ei.mark_submitted(
+                intent_path, ord_id=intent_ord_id, error=None,
+                **_intent_kwargs())
+        except Exception as exc:
+            print(
+                f"[order_executor] WARN reduce intent submitted 写失败 "
+                f"{symbol}: {exc}", file=sys.stderr)
+
+    try:
+        fa = _read_fills(
+            symbol, profile, ord_id,
+            since_ms=None if ord_id else reduce_start_ms)
+    except Exception as exc:
+        print(
+            f"[order_executor] WARN reduce fills 回读异常 {symbol}: {exc}",
+            file=sys.stderr)
+        fa = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    fill_source = "fills"
+    if not fa.get("ok") and not ox.is_dryrun():
+        try:
+            alt = _confirm_order_filled(symbol, profile, ord_id)
+        except Exception as exc:
+            print(
+                f"[order_executor] WARN reduce order 回读异常 {symbol}: {exc}",
+                file=sys.stderr)
+            alt = None
+        if alt and alt.get("ok"):
+            fa = alt
+            fill_source = str(alt.get("source") or "order_status")
+        elif alt and alt.get("state") == "canceled":
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="reduce_not_filled",
+                reject_detail="部分减仓单 canceled 且权威订单状态确认 0 成交",
+                ord_id=ord_id,
+            ), "reduce_canceled_no_fill")
+    if not fa.get("ok"):
+        _enqueue_repair(
+            "live", symbol, ord_id, "reduce_fill_unconfirmed", db_root)
+        return _finish_uncertain(receipt(
+            False, action_taken="REJECT",
+            reject_reason="reduce_fill_unconfirmed",
+            reject_detail=(
+                "部分减仓已提交但 fills/订单状态均未确认；禁止按请求量猜成交，"
+                "已入 repair_queue"), ord_id=ord_id,
+        ), "reduce_fill_unconfirmed")
+
+    fill_valid, fill_error = _validate_confirmed_close_fill(
+        fa, fill_source, dryrun=ox.is_dryrun(), requested_sz=approved_sz)
+    if not fill_valid:
+        _enqueue_repair(
+            "live", symbol, ord_id,
+            f"reduce_fill_contract_invalid:{fill_error}", db_root)
+        return _finish_uncertain(receipt(
+            False, action_taken="REJECT",
+            reject_reason="reduce_fill_contract_invalid",
+            reject_detail=(
+                "部分减仓成交端点字段不完整，禁止合成数量/价格/时间: "
+                f"{fill_error}"), ord_id=ord_id,
+        ), f"reduce_fill_contract_invalid:{fill_error}")
+
+    actual_fill_sz = _to_float(fa.get("fill_sz"))
+    fill_px = _to_float(fa.get("fill_px"))
+    if ox.is_dryrun() and fa.get("dryrun"):
+        actual_fill_sz = approved_sz
+    if actual_fill_sz is None or actual_fill_sz <= 0:
+        return _finish_uncertain(receipt(
+            False, action_taken="REJECT",
+            reject_reason="reduce_fill_size_invalid",
+            reject_detail="权威成交数量缺失，禁止写入减仓账本", ord_id=ord_id,
+        ), "reduce_fill_size_invalid")
+
+    post_position_sz: Optional[float]
+    position_delta_warning = None
+    if ox.is_dryrun():
+        post_position_sz = max(0.0, pre_position_sz - actual_fill_sz)
+    else:
+        time.sleep(1.0)
+        try:
+            post_position_sz = _position_size(
+                fetch_open_positions(profile), symbol, side)
+        except PositionsUnavailable:
+            post_position_sz = None
+        expected_remaining = max(0.0, pre_position_sz - actual_fill_sz)
+        if (post_position_sz is None
+                or abs(post_position_sz - expected_remaining)
+                > max(_EPS, pre_position_sz * 1e-8)):
+            position_delta_warning = (
+                f"expected={expected_remaining}, observed={post_position_sz}")
+            _enqueue_repair(
+                "live", symbol, ord_id,
+                f"reduce_position_delta_mismatch:{position_delta_warning}", db_root)
+
+    trade = {
+        "symbol": symbol, "action": "reduce", "side": side,
+        "sz": actual_fill_sz, "fill_sz": actual_fill_sz,
+        "requested_sz": requested_sz, "approved_sz": approved_sz,
+        "pre_position_sz": pre_position_sz,
+        "post_position_sz": post_position_sz,
+        "fill_px": fill_px, "px": fill_px, "pnl": fa.get("pnl"),
+        "channel": "live", "reason": reasoning,
+        "fill_source": fill_source, "pnl_approx": False,
+        "fill_ts": fa.get("fill_ts"), "ts_source": fa.get("ts_source"),
+        "ct_val": specs.get("ct_val"), "ordId": ord_id,
+        "partial_fill": actual_fill_sz < approved_sz - _EPS,
+        "fill_ratio": actual_fill_sz / approved_sz,
+    }
+    _journal_fill("live", trade, db_root, cycle_id, "REDUCE")
+
+    # 减仓成交已确认后，把原全仓止损数量同步到剩余仓位。失败不反向抹掉
+    # 已成交事实，但必须外显并入 repair；任何路径都不撤销止损制造裸仓。
+    protection_sync: dict[str, Any]
+    protection_p0 = False
+    if ox.is_dryrun():
+        protection_sync = {
+            "ok": True, "dryrun": True,
+            "planned_remaining_sz": post_position_sz,
+        }
+    elif post_position_sz is not None and post_position_sz > _EPS:
+        sync = adjust_protection(
+            symbol, profile, pos_side=side, resize_to_full_position=True,
+            consolidate_extra_sl=True,
+            reasoning=reasoning or "部分减仓后同步全仓止损数量",
+            db_root=db_root, cycle_id=cycle_id,
+            receipt_context=receipt_context,
+            reason_code="post_reduce_resize",
+        )
+        protection_sync = {
+            key: sync.get(key) for key in (
+                "ok", "action_taken", "reject_reason", "reject_detail",
+                "p0", "path", "protection_state", "applied")
+            if sync.get(key) is not None
+        }
+        if not sync.get("ok"):
+            _enqueue_repair(
+                "live", symbol, ord_id,
+                f"reduce_protection_sync_failed:{sync.get('reject_reason')}",
+                db_root)
+            protection_p0 = bool(
+                sync.get("p0")
+                or sync.get("reject_reason") in {
+                    "no_sl_to_preserve", "naked_after_change"
+                })
+    elif post_position_sz == 0:
+        protection_sync = {
+            "ok": True,
+            "note": "position_gone_after_confirmed_partial_order",
+        }
+    else:
+        protection_sync = {
+            "ok": False,
+            "reject_reason": "post_position_unavailable",
+        }
+
+    return _finish_completed(receipt(
+        True, action_taken="REDUCE", trades=[trade], ord_id=ord_id,
+        requested_sz=requested_sz, approved_sz=approved_sz,
+        pre_position_sz=pre_position_sz, post_position_sz=post_position_sz,
+        position_delta_warning=position_delta_warning,
+        protection_sync=protection_sync, p0=protection_p0,
+        fill_source=fill_source,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # 执行 journal：执行即留痕
 # ---------------------------------------------------------------------------
 JOURNAL_SUBDIR = "journal"
@@ -2527,10 +3414,16 @@ def _enqueue_repair(profile: str, symbol: str, ord_id: Optional[str],
     try:
         ts = ledger.now_cst()
         issue = f"[{profile}] {symbol} ord={ord_id}: {reason}"
-        fills_file = f"./tmp/repair_{profile}_{symbol}_fills.json"
+        fills_file = (
+            _PROJECT_ROOT / "tmp" /
+            f"repair_{profile}_{symbol}_fills.json"
+        ).as_posix()
+        python_wrapper = (
+            _PROJECT_ROOT / "scripts" / "run_okx_python.ps1"
+        ).as_posix()
+        okx_cli = (_PROJECT_ROOT / "scripts" / "_okxcli.py").as_posix()
         fix = (
-            "pwsh -NoProfile -File ./scripts/run_okx_python.ps1 "
-            "./scripts/_okxcli.py "
+            f"pwsh -NoProfile -File {python_wrapper} {okx_cli} "
             f"--profile {profile} --compact --out-file {fills_file} "
             f"swap fills --instId {symbol} --archive"
         )
@@ -2550,3 +3443,861 @@ def _enqueue_repair(profile: str, symbol: str, ord_id: Optional[str],
             con.close()
     except Exception as exc:  # repair 写失败不可再静默：裸仓待修记录丢失是 P0 盲区（P2-4）
         print(f"[order_executor] WARN repair_queue 写失败({reason}): {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 保护单调整（移动止损 / 止盈 / 加仓后扩全仓）——2026-08-13 主人授权
+# ---------------------------------------------------------------------------
+# 授权边界（主人 2026-08-13 逐条拍板，改动前必读）：
+#   1. **止损调整方向＝完全自主**：可收紧也可放宽，**不重算** 5% 单笔止损风险预算。
+#      这意味着开仓时经 risk_validator 核准的「最大亏损」在持仓期内不再是硬上限。
+#      仍保留 `MAX_SL_DEVIATION`(30%) 偏离闸——它防的是填错价/填错标的这类事故
+#      （止损误设成 0.01 会「表面已保护、实则永不触发」，比裸仓更隐蔽），不是风险偏好闸。
+#   2. **止损不可撤只能替换**：持仓存续期间必须始终有一张已回读确认的全仓止损。
+#      本函数任何分支都不得让持仓变成裸仓——这是 P0 不变量，优先级高于「改单成功」。
+#   3. **加仓后自动扩到全仓**：`new_sz` 走 amend 的 `--newSz`。
+#
+# **加仓会产生第二张止损**（2026-08-13 阶段3 从代码事实推定、非猜测）：`open_position`
+# 每笔成交都自挂一张 `approved_sz` 大小的 reduceOnly 止损，且 `_verify_sl_placed` 要求
+# `cTime >= 本次请求时刻`——因此加仓后交易所上必然是「旧档 + 新档」两张，而不是一张全仓单。
+# 此时总覆盖量已达全仓（非裸仓），但不满足「恰好一张全仓止损」的终局契约，
+# 而本函数第 3 段的 `duplicate_sl_before_change` 会直接拒绝。所以「加仓后自动扩到全仓」
+# 必须显式走收敛路径 `consolidate_extra_sl=True`：
+#     幸存单 amend 到全仓 → 独立回读确认 → 才撤多余单
+# 顺序不可颠倒；撤单永远发生在「接替单已被交易所确认覆盖全仓」之后，
+# 任一瞬间覆盖量都 ≥ 现仓。默认 False，保持人工改单时对残单状态的严格拒绝。
+#
+# 主路径＝`ox.amend_algo_protection`（CLI `swap algo amend`，交易所服务端原子生效，
+# 全程无「零张止损」或「两张止损」的中间窗口）。仅当 amend 失败（算法单已触发/已消失）
+# 才退化为「挂新单→回读确认→撤旧单」——该顺序保证两种失败都安全：撤旧失败最多留下
+# 两张全仓 reduceOnly 止损（先触发的平掉仓，后一张自动作废，无害）；挂新失败则旧单仍在。
+# 替换时若需要同一单承载 TP+SL，必须以 ordType=oco 新挂；普通 conditional 同时传两腿
+# 会忽略 TP，禁止把参数被 CLI 接受误当作止盈已生效。
+#
+# 止盈无风险预算含义（reduceOnly 只减不增仓），缺失也不构成裸仓，故校验较松。
+#
+# **阶段3 真单验证已通过**（2026-08-13 22:43~22:55，live DOGE 1→2 张，交易所独立回读确认）：
+#   ① amend 移动止损 0.067724→0.068776，algoId 3829560867421102080 **不变**
+#      （证实 amend 不换单、cTime 不刷新，故后置断言只能用 assert_protection_state）；
+#   ② 加仓后交易所上确为**两张分档止损**（新档 …994947575808 @0.06762 sz=1.0 +
+#      旧档 …867421102080 @0.068776 sz=1.0），与上文的代码事实推定逐字吻合；
+#   ③ `consolidate_extra_sl=True` 收敛为一张全仓：幸存单取同量中更早挂的旧档、
+#      价取最保护的一档 0.068776（未隐式放松）、撤单发生在扩仓回读确认之后，
+#      终局独立回读恰好 1 张 sz=2.0。path=amend_consolidate。
+#   验收记录见 docs/protection_amend_stage3_acceptance_20260813.md。
+#
+# 生产调用方（2026-08-13 起两条，完全对称，失败都只外显+入 repair，绝不回滚成交）：
+#   - `reduce_position` 部分减仓成交后同步止损到剩余仓位（reason_code=post_reduce_resize）；
+#   - `open_position` **加仓**成交后收敛分档止损并扩到全仓（reason_code=post_add_resize），
+#     即主人 2026-08-13 授权的「加仓后自动扩到全仓」。仅当开仓前同侧已有仓位时触发；
+#     全新开仓只有一张 SL，多跑一次改单纯属加风险。契约见 tests/test_add_protection_sync.py。
+
+_PROTECTION_TOL_PCT = 0.001          # 回读比价容差（与 _verify_trigger_placed 同口径）
+_PROTECTION_SIZE_REL_TOL = 1e-9
+
+
+def _live_protection_rows(symbol: str, pos_side: str,
+                          profile: str) -> list[dict[str, Any]]:
+    """读该仓当前所有 live reduceOnly 保护单（close 方向、同 posSide）。
+
+    只做事实归集，不做判断；调用方据此选目标单与做后置断言。
+    """
+    close_side = "sell" if pos_side == "long" else "buy"
+    try:
+        algos = ox.get_algo_orders(symbol, profile)
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for a in algos:
+        if not isinstance(a, dict):
+            continue
+        if str(a.get("instId") or "") not in ("", symbol):
+            continue
+        state = str(a.get("state") or "").lower()
+        if state and state != "live":
+            continue
+        row_pos_side = str(a.get("posSide") or "").lower()
+        if row_pos_side and row_pos_side != pos_side:
+            continue
+        row_side = str(a.get("side") or "").lower()
+        if row_side and row_side != close_side:
+            continue
+        raw_reduce_only = a.get("reduceOnly")
+        if raw_reduce_only not in (None, "") and \
+                str(raw_reduce_only).lower() not in ("true", "1"):
+            continue
+        rows.append({
+            "algoId": str(a.get("algoId") or "") or None,
+            "slTriggerPx": _to_float(a.get("slTriggerPx")),
+            "tpTriggerPx": _to_float(a.get("tpTriggerPx")),
+            "sz": _to_float(a.get("sz")),
+            "cTime": _to_float(a.get("cTime") or a.get("createTime")),
+            "state": state or None,
+        })
+    return rows
+
+
+def assert_protection_state(symbol: str, pos_side: str, profile: str, *,
+                            expected_sl_px: float, expected_sz: float,
+                            expected_tp_px: Optional[float] = None,
+                            retries: int = 2) -> dict[str, Any]:
+    """后置断言：该仓当前**恰好**有一张 live 全仓止损，且触发价＝期望值。
+
+    与 `_verify_sl_placed` 的区别：后者验证「本次新挂的单」（要求 cTime 晚于请求时刻），
+    amend 不会刷新 cTime，故不适用；本函数验证的是**保护状态的终局事实**，
+    顺带检出「旧单没撤干净」这种 `_verify_sl_placed` 命中首个匹配即返回会漏掉的情况。
+    """
+    last: dict[str, Any] = {}
+    for attempt in range(max(1, int(retries))):
+        rows = _live_protection_rows(symbol, pos_side, profile)
+        sl_rows = [r for r in rows
+                   if r["slTriggerPx"] is not None and r["slTriggerPx"] > 0]
+        matched = []
+        for r in sl_rows:
+            px_ok = abs(r["slTriggerPx"] - expected_sl_px) / expected_sl_px \
+                <= _PROTECTION_TOL_PCT
+            tp_ok = (
+                expected_tp_px is None
+                or (
+                    r.get("tpTriggerPx") is not None
+                    and abs(r["tpTriggerPx"] - expected_tp_px) / expected_tp_px
+                    <= _PROTECTION_TOL_PCT
+                )
+            )
+            sz_ok = r["sz"] is None or abs(r["sz"] - expected_sz) <= max(
+                _EPS, expected_sz * _PROTECTION_SIZE_REL_TOL)
+            if px_ok and tp_ok and sz_ok:
+                matched.append(r)
+        last = {
+            "ok": len(matched) == 1 and len(sl_rows) == 1,
+            "live_sl_count": len(sl_rows),
+            "matched_count": len(matched),
+            "rows": sl_rows,
+            "duplicate_sl": len(sl_rows) > 1,
+            "naked": len(sl_rows) == 0,
+            "expected_tp_px": expected_tp_px,
+        }
+        if last["ok"]:
+            return last
+        if attempt < max(1, int(retries)) - 1:
+            time.sleep(1.0)
+    return last
+
+
+def _cancel_stale_protection(symbol: str, profile: str,
+                             rows: list[dict[str, Any]], db_root: Path,
+                             *, note: str) -> list[str]:
+    """撤掉已被取代的保护单，返回撤失败的 algoId 列表。
+
+    **调用方必须先独立回读确认接替单已覆盖全仓**——本函数只负责撤，不做保护性判断。
+    撤失败不抛异常：多留一张 reduceOnly 止损是「过度保护」（先触发者平仓，
+    另一张自动作废），比中断流程更安全；但必入 repair_queue 由人工收敛。
+    """
+    failed: list[str] = []
+    for row in rows:
+        algo_id = str((row or {}).get("algoId") or "")
+        if not algo_id:
+            continue
+        try:
+            res = ox.cancel_algo_order(symbol, algo_id, profile)
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if not res.get("ok"):
+            failed.append(algo_id)
+    if failed:
+        _enqueue_repair(profile, symbol, None,
+                        f"{note}:{','.join(failed)}", db_root)
+        print(f"[order_executor] WARN 残余保护单撤单失败 {symbol} algoIds={failed}"
+              "（仍是过度保护而非裸仓）；已入 repair_queue", file=sys.stderr)
+    return failed
+
+
+def validate_protection_change(pos_side: str, mark_px: Optional[float],
+                               new_sl_trigger_px: Optional[float],
+                               new_tp_trigger_px: Optional[float]
+                               ) -> list[str]:
+    """纯函数确定性校验（无 I/O）。**刻意不含风险预算重算**（主人 2026-08-13 拍板）。
+
+    只挡「这单在交易所层面没有意义或几乎必是填错」的情形：
+      - 止损方向错（多头止损在现价之上／空头在其下）＝下单即触发，等同市价平仓而非止损；
+      - 偏离 mark 超 `MAX_SL_DEVIATION`(30%)＝疑似填错价或错标的；
+      - 止盈方向错（多头止盈在现价之下／空头在其上）＝同理立即成交。
+    """
+    errors: list[str] = []
+    side = str(pos_side or "").lower()
+    if side not in ("long", "short"):
+        return ["pos_side 非法（须 long|short）"]
+    mark = _to_float(mark_px)
+    if mark is None or not math.isfinite(mark) or mark <= 0:
+        return ["mark_px 缺失或非法（禁用其它字段猜）"]
+    if new_sl_trigger_px is None and new_tp_trigger_px is None:
+        return ["未提供任何新的保护价（sl/tp 至少一个）"]
+
+    if new_sl_trigger_px is not None:
+        sl = _to_float(new_sl_trigger_px)
+        if sl is None or not math.isfinite(sl) or sl <= 0:
+            errors.append("新止损价非法（须为正有限数）")
+        else:
+            if side == "long" and sl >= mark:
+                errors.append(
+                    f"多头止损 {sl} 不低于现价 {mark}：下单即触发＝市价平仓，非止损")
+            if side == "short" and sl <= mark:
+                errors.append(
+                    f"空头止损 {sl} 不高于现价 {mark}：下单即触发＝市价平仓，非止损")
+            dev = abs(sl - mark) / mark
+            if dev > rv.MAX_SL_DEVIATION:
+                errors.append(
+                    f"止损偏离现价 {dev:.1%} > "
+                    f"{rv.MAX_SL_DEVIATION:.0%}（疑填错价/错标的）")
+
+    if new_tp_trigger_px is not None:
+        tp = _to_float(new_tp_trigger_px)
+        if tp is None or not math.isfinite(tp) or tp <= 0:
+            errors.append("新止盈价非法（须为正有限数）")
+        else:
+            if side == "long" and tp <= mark:
+                errors.append(f"多头止盈 {tp} 不高于现价 {mark}：下单即触发")
+            if side == "short" and tp >= mark:
+                errors.append(f"空头止盈 {tp} 不低于现价 {mark}：下单即触发")
+    return errors
+
+
+def adjust_protection(
+    symbol: str,
+    profile: str,
+    *,
+    pos_side: Optional[str] = None,
+    new_sl_trigger_px: Optional[float] = None,
+    new_tp_trigger_px: Optional[float] = None,
+    resize_to_full_position: bool = False,
+    consolidate_extra_sl: bool = False,
+    reasoning: Optional[str] = None,
+    db_root: Path = DEFAULT_DB_ROOT,
+    cycle_id: Optional[str] = None,
+    receipt_context: Optional[dict[str, Any]] = None,
+    reason_code: str = "agent_adjust",
+    expected_pre_position_exists: Optional[bool] = None,
+    expected_pre_position_sz: Optional[float] = None,
+    expected_pre_position_pos_id: Optional[str] = None,
+    expected_pre_position_c_time: Optional[str] = None,
+) -> dict[str, Any]:
+    """调整现有持仓的保护单（移动止损 / 设改止盈 / 加仓后扩到全仓）。
+
+    返回 `trades_writer` 风格回执：`{profile, ok, action_taken, symbol, ...}`，
+    `action_taken` ∈ `ADJUST_PROTECTION` | `REJECT`。**不改变持仓数量**，
+    因此不产生 open/add/close/reduce 成交行；成功回执以
+    `decision=hold,n_orders=0` 写入 `trade_cycles.raw` 保留完整保护变更审计。
+
+    `consolidate_extra_sl=True` 时额外允许「多张分档止损 → 一张全仓止损」的收敛
+    （加仓后的必经状态，见本节顶部注释）；默认 False 时残单状态一律拒绝改单。
+
+    不变量（任何返回路径都成立）：调用前有全仓止损 ⇒ 调用后仍有全仓止损。
+    """
+    _require_live_profile(profile, "adjust_protection")
+    started_ms = time.time() * 1000.0
+    intent_path = Path(db_root) / "ledger.db"
+    intent_fingerprint: Optional[str] = None
+    intent_algo_id: Optional[str] = None
+    # OPEN/REDUCE 内部的保护数量同步已由父订单 intent 覆盖；除此之外的
+    # 所有独立保护调整都必须自建 action 键。不能让调用方仅靠换一个
+    # reason_code 就绕过执行意图，从而把已发生的交易所改单误报成零副作用。
+    standalone_intent = reason_code not in {
+        "post_add_resize", "post_reduce_resize",
+    }
+
+    def receipt(ok: bool, **kw) -> dict[str, Any]:
+        base = dict(receipt_context or {})
+        action_taken = kw.pop("action_taken", "ADJUST_PROTECTION")
+        base.update({
+            "profile": "live", "mode": "live", "ok": ok,
+            "cycle_id": cycle_id, "action_taken": action_taken,
+            "symbol": symbol, "trades": [], "n_orders": 0,
+            "p0": kw.pop("p0", False),
+            "protection_change": {
+                "reason_code": reason_code,
+                "requested_sl": _to_float(new_sl_trigger_px),
+                "requested_tp": _to_float(new_tp_trigger_px),
+                "resize_to_full_position": bool(resize_to_full_position),
+            },
+        })
+        # 保护调整是有交易所副作用、但无成交行的正式业务动作。
+        # 不让 Agent 猜 `decision=adjust_protection|traded`；返回即可原样交 writer。
+        if ok and action_taken == "ADJUST_PROTECTION":
+            base.update({"status": "ok", "decision": "hold", "errors": []})
+        if reasoning:
+            base["reasoning"] = reasoning
+        base.update(kw)
+        return base
+
+    def _intent_kwargs(now_ts: Optional[str] = None) -> dict[str, Any]:
+        return {
+            "profile": "live",
+            "cycle_id": str(cycle_id),
+            "symbol": symbol,
+            "side": str(pos_side),
+            "action": "adjust_protection",
+            "fingerprint": str(intent_fingerprint),
+            "now_ts": now_ts or ledger.now_cst(),
+        }
+
+    def _finish_clean(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_failed_clean(
+                    intent_path, error=error, **_intent_kwargs())
+                result["intent_state"] = "failed_clean"
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    "failed_clean transition failed: "
+                    f"{type(exc).__name__}: {exc}")
+                result["p0"] = True
+        return result
+
+    def _finish_uncertain(result: dict[str, Any], error: str) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_uncertain(
+                    intent_path, ord_id=intent_algo_id, error=error,
+                    **_intent_kwargs())
+                result["intent_state"] = "uncertain"
+            except Exception as exc:
+                result["intent_persist_warning"] = (
+                    "uncertain transition failed: "
+                    f"{type(exc).__name__}: {exc}")
+        # Exchange-side ambiguity is always fail-closed, but ``p0`` remains
+        # reserved for a naked position / lost persistence.  A verified old
+        # stop or duplicate reduceOnly stops are protected non-P0 states.
+        result["exchange_side_effect_uncertain"] = True
+        return result
+
+    def _finish_completed(result: dict[str, Any]) -> dict[str, Any]:
+        if intent_fingerprint:
+            try:
+                ei.mark_completed(
+                    intent_path, ord_id=intent_algo_id, receipt=result,
+                    error=None, **_intent_kwargs())
+                result["intent_state"] = "completed"
+            except Exception as exc:
+                # submitting 状态仍会阻断后续交易；交易所事实
+                # 继续返给 writer，避免因 intent 告警丢掉主账审计。
+                result["intent_persist_warning"] = (
+                    "completed transition failed: "
+                    f"{type(exc).__name__}: {exc}")
+                result["p0"] = True
+                _enqueue_repair(
+                    "live", symbol, intent_algo_id,
+                    "adjust_protection_execution_intent_complete_failed",
+                    db_root)
+        return result
+
+    ctx_errors = validate_receipt_context(
+        receipt_context, cycle_id=cycle_id, required=not ox.is_dryrun())
+    if ctx_errors:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="receipt_context_invalid",
+                       reject_detail="；".join(ctx_errors))
+    if not ox.is_dryrun() and not cycle_id:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="cycle_id_required",
+                       reject_detail="非 dry-run 调整保护单必须提供调度 cycle_id")
+    if new_sl_trigger_px is None and new_tp_trigger_px is None \
+            and not resize_to_full_position:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="no_change_requested",
+                       reject_detail="未提供新的止损/止盈价，也未要求扩到全仓")
+    if not ox.is_dryrun() and standalone_intent:
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return receipt(False, **deadline_reject)
+
+    # ── 1. 现仓求真（禁用快照；positions API 失败必须 fail-closed）──────────
+    requested_side = str(pos_side or "").strip().lower() or None
+    if requested_side not in (None, "long", "short"):
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="pos_side_invalid",
+                       reject_detail="保护调整 pos_side 必须是 long|short")
+    try:
+        positions = fetch_open_positions(profile)
+    except PositionsUnavailable as exc:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="positions_unavailable",
+                       reject_detail=f"OKX 现仓查询失败，拒绝盲改保护单: {exc}")
+    matches = [
+        p for p in positions
+        if p.get("symbol") == symbol
+        and (requested_side is None
+             or str(p.get("side") or "").lower() == requested_side)
+    ]
+    if requested_side is None and len(matches) > 1:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="pos_side_required",
+                       reject_detail=f"{symbol} 同时存在多空持仓，保护调整必须显式指定 pos_side")
+    pos = matches[0] if matches else None
+    fingerprint_error = _position_fingerprint_error(
+        pos,
+        expected_exists=expected_pre_position_exists,
+        expected_sz=expected_pre_position_sz,
+        expected_pos_id=expected_pre_position_pos_id,
+        expected_c_time=expected_pre_position_c_time,
+    )
+    if fingerprint_error:
+        return _finish_clean(receipt(
+            False, action_taken="REJECT",
+            reject_reason="pre_position_fingerprint_changed",
+            reject_detail=(
+                "执行时保护调整目标已不同于 plan/facts；未发送改单: "
+                + fingerprint_error
+            ),
+            expected_pre_position={
+                "exists": expected_pre_position_exists,
+                "sz": expected_pre_position_sz,
+                "posId": expected_pre_position_pos_id,
+                "cTime": expected_pre_position_c_time,
+            },
+            actual_pre_position=pos,
+        ), "pre_position_fingerprint_changed")
+    if pos is None:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="no_position",
+                       reject_detail=f"{symbol} 当前无 live 持仓，无保护单可调整")
+    pos_side = str(pos.get("side") or "").lower()
+    full_sz = _to_float(pos.get("sz"))
+    if pos_side not in ("long", "short") or not full_sz or full_sz <= 0:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="position_unreadable",
+                       reject_detail=f"持仓方向/数量不可读: side={pos_side} sz={full_sz}")
+
+    try:
+        mark_px = ox.get_mark_price(symbol, profile)
+    except Exception as exc:
+        mark_px = None
+        print(f"[order_executor] WARN mark price 拉取异常 {symbol}: {exc}",
+              file=sys.stderr)
+
+    # ── 2. 确定性校验（不重算风险预算——主人 2026-08-13 拍板）───────────────
+    errors = validate_protection_change(
+        pos_side, mark_px, new_sl_trigger_px, new_tp_trigger_px) \
+        if (new_sl_trigger_px is not None or new_tp_trigger_px is not None) \
+        else []
+    if errors:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="protection_change_invalid",
+                       reject_detail="；".join(errors),
+                       mark_px=mark_px)
+
+    # ── 3. 现有保护单事实 ──────────────────────────────────────────────────
+    existing = _live_protection_rows(symbol, pos_side, profile)
+    original_tp_rows = [
+        row for row in existing
+        if row.get("tpTriggerPx") is not None and row["tpTriggerPx"] > 0
+    ]
+    sl_rows = [r for r in existing
+               if r["slTriggerPx"] is not None and r["slTriggerPx"] > 0]
+    stale_rows: list[dict[str, Any]] = []
+    implied_sl: Optional[float] = None
+    if len(sl_rows) > 1 and not consolidate_extra_sl:
+        # 多张止损＝先前改单留下的残单；此状态下 amend 哪一张都无法保证终局唯一。
+        _enqueue_repair(profile, symbol, None,
+                        "adjust_protection_duplicate_sl_before_change", db_root)
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="duplicate_sl_before_change",
+                       reject_detail=f"改单前已存在 {len(sl_rows)} 张 live 止损，"
+                                     "已入 repair_queue，需人工收敛后再调整",
+                       existing_protection=sl_rows)
+    if len(sl_rows) > 1:
+        # 收敛：选「数量最大」的那张当幸存单（amend 到全仓的相对改动最小），
+        # 同量则取最早挂的；排序键全确定性，同一现场必得同一选择。
+        ordered = sorted(
+            sl_rows,
+            key=lambda r: (-(r["sz"] or 0.0), r["cTime"] or 0.0,
+                           str(r["algoId"] or "")))
+        stale_rows = ordered[1:]
+        sl_rows = [ordered[0]]
+        if new_sl_trigger_px is None:
+            # 未显式给价时取**最保护**的一档（多头最高、空头最低），
+            # 绝不因收敛而隐式放松保护；该价若已在现价错侧则退回幸存单原价。
+            prices = [r["slTriggerPx"] for r in ordered]
+            candidate = max(prices) if pos_side == "long" else min(prices)
+            if not validate_protection_change(pos_side, mark_px, candidate, None):
+                implied_sl = candidate
+    target = sl_rows[0] if sl_rows else None
+    target_sl = new_sl_trigger_px if new_sl_trigger_px is not None else (
+        implied_sl if implied_sl is not None
+        else (target["slTriggerPx"] if target else None))
+    target_tp = new_tp_trigger_px if new_tp_trigger_px is not None else (
+        target.get("tpTriggerPx") if target else None)
+    force_oco_replace = new_tp_trigger_px is not None
+    if target_sl is None:
+        return receipt(False, action_taken="REJECT",
+                       reject_reason="no_sl_to_preserve",
+                       reject_detail="该仓当前无止损且本次未提供新止损价；"
+                                     "本函数绝不产生无止损持仓")
+    # 收敛必然以全仓为目标：只留一张单，它就必须覆盖整个仓位。
+    want_sz = full_sz if (resize_to_full_position or target is None
+                          or stale_rows) else None
+    if target is not None and target.get("sz") is not None \
+            and abs(target["sz"] - full_sz) > max(_EPS, full_sz * 1e-9) \
+            and not resize_to_full_position:
+        # 止损数量已与现仓不符（多半是加仓后没扩）：顺带纠正，不给「部分保护」留口子。
+        want_sz = full_sz
+
+    if ox.is_dryrun():
+        return receipt(True, action_taken="ADJUST_PROTECTION", dryrun=True,
+                       mark_px=mark_px, pos_side=pos_side, full_sz=full_sz,
+                       existing_protection=sl_rows,
+                       consolidate_from=stale_rows or None,
+                       planned={"algoId": target["algoId"] if target else None,
+                                "path": ("oco_replace" if force_oco_replace
+                                         else "amend" if target
+                                         else "place_new"),
+                                "sl": target_sl, "tp": _to_float(target_tp),
+                                "sz": want_sz,
+                                "cancel_after": [
+                                    r.get("algoId") for r in (
+                                    existing if force_oco_replace
+                                        else stale_rows)
+                                ] or None})
+
+    # 独立保护调整必须在第一次交易所写前固化 intent。
+    # 执行成功而 writer 失败时，failure report 将看到该意图
+    # 并 fail-closed，不得声称「exchange side effect = none」。
+    if standalone_intent:
+        if not ox.is_dryrun():
+            deadline_reject = _cycle_side_effect_reject(cycle_id)
+            if deadline_reject:
+                return receipt(False, **deadline_reject)
+        request = {
+            "profile": "live",
+            "cycle_id": cycle_id,
+            "symbol": symbol,
+            "action": "adjust_protection",
+            "side": pos_side,
+            "new_sl_trigger_px": _to_float(new_sl_trigger_px),
+            "new_tp_trigger_px": _to_float(new_tp_trigger_px),
+            "resize_to_full_position": bool(resize_to_full_position),
+            "consolidate_extra_sl": bool(consolidate_extra_sl),
+            "reason_code": reason_code,
+            "target_sl": _to_float(target_sl),
+            "target_tp": _to_float(target_tp),
+            "target_sz": _to_float(want_sz or full_sz),
+            "existing_algo_ids": sorted(
+                str(row.get("algoId")) for row in existing
+                if row.get("algoId") not in (None, "")
+            ),
+            "expected_pre_position_exists": expected_pre_position_exists,
+            "expected_pre_position_sz": expected_pre_position_sz,
+            "expected_pre_position_pos_id": expected_pre_position_pos_id,
+            "expected_pre_position_c_time": expected_pre_position_c_time,
+        }
+        try:
+            reserved = ei.reserve(
+                intent_path, profile="live", cycle_id=str(cycle_id),
+                symbol=symbol, side=str(pos_side),
+                action="adjust_protection", request=request,
+                now_ts=ledger.now_cst())
+        except Exception as exc:
+            return receipt(
+                False, action_taken="REJECT", p0=True,
+                reject_reason="execution_intent_store_failed",
+                reject_detail=(
+                    "保护调整幂等意图库不可用，未写交易所: "
+                    f"{type(exc).__name__}: {exc}"))
+        if reserved.get("status") == "replay":
+            cached = dict(reserved["receipt"])
+            cached["idempotent_replay"] = True
+            cached["intent_state"] = "completed"
+            return cached
+        if reserved.get("status") != "reserved":
+            blocker = reserved.get("blocking_intent") or {}
+            _enqueue_repair(
+                "live", symbol, reserved.get("ord_id"),
+                "adjust_protection_execution_intent_blocked:"
+                f"{reserved.get('reason') or reserved.get('state')}",
+                db_root)
+            return receipt(
+                False, action_taken="REJECT", p0=True,
+                reject_reason="execution_intent_blocked",
+                reject_detail=(
+                    "已有未决或冲突的保护调整意图，"
+                    "拒绝重复写交易所"),
+                intent_state=reserved.get("state"),
+                intent_reason=reserved.get("reason"),
+                blocking_intent=blocker or None)
+        intent_fingerprint = str(reserved["fingerprint"])
+        try:
+            ei.mark_submitting(
+                intent_path, error=None, **_intent_kwargs())
+        except Exception as exc:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT", p0=True,
+                reject_reason="execution_intent_transition_failed",
+                reject_detail=(
+                    "交易所写前 intent 无法固化，已 fail-closed："
+                    f"{type(exc).__name__}: {exc}")),
+                "mark_submitting_failed")
+
+    # intent 固化也可能在锁等待期间跨过截止点；在第一次交易所写前最后检查。
+    # 内部保护收尾不在 standalone_intent 路径，不会因此被中断。
+    if not ox.is_dryrun() and standalone_intent:
+        deadline_reject = _cycle_side_effect_reject(cycle_id)
+        if deadline_reject:
+            return _finish_clean(
+                receipt(False, **deadline_reject),
+                str(deadline_reject["reject_reason"]),
+            )
+
+    # Reserve/intent persistence and protection discovery may span enough time
+    # for the old position to close and a new one to reopen with the same
+    # symbol/side.  Rebind the first amend/place to the expected position
+    # identity immediately before any protection write.
+    if (not ox.is_dryrun() and standalone_intent
+            and expected_pre_position_exists is not None):
+        try:
+            latest_positions = fetch_open_positions(profile)
+        except PositionsUnavailable as exc:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="pre_write_positions_unavailable",
+                reject_detail=(
+                    "保护单写入紧前现仓 API 不可用；无法确认仍为同一仓位，"
+                    f"已 fail-closed: {exc}"
+                ),
+            ), "pre_write_positions_unavailable")
+        latest_matches = [
+            row for row in latest_positions
+            if row.get("symbol") == symbol
+            and (requested_side is None
+                 or str(row.get("side") or "").lower() == requested_side)
+        ]
+        latest_pos = latest_matches[0] if latest_matches else None
+        late_fingerprint_error = _position_fingerprint_error(
+            latest_pos,
+            expected_exists=expected_pre_position_exists,
+            expected_sz=expected_pre_position_sz,
+            expected_pos_id=expected_pre_position_pos_id,
+            expected_c_time=expected_pre_position_c_time,
+        )
+        if late_fingerprint_error:
+            return _finish_clean(receipt(
+                False, action_taken="REJECT",
+                reject_reason="pre_position_fingerprint_changed",
+                reject_detail=(
+                    "保护单写入紧前目标仓位已不同于 plan/facts；"
+                    "未发送 amend/place: " + late_fingerprint_error
+                ),
+                expected_pre_position={
+                    "exists": expected_pre_position_exists,
+                    "sz": expected_pre_position_sz,
+                    "posId": expected_pre_position_pos_id,
+                    "cTime": expected_pre_position_c_time,
+                },
+                actual_pre_position=latest_pos,
+            ), "pre_position_fingerprint_changed")
+
+    # ── 4. 执行：amend 主路径 → 失败退「挂新→回读→撤旧」──────────────────
+    path = None
+    amend_result = None
+    fallback_result = None
+    new_algo_id = None
+    # 收敛时幸存单的价可能来自被撤的那一档（取最保护者），必须显式写进 amend；
+    # 非收敛路径维持原语义：没显式给价就只改数量，绝不「顺手」动触发价。
+    amend_sl = new_sl_trigger_px
+    if amend_sl is None and stale_rows and target_sl is not None:
+        amend_sl = target_sl
+    if force_oco_replace:
+        # 明确设置/移动 TP 时不用普通 conditional amend 猜双腿语义：先挂一张
+        # 全仓 OCO 并双腿回读，再撤全部旧保护。全程至少有一张已确认 SL。
+        path = "oco_replace"
+    elif target is not None and target.get("algoId"):
+        path = "amend"
+        intent_algo_id = str(target["algoId"])
+        amend_result = ox.amend_algo_protection(
+            symbol, target["algoId"], profile,
+            new_sl_trigger_px=amend_sl,
+            new_tp_trigger_px=_to_float(new_tp_trigger_px),
+            new_sz=want_sz)
+        if not amend_result.get("ok"):
+            path = "replace_fallback"
+            print(f"[order_executor] WARN amend 失败({amend_result.get('sMsg')})，"
+                  f"退化为挂新→撤旧 {symbol}", file=sys.stderr)
+        elif stale_rows:
+            # 收敛路径：幸存单必须先被交易所确认已覆盖全仓，才允许撤多余单。
+            # 顺序不可颠倒——先撤后确认就等于自己制造裸口窗。
+            time.sleep(1.0)
+            confirm_rows = [
+                r for r in _live_protection_rows(symbol, pos_side, profile)
+                if r["slTriggerPx"] is not None and r["slTriggerPx"] > 0]
+            survivor_now = next(
+                (r for r in confirm_rows
+                 if r.get("algoId") == target.get("algoId")), None)
+            expect_sz = want_sz or full_sz
+            covered = bool(
+                survivor_now
+                and survivor_now.get("sz") is not None
+                and abs(survivor_now["sz"] - expect_sz)
+                <= max(_EPS, expect_sz * _PROTECTION_SIZE_REL_TOL)
+                and abs(survivor_now["slTriggerPx"] - target_sl) / target_sl
+                <= _PROTECTION_TOL_PCT)
+            if not covered:
+                # 幸存单没扩上去：多余单一张不撤，持仓仍是分档全覆盖（非裸仓），
+                # 干净拒绝交人工。
+                _enqueue_repair(
+                    profile, symbol, None,
+                    "adjust_protection_consolidate_survivor_unconfirmed",
+                    db_root)
+                return _finish_uncertain(receipt(
+                    False, action_taken="REJECT",
+                    reject_reason="consolidate_survivor_unconfirmed",
+                    reject_detail="收敛时幸存止损单回读未达全仓，已停止撤单；"
+                                  "持仓仍由多张分档止损全覆盖，需人工收敛",
+                    protection_state={"rows": confirm_rows,
+                                      "expected_sz": expect_sz,
+                                      "expected_sl_px": target_sl},
+                    consolidate_from=stale_rows, path="amend_consolidate"),
+                    "consolidate_survivor_unconfirmed")
+            _cancel_stale_protection(
+                symbol, profile, stale_rows, db_root,
+                note="adjust_protection_consolidate_cancel_failed")
+            path = "amend_consolidate"
+    else:
+        path = "place_new"
+
+    if path in ("place_new", "replace_fallback", "oco_replace"):
+        if target_tp is not None:
+            place = ox.place_algo_protection(
+                symbol, pos_side, want_sz or full_sz, target_sl, profile,
+                tp_trigger_px=_to_float(target_tp))
+        else:
+            place = ox.place_algo_sl(symbol, pos_side, want_sz or full_sz,
+                                     target_sl, profile)
+        fallback_result = place
+        if not place.get("ok"):
+            # 挂新失败：旧单（若有）仍在 → 持仓保护未被破坏，干净拒绝。
+            still = assert_protection_state(
+                symbol, pos_side, profile,
+                expected_sl_px=(target["slTriggerPx"] if target else target_sl),
+                expected_sz=(target.get("sz") or full_sz) if target else full_sz,
+                retries=1)
+            if still.get("naked"):
+                _enqueue_repair(profile, symbol, None,
+                                "adjust_protection_naked_after_failed_place",
+                                db_root)
+            failed = receipt(
+                False, action_taken="REJECT",
+                reject_reason="protection_place_failed",
+                reject_detail=(
+                    f"新止损挂单失败: "
+                    f"{place.get('sMsg') or place.get('error')}"),
+                p0=bool(still.get("naked")),
+                protection_state=still, path=path)
+            # 交易所明确拒绝，且回读证明原保护的价格/数量
+            # 仍完整一致，才能证成 failed_clean；其余任何情况
+            # 仍按「可能已写交易所」阻断。
+            if still.get("ok") is True and not still.get("naked"):
+                return _finish_clean(
+                    failed, "protection_place_failed_old_state_verified")
+            return _finish_uncertain(failed, "protection_place_failed")
+        new_algo_id = None
+        for row in place.get("data", []):
+            if isinstance(row, dict) and row.get("algoId"):
+                new_algo_id = str(row["algoId"])
+                break
+        if new_algo_id:
+            intent_algo_id = new_algo_id
+        verified = _verify_sl_placed(
+            symbol, pos_side, profile, target_sl,
+            expected_sz=want_sz or full_sz, since_ms=started_ms,
+            expected_algo_id=new_algo_id)
+        tp_verified = (
+            _verify_tp_placed(
+                symbol, pos_side, profile, _to_float(target_tp),
+                expected_sz=want_sz or full_sz, since_ms=started_ms,
+                expected_algo_id=new_algo_id,
+            )
+            if target_tp is not None else {"verified": True}
+        )
+        if not verified.get("verified") or not tp_verified.get("verified"):
+            _enqueue_repair(profile, symbol, None,
+                            "adjust_protection_new_leg_unverified", db_root)
+            return _finish_uncertain(receipt(False, action_taken="REJECT",
+                           reject_reason="new_protection_unverified",
+                           reject_detail="新保护单的 SL/TP 回读未全部确认；旧单未撤，"
+                                         "持仓仍受原止损保护",
+                           verify={"sl": verified, "tp": tp_verified}, path=path),
+                           "new_protection_unverified")
+        # 新单已确认，才允许撤旧单——顺序不可颠倒（先撤后挂＝裸仓窗口）。
+        # 收敛场景下「旧单」是幸存单 + 全部多余分档单，一并撤。
+        doomed = (
+            list(existing)
+            if path == "oco_replace"
+            else ([target] if target is not None else []) + stale_rows
+        )
+        if doomed:
+            _cancel_stale_protection(
+                symbol, profile, doomed, db_root,
+                note="adjust_protection_stale_sl_not_cancelled")
+
+    # ── 5. 后置断言：终局必须恰好一张全仓止损，且价＝期望 ──────────────────
+    state = assert_protection_state(
+        symbol, pos_side, profile,
+        expected_sl_px=target_sl, expected_sz=want_sz or full_sz,
+        expected_tp_px=_to_float(target_tp))
+    if state.get("naked"):
+        # 理论上不可达（挂新失败已提前返回）；真发生＝裸仓 P0，必须外显。
+        _enqueue_repair(profile, symbol, None,
+                        "adjust_protection_naked_after_change", db_root)
+        return _finish_uncertain(receipt(False, action_taken="REJECT", p0=True,
+                       reject_reason="naked_after_change",
+                       reject_detail="改单后回读不到任何止损＝裸仓，已入 repair_queue",
+                       protection_state=state, path=path),
+                       "naked_after_change")
+    if not state.get("ok"):
+        _enqueue_repair(profile, symbol, None,
+                        "adjust_protection_state_unconfirmed", db_root)
+        return _finish_uncertain(receipt(False, action_taken="REJECT",
+                       reject_reason="protection_state_unconfirmed",
+                       reject_detail="改单后保护状态与期望不符（重复单或价格/数量不匹配），"
+                                     "持仓仍有止损但需人工核对",
+                       protection_state=state, path=path),
+                       "protection_state_unconfirmed")
+    stale_tp_cancelled: list[str] = []
+    stale_tp_failed: list[str] = []
+    if new_tp_trigger_px is not None:
+        # 旧版本可能把 TP 与 SL 分成两张 conditional algo。新 OCO 已经在上面
+        # 逐腿确认后，旧独立 TP 若仍 live 会在旧价提前退出，故此处再清理残单；
+        # 顺序仍然不会制造裸仓窗口。
+        applied_algo_id = str(
+            new_algo_id or (target or {}).get("algoId") or "")
+        active_ids = {
+            str(row.get("algoId") or "")
+            for row in _live_protection_rows(symbol, pos_side, profile)
+        }
+        stale_tp_rows = [
+            row for row in original_tp_rows
+            if str(row.get("algoId") or "")
+            and str(row.get("algoId")) != applied_algo_id
+            and str(row.get("algoId")) in active_ids
+        ]
+        if stale_tp_rows:
+            stale_tp_cancelled = [
+                str(row.get("algoId")) for row in stale_tp_rows
+            ]
+            stale_tp_failed = _cancel_stale_protection(
+                symbol, profile, stale_tp_rows, db_root,
+                note="adjust_protection_stale_tp_not_cancelled")
+    return _finish_completed(receipt(
+                   True, action_taken="ADJUST_PROTECTION", path=path,
+                   mark_px=mark_px, pos_side=pos_side, full_sz=full_sz,
+                   protection_state=state,
+                   applied={"sl": target_sl, "tp": _to_float(target_tp),
+                            "sz": want_sz or full_sz,
+                            "algoId": new_algo_id or (target or {}).get("algoId")},
+                   consolidated_from=([r.get("algoId") for r in stale_rows]
+                                      or None),
+                   stale_tp_cancelled=stale_tp_cancelled or None,
+                   stale_tp_failed=stale_tp_failed or None,
+                   protection_warning=(
+                       "stale_tp_cancel_failed" if stale_tp_failed else None),
+                   previous={"sl": (target or {}).get("slTriggerPx"),
+                             "sz": (target or {}).get("sz"),
+                             "algoId": (target or {}).get("algoId")}))

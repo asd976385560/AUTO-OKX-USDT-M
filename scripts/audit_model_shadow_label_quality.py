@@ -21,12 +21,24 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import _acceptance_thresholds as thresholds
+
 
 UTC = timezone.utc
 HORIZON_MINUTES = {"15m": 15, "1H": 60, "4H": 240}
+CANDIDATE_MODEL_KEYS = tuple(
+    f"{horizon}_{side}"
+    for horizon in HORIZON_MINUTES
+    for side in ("long", "short")
+)
+CANDIDATE_PROBABILITY_FIELDS = {
+    key: f"candidate_probability_{key}" for key in CANDIDATE_MODEL_KEYS
+}
 LABEL_COLUMNS = (
     "model_id", "model_parameters_sha256", "cycle_id", "symbol", "side",
-    "horizon", "research_probability", "signal_available_at_utc",
+    "horizon", "research_probability", "selected_probability_rank",
+    "selected_margin_rank", "selected_cross_section_size",
+    "signal_available_at_utc",
     "entry_tick_ts_utc", "entry_price", "entry_last", "entry_executable",
     "entry_price_source", "outcome_tick_ts_utc", "outcome_price",
     "outcome_last", "outcome_executable", "outcome_price_source",
@@ -36,17 +48,26 @@ LABEL_COLUMNS = (
     "opposite_side_same_horizon_probability", "selected_vs_opposite_margin",
     "selected_side_horizon_votes", "selected_side_unanimous",
     "selected_side_mean_margin", "selected_side_min_margin",
+    "selected_model", "candidate_probability_count",
+    "selected_is_highest_candidate_probability",
+    *CANDIDATE_PROBABILITY_FIELDS.values(),
     "contract_statistics_available", "contract_statistics_source_ts_utc",
     "contract_statistics_available_at_utc", "contract_oi_log_usd",
     "contract_oi_log_change_15m", "contract_taker_total_log_usd",
     "contract_taker_buy_centered", "contract_oi_taker_interaction",
+    "asset_class",
     "source_file",
 )
 BOOL_FIELDS = {
     "after_cost_hit", "selected_side_unanimous",
+    "selected_is_highest_candidate_probability",
     "contract_statistics_available",
 }
-INT_FIELDS = {"selected_side_horizon_votes"}
+INT_FIELDS = {
+    "selected_side_horizon_votes", "selected_probability_rank",
+    "selected_margin_rank", "selected_cross_section_size",
+    "candidate_probability_count",
+}
 PATH_FIELDS = {"source_file"}
 KEY_FIELDS = (
     "model_id", "model_parameters_sha256", "cycle_id", "symbol",
@@ -95,6 +116,50 @@ def _optional_bool(value: Any) -> bool | None:
         if value.strip().lower() == "false":
             return False
     return None
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _candidate_probabilities(record: dict[str, Any]) -> dict[str, float | None]:
+    raw = record.get("all_research_probabilities")
+    source = raw if isinstance(raw, dict) else {}
+    output: dict[str, float | None] = {}
+    for key in CANDIDATE_MODEL_KEYS:
+        probability = _optional_float(source.get(key))
+        output[key] = (
+            probability
+            if probability is not None and 0.0 <= probability <= 1.0
+            else None
+        )
+    return output
+
+
+def _highest_candidate_check(
+    selected_model: str | None,
+    selected_probability: float,
+    probabilities: dict[str, float | None],
+) -> bool | None:
+    valid = {
+        key: value for key, value in probabilities.items()
+        if value is not None
+    }
+    if len(valid) != len(CANDIDATE_MODEL_KEYS) or selected_model not in valid:
+        return None
+    return (
+        math.isclose(
+            selected_probability, float(valid[selected_model]),
+            rel_tol=1e-12, abs_tol=1e-12,
+        )
+        and math.isclose(
+            selected_probability, max(float(value) for value in valid.values()),
+            rel_tol=1e-12, abs_tol=1e-12,
+        )
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -187,6 +252,54 @@ def _positive(row: sqlite3.Row, field: str) -> float | None:
     return value if value is not None and value > 0 else None
 
 
+def _selected_cross_section_ranks(
+    records: list[dict[str, Any]],
+) -> dict[int, dict[str, int | None]]:
+    """Independently reconstruct outcome-free frozen cross-section ranks."""
+    eligible: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if record.get("selected_for_forward_evaluation") is not True:
+            continue
+        probability = _optional_float(record.get("research_probability"))
+        symbol = str(record.get("symbol") or "")
+        if probability is None or not 0.0 <= probability <= 1.0 or not symbol:
+            continue
+        ranking = record.get("ranking_diagnostics") or {}
+        eligible.append({
+            "index": index,
+            "probability": probability,
+            "margin": _optional_float(
+                ranking.get("selected_vs_opposite_margin")),
+            "symbol": symbol,
+            "side": str(record.get("side") or ""),
+            "horizon": str(record.get("horizon") or ""),
+        })
+    size = len(eligible)
+    result: dict[int, dict[str, int | None]] = {
+        int(item["index"]): {
+            "selected_probability_rank": None,
+            "selected_margin_rank": None,
+            "selected_cross_section_size": size,
+        }
+        for item in eligible
+    }
+    identity = lambda item: (  # noqa: E731
+        str(item["symbol"]), str(item["side"]),
+        str(item["horizon"]), int(item["index"]),
+    )
+    for rank, item in enumerate(sorted(
+        eligible,
+        key=lambda item: (-float(item["probability"]), *identity(item)),
+    ), start=1):
+        result[int(item["index"])]["selected_probability_rank"] = rank
+    for rank, item in enumerate(sorted(
+        (item for item in eligible if item["margin"] is not None),
+        key=lambda item: (-float(item["margin"]), *identity(item)),
+    ), start=1):
+        result[int(item["index"])]["selected_margin_rank"] = rank
+    return result
+
+
 def _expected_labels(
     artifacts: list[tuple[Path, dict[str, Any]]],
     market_db: Path,
@@ -214,7 +327,10 @@ def _expected_labels(
             generated = _parse_utc(payload["generated_at_utc"])
             if generated > as_of:
                 continue
-            for record in payload.get("records") or []:
+            artifact_records = list(payload.get("records") or [])
+            cross_section_ranks = _selected_cross_section_ranks(
+                artifact_records)
+            for record_index, record in enumerate(artifact_records):
                 if record.get("selected_for_forward_evaluation") is not True:
                     continue
                 counters["selected_records"] += 1
@@ -290,6 +406,13 @@ def _expected_labels(
                 after_cost = executable_return - cost_bps / 10_000.0
                 ranking = record.get("ranking_diagnostics") or {}
                 future = record.get("future_retraining_features") or {}
+                selected_model = _optional_text(record.get("selected_model"))
+                candidate_probabilities = _candidate_probabilities(record)
+                candidate_probability_count = sum(
+                    value is not None
+                    for value in candidate_probabilities.values()
+                )
+                cross_section = cross_section_ranks.get(record_index) or {}
                 rows.append({
                     "model_id": model_key[0],
                     "model_parameters_sha256": model_key[1],
@@ -298,6 +421,12 @@ def _expected_labels(
                     "side": side,
                     "horizon": horizon,
                     "research_probability": probability,
+                    "selected_probability_rank": cross_section.get(
+                        "selected_probability_rank"),
+                    "selected_margin_rank": cross_section.get(
+                        "selected_margin_rank"),
+                    "selected_cross_section_size": cross_section.get(
+                        "selected_cross_section_size"),
                     "signal_available_at_utc": _iso(availability),
                     "entry_tick_ts_utc": entry_ts,
                     "entry_price": entry_last,
@@ -330,6 +459,17 @@ def _expected_labels(
                         ranking.get("selected_side_mean_margin")),
                     "selected_side_min_margin": _optional_float(
                         ranking.get("selected_side_min_margin")),
+                    "selected_model": selected_model,
+                    "candidate_probability_count": candidate_probability_count,
+                    "selected_is_highest_candidate_probability": (
+                        _highest_candidate_check(
+                            selected_model, probability,
+                            candidate_probabilities,
+                        )),
+                    **{
+                        CANDIDATE_PROBABILITY_FIELDS[key]: value
+                        for key, value in candidate_probabilities.items()
+                    },
                     "contract_statistics_available": _optional_bool(
                         future.get("contract_statistics_available")),
                     "contract_statistics_source_ts_utc": future.get(
@@ -346,6 +486,7 @@ def _expected_labels(
                         future.get("contract_taker_buy_centered")),
                     "contract_oi_taker_interaction": _optional_float(
                         future.get("contract_oi_taker_interaction")),
+                    "asset_class": _optional_text(record.get("asset_class")),
                     "source_file": str(source_path.resolve()),
                 })
     finally:
@@ -398,6 +539,9 @@ def _metrics(
     min_sample: int,
     min_days: int,
     min_cycles: int,
+    target_precision: float,
+    min_long_labels: int | None = None,
+    min_short_labels: int | None = None,
 ) -> dict[str, Any]:
     n = len(rows)
     successes = sum(bool(row["after_cost_hit"]) for row in rows)
@@ -406,24 +550,34 @@ def _metrics(
     ece = _ece(rows)
     cycles = len({str(row["cycle_id"]) for row in rows})
     days = len({str(row["cycle_id"])[:10] for row in rows})
+    side_counts = Counter(str(row["side"]) for row in rows)
     requirements = {
         "minimum_sample_met": n >= min_sample,
         "minimum_days_met": days >= min_days,
         "minimum_cycles_met": cycles >= min_cycles,
-        "precision_at_least_90pct": precision is not None and precision >= 0.9,
-        "wilson_95_low_at_least_90pct": low is not None and low >= 0.9,
+        "precision_at_least_target": (
+            precision is not None and precision >= target_precision),
+        "wilson_95_low_at_least_target": (
+            low is not None and low >= target_precision),
         "ece_at_most_5pp": ece is not None and ece <= 0.05,
         "offline_gate_pass": offline_gate,
     }
-    measurable = (
-        requirements["minimum_sample_met"]
-        and requirements["minimum_days_met"]
-        and requirements["minimum_cycles_met"]
-    )
+    measurable_keys = [
+        "minimum_sample_met", "minimum_days_met", "minimum_cycles_met",
+    ]
+    if min_long_labels is not None:
+        requirements["minimum_long_labels_met"] = (
+            side_counts.get("long", 0) >= min_long_labels)
+        measurable_keys.append("minimum_long_labels_met")
+    if min_short_labels is not None:
+        requirements["minimum_short_labels_met"] = (
+            side_counts.get("short", 0) >= min_short_labels)
+        measurable_keys.append("minimum_short_labels_met")
+    measurable = all(requirements[key] for key in measurable_keys)
     forward = (
         measurable
-        and requirements["precision_at_least_90pct"]
-        and requirements["wilson_95_low_at_least_90pct"]
+        and requirements["precision_at_least_target"]
+        and requirements["wilson_95_low_at_least_target"]
         and requirements["ece_at_most_5pp"]
     )
     status = (
@@ -441,6 +595,10 @@ def _metrics(
         "wilson_95_low": low,
         "wilson_95_high": high,
         "ece": ece,
+        "mean_research_probability": (
+            sum(float(row["research_probability"]) for row in rows) / n
+            if n else None
+        ),
         "mean_signed_return": (
             sum(float(row["signed_return"]) for row in rows) / n if n else None
         ),
@@ -454,11 +612,185 @@ def _metrics(
         ),
         "distinct_cycles": cycles,
         "distinct_days": days,
-        "side_counts": dict(sorted(Counter(str(row["side"]) for row in rows).items())),
+        "side_counts": dict(sorted(side_counts.items())),
         "horizon_counts": dict(sorted(Counter(str(row["horizon"]) for row in rows).items())),
         "requirements": requirements,
         "status": status,
         "production_threshold_change_allowed": False,
+    }
+
+
+def _margin_band(value: float) -> str:
+    if value < 0.02:
+        return "lt_2pp"
+    if value < 0.05:
+        return "2_to_5pp"
+    if value < 0.10:
+        return "5_to_10pp"
+    return "gte_10pp"
+
+
+def _diagnostic_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    offline_gate: bool,
+    min_sample: int,
+    min_days: int,
+    min_cycles: int,
+    target_precision: float,
+) -> dict[str, Any]:
+    def scoped(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        return _metrics(
+            subset,
+            offline_gate=offline_gate,
+            min_sample=min_sample,
+            min_days=min_days,
+            min_cycles=min_cycles,
+            target_precision=target_precision,
+        )
+
+    by_side = [{
+        "side": side,
+        **scoped([row for row in rows if row.get("side") == side]),
+    } for side in ("long", "short")]
+    by_horizon_side = [{
+        "horizon": horizon,
+        "side": side,
+        **scoped([
+            row for row in rows
+            if row.get("horizon") == horizon and row.get("side") == side
+        ]),
+    } for horizon in HORIZON_MINUTES for side in ("long", "short")]
+
+    with_margin = [
+        row for row in rows
+        if row.get("selected_vs_opposite_margin") is not None
+    ]
+    by_votes = [{
+        "selected_side_horizon_votes": votes,
+        **scoped([
+            row for row in with_margin
+            if row.get("selected_side_horizon_votes") == votes
+        ]),
+    } for votes in (1, 2, 3)]
+    by_margin = [{
+        "selected_vs_opposite_margin_band": band,
+        **scoped([
+            row for row in with_margin
+            if _margin_band(float(row["selected_vs_opposite_margin"])) == band
+        ]),
+    } for band in ("lt_2pp", "2_to_5pp", "5_to_10pp", "gte_10pp")]
+
+    with_contract_flag = [
+        row for row in rows
+        if row.get("contract_statistics_available") is not None
+    ]
+    by_contract = [{
+        "contract_statistics_available": available,
+        **scoped([
+            row for row in with_contract_flag
+            if row["contract_statistics_available"] is available
+        ]),
+    } for available in (False, True)]
+
+    asset_classes = sorted({
+        str(row["asset_class"])
+        for row in rows if row.get("asset_class") is not None
+    })
+    by_asset_class = [{
+        "asset_class": asset_class,
+        **scoped([
+            row for row in rows if row.get("asset_class") == asset_class
+        ]),
+    } for asset_class in asset_classes]
+
+    by_selected_model = [{
+        "selected_model": model_key,
+        **scoped([
+            row for row in rows if row.get("selected_model") == model_key
+        ]),
+    } for model_key in CANDIDATE_MODEL_KEYS]
+
+    candidate_vector_rows = [
+        row for row in rows
+        if row.get("candidate_probability_count") == len(CANDIDATE_MODEL_KEYS)
+    ]
+    highest_check_rows = [
+        row for row in rows
+        if row.get("selected_is_highest_candidate_probability") is not None
+    ]
+    highest_check_passes = sum(
+        row["selected_is_highest_candidate_probability"] is True
+        for row in highest_check_rows
+    )
+
+    def concentration(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        counts = Counter(str(row["symbol"]) for row in subset)
+        total = len(subset)
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return {
+            "n_selected": total,
+            "distinct_symbols": len(counts),
+            "maximum_symbol_share": (
+                ranked[0][1] / total if total and ranked else None),
+            "symbol_selection_hhi": (
+                sum((count / total) ** 2 for count in counts.values())
+                if total else None
+            ),
+            "top_symbols_by_selection_count": [{
+                "symbol": symbol,
+                "selection_count": count,
+                "selection_share": count / total,
+                **scoped([
+                    row for row in subset if str(row["symbol"]) == symbol
+                ]),
+            } for symbol, count in ranked[:10]],
+        }
+
+    def top_k_metrics(rank_field: str) -> list[dict[str, Any]]:
+        return [{
+            "top_k": top_k,
+            "rank_field": rank_field,
+            **scoped([
+                row for row in rows
+                if row.get(rank_field) is not None
+                and int(row[rank_field]) <= top_k
+            ]),
+        } for top_k in (1, 3, 5, 10)]
+
+    return {
+        "ranking_diagnostic_rows": len(with_margin),
+        "ranking_diagnostic_coverage_rate": (
+            len(with_margin) / len(rows) if rows else None),
+        "contract_feature_flag_rows": len(with_contract_flag),
+        "contract_feature_flag_coverage_rate": (
+            len(with_contract_flag) / len(rows) if rows else None),
+        "candidate_probability_vector_rows": len(candidate_vector_rows),
+        "candidate_probability_vector_coverage_rate": (
+            len(candidate_vector_rows) / len(rows) if rows else None),
+        "highest_candidate_selection_check_rows": len(highest_check_rows),
+        "highest_candidate_selection_pass_rows": highest_check_passes,
+        "highest_candidate_selection_pass_rate": (
+            highest_check_passes / len(highest_check_rows)
+            if highest_check_rows else None
+        ),
+        "by_side": by_side,
+        "by_horizon_side": by_horizon_side,
+        "by_asset_class": by_asset_class,
+        "by_selected_model": by_selected_model,
+        "by_selected_side_horizon_votes": by_votes,
+        "by_selected_vs_opposite_margin_band": by_margin,
+        "by_contract_statistics_availability": by_contract,
+        "by_selected_probability_top_k": top_k_metrics(
+            "selected_probability_rank"),
+        "by_selected_margin_top_k": top_k_metrics("selected_margin_rank"),
+        "selection_concentration": {
+            "all_selected": concentration(rows),
+            "selected_probability_top_1": concentration([
+                row for row in rows
+                if row.get("selected_probability_rank") == 1
+            ]),
+        },
     }
 
 
@@ -505,7 +837,8 @@ def _row_matches(expected: dict[str, Any], actual: dict[str, Any]) -> list[str]:
 def _metrics_match(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
     scalar = (
         "n_labeled", "successes_after_cost", "precision_after_cost",
-        "wilson_95_low", "wilson_95_high", "ece", "mean_signed_return",
+        "wilson_95_low", "wilson_95_high", "ece",
+        "mean_research_probability", "mean_signed_return",
         "mean_executable_directional_return", "mean_signed_return_after_cost",
         "distinct_cycles", "distinct_days",
     )
@@ -521,6 +854,29 @@ def _metrics_match(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
         for field in ("side_counts", "horizon_counts", "requirements", "status",
                       "production_threshold_change_allowed")
     )
+
+
+def _structured_match(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, dict):
+        return (
+            isinstance(actual, dict)
+            and set(expected) == set(actual)
+            and all(_structured_match(expected[key], actual[key]) for key in expected)
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(expected) == len(actual)
+            and all(
+                _structured_match(wanted, observed)
+                for wanted, observed in zip(expected, actual)
+            )
+        )
+    if isinstance(expected, bool):
+        return actual is expected
+    if isinstance(expected, (int, float)):
+        return _close(expected, actual)
+    return expected == actual
 
 
 def audit(
@@ -562,6 +918,15 @@ def audit(
     min_sample = int(contract.get("minimum_sample", 100))
     min_days = int(contract.get("minimum_days", 5))
     min_cycles = int(contract.get("minimum_distinct_cycles", 100))
+    # 用被审计工件自报的 target_precision 重建（与 min_sample 等同款姿势），
+    # 「不得弱化」由下方独立地板校验负责——地板本身来自预注册激活边界。
+    declared_precision = _optional_float(contract.get("target_precision"))
+    target_precision = (
+        declared_precision if declared_precision is not None
+        else thresholds.shadow_target_precision(as_of)
+    )
+    min_long_labels = int(contract.get("minimum_long_labels", 30))
+    min_short_labels = int(contract.get("minimum_short_labels", 30))
     actual_models = {
         (str(item.get("model_id")), str(item.get("model_parameters_sha256"))): item
         for item in evaluation.get("models") or []
@@ -583,6 +948,9 @@ def audit(
         expected_overall = _metrics(
             model_rows, offline_gate=gate, min_sample=min_sample,
             min_days=min_days, min_cycles=min_cycles,
+            target_precision=target_precision,
+            min_long_labels=min_long_labels,
+            min_short_labels=min_short_labels,
         )
         if not _metrics_match(expected_overall, result.get("overall") or {}):
             model_metric_mismatches.append({
@@ -597,12 +965,66 @@ def audit(
                 [row for row in model_rows if row["horizon"] == horizon],
                 offline_gate=gate, min_sample=min_sample,
                 min_days=min_days, min_cycles=min_cycles,
+                target_precision=target_precision,
             )
             observed = by_horizon.get(horizon)
             if observed is None or not _metrics_match(wanted, observed):
                 model_metric_mismatches.append({
                     "model": list(model_key), "scope": horizon,
                 })
+        by_day_items = result.get("by_day") or []
+        by_day_keys = [str(item.get("day_cst")) for item in by_day_items]
+        by_day = {
+            str(item.get("day_cst")): item for item in by_day_items
+        }
+        expected_days = sorted({
+            str(row["cycle_id"])[:10] for row in model_rows
+        })
+        if len(by_day_keys) != len(set(by_day_keys)):
+            model_metric_mismatches.append({
+                "model": list(model_key),
+                "scope": "by_day_duplicate_keys",
+            })
+        if sorted(by_day) != expected_days:
+            model_metric_mismatches.append({
+                "model": list(model_key), "scope": "by_day_keys",
+            })
+        for day in expected_days:
+            wanted = _metrics(
+                [
+                    row for row in model_rows
+                    if str(row["cycle_id"])[:10] == day
+                ],
+                offline_gate=gate,
+                min_sample=min_sample,
+                min_days=min_days,
+                min_cycles=min_cycles,
+                target_precision=target_precision,
+            )
+            observed = by_day.get(day)
+            if (
+                observed is None
+                or observed.get("diagnostic_only") is not True
+                or not _metrics_match(wanted, observed)
+            ):
+                model_metric_mismatches.append({
+                    "model": list(model_key),
+                    "scope": f"by_day:{day}",
+                })
+        expected_diagnostics = _diagnostic_metrics(
+            model_rows,
+            offline_gate=gate,
+            min_sample=min_sample,
+            min_days=min_days,
+            min_cycles=min_cycles,
+            target_precision=target_precision,
+        )
+        if not _structured_match(
+            expected_diagnostics, result.get("diagnostics") or {},
+        ):
+            model_metric_mismatches.append({
+                "model": list(model_key), "scope": "diagnostics",
+            })
 
     safety_checks = {
         "confidence_claim_disallowed": evaluation.get("confidence_claim_allowed") is False,
@@ -614,20 +1036,25 @@ def audit(
         "orders_absent": evaluation.get("orders_placed") == 0,
     }
     generated_at = _parse_utc(evaluation["generated_at_utc"])
-    target_precision = _optional_float(contract.get("target_precision"))
     minimum_wilson = _optional_float(
         contract.get("minimum_wilson_95_lower_bound"))
     maximum_ece = _optional_float(contract.get("maximum_ece"))
+    # 地板=预注册激活边界解析出的值（边界前 0.90、边界起 0.80）。点精度与
+    # Wilson 下界是孪生阈值，同一个地板同时管住两者。
+    precision_floor = thresholds.shadow_target_precision(as_of)
     thresholds_not_weakened = (
-        target_precision is not None and target_precision >= 0.90
-        and minimum_wilson is not None and minimum_wilson >= 0.90
+        declared_precision is not None and declared_precision >= precision_floor
+        and minimum_wilson is not None and minimum_wilson >= precision_floor
         and maximum_ece is not None and 0.0 <= maximum_ece <= 0.05
         and min_sample >= 100
         and min_days >= 5
         and min_cycles >= 100
+        and min_long_labels >= 30
+        and min_short_labels >= 30
     )
     checks = {
         "evaluation_schema_v2": evaluation.get("schema_version") == 2,
+        "label_schema_v3": evaluation.get("label_schema_version") == 3,
         "evaluation_artifact_type_valid": evaluation.get("artifact_type")
         == "frozen_multitimeframe_model_shadow_evaluation",
         "shadow_root_matches": Path(str(evaluation.get("shadow_root"))).resolve()
@@ -688,6 +1115,12 @@ def audit(
         "mode": "read_only_business_databases",
         "intended_use": "quality gate for forward credibility research evidence",
         "grain": "one frozen model-cycle-symbol selected direction and horizon",
+        "calibration_gate_migration": {
+            **thresholds.shadow_migration_facts(as_of),
+            "declared_target_precision": declared_precision,
+            "precision_floor_in_force": precision_floor,
+            "rebuilt_with_target_precision": target_precision,
+        },
         "inputs": {
             "evaluation": str(evaluation_path.resolve()),
             "evaluation_sha256": _sha256(evaluation_path),

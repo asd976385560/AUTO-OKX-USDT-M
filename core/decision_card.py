@@ -25,6 +25,7 @@ CORE_FIELDS = (
     "portfolio_impact",
 )
 HISTORY_USAGE = {"adopt", "partial", "ignore", "none"}
+EXIT_MODES = {"fixed_tp", "dynamic_exit", "no_fixed_tp"}
 DECISION_TIMEFRAMES = ("15m", "1H", "4H")
 TIMEFRAME_DIRECTIONS = {"long", "short", "neutral"}
 MULTITIMEFRAME_SELECTION_METHOD = (
@@ -72,6 +73,14 @@ def validate_card(card: Any, path: str = "decision_card") -> list[str]:
 
     if not _present(card.get("agent_judgement")):
         errors.append(f"{path}.agent_judgement 不能为空")
+    risk_reward = card.get("risk_reward")
+    if isinstance(risk_reward, dict) and "exit_mode" in risk_reward:
+        exit_mode = str(risk_reward.get("exit_mode") or "").strip().lower()
+        if exit_mode not in EXIT_MODES:
+            errors.append(
+                f"{path}.risk_reward.exit_mode 必须是 "
+                "fixed_tp|dynamic_exit|no_fixed_tp"
+            )
     overrides = card.get("reference_overrides")
     if overrides is None or not isinstance(overrides, list):
         errors.append(f"{path}.reference_overrides 必须是 list（无覆盖时填 []）")

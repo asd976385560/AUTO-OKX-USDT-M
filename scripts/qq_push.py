@@ -13,8 +13,8 @@ Dedupe layers:
 调用方不得从正文猜测 cycle 或轮次；业务身份必须通过 --dedupe-key 显式声明。
 sent 表中其他格式的历史行只读保留，不参与当前键匹配。
 
-⚠️ --dedupe-key / --db-root 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，
-runpy 前必须 _strip_wrapper_args 剥掉，否则 raw SystemExit(2)。
+⚠️ --dedupe-key / --db-root 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，runpy 前必须
+_strip_wrapper_args 剥掉，否则 raw SystemExit(2) → 所有带键推送全灭。
 
 Structured events use qq_push_dedupe.jsonl for the canonical root and a
 root-hashed filename for non-default roots; dedupe SQLite truth always lives
@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import runpy
 import sqlite3
 import sys
@@ -48,6 +49,9 @@ SENT_TABLE_DDL = (
     "first_seen TEXT, "
     "updated_at TEXT, "
     "preview TEXT)"
+)
+REVIEWER_REPORT_KEY = re.compile(
+    r"^reviewer:(\d{4}-\d{2}-\d{2}):(daily|weekly|monthly)(?::[\w.-]+)?$"
 )
 
 
@@ -123,6 +127,74 @@ def _dedupe_key(content: str) -> tuple[str, str, str | None, str]:
     return key, content_hash, dkey, target
 
 
+def _validate_reviewer_report_before_push(
+    content: str,
+    dedupe_key: str | None,
+) -> dict | None:
+    """Fail closed for reviewer report identities before claiming a send."""
+    identity = str(dedupe_key or "")
+    match = REVIEWER_REPORT_KEY.fullmatch(identity)
+    if match is None:
+        if identity.startswith("reviewer:"):
+            raise ValueError(
+                "reviewer dedupe identity must be "
+                "reviewer:<YYYY-MM-DD>:daily|weekly|monthly")
+        return None
+    report_day, kind = match.groups()
+    supplied = _arg_value(("--content-file", "--file"))
+    if not supplied:
+        raise ValueError(
+            f"reviewer {kind} push requires a canonical report file")
+    report_path = Path(supplied).resolve()
+    expected_dir = (
+        ROOT / "reports" /
+        ({"daily": "daily-reports", "weekly": "weekly", "monthly": "monthly"}[kind])
+    ).resolve()
+    expected_name = f"{kind}-{report_day}.md"
+    if report_path.parent != expected_dir or report_path.name != expected_name:
+        raise ValueError(
+            f"reviewer {kind} push path must be "
+            f"{expected_dir / expected_name}")
+    file_content = report_path.read_text(encoding="utf-8", errors="strict")
+    if file_content != content:
+        raise ValueError("reviewer report content changed after initial read")
+
+    if kind == "daily":
+        import validate_daily_report
+        result = validate_daily_report.validate_report(
+            report_path=report_path,
+            account_db=ROOT / "db" / "account.db",
+            live_trades_db=ROOT / "db" / "live_trades.db",
+            ledger_db=ROOT / "db" / "ledger.db",
+        )
+        observed_day = str(result.get("report_ts") or "")[:10]
+    else:
+        import validate_periodic_report
+        result = validate_periodic_report.validate_report(
+            kind=kind,
+            report_path=report_path,
+            account_db=ROOT / "db" / "account.db",
+            live_trades_db=ROOT / "db" / "live_trades.db",
+            ledger_db=ROOT / "db" / "ledger.db",
+            lessons_db=ROOT / "db" / "lessons.db",
+        )
+        observed_day = str(result.get("report_key") or "")[:10]
+    if not bool(result.get("ok")):
+        errors = "; ".join(str(item) for item in result.get("errors") or [])
+        raise ValueError(
+            f"reviewer {kind} report validator rejected artifact: {errors}")
+    if observed_day != report_day:
+        raise ValueError(
+            f"reviewer {kind} identity date {report_day} differs from "
+            f"validated report date {observed_day or '<missing>'}")
+    return {
+        "kind": kind,
+        "report_day": report_day,
+        "report_path": str(report_path),
+        "checks": list(result.get("checks") or []),
+    }
+
+
 def _connect() -> sqlite3.Connection:
     """统一 dedupe 连接策略；NORMAL 为每条写连接显式设置，禁止依赖默认值。"""
     DB.parent.mkdir(parents=True, exist_ok=True)
@@ -137,13 +209,7 @@ def _connect() -> sqlite3.Connection:
         raise
 
 
-def _claim(
-    key: str,
-    content_hash: str,
-    preview: str,
-    dkey: str | None,
-    target: str,
-) -> str:
+def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: str) -> bool:
     con = _connect()
     try:
         con.execute(SENT_TABLE_DDL)
@@ -176,7 +242,7 @@ def _claim(
                 preview=preview[:160],
             )
             print(f"[qq_push_dedupe] skip duplicate key={key[:12]} status={row[0]}")
-            return "duplicate_sent" if row[0] == "sent" else "duplicate_pending"
+            return False
         con.execute(
             "INSERT OR REPLACE INTO sent(k, content_hash, status, first_seen, updated_at, preview) "
             "VALUES(?, ?, ?, ?, ?, ?)",
@@ -192,7 +258,7 @@ def _claim(
             target=target,
             preview=preview[:160],
         )
-        return "claimed"
+        return True
     finally:
         con.close()
 
@@ -234,15 +300,27 @@ def main() -> int:
         print("qq_push: 空内容，拒绝外发（exit 2）", file=sys.stderr)
         return 2
     key, content_hash, dkey, target = _dedupe_key(content)
-    claim_state = _claim(key, content_hash, content, dkey, target)
-    if claim_state == "duplicate_sent":
-        return 0
-    if claim_state == "duplicate_pending":
-        print(
-            "qq_push: prior delivery is still pending; delivery not confirmed",
-            file=sys.stderr,
+    try:
+        validation = _validate_reviewer_report_before_push(content, dkey)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        _append_event(
+            event="validation_reject",
+            dedupe_key=dkey,
+            target=target,
+            error=f"{type(exc).__name__}: {exc}",
+            preview=content[:160],
         )
-        return 3
+        print(f"qq_push: 报告校验拒绝外发：{exc}", file=sys.stderr)
+        return 2
+    if validation is not None:
+        _append_event(
+            event="validation_pass",
+            dedupe_key=dkey,
+            target=target,
+            **validation,
+        )
+    if not _claim(key, content_hash, content, dkey, target):
+        return 0
     _strip_wrapper_args()
     try:
         runpy.run_path(str(RAW), run_name="__main__")

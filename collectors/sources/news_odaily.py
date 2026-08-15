@@ -34,10 +34,14 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
+try:
+    from ._news_http import fetch_text as _fetch_text_alternate  # type: ignore
+except ImportError:
+    from _news_http import fetch_text as _fetch_text_alternate  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -117,6 +121,15 @@ def _fetch(page: int = 1, page_size: int = 16, timeout: int = 15) -> dict:
     req = urllib.request.Request(url, headers=REQ_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+
+def _fetch_alternate(page: int = 1, page_size: int = 16,
+                     timeout: int = 6) -> dict:
+    """Retry the same publisher URL through the bounded alternate TLS chain."""
+    url = f"{ENDPOINT}?page={page}&pageSize={page_size}"
+    text = _fetch_text_alternate(
+        url, timeout=float(timeout), headers=REQ_HEADERS)
+    return json.loads(text)
 
 
 def _strip_html(s: str) -> str:
@@ -252,7 +265,8 @@ def fetch_items(page_size: int = 16, max_age_hours: int = 24,
         if attempt == 2:
             time.sleep(0.5)
         try:
-            payload = _fetch(
+            fetch = _fetch if attempt == 1 else _fetch_alternate
+            payload = fetch(
                 page=1, page_size=page_size,
                 timeout=(15 if attempt == 1 else retry_timeout),
             )
@@ -261,6 +275,8 @@ def fetch_items(page_size: int = 16, max_age_hours: int = 24,
                 retry_stats.update({
                     "attempts": attempt,
                     "recovered_after_retry": attempt == 2,
+                    "transport": (
+                        "urllib" if attempt == 1 else "alternate_http"),
                 })
             return parsed
         except Exception as exc:  # noqa: BLE001

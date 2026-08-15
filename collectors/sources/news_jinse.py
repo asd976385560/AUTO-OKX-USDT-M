@@ -31,10 +31,14 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # ./collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
+try:
+    from ._news_http import fetch_text as _fetch_text_alternate  # type: ignore
+except ImportError:
+    from _news_http import fetch_text as _fetch_text_alternate  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -43,6 +47,12 @@ CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+REQ_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.jinse.com.cn",
+}
 
 # 唯一可达 host（见模块 docstring 网络事实）。注册表 endpoint 与此一致。
 DEFAULT_ENDPOINT = "https://api.jinse.com.cn/noah/v3/lives"
@@ -108,14 +118,15 @@ _SEV_MED = re.compile(
 
 
 def _fetch(url: str, timeout: int = 15) -> str:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept": "application/json, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.jinse.com.cn",
-    })
+    req = urllib.request.Request(url, headers=REQ_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
+
+
+def _fetch_alternate(url: str, timeout: int = 6) -> str:
+    """Retry the same publisher URL through the bounded alternate TLS chain."""
+    return _fetch_text_alternate(
+        url, timeout=float(timeout), headers=REQ_HEADERS)
 
 
 def _extract_symbols(text: str) -> list[str]:
@@ -240,14 +251,17 @@ def fetch_items(endpoint: str = DEFAULT_ENDPOINT, limit: int = 30,
         if attempt == 2:
             time.sleep(0.5)
         try:
+            fetch = _fetch if attempt == 1 else _fetch_alternate
             parsed = _parse(
-                _fetch(url, timeout=(15 if attempt == 1 else retry_timeout)),
+                fetch(url, timeout=(15 if attempt == 1 else retry_timeout)),
                 max_age_hours,
             )
             if retry_stats is not None:
                 retry_stats.update({
                     "attempts": attempt,
                     "recovered_after_retry": attempt == 2,
+                    "transport": (
+                        "urllib" if attempt == 1 else "alternate_http"),
                 })
             return parsed
         except Exception as exc:  # noqa: BLE001

@@ -1,8 +1,8 @@
 {
   "_meta": {
     "doc": "V2.0 §6 声明式源注册表（弃 OKX news 单点）。news 采集器（news_collect）读本表只迭代 enabled news 源；market/macro 段为 registered-only 声明；增/停/换源＝on-demand 维护会话（主人对话触发）灰度改本表，安全可审计，改采集器代码仍走灰度+人工确认。",
-    "version": "2.4.0",
-    "updated": "2026-07-27T22:40",
+    "version": "2.6.0",
+    "updated": "2026-08-13T21:30",
     "cadence_values": [
       "15m",
       "hourly",
@@ -112,12 +112,12 @@
       "endpoint": "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract?period=1H&limit=1",
       "native_cadence": "hourly",
       "required": false,
-      "staleness_sec": 10800,
+      "staleness_sec": 5400,
       "enabled": true,
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 40,
-      "note": "OKX官方Trading Statistics REST；整点采最新全部USDT线性SWAP的已闭合1H账户多空比，写market_positioning；仅软证据，不改变全部USDT-M永续交易范围"
+      "note": "OKX官方Trading Statistics REST；源为1H粒度，:00/:30采最新全部USDT线性SWAP已闭合账户多空比，写market_positioning并把任一15m决策槽最老来源年龄控制在90分钟内；仅软证据，不改变全部USDT-M永续交易范围"
     },
     {
       "id": "okx_contract_open_interest_history",
@@ -261,8 +261,23 @@
       "enabled": true,
       "auth_env": null,
       "adapter": "news_okx",
-      "timeout_sec": 30,
-      "note": "OKX CLI 1.4.2下okx news latest|important已复核可用；adapter=collectors/sources/news_okx.py（经news_writer落库）。important/latest首轮各8秒，全部首轮结束后仅对失败端点各做一次6秒有界重试，最坏仍受30秒源预算约束；最终失败照实落账。挂聚合采集cron的news步，不进fast。required=false；staleness 4h覆盖稀疏窗。失败隔离不影响RSS/中文源。"
+      "timeout_sec": 45,
+      "note": "OKX CLI 1.4.2下okx news latest|important已复核可用；adapter=collectors/sources/news_okx.py（经news_writer落库）。important/latest首轮各8秒，全部首轮结束后仅对失败端点各做一次6秒有界重试；仍失败的精确端点统一冷却3秒后各起一个新CLI进程做一次4秒冷恢复，单端点最多3阶段、无循环/历史补采，最坏受45秒源预算约束。最终失败照实落账。挂聚合采集cron的news步，不进fast。required=false；staleness 4h覆盖稀疏窗。失败隔离不影响RSS/中文源。"
+    },
+    {
+      "id": "okx_announcements",
+      "type": "news",
+      "endpoint": "/api/v5/support/announcements (+announcement-types)",
+      "native_cadence": "15m",
+      "required": false,
+      "staleness_sec": 172800,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": "news_okx_announcements",
+      "poll_interval_min": 30,
+      "timeout_sec": 75,
+      "note": "OKX官方公告（上币/下架/交易更新/API/活动）；公共无鉴权端点经_okx_http统一域名回退与0.5s端点限速（官方5req/2s）。每轮=类型列表1次+命中类别各1页；类型列表或精确失败类别统一冷却3秒后以新连接各做一次6秒上限冷恢复，最多2阶段、无循环/历史补采。代码共享75秒总网络截止，每个请求从剩余预算取上限，耗尽后明确失败且不再联网。annType→tag/severity规则映射：delistings=high、new-listings/trading-updates=medium、api/活动=low；标题高置信才提取symbol（宁缺勿假）。经news_writer落库source=okx_announcements；30分钟轮询、公告可数日无更新故staleness=48h。required=false失败不阻断主链。补规格书「官方动态」维度，供Agent做重大公告风险窗观察，不设自动闸。audit_forward_start_cst=2026-08-14T00:00（预注册前向起点：源诞生前的槽不进健康审计分母，不反向加责；不影响既有源前向窗）。",
+      "audit_forward_start_cst": "2026-08-14T00:00:00+08:00"
     },
     {
       "id": "x_search",
@@ -302,6 +317,19 @@
       "adapter": null,
       "timeout_sec": 30,
       "note": "legacy id/字段含dxy，但实际美元绝对指数为FRED DTWEXBGS=Nominal Broad U.S. Dollar Index，非ICE DXY。工作日更；时效读source_meta.dxy.source_as_of，禁止公共行掩盖旧值。ICE官方报价仍缺；另有独立macro_dxy_calc_ecb可审计计算值"
+    },
+    {
+      "id": "macro_fed_funds",
+      "type": "macro",
+      "endpoint": "FRED DFF (Effective Federal Funds Rate)",
+      "native_cadence": "weekday",
+      "required": false,
+      "staleness_sec": null,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": null,
+      "timeout_sec": 30,
+      "note": "美联储有效联邦基金利率（FRED DFF，日频、约1个工作日发布滞后）；复用§4.1 FRED key，由collect_slow宏观块采集并经public_macro.upsert_observations写regime.db.macro_observations（metric=us_fed_funds_rate），不加cross_market列。briefing宏观段展示当前值+观测日；仅Agent参考证据，不进硬风控。补规格书「宏观环境:美联储利率」维度。"
     },
     {
       "id": "macro_dxy_calc_ecb",
@@ -380,6 +408,18 @@
       "adapter": null,
       "timeout_sec": 45,
       "note": "OKX CLI优先；未来7天importance=3经济事件由daily_maintenance采集，写regime.db.macro_events"
+    },
+    {
+      "id": "token_unlocks",
+      "type": "macro",
+      "endpoint": "pending: CryptoRank/Tokenomist/DefiLlama Pro unlock API（需key）",
+      "native_cadence": "daily",
+      "required": false,
+      "staleness_sec": null,
+      "enabled": false,
+      "auth_env": "TOKEN_UNLOCKS_API_KEY",
+      "adapter": null,
+      "note": "代币解锁日历（规格书「链上/事件排除:解锁」维度）。2026-08-13核实DefiLlama /emissions已转Pro付费(402)，无Key确定性源暂缺——registered-only占位，enabled=false。当前由news-scout X关注面（Tokenomist/解锁日历类账号）以tags=unlock覆盖，主人提供key后再实装确定性adapter写macro_events(category=token_unlock)。"
     },
     {
       "id": "macro_tvl",

@@ -23,8 +23,8 @@
       "signals": [                    -- 0..n 行
         {
           "symbol": "BTC-USDT-SWAP",
-          "action": "hold",            -- 'open_long'|'open_short'|'hold'|'close'|'wait'
-          "side": null,                -- open_long=long/open_short=short/hold|wait=null/close=long|short
+          "action": "hold",            -- open_long|open_short|hold|close|reduce|adjust_protection|wait
+          "side": null,                -- open*=direction; close/reduce/adjust=position side
           "entry_hint": null,
           "stop_hint": null,
           "tp_hint": null,
@@ -134,11 +134,15 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 from core.decision_card import PROTOCOL as DECISION_PROTOCOL  # noqa: E402
 from core.decision_card import (  # noqa: E402
+    EXIT_MODES,
     validate_card,
     validate_multitimeframe_analysis,
 )
 from core.ev_calculator import build_ev_check  # noqa: E402
-from core.experience_contract import validate_contract as validate_experience_contract  # noqa: E402
+from core.experience_contract import (  # noqa: E402
+    setup_from_prices,
+    validate_contract as validate_experience_contract,
+)
 from core.multitimeframe_gate import check_multitimeframe_readiness  # noqa: E402
 
 # HANDOFF-4A（2026-07-16）：CLI 落库成功后 detached 拍一次 dispatcher（事件驱动派发）。
@@ -164,6 +168,50 @@ VALIDATION_STATE_DIR = Path(os.environ.get(
     str(_PROJECT_ROOT / "logs" / "analysis-validation"),
 ))
 MAX_VALIDATION_FAILURES = 2
+# Deploy from the first natural slot after the 21:30 incident.  Older cycles
+# remain readable/replayable, but current automatic analysis can no longer
+# spend the trade budget after its advertised absolute cutoff.
+ANALYSIS_DEADLINE_GUARD_FROM = "2026-08-15T21:45"
+ANALYSIS_DEADLINE_SECONDS = 9 * 60 + 30
+
+
+def analysis_deadline_refusal(
+    cycle_id: Any,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[dict]:
+    """Return a fail-closed refusal at/after ``cycle+09:30``.
+
+    The Agent prompt and stage supervisor use the same wall-clock contract.
+    Keeping this check in the only writer prevents a late validate-only pass or
+    direct library call from authorizing the subsequent facts/order phase.
+    """
+    cycle = str(cycle_id or "").strip()
+    if cycle < ANALYSIS_DEADLINE_GUARD_FROM:
+        return None
+    try:
+        cycle_start = datetime.strptime(
+            cycle, "%Y-%m-%dT%H:%M",
+        ).replace(tzinfo=CST)
+    except ValueError:
+        # The ordinary receipt validator owns malformed cycle diagnostics.
+        return None
+    current = now or datetime.now(CST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=CST)
+    current = current.astimezone(CST)
+    deadline = cycle_start + timedelta(seconds=ANALYSIS_DEADLINE_SECONDS)
+    if current < deadline:
+        return None
+    return {
+        "ok": False,
+        "refused": True,
+        "error": "analysis_deadline_exceeded",
+        "cycle_id": cycle,
+        "deadline_at": deadline.strftime("%Y-%m-%d %H:%M:%S"),
+        "checked_at": current.strftime("%Y-%m-%d %H:%M:%S"),
+        "production_database_writes": 0,
+    }
 
 
 def connect(
@@ -353,6 +401,8 @@ ALLOWED_SIGNAL_ACTIONS = {
     "open_short",
     "hold",
     "close",
+    "reduce",
+    "adjust_protection",
     "wait",
 }
 SIGNAL_RAW_SCHEMA_VERSION = 1
@@ -411,12 +461,44 @@ def normalize_receipt(data: dict) -> dict:
             item = dict(signal)
             if item.get("action") is not None:
                 item["action"] = str(item["action"]).strip().lower()
+            action = item.get("action")
             raw_side = item.get("side")
             item["side"] = (
                 None
                 if raw_side is None or not str(raw_side).strip()
                 else str(raw_side).strip().lower()
             )
+            # OPEN direction is already encoded unambiguously in action.  The
+            # 21:30 incident showed models can omit the redundant side field;
+            # canonicalize only that lossless case.  An explicit conflicting
+            # side remains untouched and is rejected by validate_receipt.
+            if item["side"] is None and action in {"open_long", "open_short"}:
+                item["side"] = (
+                    "long" if action == "open_long" else "short"
+                )
+            # Likewise, one textual MTF reason is semantically one evidence
+            # item.  Convert a non-empty string to the required list shape,
+            # while leaving empty strings/objects invalid and visible.
+            card = item.get("decision_card")
+            if isinstance(card, dict):
+                canonical_card = dict(card)
+                mtf = canonical_card.get("multitimeframe_analysis")
+                if isinstance(mtf, dict):
+                    canonical_mtf = dict(mtf)
+                    timeframes = canonical_mtf.get("timeframes")
+                    if isinstance(timeframes, dict):
+                        canonical_timeframes = dict(timeframes)
+                        for timeframe, row in timeframes.items():
+                            if not isinstance(row, dict):
+                                continue
+                            canonical_row = dict(row)
+                            evidence = canonical_row.get("evidence")
+                            if isinstance(evidence, str) and evidence.strip():
+                                canonical_row["evidence"] = [evidence.strip()]
+                            canonical_timeframes[timeframe] = canonical_row
+                        canonical_mtf["timeframes"] = canonical_timeframes
+                    canonical_card["multitimeframe_analysis"] = canonical_mtf
+                item["decision_card"] = canonical_card
             normalized_signals.append(item)
         normalized["signals"] = normalized_signals
     return normalized
@@ -525,18 +607,10 @@ def _validate_setup_contract(card: Any, contract: Any) -> list[str]:
     if not isinstance(rr, dict) or not isinstance(query, dict):
         return []
     try:
-        entry = float(rr["entry"])
-        stop = float(rr["stop"])
-        target = float(rr["target"])
-        expected = {
-            "stop_distance_pct": round(abs(entry - stop) / entry, 8),
-            "planned_rr": round(abs(target - entry) / abs(entry - stop), 8),
-        }
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        expected = setup_from_prices(
+            rr["entry"], rr["stop"], rr["target"])
+    except (KeyError, TypeError, ValueError):
         return []  # EV calculator owns the primary geometry error.
-    expected["setup_hash"] = hashlib.sha256(json.dumps(
-        expected, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")).hexdigest()
     actual = query.get("setup")
     if not isinstance(actual, dict):
         return [
@@ -641,12 +715,8 @@ def _regime_scope_block(
     """
     try:
         from core.instrument_context import build_instrument_context
-        resolved_root = (
-            Path(db_root).expanduser().resolve()
-            if db_root is not None else DB_PATH.parent.resolve()
-        )
         return build_instrument_context(
-            symbol, cycle_regime, cycle_id, resolved_root)
+            symbol, cycle_regime, cycle_id, _runtime_db_root(db_root))
     except Exception:  # noqa: BLE001  注入失败跳过，不阻断落库
         return None
 
@@ -678,10 +748,7 @@ def validate_receipt(
     if not isinstance(data, dict):
         return ["回执必须是 dict"]
     data = normalize_receipt(data)
-    validation_root = (
-        Path(db_root).expanduser().resolve()
-        if db_root is not None else DB_PATH.parent.resolve()
-    )
+    validation_root = _runtime_db_root(db_root)
     errors = []
     protocol = data.get("decision_protocol")
     if protocol != DECISION_PROTOCOL:
@@ -754,6 +821,8 @@ def validate_receipt(
                     "hold": {None},
                     "wait": {None, "long", "short"},
                     "close": {"long", "short"},
+                    "reduce": {"long", "short"},
+                    "adjust_protection": {"long", "short"},
                 }.get(action)
                 if expected_sides is not None and side not in expected_sides:
                     rendered = "null" if side is None else repr(side)
@@ -773,6 +842,21 @@ def validate_receipt(
                     )
                     if action in {"open_long", "open_short"}:
                         card = sig.get("decision_card")
+                        risk_reward = (
+                            card.get("risk_reward")
+                            if isinstance(card, dict) else None
+                        )
+                        exit_mode = (
+                            str(risk_reward.get("exit_mode") or "")
+                            .strip().lower()
+                            if isinstance(risk_reward, dict) else ""
+                        )
+                        if exit_mode not in EXIT_MODES:
+                            errors.append(
+                                f"signals[{i}].decision_card.risk_reward."
+                                "exit_mode 开仓时必须显式为 "
+                                "fixed_tp|dynamic_exit|no_fixed_tp"
+                            )
                         canonical_symbol = normalize_symbol(
                             str(sig.get("symbol") or ""))
                         multitimeframe_errors = validate_multitimeframe_analysis(
@@ -957,6 +1041,9 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     """
     if not isinstance(data, dict):
         return {"ok": False, "error": "回执必须是 dict"}
+    deadline_refusal = analysis_deadline_refusal(data.get("cycle_id"))
+    if deadline_refusal:
+        return deadline_refusal
     data = normalize_receipt(data)
     target = Path(db_path or DB_PATH)
     errors = validate_receipt(data, db_root=target.parent)
@@ -964,8 +1051,6 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
         return {"ok": False, "error": "; ".join(errors)}
 
     cycle_id = data["cycle_id"]
-    # ts 一律取 writer 落库时刻，不信 agent 自报值；原报 ts 仍在回执/raw 可溯源。
-    ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     mode = data["mode"]
     regime = data.get("regime")
     regime_stale = data.get("regime_stale", 0)
@@ -974,24 +1059,21 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     reported_ts = normalize_ts(str(data.get("ts") or ""))
     status = data["status"]
 
-    # analysis_runs.raw 的 schema 注释承诺“完整结构化报告 JSON”。历史实现却只
-    # 保存调用方 data.raw 子对象，导致已验证的 decision_protocol、signals 与运行
-    # 状态在持久层消失。这里保存规范化后的完整回执；调用方原 raw 仍原样保留在
-    # 嵌套 ``raw`` 字段中。列 ``ts`` 继续由 writer 掌权，Agent 自报时间单列留痕。
-    raw = dict(data)
-    raw["missing_sources"] = missing_sources
-    raw["reported_ts"] = reported_ts
-    raw["writer_ts"] = ts
-    raw["raw_schema_version"] = 2
-
     # JSON 序列化 dict 字段
     market_summary_json = json.dumps(market_summary, ensure_ascii=False) if market_summary is not None else None
     missing_json = json.dumps(missing_sources, ensure_ascii=False) if missing_sources is not None else None
-    raw_json = json.dumps(raw, ensure_ascii=False)
 
+    # Validation can rebuild exact MTF/experience evidence and cross the wall
+    # clock boundary.  Recheck immediately before the first write transaction.
+    deadline_refusal = analysis_deadline_refusal(cycle_id)
+    if deadline_refusal:
+        return deadline_refusal
     con = connect(write=True, db_path=target)
     try:
-        # 闩锁：查是否已有 status='ok' 的行 → 有则拒绝（race condition 防护）
+        # 先拿 SQLite 写锁，再在同一事务内做 status=ok CAS。否则两个 writer
+        # 都可能在无锁 SELECT 中看见空行后互相覆盖；同时锁等待也可能跨过本轮
+        # analysis 绝对截止，故 deadline 必须在拿锁后重验。
+        con.execute("BEGIN IMMEDIATE")
         existing = con.execute(
             "SELECT status, ts FROM analysis_runs WHERE cycle_id=?",
             (cycle_id,),
@@ -1000,12 +1082,30 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
             existing_status = existing[0]
             existing_ts = existing[1]
             if existing_status == "ok":
+                con.rollback()
                 return {
                     "ok": False,
                     "error": "already_exists",
                     "cycle_id": cycle_id,
                     "detail": f"analysis_runs 已有 status=ok 行 (ts={existing_ts})，拒绝覆盖（race condition 防护）",
                 }
+
+        # BEGIN IMMEDIATE/CAS 可能等待数秒。首个业务写之前以持锁后的墙钟
+        # 重验，并在此刻刷新 writer 掌权的 ts/raw，禁止把抢锁前的旧时间写成
+        # “准时完成”。越界返回前显式 rollback，持久层保持零业务改动。
+        deadline_refusal = analysis_deadline_refusal(cycle_id)
+        if deadline_refusal:
+            con.rollback()
+            return deadline_refusal
+        ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+        # analysis_runs.raw 的 schema 注释承诺“完整结构化报告 JSON”。保存
+        # 规范化后的完整回执；调用方原 raw 仍原样保留在嵌套 ``raw`` 字段。
+        raw = dict(data)
+        raw["missing_sources"] = missing_sources
+        raw["reported_ts"] = reported_ts
+        raw["writer_ts"] = ts
+        raw["raw_schema_version"] = 2
+        raw_json = json.dumps(raw, ensure_ascii=False)
 
         con.execute(
             "INSERT OR REPLACE INTO analysis_runs"
@@ -1054,10 +1154,10 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
             # Wave2 序11：regime 口径拆分块（open/close 卡注入；派生失败跳过）
             if (isinstance(decision_card, dict)
                     and sig.get("action") in (
-                        "open_long", "open_short", "close")):
+                        "open_long", "open_short", "close", "reduce",
+                        "adjust_protection")):
                 _rs = _regime_scope_block(
-                    sym, data.get("regime"), cycle_id, target.parent
-                )
+                    sym, data.get("regime"), cycle_id, target.parent)
                 if _rs:
                     decision_card = {**decision_card, "regime_scope": _rs}
             # Wave1 序8：历史经验计数的 canonical 块（scope_counts 由契约派生）
@@ -1109,8 +1209,16 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
             )
             signals_written += 1
 
+        # enrichment/逐信号写入也可能耗尽最后预算。deadline 之后不得把任何
+        # analysis_runs/signals 暂存写提交；整事务回滚，stage 也不会读到旧 ts。
+        deadline_refusal = analysis_deadline_refusal(cycle_id)
+        if deadline_refusal:
+            con.rollback()
+            return deadline_refusal
         con.commit()
     finally:
+        if con.in_transaction:
+            con.rollback()
         con.close()
 
     result = {"ok": True, "cycle_id": cycle_id, "signals_written": signals_written}
@@ -1184,6 +1292,10 @@ def main() -> int:
 
     validate_only = "--validate-only" in sys.argv
     payload_hash = hashlib.sha256(raw_bytes).hexdigest()
+    deadline_refusal = analysis_deadline_refusal(data.get("cycle_id"))
+    if deadline_refusal:
+        print(json.dumps(deadline_refusal, ensure_ascii=False))
+        return 1
     guard_error, guard_state = _validation_guard(
         data.get("cycle_id"), payload_hash, validate_only=validate_only)
     if guard_error:
@@ -1208,6 +1320,14 @@ def main() -> int:
         if budget:
             out["validation_budget"] = budget
         print(json.dumps(out, ensure_ascii=False))
+        return 1
+
+    # Exact-evidence validation may itself consume the last seconds of the
+    # analysis budget.  A payload that was timely only at validation start is
+    # not allowed to authorize facts after the absolute deadline.
+    deadline_refusal = analysis_deadline_refusal(data.get("cycle_id"))
+    if deadline_refusal:
+        print(json.dumps(deadline_refusal, ensure_ascii=False))
         return 1
 
     # --validate-only=只验不写，复用上面同一套硬校验与坏码哨兵。

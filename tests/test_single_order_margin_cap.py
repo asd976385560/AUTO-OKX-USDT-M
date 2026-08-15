@@ -149,6 +149,54 @@ class SingleOrderBudgetHelperTests(unittest.TestCase):
             b["max_single_order_imr_ratio"], rv.MAX_SINGLE_ORDER_IMR_RATIO)
         self.assertTrue(b["feasible"])
 
+    def test_target_stop_risk_sizes_down_to_lot_without_exceeding_target(self):
+        sized = rv.size_for_target_stop_risk(
+            mark_px=100.0,
+            ct_val=1.0,
+            lot_sz=0.1,
+            equity=1000.0,
+            sl_trigger_px=98.0,
+            target_risk_pct_equity=0.0075,
+            min_order_size=0.1,
+        )
+        self.assertTrue(sized["ok"])
+        self.assertEqual(3.4, sized["intended_sz"])
+        self.assertAlmostEqual(7.48, sized["intended_risk_usdt"])
+        self.assertLessEqual(
+            sized["intended_risk_pct_equity"],
+            sized["target_risk_pct_equity"],
+        )
+        self.assertAlmostEqual(
+            0.022,
+            sized["risk_distance_pct"],
+        )
+
+    def test_target_stop_risk_above_hard_cap_is_rejected(self):
+        sized = rv.size_for_target_stop_risk(
+            mark_px=100.0,
+            ct_val=1.0,
+            lot_sz=0.1,
+            equity=1000.0,
+            sl_trigger_px=98.0,
+            target_risk_pct_equity=0.051,
+        )
+        self.assertFalse(sized["ok"])
+        self.assertEqual("target_risk_pct_exceeds_hard_cap", sized["error"])
+
+    def test_target_stop_risk_does_not_raise_size_above_target_for_minimum(self):
+        sized = rv.size_for_target_stop_risk(
+            mark_px=100.0,
+            ct_val=1.0,
+            lot_sz=1.0,
+            equity=1000.0,
+            sl_trigger_px=70.0,
+            target_risk_pct_equity=0.005,
+            min_order_size=1.0,
+        )
+        self.assertFalse(sized["ok"])
+        self.assertEqual("target_risk_below_minimum_order", sized["error"])
+        self.assertGreater(sized["minimum_risk_usdt"], sized["target_risk_usdt"])
+
 
 class PostFillAuditTests(unittest.TestCase):
     """executor 成交后单笔保证金复审（纯函数 _single_order_fill_audit）。"""
@@ -252,7 +300,7 @@ class FactsSingleOrderTests(unittest.TestCase):
         self.assertTrue(policy["open_add_allowed_by_facts"])
         self.assertEqual(
             policy["allowed_executor_actions"],
-            ["open", "add", "close", "reduce"])
+            ["open", "add", "close", "reduce", "adjust_protection"])
 
     def test_actions_drop_open_add_when_ratio_gate_false(self):
         """组合 IMR 越 66.6% → open_add gate=False，动作表必须同步剔除 open/add。"""
@@ -263,7 +311,8 @@ class FactsSingleOrderTests(unittest.TestCase):
         policy = payload["action_policy"]
         self.assertFalse(policy["open_add_allowed_by_facts"])
         self.assertEqual(
-            policy["allowed_executor_actions"], ["close", "reduce"])
+            policy["allowed_executor_actions"],
+            ["close", "reduce", "adjust_protection"])
         self.assertEqual(payload["status"], "ok")
 
 

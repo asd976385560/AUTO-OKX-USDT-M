@@ -26,8 +26,10 @@ from _http import get_json
 METRIC_FEAR_GREED = "crypto_fear_greed"
 METRIC_DXY_ECB = "dxy_calc_ecb"
 METRIC_BTC_ETF = "btc_spot_etf_net_flow_usd"
+METRIC_FED_FUNDS = "us_fed_funds_rate"
 
 SOURCE_ALTERNATIVE = "alternative_me"
+SOURCE_FRED = "fred"
 SOURCE_ECB_DXY = "ecb_ice_formula"
 SOURCE_FARSIDE = "farside"
 SOURCE_SOSOVALUE = "sosovalue"
@@ -173,6 +175,38 @@ def fetch_alternative(
     if not isinstance(payload, dict):
         raise RuntimeError("Alternative.me response is not an object")
     return parse_alternative_payload(payload)
+
+
+def fed_funds_rows(
+    value: Any,
+    observation_date: Any,
+    *,
+    d1: Any = None,
+    collected_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """FRED DFF（美联储有效联邦基金利率，日频、约1个工作日发布滞后）→
+    macro_observations 行。单位=年化百分比；值/日期非法返回空列表（宁缺勿假）。"""
+    number = _finite(value)
+    observed = str(observation_date or "").strip()[:10]
+    if number is None or len(observed) != 10:
+        return []
+    if not 0.0 <= number <= 30.0:
+        # 联邦基金利率历史区间约 0–20%；越界视为坏数据不落库。
+        return []
+    return [
+        {
+            "metric": METRIC_FED_FUNDS,
+            "observation_date": observed,
+            "source": SOURCE_FRED,
+            "collected_at": collected_at or utc_now_iso(),
+            "value": number,
+            "unit": "percent_annual",
+            "label": "Effective Federal Funds Rate (DFF)",
+            "status": "official_primary",
+            "source_url": "https://fred.stlouisfed.org/series/DFF",
+            "raw": {"series": "DFF", "d1": _finite(d1)},
+        }
+    ]
 
 
 def parse_ecb_xml(xml_text: str) -> list[tuple[str, dict[str, float]]]:
@@ -540,6 +574,9 @@ def latest_snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         sources=(SOURCE_ETF_CONSENSUS,),
         statuses=("conflict",),
     )
+    fed_funds = latest_observation(
+        con, METRIC_FED_FUNDS, sources=(SOURCE_FRED,)
+    )
     return {
         "fear_greed": fear,
         "dxy_calc_ecb": dxy,
@@ -547,6 +584,7 @@ def latest_snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         "etf_confirmed": etf_confirmed,
         "etf_provisional": etf_provisional,
         "etf_conflict": etf_conflict,
+        "fed_funds": fed_funds,
     }
 
 
@@ -557,11 +595,13 @@ def source_dates(con: sqlite3.Connection) -> dict[str, str | None]:
             "macro_dxy_calc_ecb": None,
             "macro_etf_flow": None,
             "macro_fear_greed": None,
+            "macro_fed_funds": None,
         }
     mapping = {
         "macro_dxy_calc_ecb": METRIC_DXY_ECB,
         "macro_etf_flow": METRIC_BTC_ETF,
         "macro_fear_greed": METRIC_FEAR_GREED,
+        "macro_fed_funds": METRIC_FED_FUNDS,
     }
     out: dict[str, str | None] = {}
     for source_id, metric in mapping.items():

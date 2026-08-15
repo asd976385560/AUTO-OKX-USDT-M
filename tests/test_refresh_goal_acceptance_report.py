@@ -1,6 +1,7 @@
 import copy
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -23,12 +24,160 @@ from refresh_goal_acceptance_report import (  # noqa: E402
     refresh_selective_credibility,
     refresh_source_health,
 )
+
+
+CST = timezone(timedelta(hours=8))
+# 与 refresh_goal_acceptance_report 中的预注册常量同源，改一处即两处同改。
+PUSH_FORWARD_START_CST = "2026-08-12T16:00:00+08:00"
+PUSH_FINALITY_GRACE_MINUTES = 45
+
+
+def push_completeness_audit(
+    *,
+    days: int = 14,
+    target_rate: float = 0.99,
+    evaluated_at_cst: str = "2026-08-13 17:00:00",
+    as_of_cst: str = "2026-08-13T16:45:00+08:00",
+) -> dict:
+    """构造一份自洽的 Push 完整度审计工件（全达标口径）。
+
+    `refresh_report_completeness` 自 2026-08-12 起把 Push 审计作为**必填**第三位
+    参数，并对窗口/计数/速率/状态/安全标志/逐日行/失败行/前向证据交叉复算。这里
+    按同一套恒等式生成，只留 days / target_rate / as_of 少量旋钮——避免测试里手抄
+    几十个互相牵制的常量（手抄必然随生产口径演进而腐坏，本文件此前正是如此）。
+    """
+    expected = days * 96
+    start_date = datetime(2026, 7, 31, tzinfo=CST)
+    daily_rows = [
+        {
+            "date": (start_date + timedelta(days=index)).strftime("%Y-%m-%d"),
+            "expected_slots": 96,
+            "pipeline_present": 96,
+            "missing_pipeline_slots": 0,
+            "report_complete": 96,
+            "delivered_report_complete": 96,
+            "report_completeness_rate": 1.0,
+            "delivered_report_completeness_rate": 1.0,
+        }
+        for index in range(days)
+    ]
+    end_date = (start_date + timedelta(days=days - 1)).strftime("%Y-%m-%d")
+
+    # 前向窗：起点是预注册常量；终点 = as_of 减 45 分钟宽限后向下对齐 15 分钟再 +1 槽。
+    forward_start = datetime.fromisoformat(
+        PUSH_FORWARD_START_CST).astimezone(CST)
+    as_of_dt = datetime.fromisoformat(as_of_cst).astimezone(CST)
+    graced = as_of_dt - timedelta(minutes=PUSH_FINALITY_GRACE_MINUTES)
+    forward_end = max(
+        forward_start,
+        graced.replace(
+            minute=graced.minute // 15 * 15, second=0, microsecond=0,
+        ) + timedelta(minutes=15),
+    )
+    forward_expected = int(
+        (forward_end - forward_start).total_seconds() // (15 * 60))
+    forward_status = (
+        "PASSED" if forward_expected >= 96 else "INSUFFICIENT_EVIDENCE")
+    overall = (
+        "PASSED" if forward_status == "PASSED" else "PENDING_FORWARD_EVIDENCE")
+    full_counts = {
+        "expected_slots": expected,
+        "pipeline_present": expected,
+        "missing_pipeline_slots": 0,
+        "pipeline_attempts": expected,
+        "duplicate_pipeline_attempts": 0,
+        "archive_attempts_checked": expected,
+        "report_complete": expected,
+        "report_incomplete": 0,
+        "delivery_confirmed": expected,
+        "delivery_unconfirmed": 0,
+        "delivered_report_complete": expected,
+        "delivered_report_incomplete": 0,
+        "failure_slots": 0,
+    }
+    perfect_rates = {
+        "pipeline_presence_rate": 1.0,
+        "report_completeness_rate": 1.0,
+        "delivery_confirmation_rate": 1.0,
+        "delivered_report_completeness_rate": 1.0,
+    }
+    return {
+        "artifact_type": "push_report_and_delivery_completeness_audit",
+        "mode": "read_only_business_data",
+        "evaluated_at_cst": evaluated_at_cst,
+        "as_of_cst": as_of_cst,
+        "target_rate": target_rate,
+        "forward_start_cst": PUSH_FORWARD_START_CST,
+        "slot_finality_grace_minutes": PUSH_FINALITY_GRACE_MINUTES,
+        "window": {
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": end_date,
+            "end_inclusive": True,
+            "completed_calendar_days": True,
+            "days": days,
+            "schedule_minutes": 15,
+            "expected_slots": expected,
+        },
+        "counts": dict(full_counts),
+        "rates": dict(perfect_rates),
+        "statuses": {
+            "report_completeness_status": "PASSED",
+            "delivered_report_completeness_status": "PASSED",
+            "overall_status": "PASSED",
+        },
+        "status": "PASSED",
+        "overall_status": overall,
+        "daily": daily_rows,
+        "failure_rows": [],
+        "safety": {
+            "auto_resend": False,
+            "historical_backfill": False,
+            "production_database_writes": 0,
+            "production_report_mutation": False,
+            "production_threshold_change_allowed": False,
+            "production_order_authorized": False,
+            "orders_placed": 0,
+        },
+        "forward_after_remediation": {
+            "start_cst": forward_start.isoformat(),
+            "end_exclusive_cst": forward_end.isoformat(),
+            "target_rate": target_rate,
+            "minimum_slots": 96,
+            "counts": {
+                **full_counts,
+                "expected_slots": forward_expected,
+                "pipeline_present": forward_expected,
+                "pipeline_attempts": forward_expected,
+                "archive_attempts_checked": forward_expected,
+                "report_complete": forward_expected,
+                "delivery_confirmed": forward_expected,
+                "delivered_report_complete": forward_expected,
+            },
+            "rates": dict(perfect_rates),
+            "statuses": {
+                "report_completeness_status": forward_status,
+                "delivered_report_completeness_status": forward_status,
+                "overall_status": forward_status,
+            },
+            "status": forward_status,
+            "daily": [{
+                "date": forward_start.strftime("%Y-%m-%d"),
+                "expected_slots": forward_expected,
+                "pipeline_present": forward_expected,
+                "report_complete": forward_expected,
+                "delivered_report_complete": forward_expected,
+            }],
+            "failure_rows": [],
+        },
+    }
+
+
 class RefreshGoalAcceptanceReportTests(unittest.TestCase):
     def test_refreshes_natural_runtime_without_authorizing_production(self):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+                "title": ". 四项目标实施与前向验收（old）",
                 "generatedAt": "old",
                 "sources": [{"id": "runtime", "query": {}}],
                 "charts": [{"id": "throughput_chart"}],
@@ -135,7 +284,7 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+                "title": ". 四项目标实施与前向验收（old）",
                 "generatedAt": "old",
                 "sources": [{"id": "coverage_evidence", "query": {}}],
                 "tables": [],
@@ -401,6 +550,110 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
             source["id"] == "directional_separability"
             for source in result["manifest"]["sources"]
         ))
+
+    def test_refreshes_news_children_with_strict_forward_denominator(self):
+        artifact = {
+            "surface": "report",
+            "manifest": {
+                "sources": [],
+                "tables": [],
+                "blocks": [{"id": "data_section", "body": "old"}],
+            },
+            "snapshot": {"datasets": {
+                "headline": [{}],
+                "gates": [{"goal": "关键数据完善率", "current": "4H 98.6%"}],
+            }},
+        }
+
+        # 生产端逐行复算：minimum_slots=ceil(窗口小时×60/间隔)、raw_status_counts
+        # 与 observed/complete/available 互锁、exception_count=expected-complete、
+        # target_rate 与 start_cst 必须与审计头一致。这里按同一套恒等式生成，
+        # 只留 complete 一个旋钮，避免手抄常量再次腐坏。
+        forward_start = "2026-08-12T05:30:00+08:00"
+        target_rate = 0.99
+        minimum_window_hours = 24
+
+        def source_row(source, role, complete, status):
+            interval = 15
+            expected_slots = 1
+            observed = 1
+            degraded_or_failed = observed - complete
+            return {
+                "source": source,
+                "role": role,
+                "schedule_minutes": interval,
+                "start_cst": forward_start,
+                "target_rate": target_rate,
+                "minimum_slots": minimum_window_hours * 60 // interval,
+                "expected_slots": expected_slots,
+                "observed_rows": observed,
+                "complete_slots": complete,
+                "missing_slots": expected_slots - observed,
+                "degraded_or_failed_slots": degraded_or_failed,
+                "raw_status_counts": {
+                    "ok": complete, "degraded": degraded_or_failed,
+                },
+                "strict_complete_rate": complete / expected_slots,
+                "available_rate": observed / expected_slots,
+                "exception_count": expected_slots - complete,
+                "status": status,
+            }
+
+        # 关键源集合由生产端钉死，缺一即 "critical source set incomplete"。
+        critical_rows = [
+            source_row("okx_news", "official_required", 1,
+                       "INSUFFICIENT_EVIDENCE"),
+            source_row("rss_en", "required", 1, "INSUFFICIENT_EVIDENCE"),
+        ] + [
+            source_row(f"rss:{name}", "required_subsource", 1,
+                       "INSUFFICIENT_EVIDENCE")
+            for name in ("bitcoinist", "coindesk", "cointelegraph",
+                         "cryptoslate", "decrypt", "theblock")
+        ]
+        audit = {
+            "artifact_type": "scheduled_news_source_health_audit",
+            "generated_at_cst": "2026-08-12T05:37:59+08:00",
+            "forward_start_cst": forward_start,
+            "minimum_window_hours": minimum_window_hours,
+            "target_rate": target_rate,
+            # 五个安全标志为必填（生产端拒绝会改库/触发重采/触发派发/授权执行的证据）。
+            "production_mutation": False,
+            "collector_retry_triggered": False,
+            "stage_dispatch_triggered": False,
+            "production_execution_authorized": False,
+            "orders_placed": 0,
+            "overall_status": "PENDING_FORWARD_EVIDENCE",
+            "forward_after_remediation": {
+                "critical_status": "INSUFFICIENT_EVIDENCE",
+                "all_sources_status": "INSUFFICIENT_EVIDENCE",
+                "sources": critical_rows + [
+                    source_row("panews", "optional", 0,
+                               "INSUFFICIENT_EVIDENCE"),
+                ],
+            },
+        }
+        result = refresh_news_source_health(
+            artifact,
+            audit,
+            audit_relative_path="news-source-health-audit.json",
+        )
+        headline = result["snapshot"]["datasets"]["headline"][0]
+        # 关键源 8 行全 complete；可选 panews 未 complete 只进「全部源」分母。
+        self.assertEqual(8, headline["news_forward_complete_source_slots"])
+        self.assertEqual(8, headline["news_forward_expected_source_slots"])
+        self.assertEqual(8, headline["news_forward_all_complete_source_slots"])
+        self.assertEqual(9, headline["news_forward_all_expected_source_slots"])
+        self.assertEqual(
+            "INSUFFICIENT_EVIDENCE", headline["news_forward_critical_status"])
+        table = result["manifest"]["tables"][0]
+        self.assertEqual("news_source_health", table["dataset"])
+        section = next(
+            block for block in result["manifest"]["blocks"]
+            if block.get("id") == "news_source_section"
+        )
+        self.assertIn("至少24小时", section["body"])
+        self.assertEqual(
+            "未达标", result["snapshot"]["datasets"]["gates"][0]["status"])
 
     def test_refreshes_corrected_credibility_and_production_signal(self):
         artifact = {
@@ -873,15 +1126,21 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
             "manifest": {"sources": [], "tables": [], "charts": [], "blocks": []},
             "snapshot": {"datasets": {}},
         }
+        # 只读安全标志在拆分字段之前先被校验；不带就会提前抛"not read-only"，
+        # 把本用例真正要钉的 "split fields missing" 遮掉。
         natural = {
             "artifact_type": "contract_statistics_coverage_audit",
             "source": "okx_rest_contract_oi_taker_15m",
             "coverage_rate": 1.0,
+            "production_database_writes": 0,
+            "orders_placed": 0,
         }
         isolated = {
             "artifact_type": "contract_statistics_isolated_acceptance",
             "source": "okx_rest_contract_oi_taker_15m",
             "audit": {"coverage_rate": 1.0},
+            "production_database_writes": 0,
+            "orders_placed": 0,
         }
         with self.assertRaisesRegex(ValueError, "split fields missing"):
             refresh_contract_statistics_coverage(
@@ -924,12 +1183,16 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
             "artifact_type": "contract_statistics_coverage_audit",
             "source": "okx_rest_contract_oi_taker_15m",
             "latest_cycle_id": "2026-08-12T10:30",
+            "production_database_writes": 0,
+            "orders_placed": 0,
         }
         isolated = {
             "artifact_type": "contract_statistics_isolated_acceptance",
             "source": "okx_rest_contract_oi_taker_15m",
             "cycle_id": "2026-08-12T10:35",
             "audit": dict(split),
+            "production_database_writes": 0,
+            "orders_placed": 0,
         }
         with self.assertRaisesRegex(ValueError, "not a 15m boundary"):
             refresh_contract_statistics_coverage(
@@ -940,11 +1203,102 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 isolated_relative_path="isolated.json",
             )
 
+    def test_refreshes_daily_gate_without_changing_other_gates(self):
+        artifact = {
+            "surface": "report",
+            "manifest": {
+                "title": ". 四项目标实施与前向验收（old）",
+                "generatedAt": "old",
+                "sources": [{"id": "report_quality", "query": {}}],
+                "cards": [{
+                    "id": "push_card", "metrics": [], "description": "old"}],
+                "blocks": [
+                    {"id": "title", "body": "# old"},
+                    {"id": "executive_summary", "body": (
+                        "最新日报也已在备份和dry-run后受控修正，Push结构与"
+                        "投递近14日均高于99%。历史日报有效率仍为66.667%。")},
+                    {"id": "reports_section", "body": "old"},
+                    {"id": "gates_section", "body": "old"},
+                ],
+            },
+            "snapshot": {
+                "generatedAt": "old",
+                "datasets": {
+                    "headline": [{}],
+                    # Push 两行与日报行同为必需：生产端要求各恰好一行可更新，
+                    # 兼容旧名（Push 结构校验 / Push 投递确认）并统一改写为新名。
+                    "report_quality": [
+                        {
+                            "artifact_family": "Push 结构校验",
+                            "completeness_rate": 0.5,
+                        },
+                        {
+                            "artifact_family": "Push 投递确认",
+                            "completeness_rate": 0.5,
+                        },
+                        {
+                            "artifact_family": "日报历史校验",
+                            "completeness_rate": 0.5,
+                        },
+                    ],
+                    "gates": [
+                        {"goal": "关键数据完善率", "status": "未达标"},
+                        {"goal": "报告与推送完整度", "status": "部分达标"},
+                    ],
+                },
+            },
+        }
+        audit = {
+            "evaluated_at_cst": "2026-08-12 01:17:00",
+            "window": {"start_date": "2026-07-28", "end_date": "2026-08-11"},
+            "expected": 15,
+            "valid": 15,
+            "completeness_rate": 1.0,
+            "target_rate": 0.99,
+            # 日报审计的三个安全标志同为必填（生产端拒绝会写库/自动外发/授权下单的证据）。
+            "auto_send": False,
+            "database_write": False,
+            "production_order_authorized": False,
+        }
+        before_other = copy.deepcopy(
+            artifact["snapshot"]["datasets"]["gates"][0])
+        result = refresh_report_completeness(
+            artifact,
+            audit,
+            push_completeness_audit(),
+            audit_relative_path="reports/quality/audit.json",
+            push_audit_relative_path="reports/quality/push-audit.json",
+        )
+        rows = {
+            row["artifact_family"]: row
+            for row in result["snapshot"]["datasets"]["report_quality"]
+        }
+        daily = rows["日报历史校验"]
+        report_gate = result["snapshot"]["datasets"]["gates"][1]
+        self.assertEqual(daily["numerator"], 15)
+        self.assertEqual(daily["status"], "达标")
+        self.assertEqual(report_gate["status"], "达标")
+        # Push 两行按新命名就地改写，且与审计工件计数一致。
+        self.assertEqual(rows["Push 报告完整性"]["numerator"], 14 * 96)
+        self.assertEqual(rows["Push 精确送达"]["denominator"], 14 * 96)
+        self.assertEqual(rows["Push 报告完整性"]["status"], "达标")
+        self.assertEqual(rows["Push 精确送达"]["status"], "达标")
+        self.assertEqual(
+            result["snapshot"]["datasets"]["gates"][0], before_other)
+        self.assertIn(
+            "daily_report_validation_rate",
+            [item["field"] for item in result["manifest"]["cards"][0]["metrics"]],
+        )
+        self.assertEqual(
+            f"# {result['manifest']['title']}",
+            result["manifest"]["blocks"][0]["body"],
+        )
+
     def test_refreshes_fast_with_scheduled_slot_denominator(self):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": "<PROJECT_ROOT> 四项目标实施与前向验收（old）",
+                "title": ". 四项目标实施与前向验收（old）",
                 "generatedAt": "old",
                 "sources": [],
                 "cards": [{

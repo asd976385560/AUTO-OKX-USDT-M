@@ -5,12 +5,13 @@
   BTC/ETH/SOL + 按正确合约面值计算且同时满足成交额/OI门槛的标的
   + focus.md关注币 + 最新快照按美元成交额动态补足。
 生产默认100个币，当前可覆盖全部可交易性合格池；不是给全市场逐币抓深度。
-多空账户比单独走官方 Trading Statistics REST，整点覆盖最新全部 USDT 线性
-SWAP，不受盘口/逐笔动态集合上限约束。
+多空账户比单独走官方 Trading Statistics REST，在 :00/:30 覆盖最新全部 USDT
+线性 SWAP，不受盘口/逐笔动态集合上限约束；上游观测粒度仍为1H。
 
 本脚本只生成影子特征，不改变分析评分和交易风控。
 历史默认保留30天；每日04:45槽由本脚本自己的写连接裁剪，避免50档原始JSON无界增长。
-多空账户比每小时 :00 槽采全宇宙；失败不阻断盘口/逐笔主路径。
+多空账户比每小时 :00/:30 槽采全宇宙；覆盖低于99%或任一真实上游来源
+在采集完成时超过90分钟均显式降级，但不阻断盘口/逐笔主路径。
 """
 from __future__ import annotations
 
@@ -45,6 +46,8 @@ DEFAULT_POSITIONING_WORKERS = 6
 DEFAULT_CONTRACT_STATS_SYMBOLS = 500
 DEFAULT_MAX_SYMBOLS = 100
 POSITIONING_BATCH_TIMEOUT_S = 30.0
+POSITIONING_MAXIMUM_SOURCE_AGE_S = 5_400.0
+POSITIONING_PRIMARY_KEY = ("cycle_id", "symbol", "timeframe", "source")
 CONTRACT_STATS_BATCH_TIMEOUT_S = 35.0
 CONTRACT_STATS_RETRY_TIMEOUT_S = 12.0
 CONTRACT_STATS_FALLBACK_TIMEOUT_S = 7.0
@@ -60,6 +63,8 @@ CONTRACT_STATS_DIRECT_METHODS = frozenset({
     "official_public_oi_trades_candle_reconciled_fallback",
 })
 CONTRACT_STATS_MINIMUM_COVERAGE = 0.99
+MARKET_FEATURE_MINIMUM_COVERAGE = 0.99
+POSITIONING_MINIMUM_COVERAGE = 0.99
 MIN_QUOTE_VOL_USD = 5_000_000.0
 MIN_OI_USD = 5_000_000.0
 
@@ -107,7 +112,11 @@ def focus_symbols(path: Path) -> list[str]:
     return out
 
 
-def select_symbols(con: sqlite3.Connection, max_symbols: int, focus_path: Path) -> list[str]:
+def select_symbols(
+    con: sqlite3.Connection,
+    max_symbols: int,
+    focus_path: Path,
+) -> list[str]:
     latest = con.execute("SELECT MAX(ts) FROM tick_snapshots").fetchone()[0]
     latest_derivatives = con.execute("SELECT MAX(ts) FROM derivatives").fetchone()[0]
     rows = con.execute(
@@ -129,7 +138,6 @@ def select_symbols(con: sqlite3.Connection, max_symbols: int, focus_path: Path) 
     ]
     live = {r[0] for r in rows}
     selected = []
-    # 合格池优先于 focus，避免非合格关注币挤掉本轮真正可能交易的标的。
     for symbol in (
         *BASE_SYMBOLS,
         *(r[0] for r in eligible),
@@ -141,6 +149,210 @@ def select_symbols(con: sqlite3.Connection, max_symbols: int, focus_path: Path) 
         if len(selected) >= max_symbols:
             break
     return selected
+
+
+def _feature_selection_payload(symbols: list[str]) -> list[dict]:
+    return [
+        {"selection_rank": rank, "symbol": str(symbol).strip().upper()}
+        for rank, symbol in enumerate(symbols, start=1)
+    ]
+
+
+def _feature_selection_hash(rows: list[dict]) -> str:
+    encoded = json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def freeze_market_feature_selection(
+    con: sqlite3.Connection,
+    symbols: list[str],
+    *,
+    cycle_id: str,
+    collected_ts_utc: str,
+    max_symbols: int,
+) -> dict:
+    """Freeze the exact dynamic enrichment denominator once per slot."""
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:(00|15|30|45)", cycle_id
+    ):
+        raise ValueError("cycle_id must align to a 15-minute boundary")
+    rows = _feature_selection_payload(symbols)
+    normalized = [row["symbol"] for row in rows]
+    if not rows or any(not symbol for symbol in normalized):
+        raise ValueError("market feature selection is empty or invalid")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("market feature selection contains duplicate symbols")
+    if max_symbols <= 0 or len(rows) != max_symbols:
+        raise ValueError(
+            "market feature selection must exactly match max_symbols: "
+            f"selected={len(rows)} max_symbols={max_symbols}"
+        )
+    payload_hash = _feature_selection_hash(rows)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS market_feature_selection_runs(
+            cycle_id         TEXT PRIMARY KEY,
+            collected_ts_utc TEXT NOT NULL,
+            selected_count   INTEGER NOT NULL,
+            max_symbols      INTEGER NOT NULL,
+            payload_sha256   TEXT NOT NULL,
+            complete         INTEGER NOT NULL CHECK(complete IN (0,1)),
+            source           TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS market_feature_selection_rows(
+            cycle_id      TEXT NOT NULL,
+            selection_rank INTEGER NOT NULL,
+            symbol        TEXT NOT NULL,
+            PRIMARY KEY(cycle_id,symbol),
+            UNIQUE(cycle_id,selection_rank),
+            FOREIGN KEY(cycle_id)
+              REFERENCES market_feature_selection_runs(cycle_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_feature_selection_symbol
+          ON market_feature_selection_rows(symbol,cycle_id);
+    """)
+    existing = con.execute(
+        "SELECT selected_count,max_symbols,payload_sha256,complete "
+        "FROM market_feature_selection_runs WHERE cycle_id=?",
+        (cycle_id,),
+    ).fetchone()
+    if existing is not None:
+        stored_rows = [
+            {"selection_rank": int(row[0]), "symbol": str(row[1])}
+            for row in con.execute(
+                "SELECT selection_rank,symbol "
+                "FROM market_feature_selection_rows WHERE cycle_id=? "
+                "ORDER BY selection_rank",
+                (cycle_id,),
+            ).fetchall()
+        ]
+        stored_observed_hash = _feature_selection_hash(stored_rows)
+        identical = (
+            int(existing[3]) == 1
+            and int(existing[0]) == len(rows)
+            and int(existing[1]) == max_symbols
+            and str(existing[2]) == stored_observed_hash
+            and str(existing[2]) == payload_hash
+        )
+        return {
+            "status": "reused" if identical else "conflict",
+            "cycle_id": cycle_id,
+            "selected_count": len(rows),
+            "max_symbols": max_symbols,
+            "payload_sha256": payload_hash,
+            "stored_selected_count": int(existing[0]),
+            "stored_max_symbols": int(existing[1]),
+            "stored_payload_sha256": str(existing[2]),
+            "stored_observed_payload_sha256": stored_observed_hash,
+            "complete": identical,
+        }
+    try:
+        con.execute("SAVEPOINT freeze_market_feature_selection")
+        con.execute(
+            "INSERT INTO market_feature_selection_runs VALUES(?,?,?,?,?,?,?)",
+            (
+                cycle_id, collected_ts_utc, len(rows), max_symbols,
+                payload_hash, 1, "dynamic_liquidity_oi_focus_rank_v1",
+            ),
+        )
+        con.executemany(
+            "INSERT INTO market_feature_selection_rows VALUES(?,?,?)",
+            [
+                (cycle_id, row["selection_rank"], row["symbol"])
+                for row in rows
+            ],
+        )
+        con.execute("RELEASE SAVEPOINT freeze_market_feature_selection")
+        con.commit()
+    except Exception:
+        con.execute("ROLLBACK TO SAVEPOINT freeze_market_feature_selection")
+        con.execute("RELEASE SAVEPOINT freeze_market_feature_selection")
+        raise
+    return {
+        "status": "inserted",
+        "cycle_id": cycle_id,
+        "selected_count": len(rows),
+        "max_symbols": max_symbols,
+        "payload_sha256": payload_hash,
+        "complete": True,
+    }
+
+
+def market_feature_batch_passed(
+    *,
+    selected_count: int,
+    microstructure_rows: int,
+    trade_flow_rows: int,
+    minimum_coverage: float = MARKET_FEATURE_MINIMUM_COVERAGE,
+) -> bool:
+    if selected_count <= 0 or not 0 < minimum_coverage <= 1:
+        return False
+    return (
+        microstructure_rows / selected_count >= minimum_coverage
+        and trade_flow_rows / selected_count >= minimum_coverage
+    )
+
+
+def positioning_batch_passed(
+    *,
+    selected_count: int,
+    positioning_rows: int,
+    minimum_coverage: float = POSITIONING_MINIMUM_COVERAGE,
+) -> bool:
+    """Require one explicit whole-universe quality gate for positioning.
+
+    A partial official REST batch is still written for observability, but it is
+    never reported as a successful enrichment step merely because at least one
+    symbol returned.
+    """
+    if selected_count <= 0 or not 0 < minimum_coverage <= 1:
+        return False
+    return positioning_rows / selected_count >= minimum_coverage
+
+
+def positioning_source_freshness(
+    rows: list[tuple],
+    maximum_age_seconds: float = POSITIONING_MAXIMUM_SOURCE_AGE_S,
+) -> dict[str, object]:
+    """Validate real upstream timestamps at batch availability time.
+
+    ``collected_ts`` only proves that a request completed.  It must never make
+    an old upstream 1H observation look fresh.
+    """
+    if maximum_age_seconds <= 0:
+        raise ValueError("maximum_age_seconds must be positive")
+    ages: list[float] = []
+    invalid_symbols: list[str] = []
+    for row in rows:
+        symbol = str(row[3]) if len(row) > 3 else "<unknown>"
+        try:
+            source_at = datetime.fromisoformat(
+                str(row[0]).replace("Z", "+00:00"))
+            collected_at = datetime.fromisoformat(
+                str(row[1]).replace("Z", "+00:00"))
+            if source_at.tzinfo is None:
+                source_at = source_at.replace(tzinfo=timezone.utc)
+            if collected_at.tzinfo is None:
+                collected_at = collected_at.replace(tzinfo=timezone.utc)
+            age_seconds = (
+                collected_at.astimezone(timezone.utc)
+                - source_at.astimezone(timezone.utc)
+            ).total_seconds()
+            ages.append(age_seconds)
+            if age_seconds < -60.0 or age_seconds > maximum_age_seconds:
+                invalid_symbols.append(symbol)
+        except (TypeError, ValueError, IndexError):
+            invalid_symbols.append(symbol)
+    maximum_age = max(ages) if ages else None
+    return {
+        "passed": bool(rows) and not invalid_symbols,
+        "maximum_source_age_minutes": (
+            maximum_age / 60.0 if maximum_age is not None else None),
+        "invalid_symbol_count": len(invalid_symbols),
+        "invalid_symbol_examples": invalid_symbols[:20],
+    }
 
 
 def select_positioning_symbols(
@@ -323,12 +535,13 @@ def flow_features(trades: list, ct_val: float, cycle_id: str, collected_ts: str,
 
 
 def positioning_due(cycle_id: str, mode: str) -> bool:
-    """auto 仅在整点周期采；always 供隔离验证/人工补采，off 明确关闭。"""
+    """auto 在:00/:30采；always供隔离验证，off明确关闭。"""
     if mode == "off":
         return False
     if mode == "always":
         return True
-    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:00", cycle_id))
+    return bool(re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:(00|30)", cycle_id))
 
 
 def contract_statistics_due(cycle_id: str, mode: str) -> bool:
@@ -1225,12 +1438,41 @@ def write_positioning_rows(con: sqlite3.Connection, rows: list[tuple]) -> int:
     ).fetchone()
     if not exists:
         raise RuntimeError("market_positioning table missing")
+    table_info = con.execute("PRAGMA table_info(market_positioning)").fetchall()
+    actual_primary_key = tuple(
+        str(row[1])
+        for row in sorted(
+            (row for row in table_info if int(row[5]) > 0),
+            key=lambda row: int(row[5]),
+        )
+    )
+    if actual_primary_key != POSITIONING_PRIMARY_KEY:
+        raise RuntimeError(
+            "market_positioning unsafe primary key "
+            f"{actual_primary_key}; expected {POSITIONING_PRIMARY_KEY}; "
+            "run apply_positioning_batch_key_schema.py"
+        )
     con.executemany(
-        "INSERT OR REPLACE INTO market_positioning "
+        "INSERT INTO market_positioning "
         "(ts,collected_ts,cycle_id,symbol,timeframe,long_ratio,short_ratio,"
-        "long_short_ratio,raw,source) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "long_short_ratio,raw,source) VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(cycle_id,symbol,timeframe,source) DO NOTHING",
         rows,
     )
+    for expected in rows:
+        stored = con.execute(
+            "SELECT ts,collected_ts,cycle_id,symbol,timeframe,long_ratio,"
+            "short_ratio,long_short_ratio,raw,source "
+            "FROM market_positioning WHERE cycle_id=? AND symbol=? "
+            "AND timeframe=? AND source=?",
+            (expected[2], expected[3], expected[4], expected[9]),
+        ).fetchone()
+        if stored is None or tuple(stored) != tuple(expected):
+            raise RuntimeError(
+                "market_positioning immutable batch conflict: "
+                f"cycle={expected[2]} symbol={expected[3]} "
+                f"timeframe={expected[4]} source={expected[9]}"
+            )
     return len(rows)
 
 
@@ -1289,7 +1531,7 @@ def main() -> int:
     ap.add_argument("--cycle", default=None)
     ap.add_argument(
         "--positioning", choices=("auto", "always", "off"), default="auto",
-        help="OKX官方REST多空账户比：auto=仅整点，always=本轮，off=关闭",
+        help="OKX官方REST多空账户比：auto=:00/:30，always=本轮，off=关闭",
     )
     ap.add_argument(
         "--positioning-max-symbols", type=int, default=DEFAULT_POSITIONING_SYMBOLS
@@ -1299,7 +1541,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--positioning-only", action="store_true",
-        help="仅采多空账户比，不抓/写盘口和逐笔；用于隔离验证或人工补采",
+        help="仅采多空账户比，不抓/写盘口和逐笔；仅用于隔离验证",
     )
     ap.add_argument(
         "--contract-stats", choices=("auto", "always", "off"), default="off",
@@ -1321,7 +1563,8 @@ def main() -> int:
     db_path = Path(args.db_root) / "market.db"
     con = sqlite3.connect(str(db_path), timeout=20)
     try:
-        symbols = select_symbols(con, max(3, min(args.max_symbols, 150)), Path(args.focus_file))
+        feature_limit = max(3, min(args.max_symbols, 150))
+        symbols = select_symbols(con, feature_limit, Path(args.focus_file))
         collected_ts = utc_now_iso()
         cycle = args.cycle or cycle_id_now()
         positioning_limit = max(3, min(args.positioning_max_symbols, 1000))
@@ -1347,17 +1590,33 @@ def main() -> int:
             )
             wrote = write_positioning_rows(con, positioning_rows)
             con.commit()
+            selected_count = len(positioning_symbols)
+            coverage_rate = wrote / selected_count if selected_count else 0.0
+            coverage_passed = positioning_batch_passed(
+                selected_count=selected_count,
+                positioning_rows=wrote,
+            )
+            source_freshness = positioning_source_freshness(positioning_rows)
+            quality_passed = (
+                coverage_passed and bool(source_freshness["passed"])
+            )
             print(json.dumps({
-                "ok": bool(wrote),
+                "ok": quality_passed,
+                "degraded": not quality_passed,
                 "cycle": cycle,
                 "selected": positioning_symbols,
                 "wrote": {"positioning": wrote},
+                "minimum_positioning_coverage": POSITIONING_MINIMUM_COVERAGE,
+                "positioning_coverage_rate": coverage_rate,
+                "maximum_positioning_source_age_minutes": (
+                    POSITIONING_MAXIMUM_SOURCE_AGE_S / 60.0),
+                "positioning_source_freshness": source_freshness,
                 "positioning_due": True,
                 "positioning_only": True,
                 "positioning_transport": "okx_official_rest",
                 "errors": errors[:20],
             }, ensure_ascii=False))
-            return 0 if wrote else 1
+            return 0 if quality_passed else 1
         if args.contract_stats_only:
             exists = con.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -1443,6 +1702,35 @@ def main() -> int:
                 "errors": errors[:20],
             }, ensure_ascii=False))
             return 0 if passed else 1
+
+        try:
+            selection_snapshot = freeze_market_feature_selection(
+                con,
+                symbols,
+                cycle_id=cycle,
+                collected_ts_utc=collected_ts,
+                max_symbols=feature_limit,
+            )
+        except (sqlite3.Error, ValueError) as selection_exc:
+            print(json.dumps({
+                "ok": False,
+                "degraded": True,
+                "cycle": cycle,
+                "error": (
+                    "market_feature_selection_snapshot_failed: "
+                    f"{type(selection_exc).__name__}: {selection_exc}"
+                ),
+            }, ensure_ascii=False))
+            return 2
+        if selection_snapshot["status"] == "conflict":
+            print(json.dumps({
+                "ok": False,
+                "degraded": True,
+                "cycle": cycle,
+                "error": "market_feature_selection_snapshot_conflict",
+                "selection_snapshot": selection_snapshot,
+            }, ensure_ascii=False))
+            return 1
 
         specs = {
             r[0]: float(r[1] or 0)
@@ -1571,18 +1859,65 @@ def main() -> int:
         if cycle.endswith("T04:45"):
             pruned = prune_feature_history(con, args.retention_days)
         con.commit()
+        selected_count = len(symbols)
+        microstructure_coverage_rate = (
+            len(book_rows) / selected_count if selected_count else 0.0
+        )
+        trade_flow_coverage_rate = (
+            len(flow_rows) / selected_count if selected_count else 0.0
+        )
+        feature_batch_passed = market_feature_batch_passed(
+            selected_count=selected_count,
+            microstructure_rows=len(book_rows),
+            trade_flow_rows=len(flow_rows),
+        )
+        positioning_selected_count = (
+            len(positioning_symbols) if do_positioning else 0
+        )
+        positioning_coverage_rate = (
+            len(positioning_rows) / positioning_selected_count
+            if positioning_selected_count else None
+        )
+        positioning_source_quality = (
+            positioning_source_freshness(positioning_rows)
+            if do_positioning else None
+        )
+        positioning_quality_passed = (
+            not do_positioning
+            or (
+                positioning_batch_passed(
+                    selected_count=positioning_selected_count,
+                    positioning_rows=len(positioning_rows),
+                )
+                and bool(positioning_source_quality["passed"])
+            )
+        )
+        overall_batch_passed = (
+            feature_batch_passed and positioning_quality_passed
+        )
         out = {
-            "ok": bool(book_rows),
+            "ok": overall_batch_passed,
+            "degraded": not overall_batch_passed,
             "cycle": cycle,
             "selected": symbols,
+            "selection_snapshot": selection_snapshot,
             "wrote": {
                 "microstructure": len(book_rows),
                 "trade_flow": len(flow_rows),
                 "positioning": len(positioning_rows),
                 "contract_statistics": len(contract_stats_rows),
             },
+            "minimum_feature_coverage": MARKET_FEATURE_MINIMUM_COVERAGE,
+            "microstructure_coverage_rate": microstructure_coverage_rate,
+            "trade_flow_coverage_rate": trade_flow_coverage_rate,
+            "minimum_positioning_coverage": POSITIONING_MINIMUM_COVERAGE,
+            "positioning_coverage_rate": positioning_coverage_rate,
+            "maximum_positioning_source_age_minutes": (
+                POSITIONING_MAXIMUM_SOURCE_AGE_S / 60.0),
+            "positioning_source_freshness": positioning_source_quality,
+            "positioning_quality_passed": positioning_quality_passed,
             "positioning_due": do_positioning,
-            "positioning_selected": len(positioning_symbols) if do_positioning else 0,
+            "positioning_selected": positioning_selected_count,
             "positioning_transport": "okx_official_rest",
             "contract_statistics_due": do_contract_stats,
             "contract_statistics_selected": (
@@ -1595,7 +1930,7 @@ def main() -> int:
             "errors": errors[:20],
         }
         print(json.dumps(out, ensure_ascii=False))
-        return 0 if book_rows else 1
+        return 0 if overall_batch_passed else 1
     finally:
         con.close()
 

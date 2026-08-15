@@ -92,9 +92,48 @@ STAGE_TIMEOUTS = {
     "analyst": int(os.environ.get("OKX_ANALYST_TIMEOUT_S", "900")),
     "live": int(os.environ.get("OKX_TRADER_TIMEOUT_S", "720")),
 }
-# 合并轮同时做 gate、分析落库、实盘执行和交易落库，独立给 1500s；
+# 合并轮的配置上限仍保留 1500s；真正下发给 Gateway 的 timeout 会再按
+# ``cycle+12:00`` 的绝对时钟收紧。Gateway 自己先结束 turn，给 CLI 30 秒返回缓冲，
+# 随后 stage_runner 仍在 ``cycle+13:00`` 整树兜底，最后 1 分钟留给失败报告/推送。
 # 人工回滚后的 full live 沿用上面的 720s。
 UNIFIED_LIVE_TIMEOUT = int(os.environ.get("OKX_UNIFIED_LIVE_TIMEOUT_S", "1500"))
+# 15 分钟固定节奏下的业务完成目标，不是硬杀进程超时。统一轮应把主要时间留给
+# 当轮判断与确定性落库；25 分钟 hard timeout 仍只负责兜住真正挂死，避免在订单或
+# writer 临界区强杀。候选深挖数只约束串行取证成本，不限制 Agent 的多空、退出或
+# 保护调整裁决权。深挖 2..3 是动态评估区间，不是最低开仓数或
+# 方向配额；最终 signals 仍允许为空。
+UNIFIED_ANALYSIS_TARGET_MIN = 5
+UNIFIED_FINALIZE_RESERVE_MIN = 3
+UNIFIED_OPEN_REVIEW_MIN = 2
+UNIFIED_OPEN_FINALISTS = 3
+UNIFIED_COMPLETE_SLA_MIN = 14
+UNIFIED_PUSH_RECONCILE_RESERVE_MIN = 1
+UNIFIED_GATEWAY_DEADLINE_SECONDS = 12 * 60
+
+
+def _unified_live_timeout_seconds(
+    cycle_id: str,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Return the bounded Gateway run budget for one unified live cycle.
+
+    ``openclaw agent --timeout`` is forwarded to the Gateway as the actual
+    agent-run timeout.  Keeping it below the supervisor's cycle+13:00 hard
+    kill prevents the Gateway-owned turn from continuing to call tools after
+    its local CLI process has already been terminated.
+    """
+    cycle_start = datetime.strptime(
+        str(cycle_id), "%Y-%m-%dT%H:%M",
+    ).replace(tzinfo=CST)
+    current = now or datetime.now(CST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=CST)
+    current = current.astimezone(CST)
+    deadline = cycle_start + timedelta(
+        seconds=UNIFIED_GATEWAY_DEADLINE_SECONDS)
+    remaining = int((deadline - current).total_seconds())
+    return max(1, min(UNIFIED_LIVE_TIMEOUT, remaining))
 
 # 直起 node + openclaw.mjs（绕开 openclaw.cmd）：
 #   ① 不经 cmd.exe → 无控制台弹窗（CREATE_NO_WINDOW 对 .cmd 仍会闪 cmd 窗）；
@@ -149,9 +188,6 @@ def _launcher() -> list[str]:
             Path(_OPENCLAW_MJS).is_file() and Path(_NODE_BIN).is_file()
         )
     except OSError:
-        # Sandboxed/public environments may not be allowed to stat the host's
-        # user-owned OpenClaw installation.  Treat it as unavailable instead
-        # of crashing command construction.
         bundled_launcher_available = False
     if bundled_launcher_available:
         # --stack-size=8192：node 一开始就带大栈，OpenClaw entry.js 的 hasStackSizeConfigured()
@@ -386,7 +422,13 @@ def _run_briefing(db_root: str | os.PathLike | None = None) -> str:
         return ""
 
 
-def _unified_live_message(cycle_id: str, brief: str) -> str:
+def _unified_live_message(
+    cycle_id: str,
+    brief: str,
+    *,
+    now: datetime | None = None,
+    db_root: str | os.PathLike | None = None,
+) -> str:
     """Build the unified-route prompt with the writer contract in-band.
 
     ``unified`` is a dispatcher routing mode, while analysis_runs.mode has
@@ -395,6 +437,38 @@ def _unified_live_message(cycle_id: str, brief: str) -> str:
     handoff states the minimal receipt shape explicitly.
     """
     safe_cycle = cycle_id.replace(":", "-")
+    runtime_db_root = _resolve_db_root(db_root).as_posix()
+    tmp_root = (_PROJECT_ROOT / "tmp").as_posix()
+    python_wrapper = (_PROJECT_ROOT / "scripts" / "run_okx_python.ps1").as_posix()
+    position_runner = (
+        _PROJECT_ROOT / "scripts" / "live_position_action_runner.py"
+    ).as_posix()
+    mtf_runner = (
+        _PROJECT_ROOT / "scripts" / "multitimeframe_decision_evidence.py"
+    ).as_posix()
+    cycle_start = datetime.strptime(cycle_id, "%Y-%m-%dT%H:%M").replace(tzinfo=CST)
+    analysis_deadline = cycle_start + timedelta(minutes=9, seconds=30)
+    terminal_deadline = cycle_start + timedelta(
+        minutes=UNIFIED_COMPLETE_SLA_MIN - UNIFIED_PUSH_RECONCILE_RESERVE_MIN)
+    completion_deadline = cycle_start + timedelta(minutes=UNIFIED_COMPLETE_SLA_MIN)
+    analysis_deadline_text = analysis_deadline.strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    terminal_deadline_text = terminal_deadline.strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    completion_deadline_text = completion_deadline.strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    observed_at = now or datetime.now(CST)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=CST)
+    observed_at = observed_at.astimezone(CST)
+    analysis_remaining_seconds = max(
+        0, int((analysis_deadline - observed_at).total_seconds()))
+    if analysis_remaining_seconds <= 150:
+        dynamic_candidate_limit = 1
+    elif analysis_remaining_seconds <= 300:
+        dynamic_candidate_limit = 2
+    else:
+        dynamic_candidate_limit = UNIFIED_OPEN_FINALISTS
+    dynamic_candidate_floor = min(
+        UNIFIED_OPEN_REVIEW_MIN, dynamic_candidate_limit)
+    observed_at_text = observed_at.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     brief_block = (
         "\n【本轮统一决策简报（分析前预读，直接据此完成分析+实盘）】\n"
         f"--- decision_briefing ---\n{brief}\n--- end ---\n"
@@ -410,38 +484,123 @@ def _unified_live_message(cycle_id: str, brief: str) -> str:
         "risk_reward、portfolio_impact、historical_experience(dict，内含 "
         "matched_wins/matched_losses/missed_opportunities 三个 list 及 usage/reason)、"
         "agent_judgement、reference_overrides(list)。这些字段不得放在 signal 顶层，"
-        "也不得改名为 rationale/final_judgement/overrides；HOLD/WAIT 同样必须给完整卡。"
+        "也不得改名为 rationale/final_judgement/overrides；动作允许 "
+        "open_long/open_short/hold/close/reduce/adjust_protection/wait，"
+        "open_long/open_short 必须显式写 side=long/short 且与 action 一致，"
+        "字段枚举契约记为 side=long|short；"
+        "不得依赖 writer 兼容归一化；"
+        "凡写入 signals 的动作都必须给完整卡，HOLD/WAIT 若写入同样必须给完整卡。"
+        "但本自动 unified 路由的 signals 是最终开仓短名单，不是 briefing 逐项转录："
+        f"只允许 0..{UNIFIED_OPEN_FINALISTS} 项且只保留最终决定 open_long/open_short 的"
+        "候选；没有最终开仓候选就写 signals=[]。未入选候选不得展开成 WAIT/HOLD signal，"
+        "现有持仓也不得在 pre-facts analysis 中逐仓展开成 HOLD signal；全局取舍浓缩进 "
+        "market_summary，现仓管理留到同轮 live facts 后逐仓判断。"
+        "0..3 只是容量上限，不设最低开仓数、多空配额或强制交易。"
+        "open_* 的 risk_reward.exit_mode 必须明确为 "
+        "fixed_tp/dynamic_exit/no_fixed_tp；target 仍用于 EV 与参考，只有 fixed_tp 附挂。"
         "每个 open_long/open_short 候选还必须先运行只读工具 "
         "multitimeframe_decision_evidence.py，以本轮固定 cycle 和完整 instId 生成证据文件；"
         "15m/1H/4H 任一 exact 已收盘 K 线、指标或至少 34 根历史不足即不得产出 open。"
         "把工具返回的完整 evidence_contract 原样放进 "
         "decision_card.multitimeframe_analysis.evidence_contract，并对 15m/1H/4H "
-        "分别填写 direction/evidence/relative_rank；三个 rank 必须恰为 1/2/3，"
+        "分别填写 direction/evidence/relative_rank；每个 evidence 固定为非空 "
+        "JSON list[string]（一条也写成 [\"...\"]，禁裸字符串/空串/object）；"
+        "三个 rank 必须恰为 1/2/3，"
         "selected_timeframe 指向 rank=1 且方向与开仓 side 一致。selection_method 固定为 "
         "relative_rank_1_among_15m_1H_4H_not_calibrated，"
         "calibrated_confidence=null、confidence_claim_allowed=false；"
         "在独立前瞻验证达到 90% 前不得写 90% 可信度。"
+        "每个 open_* 还须把本卡三价原样传给 find_similar_experience.py："
+        f"--as-of {cycle_id} --entry <entry> --stop <stop> --target <target>；"
+        "禁止自行换算百分比或 RR，工具与 writer 共用规范化函数。"
     )
     trade_receipt_contract = (
         "【trade writer 契约】交易阶段的 cycle 顶层 decision_card 不是摘要容器，"
         "必须直接包含同一组固定键：direction_evidence(list)、opposing_evidence(list)、"
         "execution_conditions、invalidation_point、risk_reward、portfolio_impact、"
         "historical_experience(dict)、agent_judgement、reference_overrides(list)。"
-        "HOLD/ADJUST 也必须完整填写，禁止改成 summary/open_candidates/hold_positions。"
+        "HOLD/WAIT/REDUCE/ADJUST_PROTECTION 也必须完整填写，禁止改成 "
+        "summary/open_candidates/hold_positions。"
+        "只有 executor 成功返回 action_taken=ADJUST_PROTECTION 且保留 "
+        "protection_change、path、protection_state.ok=true 与 applied，才可报告保护调整；"
+        "未调用 executor 或无终局回读时必须写 HOLD，不得自行写模糊 ADJUST。"
         "OPEN/ADD 必须原样保留 analysis 的 multitimeframe_analysis；executor 会在任何"
-        "交易所账户/订单 I/O 前按同 cycle 重读 market.db，并逐字段比对 evidence_contract，"
-        "数据未就绪或契约不一致均 clean reject。"
+        "交易所账户/订单 I/O 前按同 cycle 重读 market.db，当前三周期未就绪则 clean reject。"
+        "完全一致使用 current_market_exact；若同槽后续采集修订已收盘数据，仅当卡内契约"
+        "逐字段命中同 cycle/symbol/side 的 analysis.db writer 已验证锚点"
+        "analysis_db_writer_validated 才继续，并在回执保留 post_analysis_market_revision"
+        "和 supplied/current/persisted hash；否则 clean reject。持久化锚点不替代 readiness。"
         "调用 trades_writer.py --facts-file 时，回执应省略 live_facts 让 writer 原样注入；"
         "若携带则必须与 facts 文件整份完全相同，禁止摘要或重算。"
+        "本轮不论是否包含 OPEN/ADD，都必须一次 write 完整 position plan 后立即且只调用一次 "
+        "live_position_action_runner.py；actions=[] 即 HOLD，OPEN/ADD/CLOSE/REDUCE/"
+        "ADJUST_PROTECTION 可在同一 plan 混合。runner 不替你判断，也不设退出阈值；OPEN/ADD"
+        "只写 side/target_stop_risk_pct_equity/lev，runner 从 analysis.db 只读绑定同 symbol"
+        " canonical card 并确定性换算张数。计划 receipt_context 只放 cycle/status/protocol/card/"
+        "equity/regime，禁止预填 decision/action_taken/n_orders/trades/errors/ok；"
+        f"plan={tmp_root}/position_plan_{safe_cycle}.json，"
+        f"receipt={tmp_root}/_receipt_live_{safe_cycle}.json。"
+        f"命令：pwsh -NoProfile -File {python_wrapper} "
+        f"{position_runner} "
+        f"--cycle-id {cycle_id} --plan-file {tmp_root}/position_plan_{safe_cycle}.json "
+        f"--facts-file {tmp_root}/live_facts_{safe_cycle}.json "
+        f"--receipt-file {tmp_root}/_receipt_live_{safe_cycle}.json "
+        f"--db-root {runtime_db_root}。"
+        "plan 后立即 runner/30s 机器闸核验 live_runner_state 的 cycle/facts_hash/"
+        "plan_sha256。runner 在后续 OPEN/ADD 前会先提交此前成交、显式带 "
+        "runner_in_progress=true 的 partial superset；batch_status=partial|failed、"
+        "interim/final writer 失败或非零退出就是 terminal failure，禁止重跑、补动作或另写 HOLD。"
+    )
+    throughput_contract = (
+        "【周期内吞吐契约】统一轮的业务完成目标为起棒后 8 分钟内形成成功终态："
+        f"前 {UNIFIED_ANALYSIS_TARGET_MIN} 分钟内冻结 analysis，至少预留 "
+        f"{UNIFIED_FINALIZE_RESERVE_MIN} 分钟完成 live facts、持仓管理/交易、writer 与"
+        "只读终态核验。优先直接消费已预读 briefing，open 候选深挖的动态目标区间为 "
+        f"{UNIFIED_OPEN_REVIEW_MIN}..{UNIFIED_OPEN_FINALISTS} 个：候选充足时先完整检查前 "
+        f"{UNIFIED_OPEN_REVIEW_MIN} 个，如因数据不就绪或 Agent 判断否决，就在同一 5 分钟"
+        f"分析预算内顺延第 3 个，上限 {UNIFIED_OPEN_FINALISTS} 个。现有持仓数量、"
+        "已持有同向/反向仓、软集中度或未触发硬风控的组合占用，不得单独成为停止候选求证的"
+        "理由。到分析预算仍无可辩护开仓时，立即写完整 "
+        "market_summary 与 signals=[]，而不是继续搜索或生成候选 WAIT/HOLD 卡。随后交易阶段"
+        "仍以完整顶层 HOLD/WAIT 回执记录无动作结论。深挖 2..3 不是强制交易，最终开仓卡可为 0..3，"
+        "不设最低数和方向配额。该预算只消除串行探查和收尾拖延，"
+        "不限制做多、做空、"
+        "全平、减仓、止损或止盈裁决，也不得用来跳过 gate、证据契约、executor、writer、"
+        "保护单确认或失败重写规则。分析落库后立即进入 facts；trades_writer 返回 ok:true 后立即给出"
+        "简短终答，不再复盘、扩展研究或调用任何工具；trade_cycles 的独立落库后置核验只由"
+        "stage_runner 承担。"
+        "【本轮动态时间预算】本消息生成时刻为 "
+        f"{observed_at_text}，距 analysis 绝对闸尚余 "
+        f"{analysis_remaining_seconds} 秒；本轮候选深挖区间据此收敛为 "
+        f"{dynamic_candidate_floor}..{dynamic_candidate_limit} 个、硬上限="
+        f"{dynamic_candidate_limit}。这是迟起小时轮的耗时预算，不是方向、开仓数或仓位"
+        "约束；完整 300+ 宇宙判断仍由已预读 briefing/确定性快照承担。达到本轮上限后"
+        "立即完成取舍，禁止再开新候选。消息已给出权威调度时钟和完整 writer 契约；"
+        "自动轮禁止调用 session_status，禁止读取 analysis_template、"
+        "trade_template、writer 源码或无关手册。允许读取 MEMORY.md 并调用 memory_search"
+        "（两者合计≤2 次，建议用于最终 open/风险动作候选的同标的历史教训）；"
+        "记忆命中与本消息、briefing 或权威事实脚本冲突时一律以后者为准，"
+        "不得因记忆检索逼近本轮时间闸。只允许为最终 open 候选补齐必需的三周期/"
+        "经验契约、上述受限记忆检索，以及随后 facts、executor、writer 所需工具。"
+        f"本轮绝对时间闸：analysis 最迟 {analysis_deadline_text} 冻结，Agent 业务终态最迟 "
+        f"{terminal_deadline_text} 落库，为 push+对账预留 {UNIFIED_PUSH_RECONCILE_RESERVE_MIN} 分钟；"
+        f"完整周期必须严格早于 {completion_deadline_text}。临近 analysis 绝对时间闸时不再开新的"
+        "候选深挖，立即完成已有证据的取舍与 writer；这不允许跳过风控、executor、成交确认或终态落库。"
+        "到达 Agent 业务终态硬截止后不得再发起新的 OPEN/ADD/CLOSE/REDUCE 或独立保护调整；"
+        "runner 会按本轮隔离 session 发 Gateway abort，executor 仍按 cycle 二次拒绝后台残留 turn；"
+        "已开始订单的保护确认与安全回滚仍须完整收尾。"
     )
     terminal_contract = (
         "【交易阶段终止契约】live facts 文件读完后，writer 命令、回执字段与流程已由本消息"
-        "和 AGENTS.md 完整给出；禁止再读取 trades_writer.py 源码、探查 schema、回看无关手册"
-        "或继续研究实现。必须立即形成最终交易判断：若不 OPEN/ADD/CLOSE/REDUCE 就生成完整"
-        "HOLD/ADJUST 回执；随后调用 trades_writer，并只读核验本 cycle 的 trade_cycles 已存在。"
-        "在 trade_cycles 成功终态存在前，禁止发送最终答复、禁止无内容 stop、禁止以‘下一步将’"
-        "结束。即使零成交，HOLD 也必须先落库；writer 失败则按手册保留文件并报告 terminal failure，"
-        "不得把未落库当作正常结束。"
+        "和 AGENTS.md 完整给出；禁止再读取 trades_writer.py 源码、探查 schema、搜索或读取"
+        "历史 _receipt_live_*.json、回看无关手册"
+        "或继续研究实现。必须立即形成最终交易判断：若不 "
+        "OPEN/ADD/CLOSE/REDUCE/ADJUST_PROTECTION 就生成完整 HOLD/WAIT 回执；"
+        "随后调用 trades_writer；writer 返回前禁止最终答复、禁止无内容 stop。writer 返回 ok:true 后，"
+        "严禁再调用 query_db、--help、--schema 或"
+        "任何其他工具，必须立即发送简短最终答复；stage_runner 会独立核验本 cycle 的 trade_cycles，"
+        "Agent 不得重复核验。即使零成交，HOLD 也必须先落库且只能由 writer 完成；writer 失败则按手册保留"
+        "文件并报告 terminal failure，不得把未落库当作正常结束。"
     )
     return (
         f"OKX 本轮工作：stage=live cycle={cycle_id} dispatch_mode=unified；"
@@ -449,15 +608,15 @@ def _unified_live_message(cycle_id: str, brief: str) -> str:
         f"你是本轮唯一分析+实盘决策 Agent：先以 cycle={cycle_id} 执行采集 gate，"
         f"生成并经 analyst_writer 落 analysis.db；仅 status=ok 且 writer 成功后，"
         f"再直查 OKX live 现仓/余额，完成实盘决策、executor 调用和 trades_writer 落库。"
-        f"{analysis_receipt_contract}{trade_receipt_contract}{terminal_contract}"
-        "多周期证据命令格式：pwsh -NoProfile -File "
-        "<PROJECT_ROOT>/scripts/run_okx_python.ps1 "
-        "<PROJECT_ROOT>/scripts/multitimeframe_decision_evidence.py "
-        "--db-root <PROJECT_ROOT>/db "
+        f"{analysis_receipt_contract}{trade_receipt_contract}{throughput_contract}"
+        f"{terminal_contract}"
+        f"多周期证据命令格式：pwsh -NoProfile -File {python_wrapper} "
+        f"{mtf_runner} --db-root {runtime_db_root} "
         f"--symbol <完整instId> --cycle-id {cycle_id} "
-        f"--out-file ./tmp/mtf_{safe_cycle}_<symbol>.json；只读取该文件，禁止手算/hash。"
-        "analysis 回执必须一次完整写文件，先 validate-only 后正式 writer，禁止 edit/局部补丁循环；"
-        "校验失败最多整文件重写一次，第二次失败即停止，禁止跳过 writer。"
+        f"--out-file {tmp_root}/mtf_{safe_cycle}_<symbol>.json；只读取该文件，禁止手算/hash。"
+        "analysis 回执必须直接用 write 一次完整写最终 JSON 文件，禁止先建 Python/PowerShell"
+        "生成器，先 validate-only 后正式 writer，禁止 edit/局部补丁循环；校验失败最多用 write"
+        "整文件覆盖一次，第二次失败即停止，禁止跳过 writer。"
         "禁止调用 sqlite3 CLI 临时探查 schema 或业务库；schema 只读 db/schema.sql，"
         "业务查询只用已批准的 query_db.py/事实脚本。"
         "gate/两个 writer/executor 的 cycle_id 均固定为上述派单 cycle，禁墙钟重解析。"
@@ -497,17 +656,22 @@ def _send_autoheal_p0_alert(
              "--dedupe-key", f"autoheal-p0:{profile}:{cycle_id}:{fingerprint}",
              "--db-root", str(_resolve_db_root(db_root))],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, creationflags=_CREATE_NO_WINDOW,
+            # qq_push 内部总预算封顶 55s；外层 60s 保留状态收尾时间。
+            timeout=60, creationflags=_CREATE_NO_WINDOW,
         )
         return proc.returncode == 0
     except Exception:
         return False
 
 
-def _check_tmp_stdlib_shadow(stage: str, cycle_id: str) -> list[str]:
+def _check_tmp_stdlib_shadow(
+    stage: str,
+    cycle_id: str,
+    db_root: str | os.PathLike | None = None,
+) -> list[str]:
     """插入点 A0：起棒前查 tmp 有没有文件遮蔽标准库（2026-08-06）。
 
-    trader 的当轮执行脚本按契约只能写 `./tmp/`，Python 会把该目录放进
+    trader 的当轮执行脚本按契约只能写项目 `tmp/`，Python 会把该目录放进
     `sys.path[0]`；tmp 里一旦有 `bisect.py` 之类调试残留，`order_executor` 的
     `import tempfile` 会直接 ImportError，**下一笔 OPEN/CLOSE 必炸**。
 
@@ -516,11 +680,12 @@ def _check_tmp_stdlib_shadow(stage: str, cycle_id: str) -> list[str]:
     在派发层阻断会把本来能正常完成的 HOLD 轮一起杀掉，比问题本身更糟。
     """
     try:
-        if r"./scripts" not in sys.path:
-            sys.path.insert(0, r"./scripts")
+        scripts_dir = _PROJECT_ROOT / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
         from tmp_cleanup import find_stdlib_shadows
 
-        names = [p.name for p in find_stdlib_shadows(Path(r"./tmp"))]
+        names = [p.name for p in find_stdlib_shadows(_PROJECT_ROOT / "tmp")]
     except Exception as exc:            # 探测本身绝不拖垮起棒
         print(f"[trigger] WARN tmp 遮蔽探测失败（忽略）: {exc}", file=sys.stderr)
         return []
@@ -530,14 +695,19 @@ def _check_tmp_stdlib_shadow(stage: str, cycle_id: str) -> list[str]:
           f"cycle={cycle_id} files={','.join(names)}"
           "——本轮若产生成交，执行脚本会炸在 import；不阻断起棒",
           file=sys.stderr)
-    _send_tmp_shadow_alert(stage, cycle_id, names)
+    _send_tmp_shadow_alert(stage, cycle_id, names, db_root)
     return names
 
 
-def _send_tmp_shadow_alert(stage: str, cycle_id: str, names: list[str]) -> bool:
+def _send_tmp_shadow_alert(
+    stage: str,
+    cycle_id: str,
+    names: list[str],
+    db_root: str | os.PathLike | None = None,
+) -> bool:
     """按遮蔽文件名集合去重的 P1 告警——同一批残留只吵一次，不是每轮一条。"""
     message = compact_text(
-        f"[P1] ./tmp 下有 {len(names)} 个文件遮蔽标准库："
+        f"[P1] {_PROJECT_ROOT.as_posix()}/tmp 下有 {len(names)} 个文件遮蔽标准库："
         f"{','.join(sorted(names)[:5])}；stage={stage} cycle={cycle_id}。"
         "trader 当轮执行脚本写在 tmp、sys.path[0] 即该目录，下一笔 OPEN/CLOSE "
         "会 ImportError（HOLD 轮不受影响）。处理：删除或改名这些文件，"
@@ -551,9 +721,11 @@ def _send_tmp_shadow_alert(stage: str, cycle_id: str, names: list[str]) -> bool:
     try:
         proc = subprocess.run(
             [sys.executable, str(push_py), "--alert", "--message", message,
-             "--dedupe-key", f"tmp-stdlib-shadow:{fingerprint}"],
+             "--dedupe-key", f"tmp-stdlib-shadow:{fingerprint}",
+             "--db-root", str(_resolve_db_root(db_root))],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, creationflags=_CREATE_NO_WINDOW,
+            # qq_push 内部总预算封顶 55s；外层 60s 保留状态收尾时间。
+            timeout=60, creationflags=_CREATE_NO_WINDOW,
         )
         return proc.returncode == 0
     except Exception:
@@ -711,7 +883,8 @@ def _trader_preload(
         sigs = con.execute(
             "SELECT symbol, total, action, side, confidence, entry_hint, stop_hint, "
             "tp_hint, reasoning, decision_card FROM analysis_signals WHERE cycle_id=? "
-            "ORDER BY CASE action WHEN 'close' THEN 0 WHEN 'open_long' THEN 1 "
+            "ORDER BY CASE action WHEN 'close' THEN 0 WHEN 'reduce' THEN 0 "
+            "WHEN 'adjust_protection' THEN 0 WHEN 'open_long' THEN 1 "
             "WHEN 'open_short' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END, rowid",
             (cycle_id,)).fetchall()
         con.close()
@@ -784,7 +957,14 @@ def _trader_preload(
     # ⑤ 必须自取项（防预载诱导偷懒）
     profile = "live"
     safe_cycle = cycle_id.replace(":", "-")
-    facts_file = f"<PROJECT_ROOT>/tmp/live_facts_{safe_cycle}.json"
+    runtime_db_root = _resolve_db_root(db_root).as_posix()
+    tmp_root = (_PROJECT_ROOT / "tmp").as_posix()
+    python_wrapper = (_PROJECT_ROOT / "scripts" / "run_okx_python.ps1").as_posix()
+    facts_runner = (_PROJECT_ROOT / "scripts" / "live_decision_facts.py").as_posix()
+    position_runner = (
+        _PROJECT_ROOT / "scripts" / "live_position_action_runner.py"
+    ).as_posix()
+    facts_file = f"{tmp_root}/live_facts_{safe_cycle}.json"
     # demo 的 role_policy（max-size 容量口径）随 2026-08-06 全量下线移除。
     role_policy = (
         "Live OPEN/ADD 的组合保证金闸只认执行时同次 "
@@ -803,13 +983,18 @@ def _trader_preload(
         "禁写‘既有仓 X% 接近单笔15%’、禁算 15%-X%、禁用 gross/net 判断保证金紧张，"
         "禁心算每张保证金、禁缩量后改参重试逼近上限。"
         "每个 OPEN/ADD 候选必须先运行 multitimeframe_decision_evidence.py，固定 "
-        f"--cycle-id {cycle_id}，输出到 ./tmp/mtf_{safe_cycle}_<symbol>.json；"
+        f"--cycle-id {cycle_id}，输出到 {tmp_root}/mtf_{safe_cycle}_<symbol>.json；"
         "15m/1H/4H 必须全部 exact-ready，完整 evidence_contract 原样进入 "
-        "decision_card.multitimeframe_analysis。三个周期分别给方向证据和唯一 rank 1/2/3，"
+        "decision_card.multitimeframe_analysis。OPEN/ADD 必须显式给出与 action 一致的 "
+        "side=long/short；三个周期的 evidence 都必须是非空 JSON list[string]，"
+        "分别给方向证据和唯一 rank 1/2/3，"
         "选择 rank=1；calibrated_confidence=null、confidence_claim_allowed=false。"
-        "executor 会在账户/订单 I/O 前独立重读 market.db 并比对契约，禁止编辑、摘录或重算。"
+        "executor 会在账户/订单 I/O 前独立重读 market.db；当前三周期必须 ready。完全一致"
+        "走 current_market_exact；同槽后续采集修订时，只接受 analysis_db_writer_validated"
+        "锚点并保留 post_analysis_market_revision 与双时点 hash。禁止编辑、摘录或重算。"
         "任何 open_* 历史数字只认 find_similar_experience 以固定 cycle --as-of "
-        "输出的 evidence_contract：原样写进 decision_card；只引用 exact_setup/"
+        "并直接传本卡 --entry/--stop/--target（禁止自行换算百分比或 RR）输出的 "
+        "evidence_contract：原样写进 decision_card；只引用 exact_setup/"
         "same_symbol_similar/cross_symbol_similar 具名 summary，截断样例数组禁止计数或混栏。"
         "已取消的旧同侧/集中度硬规则不得恢复，回执不得复述其旧阈值，"
         "任何旧 MEMORY 或旧回执里的该规则无效；0.0666 也是错误阈值。"
@@ -817,21 +1002,38 @@ def _trader_preload(
     parts.append(
         "【你仍需自取（唯一权威，禁用预载替代）】\n"
         "  一次性只读事实包：pwsh -NoProfile -File "
-        "<PROJECT_ROOT>/scripts/run_okx_python.ps1 "
-        "<PROJECT_ROOT>/scripts/live_decision_facts.py "
+        f"{python_wrapper} "
+        f"{facts_runner} --db-root {runtime_db_root} "
         f"--profile {profile} --cycle-id {cycle_id} --out-file {facts_file}；"
         f"随后 read {facts_file}\n"
         "  命令须原样直跑；该文件一次读取 OKX 现仓、余额、ctVal 和活动 SL，"
         "并确定性给出 position_age_hours、止损损失和 IMR 比例。禁止编辑该文件，"
         "禁止自行换算这些字段。status=blocking 时禁止 OPEN/ADD；只有 "
-        "action_policy.allowed_executor_actions 明确包含 close/reduce 且原始现仓已核验，"
+        "action_policy.allowed_executor_actions 明确包含所选 "
+        "close/reduce/adjust_protection 且原始现仓已核验，"
         "才保留去风险出口，否则不调用 executor，并写 terminal error 回执后停止。"
         "status=ok 时 exchange.positions/balance 才可用于新增风险判断。"
-        "HOLD/ADJUST 调 trades_writer 必须同时传 --facts-file；成交回执则在同一进程"
-        "把完整 live_facts 原样挂入 receipt 后 commit_receipt。"
-        "facts 文件读完后禁止再读 trades_writer.py 源码、探查 schema 或研究实现；"
-        "立即决定并生成完整回执，调用 writer 后只读核验本 cycle trade_cycles。"
-        "trade_cycles 成功终态存在前禁止最终答复或无内容 stop；零成交 HOLD 也必须先落库。"
+        "不论是否包含 OPEN/ADD，HOLD/WAIT、OPEN、ADD、CLOSE、REDUCE 与 "
+        "ADJUST_PROTECTION 都只允许交给下述固定 runner；禁止临场拼 executor/"
+        "writer Python 或按动作分支绕开 runner。OPEN/ADD 只在 plan 声明 "
+        "target_stop_risk_pct_equity 与 lev，runner 读取本 cycle canonical analysis "
+        "card、确定性定仓，并把逐笔 card 与完整 live_facts 绑定到回执。"
+        "必须一次 write 完整 "
+        f"{tmp_root}/position_plan_{safe_cycle}.json，落盘后立即且只调用一次 "
+        "live_position_action_runner.py；plan 后 30s 机器闸要求出现合法 runner marker；"
+        "actions=[] 即 HOLD，runner 不产生判断，只按你逐仓裁决执行、需要时先提交 "
+        "runner_in_progress=true 的 interim superset，再同进程落唯一 final 回执。命令："
+        "pwsh -NoProfile -File "
+        f"{python_wrapper} {position_runner} "
+        f"--cycle-id {cycle_id} --plan-file {tmp_root}/position_plan_{safe_cycle}.json "
+        f"--facts-file {facts_file} --receipt-file "
+        f"{tmp_root}/_receipt_live_{safe_cycle}.json --db-root {runtime_db_root}。"
+        "batch_status=partial|failed 或非零退出即 terminal failure，禁止重跑或写 HOLD 覆盖。"
+        "facts 文件读完后禁止再读 trades_writer.py 源码、探查 schema、搜索历史回执或研究实现；"
+        "立即决定并生成完整回执；writer 返回前禁止最终答复、禁止无内容 stop。writer 返回 ok:true 后"
+        "严禁 query_db、--help、--schema 或任何其他"
+        "工具，立即给出简短最终答复；stage_runner 独立核验本 cycle trade_cycles，Agent 不得重复"
+        "核验。零成交 HOLD 也必须先落库且只能由 writer 完成。"
         f"{role_policy}"
     )
     return "\n\n" + "\n\n".join(parts) + "\n"
@@ -863,13 +1065,15 @@ def build_cmd(
     mode: str,
     db_root: str | os.PathLike | None = None,
 ) -> list[str]:
+    cycle_id = validate_cycle_id(cycle_id)
+    resolved_db_root = _resolve_db_root(db_root)
     agent = STAGE_AGENTS[stage]
     # 插入点 A0：tmp 遮蔽标准库探测（纯只读，只告警）。放在最前面：它与账本无关，
     # 失败也不该影响自愈/简报，而一旦命中就说明本轮任何成交都写不进去。
-    _check_tmp_stdlib_shadow(stage, cycle_id)
+    _check_tmp_stdlib_shadow(stage, cycle_id, resolved_db_root)
     # 插入点 A：先自愈账本，再生成简报——顺序不可颠倒（简报要反映修好后的持仓）。
     # dry-run 走不到这里（fire 在 build_cmd 前就已返回），故干跑不会写库。
-    autoheal = _autoheal_ledger(stage, cycle_id, db_root)
+    autoheal = _autoheal_ledger(stage, cycle_id, resolved_db_root)
     if autoheal.get("blocking"):
         kinds = sorted({
             str(item.get("kind") or "UNKNOWN")
@@ -901,7 +1105,7 @@ def build_cmd(
     # 触发消息只写"本轮工作"（stage/cycle/mode + analyst 的数据简报）；
     # 流程/红线/注意事项全在各 agent 的 AGENTS.md（OpenClaw 每轮自动加载），不再塞触发消息。
     if stage == "analyst":
-        brief = _analyst_briefing(cycle_id, db_root)
+        brief = _analyst_briefing(cycle_id, resolved_db_root)
         brief_block = (
             "\n【本轮数据简报（已预读，直接据此分析）】\n"
             f"--- decision_briefing ---\n{brief}\n--- end ---\n"
@@ -915,11 +1119,13 @@ def build_cmd(
     elif stage == "live" and mode == "unified":
         # 统一 live 在 analysis 尚未产出时起棒：预载采集后的全量 briefing，
         # 同一会话先 analyst_writer，成功后再走 OKX API + executor + trades_writer。
-        brief = _analyst_briefing(cycle_id, db_root)
-        msg = _unified_live_message(cycle_id, brief)
+        brief = _analyst_briefing(cycle_id, resolved_db_root)
+        msg = _unified_live_message(
+            cycle_id, brief, db_root=resolved_db_root
+        )
     elif stage == "live":
         # trader 预载减少冷启动逐库自查；各块独立 fail-safe，缺块留标记回退自查。
-        preload = _trader_preload(cycle_id, stage, db_root)
+        preload = _trader_preload(cycle_id, stage, resolved_db_root)
         msg = (
             f"OKX 本轮工作：stage={stage} cycle={cycle_id} mode={mode}。"
             f"本轮写库/回执/executor 调用的 cycle_id 一律用上面的 cycle={cycle_id}，"
@@ -931,11 +1137,11 @@ def build_cmd(
             f"OKX 本轮工作：stage={stage} cycle={cycle_id} mode={mode}。"
             f"按你的 AGENTS.md（操作手册）执行。"
         )
-    key = session_key(stage, cycle_id, db_root)
+    key = session_key(stage, cycle_id, resolved_db_root)
     msg_file = _write_message_file(key, msg)
     msg_args = (["--message-file", str(msg_file)] if msg_file
                 else ["--message", msg])
-    timeout = (UNIFIED_LIVE_TIMEOUT
+    timeout = (_unified_live_timeout_seconds(cycle_id)
                if stage == "live" and mode == "unified"
                else STAGE_TIMEOUTS.get(stage, 720))
     return _launcher() + [
@@ -950,6 +1156,7 @@ def build_cmd(
 
 def _fire_push_script(
     cycle_id: str,
+    mode: str = "script",
     db_root: str | os.PathLike | None = None,
 ) -> str:
     """push stage 纯脚本路径：detached 起 push_pipeline.py
@@ -965,6 +1172,10 @@ def _fire_push_script(
     key = session_key("push", cycle_id, resolved_db_root)
     inner_cmd = [_PYTHON_EXE, _PUSH_PIPELINE, "--cycle", cycle_id,
                  "--db-root", str(resolved_db_root)]
+    if mode == "failure_report":
+        # push_pipeline 会独立重验未来激活边界、精确 cycle 身份、failed 终态
+        # 与 profile 租约释放；这里只传递意图，不携带可伪造的失败详情。
+        inner_cmd.append("--upstream-failure-report")
     cmd = _supervised_cmd(
         "push", cycle_id, "script", inner_cmd, db_root=resolved_db_root
     )
@@ -1002,13 +1213,13 @@ def fire(
     """
     cycle_id = validate_cycle_id(cycle_id)
     if stage == "push":
-        return _fire_push_script(cycle_id, db_root=db_root)
+        if mode in {"full", "script"}:
+            return _fire_push_script(cycle_id, db_root=db_root)
+        return _fire_push_script(cycle_id, mode, db_root=db_root)
     if stage not in STAGE_AGENTS:
         raise ValueError(f"unknown stage: {stage}")
     resolved_db_root = _resolve_db_root(db_root)
     dry = os.environ.get("OKX_TRIGGER_DRYRUN") == "1"
-    # Gateway tool processes cannot prove propagation of an arbitrary local
-    # root.  Reject before creating trigger artifacts or subprocess commands.
     if not dry and os.path.normcase(os.fspath(resolved_db_root)) != os.path.normcase(
         os.fspath(_CANONICAL_DB_ROOT)
     ):

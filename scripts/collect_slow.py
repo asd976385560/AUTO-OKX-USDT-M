@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import time
@@ -10,18 +11,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from _http import TokenBucket, get_json, load_coingecko_key, load_fred_key, make_client
+from _kline_indicators import (
+    extend_with_boll_obv,
+    extended_row_tail,
+    kline_insert_plan,
+)
 from _okxcli import okx_json
 from _okx_http import fetch_candles_batch_sync, fetch_instruments_sync
-from public_macro import import_xsearch_etf, latest_snapshot, reconcile_etf_consensus
+from public_macro import (
+    fed_funds_rows,
+    import_xsearch_etf,
+    latest_snapshot,
+    reconcile_etf_consensus,
+    upsert_observations,
+)
 from regime_classifier import classify_regime
 
-DEFAULT_DB_ROOT = Path(r"./db")
+DEFAULT_DB_ROOT = Path(r".\db")
 FRED_SERIES = {
     # 兼容字段名仍为 dxy，但实际序列是 FRED Nominal Broad U.S. Dollar Index，
     # 不是 ICE DXY。展示层必须标 USD_BROAD(DTWEXBGS)，禁混称。
     "dxy": "DTWEXBGS",
     "vix": "VIXCLS",
     "spx": "SP500",
+    # 美联储有效联邦基金利率（日频、约1个工作日滞后）；写 macro_observations
+    # （metric=us_fed_funds_rate），不加 cross_market 列。规格书「宏观:美联储利率」。
+    "fed_funds": "DFF",
 }
 # 入库时再补 -USDT-SWAP 后缀（见 collect_coin_sentiment 末尾 f"{ccy}-USDT-SWAP"）。
 SYMBOLS = None  # None = 收集所有币种，不再过滤
@@ -272,11 +287,29 @@ def _fetch_all_swap_symbols() -> list[str]:
 def _ensure_instruments_cache_table(con: sqlite3.Connection) -> None:
     con.execute("""
         CREATE TABLE IF NOT EXISTS instruments_cache (
-            instId    TEXT PRIMARY KEY,
-            ctVal     REAL,
-            lotSz     REAL
+            instId              TEXT PRIMARY KEY,
+            ctVal               REAL,
+            lotSz               REAL,
+            list_time_utc       TEXT,
+            state               TEXT,
+            inst_category       TEXT,
+            metadata_updated_at TEXT
         )
     """)
+    existing = {
+        str(row[1]) for row in con.execute("PRAGMA table_info(instruments_cache)")
+    }
+    additions = {
+        "list_time_utc": "TEXT",
+        "state": "TEXT",
+        "inst_category": "TEXT",
+        "metadata_updated_at": "TEXT",
+    }
+    for name, column_type in additions.items():
+        if name not in existing:
+            con.execute(
+                f"ALTER TABLE instruments_cache ADD COLUMN {name} {column_type}"
+            )
     con.commit()
 
 
@@ -284,24 +317,59 @@ def _collect_instruments_cache(
     market_con: sqlite3.Connection, all_instruments: list[dict]
 ) -> int:
     """
-    Write ctVal / lotSz for all USDT-M linear SWAP instruments
+    Write ctVal / lotSz and official listing metadata for all USDT-M linear
+    SWAP instruments
     into market.db.instruments_cache.
     Called by Job E (collect_slow.py) every hour so ctVal data stays fresh.
     """
     _ensure_instruments_cache_table(market_con)
     count = 0
+    metadata_updated_at = utc_now_iso()
     for inst in all_instruments:
         inst_id = inst.get("instId", "")
         if "-USDT-SWAP" not in inst_id:
             continue
         try:
+            ct_val = to_float(inst.get("ctVal"))
+            lot_sz = to_float(inst.get("lotSz"))
+            if ct_val is None or not math.isfinite(ct_val) or ct_val <= 0:
+                print(
+                    f"  [warn] instruments_cache {inst_id}: "
+                    "official ctVal missing/invalid; no default fabricated"
+                )
+                ct_val = None
+            if lot_sz is None or not math.isfinite(lot_sz) or lot_sz <= 0:
+                print(
+                    f"  [warn] instruments_cache {inst_id}: "
+                    "official lotSz missing/invalid; no default fabricated"
+                )
+                lot_sz = None
             market_con.execute(
-                """INSERT OR REPLACE INTO instruments_cache (instId, ctVal, lotSz)
-                   VALUES (?, ?, ?)""",
+                """INSERT INTO instruments_cache (
+                       instId,ctVal,lotSz,list_time_utc,state,inst_category,
+                       metadata_updated_at
+                   ) VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(instId) DO UPDATE SET
+                       ctVal=COALESCE(excluded.ctVal,instruments_cache.ctVal),
+                       lotSz=COALESCE(excluded.lotSz,instruments_cache.lotSz),
+                       list_time_utc=COALESCE(
+                           excluded.list_time_utc,
+                           instruments_cache.list_time_utc
+                       ),
+                       state=COALESCE(excluded.state,instruments_cache.state),
+                       inst_category=COALESCE(
+                           excluded.inst_category,
+                           instruments_cache.inst_category
+                       ),
+                       metadata_updated_at=excluded.metadata_updated_at""",
                 (
                     inst_id,
-                    float(inst.get("ctVal") or 1),
-                    float(inst.get("lotSz") or 1),
+                    ct_val,
+                    lot_sz,
+                    ms_to_iso(inst.get("listTime")),
+                    str(inst.get("state") or "").strip() or None,
+                    str(inst.get("instCategory") or "").strip() or None,
+                    metadata_updated_at,
                 ),
             )
             count += 1
@@ -324,6 +392,14 @@ def collect_slow_klines(
     # Fetch slow K-lines per timeframe: HTTP concurrent (was 1460 CLI subprocess calls)
     rows_to_write: list[tuple] = []
     incomplete: list[str] = []
+    # 2026-08-13 BOLL/OBV 扩展列 migration-aware：迁移未跑按旧列写（零行为变化）。
+    insert_plan = kline_insert_plan(market_con)
+    if not insert_plan["extended"]:
+        print(
+            "[collect_slow][WARN] kline_cache 缺 BOLL/OBV 扩展列"
+            "（apply_kline_indicator_schema 未跑），按旧列写入",
+            flush=True,
+        )
     deadline = time.monotonic() + SLOW_KLINE_BUDGET_S
     for tf, bar in SLOW_TIMEFRAMES.items():
         remaining = deadline - time.monotonic()
@@ -352,32 +428,28 @@ def collect_slow_klines(
                 for entry in reversed(raw_candles)
                 if ms_to_iso(entry[0]) is not None
             ]
-            enriched = compute_indicators(candles)
+            enriched = extend_with_boll_obv(compute_indicators(candles))
             for item in enriched:
-                rows_to_write.append(
-                    (
-                        item["ts"],
-                        symbol,
-                        tf,
-                        item["o"],
-                        item["h"],
-                        item["l"],
-                        item["c"],
-                        item["v"],
-                        item["ma5"],
-                        item["ma20"],
-                        item["atr14"],
-                        item["rsi14"],
-                        item["macd_hist"],
-                    )
+                base_row = (
+                    item["ts"],
+                    symbol,
+                    tf,
+                    item["o"],
+                    item["h"],
+                    item["l"],
+                    item["c"],
+                    item["v"],
+                    item["ma5"],
+                    item["ma20"],
+                    item["atr14"],
+                    item["rsi14"],
+                    item["macd_hist"],
                 )
+                if insert_plan["extended"]:
+                    base_row += extended_row_tail(item)
+                rows_to_write.append(base_row)
 
-    market_con.executemany(
-        "INSERT OR REPLACE INTO kline_cache "
-        "(ts, symbol, tf, o, h, l, c, v, ma5, ma20, atr14, rsi14, macd_hist) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        rows_to_write,
-    )
+    market_con.executemany(insert_plan["sql"], rows_to_write)
     market_con.commit()
     return len(rows_to_write), incomplete
 
@@ -528,8 +600,8 @@ def _deterministic_sentiment(news_con: sqlite3.Connection) -> int:
     （脱 OKX 硬依赖，OKX 死也不归零）。写库仍走慢采（news.db 单写者），不破单写不变量。"""
     try:
         import sys as _sys
-        if r"./scripts" not in _sys.path:
-            _sys.path.insert(0, r"./scripts")
+        if r".\scripts" not in _sys.path:
+            _sys.path.insert(0, r".\scripts")
         import sentiment_compute as _sc
         main_db = next((r[2] for r in news_con.execute("PRAGMA database_list").fetchall()
                         if r[1] == "main"), None)
@@ -681,6 +753,10 @@ def main() -> int:
             dxy, dxy_d1, dxy_obs_date = fred_latest(client, bucket, FRED_SERIES["dxy"], fred_key)
             vix, vix_d1, _vix_date = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
             spx, spx_d1, _spx_date = fred_latest(client, bucket, FRED_SERIES["spx"], fred_key)
+            # 联邦基金利率同 client/bucket 顺路采；失败只 WARN（fred_latest 内已兜），
+            # 不影响 cross_market 行——落库在下方 public_macro 同步块（宁缺勿假）。
+            fed_rate, fed_d1, fed_obs_date = fred_latest(
+                client, bucket, FRED_SERIES["fed_funds"], fred_key)
             # DefiLlama /v2/chains 是本块唯一无内层保护的取数——超时/坏响应会抛异常冒泡到
             # 下方 except、跳过整行 cross_market（连带丢弃新鲜的 dxy/regime），使整个 :00 槽
             # regime stale 丢轮。与 CoinGecko/FRED 一致包内层 try：失败→None→走 697 行
@@ -709,6 +785,15 @@ def main() -> int:
         try:
             imported = import_xsearch_etf(news_con, cm_con)
             consensus = reconcile_etf_consensus(cm_con)
+            fed_written = upsert_observations(
+                cm_con, fed_funds_rows(fed_rate, fed_obs_date, d1=fed_d1))
+            if fed_written:
+                cm_con.commit()
+                print(
+                    "[collect_slow] fed_funds(DFF) "
+                    f"{fed_rate}% as_of={fed_obs_date} -> macro_observations",
+                    flush=True,
+                )
             public_macro_snapshot = latest_snapshot(cm_con)
             if imported or consensus.get("cross_checked") or consensus.get("conflicts"):
                 print(

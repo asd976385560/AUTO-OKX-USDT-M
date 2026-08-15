@@ -12,15 +12,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r".\collectors")
 import ledger  # noqa: E402
 
 from _okxcli import okx_json
 
 CST = timezone(timedelta(hours=8))
+_REQUEST_TIMEOUT_SECONDS = 45
+_COLD_RETRY_DELAY_SECONDS = 3.0
+_MAX_FETCH_ATTEMPTS = 2
 
 
 def to_float(value):
@@ -37,16 +41,70 @@ def fmt_ms(value) -> str | None:
         return None
 
 
-def collect(profile: str, limit: int) -> list[tuple]:
+def collect(
+    profile: str,
+    limit: int,
+    *,
+    retry_stats: dict | None = None,
+    sleep_fn=time.sleep,
+) -> list[tuple]:
+    """Fetch the current bill page with one bounded cold recovery attempt.
+
+    A missing bill page blocks the daily report because fees, funding and
+    realized PnL would otherwise be incomplete.  The retry is deliberately
+    limited to the same current request: it does not page backwards, backfill
+    history, or turn a persistent exchange failure into a successful result.
+    """
     if "demo" in str(profile).strip().lower():
         raise ValueError(
             f"collect_account_bills 只支持 live，收到 {profile!r}。"
             "demo 已于 2026-08-06 全量下线，账单历史行也已清除；"
             "再采会把 profile='demo' 行重新写回 account_bills。")
-    payload = okx_json(
-        "account", "bills", "--instType", "SWAP", "--limit", str(limit),
-        global_args=["--profile", profile], timeout_sec=45,
-    )
+    started = time.monotonic()
+    initial_error: Exception | None = None
+    try:
+        payload = okx_json(
+            "account", "bills", "--instType", "SWAP", "--limit", str(limit),
+            global_args=["--profile", profile],
+            timeout_sec=_REQUEST_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the final transport error
+        initial_error = exc
+        sleep_fn(_COLD_RETRY_DELAY_SECONDS)
+        try:
+            payload = okx_json(
+                "account", "bills", "--instType", "SWAP", "--limit", str(limit),
+                global_args=["--profile", profile],
+                timeout_sec=_REQUEST_TIMEOUT_SECONDS,
+            )
+        except Exception as final_exc:  # noqa: BLE001
+            if retry_stats is not None:
+                retry_stats.update({
+                    "attempts": _MAX_FETCH_ATTEMPTS,
+                    "recovered_after_cold_retry": False,
+                    "cold_retry_delay_seconds": _COLD_RETRY_DELAY_SECONDS,
+                    "initial_error": (
+                        f"{type(initial_error).__name__}: {initial_error}")[:240],
+                    "final_error": (
+                        f"{type(final_exc).__name__}: {final_exc}")[:240],
+                    "historical_retry": False,
+                    "unbounded_retry": False,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                })
+            raise
+    if retry_stats is not None:
+        retry_stats.update({
+            "attempts": 2 if initial_error is not None else 1,
+            "recovered_after_cold_retry": initial_error is not None,
+            "cold_retry_delay_seconds": (
+                _COLD_RETRY_DELAY_SECONDS if initial_error is not None else 0.0),
+            "initial_error": (
+                f"{type(initial_error).__name__}: {initial_error}"[:240]
+                if initial_error is not None else None),
+            "historical_retry": False,
+            "unbounded_retry": False,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        })
     items = payload if isinstance(payload, list) else (payload.get("data") or [])
     fetched_at = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     rows = []
@@ -69,18 +127,26 @@ def collect(profile: str, limit: int) -> list[tuple]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="实盘账单采集")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--profiles", default="live")
     ap.add_argument("--limit", type=int, default=100)
     args = ap.parse_args()
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     all_rows = []
     errors = []
+    retry_stats = {}
     for profile in profiles:
+        profile_retry_stats: dict = {}
         try:
-            all_rows.extend(collect(profile, max(1, min(args.limit, 100))))
+            all_rows.extend(collect(
+                profile,
+                max(1, min(args.limit, 100)),
+                retry_stats=profile_retry_stats,
+            ))
         except Exception as exc:
             errors.append(f"{profile}:{type(exc).__name__}:{exc}")
+        finally:
+            retry_stats[profile] = profile_retry_stats
     con = ledger.connect(Path(args.db_root) / "account.db")
     try:
         before = con.total_changes
@@ -98,7 +164,7 @@ def main() -> int:
     print(json.dumps({
         "ok": bool(all_rows) or not errors,
         "profiles": profiles, "fetched": len(all_rows), "inserted": inserted,
-        "errors": errors,
+        "errors": errors, "retry_stats": retry_stats,
     }, ensure_ascii=False))
     return 0 if all_rows or not errors else 1
 

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -19,7 +20,10 @@ for _p in (SCRIPTS,):
 
 import build_push_payload  # noqa: E402
 import daily_report_writer  # noqa: E402
+import missed_opps_writer  # noqa: E402
+import render_push_report  # noqa: E402
 import validate_daily_report  # noqa: E402
+import validate_push_format  # noqa: E402
 
 
 TRADE_SCHEMA = """
@@ -67,6 +71,85 @@ def _create_db(path: Path, schema: str) -> None:
         con.commit()
     finally:
         con.close()
+
+
+class MissedOpportunityMaturityTests(unittest.TestCase):
+    def test_report_window_is_shifted_as_one_continuous_24h_window(self):
+        self.assertEqual(
+            ("2026-08-11 04:00:00", "2026-08-12 04:00:00"),
+            missed_opps_writer._matured_candidate_window(
+                "2026-08-11 08:00:00", "2026-08-12 08:00:00"),
+        )
+        self.assertEqual(
+            ("2026-08-11 04:00:00", "2026-08-12 04:00:00"),
+            daily_report_writer._missed_opps_candidate_window(
+                "2026-08-11 08:00:00", "2026-08-12 08:00:00"),
+        )
+        self.assertEqual(
+            ("2026-08-11 04:00:00", "2026-08-12 04:00:00"),
+            validate_daily_report._expected_missed_candidate_window(
+                "2026-08-11 08:00:00", "2026-08-12 08:00:00"),
+        )
+
+    def test_four_hour_outcome_requires_exact_16_quarter_hour_starts(self):
+        start = "2026-08-11T00:00:00Z"
+        rows = [
+            (f"2026-08-11T{hour:02d}:{minute:02d}:00Z", 1, 1, 1, 1)
+            for hour in range(4)
+            for minute in (0, 15, 30, 45)
+        ]
+        self.assertTrue(
+            missed_opps_writer._complete_four_hour_rows(rows, start))
+        self.assertFalse(
+            missed_opps_writer._complete_four_hour_rows(rows[:-1], start))
+        gapped = list(rows)
+        gapped[8] = ("2026-08-11T02:15:00Z", 1, 1, 1, 1)
+        self.assertFalse(
+            missed_opps_writer._complete_four_hour_rows(gapped, start))
+
+    def test_four_hour_outcome_rejects_invalid_ohlc(self):
+        start = "2026-08-11T00:00:00Z"
+        rows = [
+            (f"2026-08-11T{hour:02d}:{minute:02d}:00Z", 10, 11, 9, 10)
+            for hour in range(4)
+            for minute in (0, 15, 30, 45)
+        ]
+        invalid_high = list(rows)
+        invalid_high[3] = (*invalid_high[3][:2], 8, 9, 10)
+        self.assertFalse(missed_opps_writer._complete_four_hour_rows(
+            invalid_high, start))
+        nonfinite = list(rows)
+        nonfinite[4] = (*nonfinite[4][:4], float("nan"))
+        self.assertFalse(missed_opps_writer._complete_four_hour_rows(
+            nonfinite, start))
+
+    def test_writer_count_excludes_both_shifted_window_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lessons = Path(tmp) / "lessons.db"
+            con = sqlite3.connect(lessons)
+            try:
+                con.execute("CREATE TABLE missed_opportunities(ts TEXT)")
+                con.executemany(
+                    "INSERT INTO missed_opportunities VALUES(?)",
+                    [
+                        ("2026-08-11 03:45:00",),
+                        ("2026-08-11 04:00:00",),
+                        ("2026-08-12 03:45:00",),
+                        ("2026-08-12 04:00:00",),
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+            with mock.patch.object(
+                    daily_report_writer, "LESSONS_DB", lessons):
+                self.assertEqual(
+                    2,
+                    daily_report_writer._missed_opps_window_count(
+                        "2026-08-11 08:00:00",
+                        "2026-08-12 08:00:00",
+                    ),
+                )
 
 
 class ReportRevisionTests(unittest.TestCase):
@@ -498,15 +581,18 @@ class PushSingleBookPayloadTests(unittest.TestCase):
 
     CYCLE = "2026-08-06T12:00"
 
-    def _db_root(self, tmp: str, live_row: bool) -> Path:
+    def _db_root(
+        self, tmp: str, live_row: bool, *, cycle: str | None = None
+    ) -> Path:
         root = Path(tmp)
+        cycle = cycle or self.CYCLE
         con = sqlite3.connect(root / "live_trades.db")
         try:
             con.executescript(CYCLE_SCHEMA + TRADE_SCHEMA)
             if live_row:
                 con.execute(
                     "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
-                    (self.CYCLE, "2026-08-06 12:01:00", "full", "hold",
+                    (cycle, "2026-08-06 12:01:00", "full", "hold",
                      0, None, "", "{}"))
             con.commit()
         finally:
@@ -525,6 +611,306 @@ class PushSingleBookPayloadTests(unittest.TestCase):
         self.assertEqual(payload["channel"], "live")
         self.assertNotIn("db_rows_demo", payload["execution"])
 
+    def test_build_reports_exchange_fill_from_prior_business_cycle(self):
+        report_cycle = "2026-08-06T12:15"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(
+                tmp, live_row=True, cycle=report_cycle)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:14:18", "BCH-USDT-SWAP",
+                     "close", "short", 36.0, 204.1, 6.84,
+                     json.dumps({
+                         "reconcile_source": "exchange_fills_reconcile",
+                         "ord_ids": ["3833488461226856449"],
+                     })),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            payload = build_push_payload.build(
+                root, report_cycle,
+                now=datetime(2026, 8, 6, 12, 16, tzinfo=timezone(
+                    timedelta(hours=8))),
+            )
+
+        self.assertEqual(payload["action_taken"], "HOLD")
+        self.assertEqual(
+            payload["business_report_attestation"]["trade_count"], 0)
+        interval = payload["inter_report_exchange_attestation"]
+        self.assertEqual(interval["fill_count"], 1)
+        self.assertEqual(
+            interval["window_start_exclusive_cst"],
+            "2026-08-06 12:00:00",
+        )
+        self.assertEqual(
+            interval["window_end_inclusive_cst"],
+            "2026-08-06 12:15:00",
+        )
+        self.assertEqual(interval["fills"][0]["symbol"], "BCH-USDT-SWAP")
+        self.assertEqual(
+            interval["fills"][0]["ord_ids"],
+            ["3833488461226856449"],
+        )
+
+    def test_inter_report_exchange_window_is_half_open_and_deduplicated(self):
+        report_cycle = "2026-08-06T12:15"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=True, cycle=report_cycle)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                rows = [
+                    ("2026-08-06T12:00", "2026-08-06 12:00:00", "BOUNDARY-OLD", "exchange_fills_reconcile"),
+                    ("2026-08-06T12:00", "2026-08-06 12:00:01", "INSIDE", "exchange_fills_reconcile"),
+                    ("2026-08-06T12:00", "2026-08-06 12:15:00", "BOUNDARY-NOW", "execution_journal_recovery"),
+                    (report_cycle, "2026-08-06 12:14:00", "CURRENT-CYCLE", "exchange_fills_reconcile"),
+                    ("2026-08-06T12:00", "2026-08-06 12:14:00", "NOT-RECOVERED", "agent_execution"),
+                ]
+                for index, (cycle_id, ts, symbol, source) in enumerate(rows):
+                    con.execute(
+                        "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                        "fill_px,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (cycle_id, ts, symbol, "close", "long", 1.0,
+                         10.0, 1.0, json.dumps({
+                             "reconcile_source": source,
+                             "ord_ids": [f"ord-{index}", f"ord-{index}"],
+                         })),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+            interval = build_push_payload._inter_report_exchange_attestation(
+                str(root), report_cycle)
+
+        self.assertEqual(interval["fill_count"], 2)
+        self.assertEqual(
+            [row["symbol"] for row in interval["fills"]],
+            ["INSIDE", "BOUNDARY-NOW"],
+        )
+        self.assertEqual(interval["fills"][0]["ord_ids"], ["ord-1"])
+
+    def test_inter_report_exchange_accepts_direct_fill_with_unique_ord_id(self):
+        report_cycle = "2026-08-06T12:15"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=True, cycle=report_cycle)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                rows = [
+                    (
+                        "DIRECT-CONFIRMED",
+                        {"fill_source": "fills",
+                         "ts_source": "fills.fillTime",
+                         "ordId": "ord-direct"},
+                    ),
+                    (
+                        "DIRECT-NO-ORD",
+                        {"fill_source": "fills",
+                         "ts_source": "fills.fillTime"},
+                    ),
+                    (
+                        "DIRECT-WRONG-TS",
+                        {"fill_source": "fills",
+                         "ts_source": "writer_commit",
+                         "ordId": "ord-untrusted"},
+                    ),
+                ]
+                for index, (symbol, raw) in enumerate(rows):
+                    con.execute(
+                        "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                        "fill_px,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (self.CYCLE, f"2026-08-06 12:14:1{index}", symbol,
+                         "open", "long", 1.0, 10.0, 0.0,
+                         json.dumps(raw)),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+            interval = build_push_payload._inter_report_exchange_attestation(
+                str(root), report_cycle)
+
+        self.assertEqual(interval["fill_count"], 1)
+        self.assertEqual(
+            interval["fills"][0]["symbol"], "DIRECT-CONFIRMED")
+        self.assertEqual(
+            interval["fills"][0]["reconcile_source"], "fills")
+        self.assertEqual(
+            interval["fills"][0]["ord_ids"], ["ord-direct"])
+
+    def test_position_projection_uses_half_open_window_and_marks_changes(self):
+        baseline = [{
+            "symbol": "ETH-USDT-SWAP", "side": "long", "sz": 2.0,
+            "avgPx": 100.0, "lev": 10.0, "upl": 1.0,
+        }]
+        trades = [
+            {"id": 1, "ts": "2026-08-06 12:00:59",
+             "symbol": "ETH-USDT-SWAP", "action": "open",
+             "side": "long", "sz": 1.0, "fill_px": 99.0, "lev": 10.0},
+            {"id": 2, "ts": "2026-08-06 12:01:00",
+             "symbol": "ETH-USDT-SWAP", "action": "open",
+             "side": "long", "sz": 1.0, "fill_px": 99.0, "lev": 10.0},
+            {"id": 3, "ts": "2026-08-06 12:02:00",
+             "symbol": "BTC-USDT-SWAP", "action": "open",
+             "side": "short", "sz": 3.0, "fill_px": 90.0, "lev": 10.0},
+            {"id": 4, "ts": "2026-08-06 12:04:00",
+             "symbol": "ETH-USDT-SWAP", "action": "close",
+             "side": "long", "sz": 2.0, "fill_px": 101.0, "lev": 10.0},
+        ]
+
+        projected = build_push_payload._project_positions_through_trades(
+            baseline, trades, "2026-08-06 12:01:00",
+            as_of="2026-08-06 12:03:00")
+
+        self.assertEqual(
+            [(row["symbol"], row["sz"]) for row in projected],
+            [("ETH-USDT-SWAP", 2.0), ("BTC-USDT-SWAP", 3.0)],
+        )
+        self.assertNotIn("_projected_after_baseline", projected[0])
+        self.assertTrue(projected[1]["_projected_after_baseline"])
+        self.assertTrue(projected[1]["_projected_open_after_baseline"])
+
+    def test_build_projects_post_facts_open_into_positions_with_stop(self):
+        cst = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            facts = {
+                "cycle_id": self.CYCLE,
+                "status": "ok",
+                "as_of": "2026-08-06 12:01:00",
+                "balance": {"totalEq": 1000.0},
+                "positions": [{
+                    "instId": "ETH-USDT-SWAP", "posSide": "long",
+                    "contracts": 2.0, "avgPx": 100.0, "lever": 10.0,
+                    "upl": 1.0, "markPx": 101.0,
+                    "mark_notional_usdt": 202.0, "position_imr": 20.2,
+                    "position_age_hours": 1.0,
+                    "sl": {"verified": True, "trigger_px": 95.0},
+                }],
+            }
+            cycle_raw = {
+                "action_taken": "OPEN_SHORT",
+                "live_facts": facts,
+                "trades": [],
+            }
+            trade_raw = json.dumps({"sl_trigger_px": 92.0})
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:02:00", "live", "traded",
+                     1, 1000.0, "", json.dumps(cycle_raw)),
+                )
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,lev,margin,notional,pnl,raw) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:02:00", "BTC-USDT-SWAP",
+                     "open", "short", 3.0, 90.0, 10.0, 27.0, 270.0,
+                     0.0, trade_raw),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            payload = build_push_payload.build(
+                root, self.CYCLE,
+                now=datetime(2026, 8, 6, 12, 3, tzinfo=cst))
+
+        positions = {row["symbol"]: row for row in payload["positions"]}
+        self.assertEqual(set(positions), {"ETH-USDT-SWAP", "BTC-USDT-SWAP"})
+        self.assertEqual(positions["ETH-USDT-SWAP"]["sz"], 2.0)
+        self.assertEqual(positions["BTC-USDT-SWAP"]["sz"], 3.0)
+        self.assertEqual(positions["BTC-USDT-SWAP"]["sl_px"], 92.0)
+        self.assertEqual(payload["assets"]["live"]["positions"], 2)
+        self.assertEqual(payload["risk"]["position_count"], 2)
+
+    def test_reconciled_close_uses_preserved_business_context(self):
+        cst = timezone(timedelta(hours=8))
+        card = {
+            "direction_evidence": ["verified live facts"],
+            "opposing_evidence": ["no new open"],
+            "execution_conditions": {"hold": "keep exchange SL"},
+            "invalidation_point": {"APR": "SL 0.518"},
+            "risk_reward": {"exit_mode": "no_fixed_tp"},
+            "portfolio_impact": {"after": "protected close"},
+            "historical_experience": {
+                "matched_wins": [], "matched_losses": [],
+                "missed_opportunities": [], "usage": "none",
+                "reason": "no new open",
+            },
+            "agent_judgement": "HOLD before protective fill",
+            "reference_overrides": [],
+        }
+        facts = {
+            "cycle_id": self.CYCLE,
+            "status": "ok",
+            "as_of": "2026-08-06 12:01:00",
+            "balance": {
+                "totalEq": 1000.0,
+                "current_portfolio_imr_ratio": 0.42,
+                "max_portfolio_imr_ratio": 0.666,
+            },
+            "positions": [{
+                "instId": "APR-USDT-SWAP", "posSide": "long",
+                "contracts": 31.0, "avgPx": 0.5442, "lever": 10.0,
+                "upl": -6.0, "markPx": 0.5226,
+                "mark_notional_usdt": 16.2, "position_imr": 1.62,
+                "position_age_hours": 3.2,
+                "sl": {"verified": True, "trigger_px": 0.518},
+            }],
+        }
+        cycle_raw = {
+            "reconcile_source": "exchange_fills_reconcile",
+            "business_context_preserved": True,
+            "business_context_source_cycle_id": self.CYCLE,
+            "decision_protocol": "decision_card_v1",
+            "decision_card": card,
+            "live_facts": facts,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "INSERT INTO trade_cycles VALUES(?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:02:00", "live", "traded",
+                     1, 1000.0, "exchange fill reconcile",
+                     json.dumps(cycle_raw)),
+                )
+                con.execute(
+                    "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,"
+                    "fill_px,lev,margin,notional,pnl,reasoning,raw) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.CYCLE, "2026-08-06 12:02:00", "APR-USDT-SWAP",
+                     "close", "long", 31.0, 0.5177, 10.0, None, None,
+                     -8.22, "exchange protective fill",
+                     json.dumps({"reconcile_source":
+                                 "exchange_fills_reconcile"})),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            payload = build_push_payload.build(
+                root, self.CYCLE,
+                now=datetime(2026, 8, 6, 12, 3, tzinfo=cst))
+
+        self.assertEqual(payload["action_taken"], "CLOSE")
+        self.assertEqual(
+            payload["decision"]["origin"],
+            "exchange_reconcile_after_business_terminal",
+        )
+        self.assertEqual(payload["decision"]["decision_card"], card)
+        self.assertEqual(
+            payload["risk"]["current_portfolio_imr_ratio"], 0.42)
+        self.assertEqual(payload["positions"], [])
+
     def test_missing_live_cycle_is_flagged_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = build_push_payload.build(
@@ -534,6 +920,243 @@ class PushSingleBookPayloadTests(unittest.TestCase):
              "detail": "本轮 trade_cycles 未落库——push 闸要求 live 落库，"
                        "出现即为异常"},
             payload["exceptions"])
+
+    def test_terminal_failure_builds_explicit_wait_report_without_trade_row(self):
+        failure = {
+            "stage": "live",
+            "cycle_id": self.CYCLE,
+            "mode": "unified",
+            "status": "failed",
+            "failure_kind": "agent_idle_timeout",
+            "child_returncode": 1,
+            "returncode": 1,
+            "started_at": "2026-08-06 12:01:00",
+            "finished_at": "2026-08-06 12:10:00",
+            "profile_lease_released": True,
+            "production_database_writes": 0,
+            "orders_placed": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            con = sqlite3.connect(root / "ledger.db")
+            try:
+                con.execute(
+                    "CREATE TABLE execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.commit()
+            finally:
+                con.close()
+            payload = build_push_payload.build(
+                root,
+                self.CYCLE,
+                upstream_failure=failure,
+            )
+        self.assertEqual(payload["action_taken"], "WAIT")
+        self.assertEqual(payload["report_mode"], "upstream_failure")
+        self.assertEqual(
+            payload["decision"]["origin"], "system_failure_fallback")
+        self.assertIn(
+            "Agent 未形成当轮判断",
+            payload["decision"]["decision_card"]["agent_judgement"],
+        )
+        self.assertEqual(payload["risk"]["status"], "BLOCKED_UPSTREAM_FAILURE")
+        self.assertEqual(payload["execution"]["db_rows_live"], 0)
+        self.assertEqual(
+            payload["execution_intent_safety"]["status"], "PASSED")
+        self.assertEqual(payload["orders_placed"], 0)
+        self.assertTrue(any(
+            item.get("name") == "live_trader"
+            and item.get("status") == "failed"
+            for item in payload["exceptions"]
+        ))
+
+    def test_collection_failure_builds_wait_without_fake_agent_judgement(self):
+        failure = {
+            "stage": "collection",
+            "cycle_id": self.CYCLE,
+            "mode": "quarter",
+            "status": "failed",
+            "failure_kind": "collection_gate_failed",
+            "child_returncode": 1,
+            "returncode": 1,
+            "started_at": "2026-08-06 12:00:01",
+            "finished_at": "2026-08-06 12:02:01",
+            "profile_lease_released": True,
+            "same_cycle_live_dispatched": False,
+            "missing_required_sources": ["fast"],
+            "failed_steps": ["fast"],
+            "collection_receipt_sha256": "a" * 64,
+            "production_database_writes": 0,
+            "orders_placed": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            con = sqlite3.connect(root / "ledger.db")
+            try:
+                con.execute(
+                    "CREATE TABLE execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.commit()
+            finally:
+                con.close()
+            payload = build_push_payload.build(
+                root, self.CYCLE, upstream_failure=failure)
+
+            with (
+                mock.patch.object(
+                    render_push_report, "authoritative_cycle_count",
+                    return_value=None),
+                mock.patch.object(
+                    render_push_report, "authoritative_cycle_duration",
+                    return_value=None),
+                mock.patch.object(
+                    render_push_report, "authoritative_equity",
+                    return_value=None),
+                mock.patch.object(
+                    render_push_report, "authoritative_cum_pnl",
+                    return_value=None),
+                mock.patch.object(
+                    render_push_report, "authoritative_position_count",
+                    return_value=None),
+            ):
+                content = render_push_report.render(payload)["content"]
+            validation = validate_push_format.validate(
+                content, cycle_id=self.CYCLE)
+
+        self.assertEqual(payload["action_taken"], "WAIT")
+        self.assertIn("采集闸失败", payload["summary"])
+        self.assertIn(
+            "Agent 未启动",
+            payload["decision"]["decision_card"]["agent_judgement"],
+        )
+        self.assertFalse(any(
+            item.get("name") == "live_trader"
+            for item in payload["exceptions"]
+        ))
+        self.assertTrue(any(
+            item.get("name") == "collection_gate"
+            and item.get("status") == "failed"
+            for item in payload["exceptions"]
+        ))
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("采集闸失败", content)
+        normal_missing_market = json.loads(json.dumps(payload))
+        normal_missing_market.pop("report_mode", None)
+        normal_missing_market.pop("upstream_failure", None)
+        with self.assertRaises(SystemExit):
+            render_push_report.validate_input(normal_missing_market)
+
+    def test_failure_card_distinguishes_analysis_from_missing_trade_terminal(self):
+        failure = {
+            "failure_kind": "business_output_missing",
+            "business_check": {"checks": [
+                {"db": "analysis.db", "table": "analysis_runs",
+                 "found": True},
+                {"db": "live_trades.db", "table": "trade_cycles",
+                 "found": False},
+            ]},
+        }
+
+        card = build_push_payload._upstream_failure_card(failure)
+
+        self.assertIn("analysis.db 已形成分析证据", card["direction_evidence"][0])
+        self.assertIn("交易终态缺失", card["opposing_evidence"][0])
+        self.assertIn("已形成分析，但未形成交易终态", card["agent_judgement"])
+        self.assertNotIn("未形成当轮判断", card["agent_judgement"])
+
+    def test_failure_report_refuses_existing_business_terminal(self):
+        failure = {
+            "stage": "live", "cycle_id": self.CYCLE,
+            "status": "failed", "returncode": 1,
+            "profile_lease_released": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "trade terminal exists"):
+                build_push_payload.build(
+                    self._db_root(tmp, live_row=True),
+                    self.CYCLE,
+                    upstream_failure=failure,
+                )
+
+    def test_failure_report_refuses_partial_business_terminal(self):
+        failure = {
+            "stage": "live", "cycle_id": self.CYCLE,
+            "status": "failed", "returncode": 1,
+            "profile_lease_released": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=True)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "UPDATE trade_cycles SET decision='unknown',n_orders=0 "
+                    "WHERE cycle_id=?", (self.CYCLE,))
+                con.commit()
+            finally:
+                con.close()
+            with self.assertRaisesRegex(ValueError, "trade terminal exists"):
+                build_push_payload.build(
+                    root, self.CYCLE, upstream_failure=failure)
+
+    def test_failure_report_blocks_submitted_execution_intent(self):
+        failure = {
+            "stage": "live", "cycle_id": self.CYCLE,
+            "status": "failed", "returncode": 1,
+            "profile_lease_released": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            con = sqlite3.connect(root / "ledger.db")
+            try:
+                con.execute(
+                    "CREATE TABLE execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.execute(
+                    "INSERT INTO execution_intents VALUES(?,?,?,?,?,?)",
+                    ("live", self.CYCLE, "submitted", "ord-1",
+                     "2026-08-06 12:05:00", None),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with self.assertRaisesRegex(
+                    ValueError, "non-clean execution intents"):
+                build_push_payload.build(
+                    root, self.CYCLE, upstream_failure=failure)
+
+    def test_failure_report_blocks_completed_timestamp_even_if_state_is_clean(self):
+        failure = {
+            "stage": "live", "cycle_id": self.CYCLE,
+            "status": "failed", "returncode": 1,
+            "profile_lease_released": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=False)
+            con = sqlite3.connect(root / "ledger.db")
+            try:
+                con.execute(
+                    "CREATE TABLE execution_intents("
+                    "profile TEXT,cycle_id TEXT,state TEXT,ord_id TEXT,"
+                    "submitted_at TEXT,completed_at TEXT)"
+                )
+                con.execute(
+                    "INSERT INTO execution_intents VALUES(?,?,?,?,?,?)",
+                    ("live", self.CYCLE, "failed_clean", None, None,
+                     "2026-08-06 12:05:00"),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with self.assertRaisesRegex(
+                    ValueError, "non-clean execution intents"):
+                build_push_payload.build(
+                    root, self.CYCLE, upstream_failure=failure)
 
     def test_present_row_with_unknown_decision_stays_unknown(self):
         """行在但动作不可解释仍须被拦——这条不因 demo 下线而放开。"""

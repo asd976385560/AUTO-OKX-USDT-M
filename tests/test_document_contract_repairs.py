@@ -17,6 +17,15 @@ def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
+def load_script(relative: str):
+    path = ROOT / relative
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_doc_checker():
     path = ROOT / "scripts" / "check_doc_versions.py"
     spec = importlib.util.spec_from_file_location("check_doc_versions_contract", path)
@@ -75,8 +84,25 @@ class TemplateContractTests(unittest.TestCase):
 
     def test_push_contract_matches_validator_and_archives_before_send(self):
         template = read("templates/push_template.md")
-        self.assertIn("17 项", template)
-        self.assertIn("10 个 emoji 锚点", template)
+        validator = load_script("scripts/validate_push_format.py")
+        section_names = [name for _pattern, name in validator.REQUIRED_SECTIONS]
+        non_anchor_names = {
+            "轮次", "耗时", "动作", "资金字段",
+            "累计收益字段", "BTC 行情", "ETH 行情",
+        }
+        anchor_count = sum(
+            name not in non_anchor_names for name in section_names
+        )
+        self.assertEqual(len(section_names), 16)
+        self.assertEqual(anchor_count, 9)
+        self.assertNotIn("三周期判断", section_names)
+        self.assertEqual(
+            validator.MULTITIMEFRAME_REPORT_REQUIRED_FROM,
+            "2026-08-12T20:00",
+        )
+        self.assertIn("16 项", template)
+        self.assertIn("9 个 emoji 锚点", template)
+        self.assertIn("版本化硬校验", template)
         self.assertLess(template.index("-> `push_archive`"), template.index("-> `qq_push`"))
         self.assertNotRegex(
             template,
@@ -110,8 +136,8 @@ class CrossDocumentFactTests(unittest.TestCase):
 
     def test_push_pipeline_archive_precedes_send(self):
         source = read("scripts/push_pipeline.py")
-        archive_call = source.index('_run(r"./scripts/push_archive.py"')
-        send_call = source.index('_run(\n                r"./scripts/qq_push.py"')
+        archive_call = source.index(r'r".\scripts\push_archive.py"')
+        send_call = source.index(r'r".\scripts\qq_push.py"')
         self.assertLess(archive_call, send_call)
 
 

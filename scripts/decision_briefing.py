@@ -5,7 +5,7 @@
 任何子段失败只标注 N/A，不中断（决策不能因简报缺段而停）。
 
 用法:
-  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ./scripts//decision_briefing.py [--db-root ./db] [--top 5] [--out-file ./tmp//briefing_<stage>.md]
+  pwsh -NoProfile -File .\\scripts\\run_okx_python.ps1 .\\scripts\\decision_briefing.py [--db-root .\\db] [--top 5] [--out-file .\\tmp\\briefing_<stage>.md]
 
 --out-file（2026-07-15）：stdout 照常输出（契约不变），同时把全文写入 UTF-8 文件。
 agent exec 环境是 cp936 pwsh——对本脚本输出接管道/捕获（`| tail`/`| Select-Object`/`2>&1 |`）
@@ -13,6 +13,7 @@ agent exec 环境是 cp936 pwsh——对本脚本输出接管道/捕获（`| tai
 """
 import argparse
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -24,6 +25,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+import exit_quality  # noqa: E402
 from core.risk_validator import MAX_PORTFOLIO_IMR_RATIO  # noqa: E402
 from core.multitimeframe_gate import (  # noqa: E402
     MINIMUM_BARS_FOR_FULL_INDICATORS,
@@ -34,7 +36,15 @@ CST = timezone(timedelta(hours=8))
 MIN_QUOTE_VOL_USD = 5_000_000  # 流动性下限：过滤微盘噪音
 MIN_OI_USD = 5_000_000         # 可交易候选 OI 下限：过滤成交额虚高但盘口承载不足
 TRADEABLE_CANDIDATE_COUNT = 8
+EARLY_STRUCTURE_CANDIDATE_COUNT = 8  # 早期结构组：4H 立向、15m 未同向（2026-08-14）
+WAIT_STREAK_MIN_DISPLAY = 2    # 连续 wait 轮数达到该值才展示（1 轮是噪音）
+WAIT_STREAK_LOOKBACK = 96      # 每标的回看最近 96 条信号（≈24h）判连等
 DECISION_TIMEFRAMES = ("15m", "1H", "4H")
+POSITIONING_SOURCE = "okx_rest_contract_long_short_ratio"
+POSITIONING_MINIMUM_COVERAGE = 0.99
+POSITIONING_MAXIMUM_SOURCE_AGE_MINUTES = 90.0
+CANDIDATE_MICRO_MAXIMUM_AGE_MINUTES = 30.0
+CANDIDATE_FLOW_MAXIMUM_SPAN_MINUTES = 30.0
 TIMEFRAME_SECONDS = {"15m": 15 * 60, "1H": 60 * 60, "4H": 4 * 60 * 60}
 DXY_OBSERVATION_WINDOW = 20    # DTWEXBGS 是周频；按 source_as_of 取真实观测，不取 carry-forward 日历行
 DXY_MIN_OBSERVATIONS = 3       # 仅保证可描述离散度；样本量会原样展示给 Agent 自主权衡
@@ -68,6 +78,221 @@ def age_min(ts_utc_iso):
 def fmt_age(ts):
     a = age_min(ts)
     return f"{a:.0f}m" if a is not None else "?"
+
+
+def early_structure_side(votes):
+    """4H 满票立向且 15m 未同向 → 'long'|'short'|None（早期结构判定）。
+
+    2026-08-14：成熟候选排序（|三周期一致|→|chg24h|）天然偏晚期结构，模型有
+    正当理由「不追」（2026-08-13 实测 8 候选中 4 个因「位置过热/太晚」被 wait）。
+    本判定挑出 4H 方向已立、15m 回调/整理未走完的候选；只改证据呈现，
+    不构成任何自动闸或下单指令。votes[tf] ∈ {-2, 0, 2}。
+    """
+    v4 = votes.get("4H")
+    v15 = votes.get("15m")
+    if v4 is None or v15 is None:
+        return None
+    if v4 >= 2 and v15 <= 0:
+        return "long"
+    if v4 <= -2 and v15 >= 0:
+        return "short"
+    return None
+
+
+def consecutive_wait_streak(ana, symbol, lookback=None):
+    """该标的最近连续 action='wait' 的信号轮数与最新一轮 side；遇非 wait 即停。
+
+    每 cycle 是独立 session、模型无跨轮记忆——「同一标的已连等 N 轮」必须由
+    简报外显，新 session 才看得见自己在拖延。只读 analysis_signals；
+    连接/查询异常由调用方兜（简报任何子段失败不中断）。
+    """
+    if lookback is None:
+        lookback = WAIT_STREAK_LOOKBACK
+    rows = ana.execute(
+        "SELECT action, side FROM analysis_signals WHERE symbol=? "
+        "ORDER BY cycle_id DESC LIMIT ?",
+        (symbol, lookback),
+    ).fetchall()
+    streak, side = 0, None
+    for row in rows:
+        if str(row["action"] or "") != "wait":
+            break
+        if streak == 0:
+            side = row["side"]
+        streak += 1
+    return streak, side
+
+
+def positioning_evidence_quality(
+    rows,
+    expected_symbols,
+    *,
+    now: datetime | None = None,
+    minimum_coverage: float = POSITIONING_MINIMUM_COVERAGE,
+    maximum_source_age_minutes: float = (
+        POSITIONING_MAXIMUM_SOURCE_AGE_MINUTES),
+):
+    """Fail closed before exposing positioning as decision evidence."""
+    if not 0 < minimum_coverage <= 1:
+        raise ValueError("minimum_coverage must be in (0,1]")
+    if maximum_source_age_minutes <= 0:
+        raise ValueError("maximum_source_age_minutes must be positive")
+    evaluated = now or datetime.now(timezone.utc)
+    if evaluated.tzinfo is None:
+        evaluated = evaluated.replace(tzinfo=timezone.utc)
+    evaluated = evaluated.astimezone(timezone.utc)
+    expected = {str(symbol) for symbol in expected_symbols}
+    counts: dict[str, int] = {}
+    invalid: list[dict[str, object]] = []
+    ages: list[float] = []
+    for row in rows:
+        symbol = str(row["symbol"])
+        counts[symbol] = counts.get(symbol, 0) + 1
+        reasons: list[str] = []
+        try:
+            source_at = datetime.fromisoformat(
+                str(row["ts"]).replace("Z", "+00:00"))
+            if source_at.tzinfo is None:
+                source_at = source_at.replace(tzinfo=timezone.utc)
+            age = (
+                evaluated - source_at.astimezone(timezone.utc)
+            ).total_seconds() / 60.0
+            ages.append(age)
+            if age < -1.0:
+                reasons.append("source_ts_after_decision")
+            elif age > maximum_source_age_minutes:
+                reasons.append("source_ts_stale_for_decision")
+        except (TypeError, ValueError):
+            reasons.append("source_ts_invalid")
+        try:
+            long_ratio = float(row["long_ratio"])
+            short_ratio = float(row["short_ratio"])
+            long_short_ratio = float(row["long_short_ratio"])
+            if not all(map(math.isfinite, (
+                long_ratio, short_ratio, long_short_ratio
+            ))):
+                reasons.append("ratio_non_finite")
+            elif (
+                not 0 <= long_ratio <= 1
+                or not 0 <= short_ratio <= 1
+                or long_short_ratio < 0
+                or abs(long_ratio + short_ratio - 1.0) > 1e-6
+                or abs(long_ratio - long_short_ratio * short_ratio) > 1e-6
+            ):
+                reasons.append("ratio_algebra_invalid")
+        except (TypeError, ValueError):
+            reasons.append("ratio_invalid")
+        if reasons:
+            invalid.append({"symbol": symbol, "reasons": reasons})
+    observed = set(counts)
+    duplicates = sorted(
+        symbol for symbol, count in counts.items() if count != 1)
+    invalid_symbols = {str(item["symbol"]) for item in invalid}
+    valid = (
+        (expected & observed) - set(duplicates) - invalid_symbols
+        if expected else set()
+    )
+    coverage = len(valid) / len(expected) if expected else 0.0
+    extra = sorted(observed - expected) if expected else sorted(observed)
+    passed = bool(expected) and (
+        coverage >= minimum_coverage
+        and not duplicates
+        and not extra
+        and not invalid
+    )
+    return {
+        "status": "PASSED" if passed else "NOT_MET",
+        "expected_symbols": len(expected),
+        "observed_unique_symbols": len(observed),
+        "valid_symbols": len(valid),
+        "coverage_rate": coverage,
+        "maximum_source_age_minutes": max(ages) if ages else None,
+        "missing_symbols": sorted(expected - observed),
+        "extra_symbols": extra,
+        "duplicate_symbols": duplicates,
+        "invalid_rows": invalid[:20],
+        "invalid_row_count": len(invalid),
+    }
+
+
+def candidate_soft_evidence(
+    micro_row=None,
+    positioning_row=None,
+    *,
+    positioning_batch_passed=False,
+):
+    """Format candidate-specific soft evidence without creating a gate."""
+    def value(row, key):
+        if row is None:
+            return None
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    def finite(row, key, *, minimum=None, maximum=None):
+        try:
+            number = float(value(row, key))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        if minimum is not None and number < minimum:
+            return None
+        if maximum is not None and number > maximum:
+            return None
+        return number
+
+    spread = finite(micro_row, "spread_bps", minimum=0.0)
+    imbalance = finite(
+        micro_row, "imbalance_25bp", minimum=-1.0, maximum=1.0)
+    taker_buy = finite(
+        micro_row, "taker_buy_ratio", minimum=0.0, maximum=1.0)
+    cvd = finite(micro_row, "cvd_notional_usd")
+    flow_span_ms = finite(micro_row, "sample_span_ms", minimum=0.0)
+    flow_sample_count = finite(micro_row, "sample_count", minimum=0.0)
+    flow_fresh = (
+        flow_span_ms is not None
+        and flow_span_ms <= CANDIDATE_FLOW_MAXIMUM_SPAN_MINUTES * 60_000
+    )
+    buy_slippage = finite(
+        micro_row, "buy_slippage_500usd_bps", minimum=0.0)
+    sell_slippage = finite(
+        micro_row, "sell_slippage_500usd_bps", minimum=0.0)
+    micro_available = spread is not None and imbalance is not None
+    if micro_available:
+        parts = [f"spread={spread:.2f}bp", f"imb={imbalance:+.2f}"]
+        if flow_fresh and taker_buy is not None:
+            parts.append(f"buy={taker_buy:.0%}")
+        if flow_fresh and cvd is not None:
+            parts.append(f"CVD=${cvd / 1_000:+.0f}K")
+        if flow_fresh and flow_sample_count is not None:
+            parts.append(
+                f"flowN/span={int(flow_sample_count)}/"
+                f"{flow_span_ms / 1_000:.0f}s")
+        elif taker_buy is not None or cvd is not None:
+            parts.append("flow=N/A(stale_span)")
+        if buy_slippage is not None and sell_slippage is not None:
+            parts.append(
+                f"slipB/S={buy_slippage:.2f}/{sell_slippage:.2f}bp")
+        micro_text = "µ(" + " ".join(parts) + ")"
+    else:
+        micro_text = "µ=N/A"
+
+    account_ratio = (
+        finite(positioning_row, "long_short_ratio", minimum=0.0)
+        if positioning_batch_passed else None
+    )
+    positioning_available = account_ratio is not None
+    positioning_text = (
+        f"acctL/S={account_ratio:.2f}"
+        if positioning_available else "acctL/S=N/A"
+    )
+    return {
+        "text": f"{micro_text} {positioning_text}",
+        "micro_available": micro_available,
+        "positioning_available": positioning_available,
+    }
 
 
 def closed_bar_cutoff(evaluation_ts_utc: str, timeframe: str) -> str:
@@ -560,6 +785,17 @@ def _render(root, top):
                 else "未采到"
             )
         )
+        fed_row = public_snapshot.get("fed_funds") or {}
+        fed_value = fed_row.get("value")
+        print(
+            "  美联储利率(DFF有效联邦基金利率) "
+            + (
+                f"{fed_value:.2f}%/年 (as_of={fed_row.get('observation_date') or '?'}, "
+                "FRED官方；日频约1个工作日滞后)"
+                if isinstance(fed_value, (int, float))
+                else "未采到（FRED DFF，macro_observations）"
+            )
+        )
         # 兼容键 dxy_zone 实际基于 USD_BROAD(DTWEXBGS) 的真实 FRED 周观测。
         def _dxy_zone():
             if r["dxy"] is None:
@@ -716,15 +952,40 @@ def _render(root, top):
                 trend = "↑MA" if (k["ma20"] and k["c"] > k["ma20"]) else "↓MA"
                 rsi = f"RSI{k['rsi14']:.0f}" if k["rsi14"] is not None else "RSI?"
                 macd = "MACD+" if (k["macd_hist"] or 0) > 0 else "MACD-"
-                parts.append(f"{tf} {trend}/{rsi}/{macd}")
+                # 2026-08-13 扩展指标（迁移后才有列/值；缺列/缺值不显示）
+                keys = k.keys()
+                boll = ""
+                if ("boll20_up" in keys and k["boll20_up"] is not None
+                        and k["boll20_dn"] is not None and k["c"] is not None):
+                    if k["c"] > k["boll20_up"]:
+                        boll = "/BOLL↑破上轨"
+                    elif k["c"] < k["boll20_dn"]:
+                        boll = "/BOLL↓破下轨"
+                    else:
+                        boll = "/BOLL内"
+                obv = ""
+                if "obv" in keys and k["obv"] is not None:
+                    prev_rows = mkt.execute(
+                        "SELECT obv FROM kline_cache WHERE symbol=? AND tf=? "
+                        "AND ts<? AND obv IS NOT NULL "
+                        "ORDER BY ts DESC LIMIT 5",
+                        (sym, tf, k["ts"]),
+                    ).fetchall()
+                    if prev_rows:
+                        delta = k["obv"] - prev_rows[-1]["obv"]
+                        obv = ("/OBV↑" if delta > 0
+                               else ("/OBV↓" if delta < 0 else "/OBV→"))
+                parts.append(f"{tf} {trend}/{rsi}/{macd}{boll}{obv}")
             print(f"  {sym.split('-')[0]}: " + " | ".join(parts))
-        print("  （↑/↓MA=价在MA20上/下；候选山寨币历史相似度仍须单独 find_similar_history）")
+        print("  （↑/↓MA=价在MA20上/下；BOLL=收盘相对布林带(20,2)位置；"
+              "OBV↑/↓=对比近5根已收盘的量能方向(窗口内累计,仅方向/背离参考)；"
+              "扩展指标缺列=迁移未跑；候选山寨币历史相似度仍须单独 find_similar_history）")
     safe(s_tech)
 
     # ── 2.6 高流动性可交易候选（双流动性闸 + 多周期结构） ──
     section(
         f"高流动性可交易候选（成交额≥${MIN_QUOTE_VOL_USD/1e6:.0f}M "
-        f"且 OI≥${MIN_OI_USD/1e6:.0f}M）"
+        f"且 OI≥${MIN_OI_USD/1e6:.0f}M；成熟趋势+早期结构两组）"
     )
 
     def s_tradeable_candidates():
@@ -770,7 +1031,7 @@ def _render(root, top):
                 continue
             if r["symbol"] in held:
                 continue
-            parts, trend_vote, all_ready = [], 0, True
+            parts, votes, all_ready = [], {}, True
             for tf in DECISION_TIMEFRAMES:
                 k, ready = closed_kline_readiness(
                     mkt, r["symbol"], tf, tick_ts)
@@ -780,13 +1041,14 @@ def _render(root, top):
                     continue
                 above = k["ma20"] is not None and k["c"] > k["ma20"]
                 macd_up = k["macd_hist"] is not None and k["macd_hist"] > 0
-                trend_vote += (1 if above else -1) + (1 if macd_up else -1)
+                votes[tf] = (1 if above else -1) + (1 if macd_up else -1)
                 trend = "↑MA" if above else "↓MA"
                 rsi = f"R{k['rsi14']:.0f}" if k["rsi14"] is not None else "R?"
                 macd = "M+" if macd_up else "M-"
                 parts.append(f"{tf}{trend}/{rsi}/{macd}")
             if not all_ready:
                 continue
+            trend_vote = sum(votes.values())
             bias = "偏多" if trend_vote >= 2 else ("偏空" if trend_vote <= -2 else "混合")
             # 先看多周期一致性，再看实际波动；成交额/OI 仅用于同分时稳定排序。
             rank_key = (
@@ -799,6 +1061,7 @@ def _render(root, top):
                 "row": r,
                 "parts": parts,
                 "trend_vote": trend_vote,
+                "votes": votes,
                 "bias": bias,
                 "quote_vol": quote_vol,
                 "rank_key": rank_key,
@@ -818,24 +1081,214 @@ def _render(root, top):
                 seen.add(x["row"]["symbol"])
         picked.sort(key=lambda x: x["rank_key"], reverse=True)
 
-        if not picked:
+        # 早期结构组（2026-08-14）：成熟组排序天然只出「已走完」的晚期结构，
+        # 模型有正当理由「不追」→ 统计上就是 wait 74%。本组专门呈现 4H 满票
+        # 立向、15m 未同向（回调/整理未走完）的候选，给「还没走完」的结构一个
+        # 不被晚期结构挤掉的独立配额；仍只是证据，非下单指令。
+        early_pool = []
+        for x in ranked:
+            if x["row"]["symbol"] in seen:
+                continue
+            e_side = early_structure_side(x["votes"])
+            if e_side is None:
+                continue
+            agree_1h = (x["votes"].get("1H") or 0) * x["votes"]["4H"] > 0
+            x["early_side"] = e_side
+            x["early_key"] = (
+                1 if agree_1h else 0,
+                min(x["quote_vol"] / MIN_QUOTE_VOL_USD, 100),
+                min((x["row"]["oi_usd"] or 0) / MIN_OI_USD, 100),
+            )
+            early_pool.append(x)
+        early_pool.sort(key=lambda x: x["early_key"], reverse=True)
+        e_long = [x for x in early_pool if x["early_side"] == "long"]
+        e_short = [x for x in early_pool if x["early_side"] == "short"]
+        early = e_long[:EARLY_STRUCTURE_CANDIDATE_COUNT // 2]
+        early += e_short[:EARLY_STRUCTURE_CANDIDATE_COUNT // 2]
+        e_seen = {x["row"]["symbol"] for x in early}
+        for x in early_pool:
+            if len(early) >= EARLY_STRUCTURE_CANDIDATE_COUNT:
+                break
+            if x["row"]["symbol"] not in e_seen:
+                early.append(x)
+                e_seen.add(x["row"]["symbol"])
+        early.sort(key=lambda x: x["early_key"], reverse=True)
+
+        if not picked and not early:
             print("  无符合双流动性闸且技术数据完整的候选")
             return
-        for x in picked:
+
+        # 连续 wait 轮数：每 cycle 独立 session、无跨轮记忆——「已连等 N 轮」
+        # 必须由简报外显，新 session 才看得见自己在拖延。
+        streaks = {}
+        try:
+            ana = connect(root, "analysis.db")
+            try:
+                for x in picked + early:
+                    sym = x["row"]["symbol"]
+                    streak, w_side = consecutive_wait_streak(ana, sym)
+                    if streak >= WAIT_STREAK_MIN_DISPLAY:
+                        streaks[sym] = (streak, w_side)
+            finally:
+                ana.close()
+        except Exception:
+            streaks = {}
+
+        candidate_symbols = {
+            str(x["row"]["symbol"]) for x in picked + early
+        }
+        micro_map = {}
+        micro_ts = None
+        try:
+            micro_ts = mkt.execute(
+                "SELECT MAX(ts) AS m FROM market_microstructure"
+            ).fetchone()["m"]
+            if micro_ts:
+                micro_rows = mkt.execute(
+                    "SELECT m.symbol,m.spread_bps,m.imbalance_25bp,"
+                    "m.buy_slippage_500usd_bps,m.sell_slippage_500usd_bps,"
+                    "f.taker_buy_ratio,f.cvd_notional_usd,"
+                    "f.sample_count,f.sample_span_ms "
+                    "FROM market_microstructure m "
+                    "LEFT JOIN market_trade_flow f "
+                    "ON f.ts=m.ts AND f.symbol=m.symbol WHERE m.ts=?",
+                    (micro_ts,),
+                ).fetchall()
+                micro_age = age_min(micro_ts)
+                if (
+                    micro_age is not None
+                    and -1.0 <= micro_age <= CANDIDATE_MICRO_MAXIMUM_AGE_MINUTES
+                ):
+                    micro_map = {
+                        str(row["symbol"]): row for row in micro_rows
+                        if str(row["symbol"]) in candidate_symbols
+                    }
+        except (sqlite3.Error, TypeError, ValueError):
+            micro_map = {}
+            micro_ts = None
+
+        positioning_map = {}
+        positioning_collected_ts = None
+        positioning_batch_ok = False
+        try:
+            latest_positioning = mkt.execute(
+                "SELECT collected_ts FROM market_positioning "
+                "WHERE source=? AND timeframe='1H' "
+                "ORDER BY datetime(collected_ts) DESC LIMIT 1",
+                (POSITIONING_SOURCE,),
+            ).fetchone()
+            if latest_positioning:
+                positioning_collected_ts = latest_positioning["collected_ts"]
+                positioning_rows = mkt.execute(
+                    "SELECT symbol,ts,long_ratio,short_ratio,long_short_ratio "
+                    "FROM market_positioning WHERE collected_ts=? "
+                    "AND source=? AND timeframe='1H' ORDER BY symbol",
+                    (positioning_collected_ts, POSITIONING_SOURCE),
+                ).fetchall()
+                expected_symbols = {
+                    str(row["symbol"])
+                    for row in mkt.execute(
+                        "SELECT DISTINCT symbol FROM tick_snapshots "
+                        "WHERE ts=? AND symbol LIKE '%-USDT-SWAP'",
+                        (tick_ts,),
+                    ).fetchall()
+                }
+                positioning_batch_ok = positioning_evidence_quality(
+                    positioning_rows, expected_symbols)["status"] == "PASSED"
+                if positioning_batch_ok:
+                    positioning_map = {
+                        str(row["symbol"]): row for row in positioning_rows
+                        if str(row["symbol"]) in candidate_symbols
+                    }
+        except (sqlite3.Error, TypeError, ValueError):
+            positioning_map = {}
+            positioning_collected_ts = None
+            positioning_batch_ok = False
+
+        soft_evidence = {
+            symbol: candidate_soft_evidence(
+                micro_map.get(symbol), positioning_map.get(symbol),
+                positioning_batch_passed=positioning_batch_ok,
+            )
+            for symbol in candidate_symbols
+        }
+
+        def cand_line(x, bias_label):
             r = x["row"]
             funding = (
                 f"{r['funding_rate']*100:+.4f}%"
                 if r["funding_rate"] is not None else "N/A"
             )
-            print(
-                f"  {r['symbol'].split('-')[0]} {x['bias']} "
+            st = streaks.get(r["symbol"])
+            streak_s = f" 连wait{st[0]}轮({st[1] or '?'})" if st else ""
+            soft = soft_evidence.get(
+                str(r["symbol"]), candidate_soft_evidence())
+            return (
+                f"  {r['symbol'].split('-')[0]} {bias_label} "
                 f"chg{r['chg24h']:+.1f}% vol${x['quote_vol']/1e6:.0f}M "
-                f"OI${r['oi_usd']/1e6:.0f}M funding={funding} | "
+                f"OI${r['oi_usd']/1e6:.0f}M funding={funding}{streak_s} | "
                 + " ".join(x["parts"])
+                + f" | {soft['text']}"
             )
+
+        print("  「成熟趋势」三周期已对齐（结构成熟度最高，是否追高自辨）:")
+        if picked:
+            for x in picked:
+                print(cand_line(x, x["bias"]))
+        else:
+            print("    无")
+        print("  「早期结构」4H 立向、15m 未同向（回调/整理未走完）:")
+        if early:
+            for x in early:
+                print(cand_line(
+                    x, "早多" if x["early_side"] == "long" else "早空"))
+        else:
+            print("    无（本轮无 4H 立向且短周期回调中的候选）")
+
+        micro_covered = sum(
+            bool(item["micro_available"]) for item in soft_evidence.values())
+        positioning_covered = sum(
+            bool(item["positioning_available"])
+            for item in soft_evidence.values()
+        )
         print(
-            "  （仅为可交易性+结构候选，不是下单指令；统一 live 仍须结合新闻、"
-            "历史相似度、风险回报和组合暴露自主决断）"
+            "  候选软证据覆盖: "
+            f"micro={micro_covered}/{len(candidate_symbols)}"
+            f"@{fmt_age(micro_ts) if micro_ts else 'N/A'}前，"
+            f"官方账户L/S={positioning_covered}/{len(candidate_symbols)}"
+            f"@{fmt_age(positioning_collected_ts) if positioning_collected_ts else 'N/A'}前；"
+            "缺失只记N/A，不作为否决或反向证据"
+        )
+
+        try:
+            les = connect(root, "lessons.db")
+            try:
+                mo = les.execute(
+                    "SELECT direction_hint AS d, COUNT(*) AS n, "
+                    "SUM(would_hit_1r_fixed2pct) AS hit "
+                    "FROM missed_opportunities WHERE ts LIKE '202%' "
+                    "AND ts>=datetime('now','-7 days') GROUP BY direction_hint"
+                ).fetchall()
+            finally:
+                les.close()
+            mo_parts = []
+            for r in mo:
+                if r["d"] not in ("long", "short") or not r["n"]:
+                    continue
+                mo_parts.append(
+                    f"{r['d']} {int(r['hit'] or 0)}/{r['n']}"
+                    f"={(r['hit'] or 0) / r['n'] * 100:.0f}%"
+                )
+            if mo_parts:
+                print("  错失池7d触及+2%率(fixed2pct路径盲代理，不校验先触SL): "
+                      + " | ".join(mo_parts)
+                      + "（提示方向机会不对称，非下单指令）")
+        except Exception:
+            pass
+        print(
+            "  （两组仅候选来源不同，均非下单指令；连wait轮数=该标的最近连续"
+            " wait 的分析轮数，自查是否在无新证据下重复拖延。统一 live 仍须"
+            "结合新闻、历史相似度、风险回报和组合暴露自主决断）"
         )
     safe(s_tradeable_candidates)
 
@@ -905,20 +1358,44 @@ def _render(root, top):
     def s_positioning():
         latest = mkt.execute(
             "SELECT collected_ts FROM market_positioning "
-            "ORDER BY datetime(collected_ts) DESC LIMIT 1"
+            "WHERE source=? AND timeframe='1H' "
+            "ORDER BY datetime(collected_ts) DESC LIMIT 1",
+            (POSITIONING_SOURCE,),
         ).fetchone()
         if not latest:
             print("  暂无数据")
             return
         rows = mkt.execute(
             "SELECT symbol,ts,long_ratio,short_ratio,long_short_ratio "
-            "FROM market_positioning WHERE collected_ts=? "
+            "FROM market_positioning WHERE collected_ts=? AND source=? "
+            "AND timeframe='1H' "
             "ORDER BY CASE symbol WHEN 'BTC-USDT-SWAP' THEN 0 "
-            "WHEN 'ETH-USDT-SWAP' THEN 1 WHEN 'SOL-USDT-SWAP' THEN 2 ELSE 3 END "
-            "LIMIT 8",
-            (latest["collected_ts"],),
+            "WHEN 'ETH-USDT-SWAP' THEN 1 WHEN 'SOL-USDT-SWAP' THEN 2 ELSE 3 END, "
+            "symbol",
+            (latest["collected_ts"], POSITIONING_SOURCE),
         ).fetchall()
-        for r in rows:
+        tick_ts = mkt.execute(
+            "SELECT MAX(ts) AS m FROM tick_snapshots"
+        ).fetchone()["m"]
+        expected = {
+            str(row["symbol"])
+            for row in mkt.execute(
+                "SELECT DISTINCT symbol FROM tick_snapshots "
+                "WHERE ts=? AND symbol LIKE '%-USDT-SWAP'",
+                (tick_ts,),
+            ).fetchall()
+        } if tick_ts else set()
+        quality = positioning_evidence_quality(rows, expected)
+        if quality["status"] != "PASSED":
+            age = quality["maximum_source_age_minutes"]
+            age_text = f"{age:.1f}m" if age is not None else "N/A"
+            print(
+                "  本轮不可用：真实源时效或全宇宙完整性未过闸 "
+                f"({quality['valid_symbols']}/{quality['expected_symbols']}, "
+                f"最老源年龄={age_text})；不作为方向证据"
+            )
+            return
+        for r in rows[:8]:
             print(
                 f"  {r['symbol'].split('-')[0]} long={r['long_ratio']:.0%} "
                 f"short={r['short_ratio']:.0%} L/S={r['long_short_ratio']:.2f} "
@@ -1342,10 +1819,49 @@ def _render(root, top):
                   f"| {str(r['notes'] or '')[:60]}")
         if not missed:
             print("    无")
+        try:
+            eq_block = exit_quality.compute(
+                account_db=Path(root) / "account.db",
+                live_trades_db=Path(root) / "live_trades.db",
+                report_start_ts=(
+                    datetime.now(exit_quality.CST) - timedelta(days=7)
+                ).strftime("%Y-%m-%d %H:%M:%S"),
+                report_end_ts=datetime.now(exit_quality.CST).strftime(
+                    "%Y-%m-%d %H:%M:%S"),
+            )
+            gb = eq_block["peak_giveback"]
+            mr = eq_block["margin_return_review"]
+            rate = mr["explicit_review_rate"]
+            print(
+                "  退出质量7d（后验窗已成熟部分；仅参考，不设自动闸）: "
+                f"曾达1R {gb['reached_1r']} 笔 / 平仓仍≥1R "
+                f"{gb['closed_at_or_above_1r']} 笔，错失止盈池 "
+                f"{gb['missed_take_profit_pool_size']} 笔；峰值≥"
+                f"{gb['profitable_peak_threshold_r']}R 的中位回吐 "
+                f"{gb['profitable_peak_giveback_median_r']}R；"
+                f"保证金收益率≥{mr['threshold_fraction']:.0%} 被标记 "
+                f"{mr['flagged_position_cycles']} 次、显式复核率 "
+                + ("无样本" if rate is None else f"{rate:.0%}")
+                + f"，处置 {mr['disposition_counts'] or '无'}"
+            )
+            for item in gb["missed_take_profit_pool"][:3]:
+                print(
+                    f"    · {item['symbol']} {item['side']} 峰值 "
+                    f"{item['peak_r']}R → 平仓 {item['realized_r_net']}R"
+                    f"（出口 {item['exit_category']}）"
+                )
+            print(
+                "    ➤ 这是既往退出的后验统计，不是止盈指令：是否止盈、"
+                "减仓还是继续持有仍由当前证据逐仓自主裁决。"
+            )
+        except Exception:
+            pass
+
         print(
             "  ➤ 本段只是全局预览，严禁据此声称某标的直接 N胜/N负。"
             "每个拟执行标的必须以完整 instId + side + regime + action=open + "
             "profile=live + 固定 cycle --as-of 调 find_similar_experience.py；"
+            "直接传本卡 --entry/--stop/--target，禁止自行换算百分比或 RR；"
             "把 evidence_contract 原样写入决策卡。数字只认 exact_setup/"
             "same_symbol_similar/cross_symbol_similar 具名 summary；matched_* 与 "
             "cross_symbol_* 是截断样例，禁止数数组或混栏。另自主注明 "
@@ -1496,7 +2012,7 @@ def _render(root, top):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=r".\db")
     ap.add_argument("--top", type=int, default=5)
     # 2026-07-15：exec(cp936 pwsh) 对 stdout 接管道会把中文 GBK 坏码——agent 需复读/截断时
     # 用 --out-file 落 UTF-8 文件后 read（文件通道绕开 shell 解码）。stdout 行为不变（纯加法）。

@@ -4,7 +4,7 @@
 | 库            | 唯一 writer   | 读者          | 本脚本动作                         |
 |:--------------|:--------------|:--------------|:-----------------------------------|
 | regime.db     | 慢采脚本      | 分析员        | 建 cross_market（schema 同现 market.db）|
-| analysis.db   | 分析员        | live trader   | 建 analysis_runs + analysis_signals |
+| analysis.db   | 分析员        | 实盘 trader   | 建 analysis_runs + analysis_signals |
 | live_trades.db| 实盘 trader   | 复盘          | 建 trades + trade_cycles            |
 | ledger.db     | 各采集器      | 全体          | 委托 ledger.init_ledger             |
 
@@ -14,7 +14,7 @@
 确认的生产步（见 docs/团队架构 切换清单），不在本脚本内做，避免误碰生产。
 
 用法：
-    python init_v20_dbs.py --root ./db          # 生产（建空库，不动现有库）
+    python init_v20_dbs.py --root .\\db          # 生产（建空库，不动现有库）
     python init_v20_dbs.py --root <tmp> --verify       # tmp 验证 schema + journal_mode
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r".\collectors")
 import ledger  # noqa: E402  复用 connect()/init_ledger()（WAL 单一来源）
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS analysis_signals (
     symbol       TEXT NOT NULL,
     dim1 INTEGER, dim2 INTEGER, dim3 INTEGER, dim4 INTEGER, dim5 INTEGER,
     total        INTEGER,
-    action       TEXT,               -- open_long|open_short|hold|close|wait
+    action       TEXT,               -- open_long|open_short|hold|close|reduce|adjust_protection|wait
     side         TEXT,               -- long|short|null
     confidence   REAL,
     entry_hint   REAL,
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS analysis_signals (
 CREATE INDEX IF NOT EXISTS idx_analysis_signals_cycle ON analysis_signals(cycle_id);
 """
 
-# live_trades.db：live trader 是交易表的唯一 writer。
+# live_trades.db：实盘 trader 是唯一 writer。
 DDL_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +188,7 @@ def journal_mode(path: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 数据库初始化（只建表不搬数据）")
-    ap.add_argument("--root", default=r"./db")
+    ap.add_argument("--root", default=r".\db")
     ap.add_argument("--verify", action="store_true", help="建完打印 schema + journal_mode")
     args = ap.parse_args()
     root = Path(args.root)

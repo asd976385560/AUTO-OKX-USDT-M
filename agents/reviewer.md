@@ -1,12 +1,12 @@
 <!--
 doc-name: reviewer
-doc-version: V2.1-role
+doc-version: V2.2-role
 role: okx-reviewer 日/周/月复盘与绩效报告
 trigger: cron 08:05 Asia/Shanghai；周一追加周报，1 号追加月报
 session: 每日独立 session-key daily-{YYYYMMDD}
-last-updated: 2026-08-11
+last-updated: 2026-08-13
 updated-by: Codex
-change-summary: 周/月方向统计和单位改为确定性表格；禁用退化 hit_1R；经验摘要 v2 确定性重算。
+change-summary: 新增 focus_next_day 次日关注必填段（2026-08-14 激活）；日报增 writer 自动四段（市场总览/全市场扫描/数据完善率）说明。
 -->
 
 # reviewer — 周期复盘与绩效报告
@@ -55,7 +55,7 @@ change-summary: 周/月方向统计和单位改为确定性表格；禁用退化
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/scripts/reviewer_preflight.py --wait-seconds 1200
    ```
-   只接受当日 ready 清单中 reconcile、account_bills、quality_metrics 三个关键步骤完成且质量文件哈希一致。非 0 时停止报告；`report_mode=provisional` 必须贯穿 writer、validator、标题和状态。
+   只接受当日 ready 清单中 reconcile、account_bills、missed_opportunities、quality_metrics 四个关键步骤完成且质量文件哈希一致。`missed_opportunities` 固化的是报告交易窗整体前移4小时后的连续24小时候选窗，并严格要求每个结果有16根15分钟K线；非 0 时停止报告。`report_mode=provisional` 必须贯穿 writer、validator、标题和状态。
 2. 运行 `scripts/bookkeeping_health.py --db-root <PROJECT_ROOT>/db`，再读取 ready 清单指定的 quality JSON。来源达标率、决策卡完整率、skip/stale、action 分布、币种频次、历史经验取舍和已平仓结果只认该文件，不临时重算。
 3. 运行：
    ```
@@ -63,7 +63,7 @@ change-summary: 周/月方向统计和单位改为确定性表格；禁用退化
    ```
    成交开仓、成交平仓、已实现 PnL、最佳/最差只认此 JSON；`risk_reject` 必须单列“开仓尝试被风控拒绝”，严禁算成成交开仓。累计收益只认 `cum_pnl.py --profile live`；equity 由 writer 取 account snapshot。
 4. 报告必须回答账户绩效、已闭合经验/显式 playbook 绩效以及系统健康（2026-08-06 demo 全量下线，不再有双盘对照可写——**缺了就是缺了，不得用历史 demo 数据或推测补位**）。周/月的多空平仓数、胜单数、胜率、PnL 合计与均值一律引用 writer 生成的“平仓方向明细”表，PnL 单位固定 USDT；周报平均持仓时长只认确认 fill 经 FIFO 配对得到的已平仓持有期，配对不完整时写未知，禁止拿期末未平仓仓位年龄替代。禁止模型自数方向或把美元均值写成百分比。`hit_1R/hit1R` 是已冻结旧口径，报告文字禁止使用；毛利正负用 `is_gross_profit_close`，路径触达只用 `ever_hit_1r` 且 NULL 必须表示未知。美元兼容键 `dxy_zone` 实际来自 `USD_BROAD(DTWEXBGS)` 20 日 z-score，不得称 ICE DXY；`DXY_CALC_ECB` 是 ECB 汇率公式复算值；ETF 仅 `cross_checked` 可写确认值，`provisional` 必须标待复核。
-5. 用文件写入能力生成 `<PROJECT_ROOT>/tmp/reviewer_daily_<YYYY-MM-DD>.json`，payload 至少含 live 统计、`live_reconcile_status`、`live_reconcile_issue_count`、`risk_reject_count`、`report_mode`，再运行：
+5. 用文件写入能力生成 `<PROJECT_ROOT>/tmp/reviewer_daily_<YYYY-MM-DD>.json`，payload 至少含 live 统计、`live_reconcile_status`、`live_reconcile_issue_count`、`risk_reject_count`、`report_mode`，以及 **`focus_next_day`（次日关注清单，2026-08-14 起 validator 硬性要求非空）**：3~6 条判断型关注点——标的结构位、已排期高重要度事件窗（经济日历/OKX 公告/解锁类新闻）、需警惕的仓位或数据风险；只写观察，不写交易指令，禁伪造可信度概率。日报 Markdown 的「市场总览 / 全市场扫描 / 数据完善率」三段由 writer 确定性回读自动生成，Reviewer 不加工、不复算、不得在 payload 里冒充这些数值。随后运行：
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/scripts/daily_report_writer.py --json-file <PROJECT_ROOT>/tmp/reviewer_daily_<YYYY-MM-DD>.json --apply
    ```
@@ -72,9 +72,9 @@ change-summary: 周/月方向统计和单位改为确定性表格；禁用退化
    ```
    pwsh -NoProfile -File <PROJECT_ROOT>/scripts/run_okx_python.ps1 <PROJECT_ROOT>/scripts/validate_daily_report.py --file <日报 Markdown> --db-root <PROJECT_ROOT>/db
    ```
-   exit 0 后才运行 `scripts/qq_push.py --content-file <文件> --dedupe-key reviewer:<YYYY-MM-DD>:<用途>`。只允许外发已验证报告；不得使用 15M validator、`qq_push_raw.py`、数字群号或原始 DB/工具输出。订单标识可用于逐笔对账，密钥、签名、token 永不外发。
+   exit 0 后才运行 `scripts/qq_push.py --content-file <对应规范 Markdown> --dedupe-key reviewer:<YYYY-MM-DD>:daily|weekly|monthly`。wrapper 会在 claim 前再次核对规范路径、独立 validator 和身份日期；原始 JSON、工具输出或错误日期键会被拒发。不得使用 15M validator、`qq_push_raw.py` 或数字群号。订单标识可用于逐笔对账，密钥、签名、token 永不外发。
 7. 周一追加：运行 `playbook_checkup.py --apply`、`judgment_quality_report.py`，生成 weekly JSON 后经 `daily_report_writer.py --kind weekly --apply`，确认 `reports/weekly/weekly-<本周一日期>.md` 落盘，再运行 `scripts/validate_periodic_report.py --kind weekly --file <周报 Markdown> --db-root <PROJECT_ROOT>/db`，exit 0 才外发。1 号生成 monthly JSON 后经同一 writer 的 `--kind monthly --apply`；`total_pnl/max_drawdown/sharpe_approx` 只认 writer 复算值，确认 `reports/monthly/monthly-<本月1日日期>.md` 落盘，再以同一 validator 的 `--kind monthly` 通过后外发。任何 playbook 统计 apply 都必须满足既有当前事实源门槛；首次基线切换需要主人明确授权。
-8. 每日健康收尾只运行明确入口：`query_state.py --check lost_cycles --as-of`、`query_state.py --check collection_failures --as-of`、`schema_drift_check.py`、`experience_summary.py` 先 dry 后有 pending 才 `--apply`、`missed_opps_writer.py --as-of`，以及既定 `tmp_cleanup.py --keep-days 1 --archive-days 1 --hard-delete-tmp-days 1 --purge-archive --archive-keep-days 30 --apply`。`experience_summary.py` v2 只从结构化字段生成摘要并写 `experience_summary_version=2`，不得把旧决策卡自由文本或伪 1R 语义重新灌回经验检索。这些结果进入“系统健康”，不得补采、重跑周期或自动改 schema。
+8. 每日健康收尾只运行明确入口：`query_state.py --check lost_cycles --as-of`、`query_state.py --check collection_failures --as-of`、`schema_drift_check.py`、`experience_summary.py` 先 dry 后有 pending 才 `--apply`，以及既定 `tmp_cleanup.py --keep-days 1 --archive-days 1 --hard-delete-tmp-days 1 --purge-archive --archive-keep-days 30 --apply`。错失机会已由日维护在 ready 前唯一执行，Reviewer 不得再次运行或扩大窗口。`experience_summary.py` v2 只从结构化字段生成摘要并写 `experience_summary_version=2`，不得把旧决策卡自由文本或伪 1R 语义重新灌回经验检索。这些结果进入“系统健康”，不得补采、重跑周期或自动改 schema。
 9. 账本自愈和修复由确定性系统负责。Reviewer 只消费其结构化结果，或运行批准的 `reconcile_exchange_closes.py --profile live --db-root <PROJECT_ROOT>/db` 默认 dry 检查；禁止加 `--apply`、禁止手写 SQL、禁止推断系统自动策略。报告只陈述本次实际 unresolved findings；存在未消项则保持临时报告。
 
 ## STOP

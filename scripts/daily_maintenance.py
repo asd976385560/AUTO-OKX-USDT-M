@@ -67,6 +67,7 @@ REVIEWER_READY_DIR = Path(os.environ.get(
 REVIEWER_CRITICAL_STEPS = (
     "reconcile",
     "account_bills",
+    "missed_opportunities",
     "quality_metrics",
 )
 CST = timezone(timedelta(hours=8))
@@ -76,7 +77,12 @@ STEPS = [
     # 已推」（脚本工作正常，差异经 QQ P1 走人工通道），只有 rc≥2 才算本步失败。
     ("reconcile", [str(SCRIPTS / "reconcile_daily.py")], 1200, (0, 1)),
     ("account_bills", [str(SCRIPTS / "collect_account_bills.py")], 120, (0,)),
-    # 质量指标是 reviewer handoff 的第三个关键步骤。成功落完整 JSON 后立即
+    # 日报前固化已完整成熟的 4 小时错失机会窗；使用公开根下的
+    # 相对 db-root，不引用宿主或生产绝对路径。
+    ("missed_opportunities", [
+        str(SCRIPTS / "missed_opps_writer.py"),
+    ], 180, (0,)),
+    # 质量指标是 reviewer handoff 的第四个关键步骤。成功落完整 JSON 后立即
     # 发布 ready manifest；后续非关键维护继续跑，不阻塞 08:05 reviewer。
     ("quality_metrics", [str(SCRIPTS / "quality_metrics.py")], 120, (0,)),
     ("universe_judgment_evaluation", [
@@ -121,6 +127,17 @@ STEPS = [
         "--json-out", str(
             QUALITY_REPORT_DIR / "daily-report-completeness.json"),
     ], 60, (0,)),
+    ("periodic_report_completeness", [
+        str(SCRIPTS / "audit_periodic_report_completeness.py"),
+        "--weekly-start", "2026-08-03",
+        "--monthly-start", "2026-08-01",
+        "--forward-weekly-start", "2026-08-17",
+        "--forward-monthly-start", "2026-09-01",
+        "--forward-weekly-minimum", "12",
+        "--forward-monthly-minimum", "6",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "periodic-report-completeness-audit.json"),
+    ], 60, (0,)),
     ("push_completeness", [
         str(SCRIPTS / "audit_push_completeness.py"),
         "--days", "14",
@@ -155,6 +172,11 @@ STEPS = [
         str(SCRIPTS / "audit_positioning_coverage.py"),
         "--market-db", r"./db/market.db",
         "--minimum-rate", "0.99",
+        "--maximum-source-age-minutes", "90",
+        "--forward-start", "2026-08-13T03:00:00+08:00",
+        "--forward-minimum-slots", "24",
+        "--availability-forward-start", "2026-08-13T03:00:00+08:00",
+        "--availability-minimum-slots", "96",
         "--json-out", str(
             QUALITY_REPORT_DIR / "positioning-coverage-audit.json"),
     ], 60, (0,)),
@@ -173,6 +195,25 @@ STEPS = [
         "--forward-minimum-slots", "96",
         "--json-out", str(
             QUALITY_REPORT_DIR / "contract-statistics-coverage-audit.json"),
+    ], 180, (0,)),
+    ("market_field_coverage", [
+        str(SCRIPTS / "audit_market_field_coverage.py"),
+        "--market-db", r"./db/market.db",
+        "--forward-start", "2026-08-12T22:45:00+08:00",
+        "--target-rate", "0.99",
+        "--minimum-slots", "96",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "market-field-coverage-audit.json"),
+    ], 180, (0,)),
+    ("market_feature_coverage", [
+        str(SCRIPTS / "audit_market_feature_coverage.py"),
+        "--market-db", r"./db/market.db",
+        "--forward-start", "2026-08-12T23:15:00+08:00",
+        "--target-rate", "0.99",
+        "--minimum-slots", "96",
+        "--expected-symbols-per-slot", "100",
+        "--json-out", str(
+            QUALITY_REPORT_DIR / "market-feature-coverage-audit.json"),
     ], 180, (0,)),
     ("multitimeframe_coverage", [
         str(SCRIPTS / "audit_multitimeframe_coverage.py"),

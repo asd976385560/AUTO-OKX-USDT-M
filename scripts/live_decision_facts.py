@@ -273,6 +273,7 @@ def _position_facts(row: dict, instrument: dict | None, algos: list[dict],
     lever = _number(row.get("lever"), positive=True)
     imr = _number(row.get("imr"), nonnegative=True)
     upl = _number(row.get("upl"))
+    exchange_upl_ratio = _number(row.get("uplRatio"))
     ctime = _number(row.get("cTime"), positive=True)
     errors: list[str] = []
     for field, value in (
@@ -294,6 +295,35 @@ def _position_facts(row: dict, instrument: dict | None, algos: list[dict],
             errors.append(f"position[{symbol}].cTime_in_future")
             age_hours = None
     base_qty = contracts * ct_val if ct_val is not None else None
+    entry_notional = (
+        avg_px * base_qty
+        if avg_px is not None and base_qty is not None else None
+    )
+    mark_notional = (
+        mark_px * base_qty
+        if mark_px is not None and base_qty is not None else None
+    )
+    initial_margin_estimate = (
+        entry_notional / lever
+        if entry_notional is not None and lever is not None else None
+    )
+    upl_ratio = exchange_upl_ratio
+    upl_ratio_source = (
+        "exchange.positions.uplRatio" if upl_ratio is not None else None
+    )
+    if (
+        upl_ratio is None and upl is not None
+        and initial_margin_estimate is not None
+        and initial_margin_estimate > 0
+    ):
+        upl_ratio = upl / initial_margin_estimate
+        upl_ratio_source = "derived.upl/entry_notional_div_leverage"
+    price_return = None
+    if avg_px is not None and mark_px is not None and side is not None:
+        price_return = (
+            (mark_px - avg_px) / avg_px
+            if side == "long" else (avg_px - mark_px) / avg_px
+        )
     sl = _select_live_sl(row, algos)
     if not sl["verified"]:
         errors.append(f"position[{symbol}].full_size_live_reduce_only_sl_missing")
@@ -309,6 +339,22 @@ def _position_facts(row: dict, instrument: dict | None, algos: list[dict],
         else:
             pnl_at_stop = (avg_px - trigger) * base_qty
             additional_to_stop = (mark_px - trigger) * base_qty
+    additional_loss_to_stop = (
+        max(0.0, -additional_to_stop)
+        if additional_to_stop is not None else None
+    )
+    secured_profit_at_stop = (
+        max(0.0, pnl_at_stop) if pnl_at_stop is not None else None
+    )
+    profit_retention_at_stop_pct = None
+    giveback_to_stop_pct = None
+    if upl is not None and upl > 0:
+        if secured_profit_at_stop is not None:
+            profit_retention_at_stop_pct = (
+                secured_profit_at_stop / upl * 100.0
+            )
+        if additional_loss_to_stop is not None:
+            giveback_to_stop_pct = additional_loss_to_stop / upl * 100.0
     return {
         "instId": symbol,
         "posSide": side,
@@ -328,15 +374,20 @@ def _position_facts(row: dict, instrument: dict | None, algos: list[dict],
         ),
         "position_age_hours": _rounded(age_hours, 4),
         "upl": _rounded(upl),
+        "upl_ratio_initial_margin": _rounded(upl_ratio, 10),
+        "upl_pct_initial_margin": _rounded(
+            upl_ratio * 100.0 if upl_ratio is not None else None, 4),
+        "upl_ratio_source": upl_ratio_source,
+        "signed_price_return_pct_from_entry": _rounded(
+            price_return * 100.0 if price_return is not None else None, 4),
+        # 50% 只触发显式复核，不是自动平仓阈值；最终动作仍由 Agent
+        # 结合逐仓 15m/1H/4H、原始计划、保护与组合机会自主裁决。
+        "margin_return_review_at_or_above_50pct": bool(
+            upl_ratio is not None and upl_ratio >= 0.5),
         "position_imr": _rounded(imr),
-        "entry_notional_usdt": _rounded(
-            avg_px * base_qty if avg_px is not None and base_qty is not None
-            else None
-        ),
-        "mark_notional_usdt": _rounded(
-            mark_px * base_qty if mark_px is not None and base_qty is not None
-            else None
-        ),
+        "initial_margin_estimate_usdt": _rounded(initial_margin_estimate),
+        "entry_notional_usdt": _rounded(entry_notional),
+        "mark_notional_usdt": _rounded(mark_notional),
         "sl": sl,
         "pnl_at_stop_from_entry_usdt": _rounded(pnl_at_stop),
         "loss_at_stop_from_entry_usdt": _rounded(
@@ -344,9 +395,12 @@ def _position_facts(row: dict, instrument: dict | None, algos: list[dict],
         ),
         "additional_pnl_to_stop_from_mark_usdt": _rounded(additional_to_stop),
         "additional_loss_to_stop_from_mark_usdt": _rounded(
-            max(0.0, -additional_to_stop)
-            if additional_to_stop is not None else None
-        ),
+            additional_loss_to_stop),
+        "secured_profit_at_stop_usdt": _rounded(secured_profit_at_stop),
+        "profit_retention_at_stop_pct_of_current_upl": _rounded(
+            profit_retention_at_stop_pct, 4),
+        "giveback_to_stop_pct_of_current_upl": _rounded(
+            giveback_to_stop_pct, 4),
     }, errors
 
 
@@ -394,12 +448,15 @@ def derive_facts(
                    and balance.get("new_open_current_ratio_gate") is True)
     if not errors:
         allowed_executor_actions = (
-            ["open", "add", "close", "reduce"] if open_add_ok
-            else ["close", "reduce"])
+            ["open", "add", "close", "reduce", "adjust_protection"]
+            if open_add_ok and open_rows
+            else ["open", "add"] if open_add_ok
+            else ["close", "reduce", "adjust_protection"] if open_rows
+            else [])
     elif position_truth_verified and open_rows:
         # 余额、ctVal 或保护单缺失时绝不新增风险，但已确认现仓仍必须保留
         # 去风险出口；不能因“开仓事实不全”反向阻断 CLOSE/REDUCE。
-        allowed_executor_actions = ["close", "reduce"]
+        allowed_executor_actions = ["close", "reduce", "adjust_protection"]
     else:
         allowed_executor_actions = []
     payload = {
@@ -414,6 +471,18 @@ def derive_facts(
         "status": "ok" if not errors else "blocking",
         "balance": balance,
         "positions": positions,
+        "position_profit_review_policy": {
+            "margin_return_attention_threshold_fraction": 0.5,
+            "attention_flag_is_non_binding": True,
+            "automatic_close_authorized": False,
+            "agent_outcomes": [
+                "hold", "close", "reduce", "adjust_protection",
+            ],
+            "decision_basis": (
+                "current_exchange_facts_plus_position_15m_1H_4H_"
+                "plus_original_exit_plan_and_portfolio_opportunity_cost"
+            ),
+        },
         "errors": errors,
         "action_policy": {
             "position_truth_verified": position_truth_verified,

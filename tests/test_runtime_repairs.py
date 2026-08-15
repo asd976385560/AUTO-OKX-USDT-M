@@ -27,6 +27,7 @@ import fast_collect  # noqa: E402
 import build_push_payload  # noqa: E402
 import collect_slow  # noqa: E402
 import collect_market_features  # noqa: E402
+import collect_positioning_current  # noqa: E402
 import daily_maintenance  # noqa: E402
 import news_collect  # noqa: E402
 import public_macro  # noqa: E402
@@ -37,10 +38,196 @@ import slow_collect  # noqa: E402
 import source_freshness  # noqa: E402
 import validate_push_format  # noqa: E402
 import _okx_http  # noqa: E402
+import _okx_market_feature_recovery  # noqa: E402
+import _okx_ticker_fallback  # noqa: E402
 from core import order_executor  # noqa: E402
 
 
 class SlowCollectRegressionTests(unittest.TestCase):
+
+    def test_okx_transport_fallback_uses_reserved_original_deadline(self):
+        client = mock.Mock()
+        request = _okx_http.httpx.Request(
+            "GET", "https://openapi.okx.com/api/v5/market/tickers"
+        )
+        client.get.side_effect = _okx_http.httpx.ConnectError(
+            "tls eof", request=request
+        )
+        fallback = mock.Mock(
+            return_value=[{"instId": "BTC-USDT-SWAP"}]
+        )
+        with (
+            mock.patch.object(
+                _okx_http, "_BASE_URLS", ("https://openapi.okx.com",)
+            ),
+            mock.patch.object(_okx_http.time, "sleep"),
+        ):
+            result = _okx_http._get_data(
+                client,
+                "/api/v5/market/tickers",
+                {"instType": "SWAP"},
+                retries=0,
+                deadline=time.monotonic() + 8.0,
+                transport_fallback=fallback,
+                transport_fallback_reserve_s=2.0,
+            )
+        self.assertEqual([{"instId": "BTC-USDT-SWAP"}], result)
+        fallback.assert_called_once()
+        self.assertEqual(
+            "https://openapi.okx.com/api/v5/market/tickers",
+            fallback.call_args.args[0],
+        )
+        self.assertEqual({"instType": "SWAP"}, fallback.call_args.args[1])
+        self.assertGreaterEqual(fallback.call_args.args[2], 1.9)
+        self.assertLessEqual(client.get.call_args.kwargs["timeout"], 6.1)
+
+    def test_okx_http_status_never_uses_transport_fallback(self):
+        client = mock.Mock()
+        request = _okx_http.httpx.Request(
+            "GET", "https://openapi.okx.com/api/v5/market/tickers"
+        )
+        response = mock.Mock()
+        response.raise_for_status.side_effect = _okx_http.httpx.HTTPStatusError(
+            "service unavailable",
+            request=request,
+            response=_okx_http.httpx.Response(503, request=request),
+        )
+        client.get.return_value = response
+        fallback = mock.Mock()
+        with mock.patch.object(
+            _okx_http, "_BASE_URLS", ("https://openapi.okx.com",)
+        ):
+            with self.assertRaises(RuntimeError):
+                _okx_http._get_data(
+                    client,
+                    "/api/v5/market/tickers",
+                    {"instType": "SWAP"},
+                    retries=0,
+                    deadline=time.monotonic() + 8.0,
+                    transport_fallback=fallback,
+                    transport_fallback_reserve_s=2.0,
+                )
+        fallback.assert_not_called()
+
+    def test_okx_aggregate_ticker_schannel_is_exact_and_audited(self):
+        stats = {}
+        body = (
+            '{"code":"0","data":['
+            '{"instId":"BTC-USDT-SWAP","last":"65000"}]}'
+        )
+        with (
+            mock.patch.object(
+                _okx_ticker_fallback.okx,
+                "_BASE_URLS",
+                ("https://openapi.okx.com",),
+            ),
+            mock.patch.object(
+                _okx_ticker_fallback._news_http,
+                "_fetch_text_schannel",
+                return_value=body,
+            ) as native,
+        ):
+            rows = _okx_ticker_fallback.fetch_tickers_all_schannel_sync(
+                "https://openapi.okx.com/api/v5/market/tickers",
+                {"instType": "SWAP"},
+                6.0,
+                transport=stats,
+            )
+        self.assertEqual("BTC-USDT-SWAP", rows[0]["instId"])
+        native.assert_called_once()
+        self.assertEqual(
+            "https://openapi.okx.com/api/v5/market/tickers?instType=SWAP",
+            native.call_args.args[0],
+        )
+        self.assertEqual(1, stats["schannel_fallback_requested"])
+        self.assertEqual(1, stats["schannel_fallback_successes"])
+
+    def test_okx_aggregate_ticker_schannel_rejects_other_url(self):
+        with self.assertRaisesRegex(ValueError, "non-official URL"):
+            _okx_ticker_fallback.fetch_tickers_all_schannel_sync(
+                "https://example.com/api/v5/market/tickers",
+                {"instType": "SWAP"},
+                6.0,
+            )
+
+    def test_okx_single_ticker_batch_probes_official_domain_then_batches(self):
+        row = {"instId": "BTC-USDT-SWAP", "last": "65000"}
+        primary_context = mock.MagicMock()
+        primary_client = mock.Mock()
+        primary_context.__enter__.return_value = primary_client
+        fallback_context = mock.MagicMock()
+        fallback_client = mock.Mock()
+        fallback_context.__enter__.return_value = fallback_client
+        transport = {}
+        domains = ("https://openapi.okx.com", "https://www.okx.com")
+        with (
+            mock.patch.object(_okx_ticker_fallback.okx, "_BASE_URLS", domains),
+            mock.patch.object(
+                _okx_ticker_fallback.okx,
+                "_client",
+                side_effect=[primary_context, fallback_context],
+            ) as client_factory,
+            mock.patch.object(
+                _okx_ticker_fallback,
+                "_request_ticker",
+                side_effect=[RuntimeError("primary down"), row],
+            ) as probe,
+            mock.patch.object(
+                _okx_ticker_fallback, "_batch_on_domain",
+                return_value={"BTC-USDT-SWAP": row},
+            ) as batch,
+        ):
+            result = _okx_ticker_fallback.fetch_tickers_batch_sync(
+                ["BTC-USDT-SWAP"],
+                batch_timeout_s=10,
+                transport=transport,
+            )
+        self.assertEqual({"BTC-USDT-SWAP": row}, result)
+        self.assertEqual(2, probe.call_count)
+        self.assertEqual(2, client_factory.call_count)
+        self.assertIs(primary_client, probe.call_args_list[0].args[0])
+        self.assertIs(fallback_client, probe.call_args_list[1].args[0])
+        self.assertEqual(
+            "https://www.okx.com", probe.call_args_list[1].args[1]
+        )
+        self.assertTrue(transport["fresh_client_per_probe"])
+        self.assertEqual("https://www.okx.com", transport["selected_base"])
+        self.assertEqual("https://www.okx.com", batch.call_args.kwargs["base"])
+        self.assertEqual(
+            ["BTC-USDT-SWAP"], list(batch.call_args.args[0])
+        )
+
+    def test_market_feature_transport_recovers_only_exact_missing_set(self):
+        symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+        book = {"bids": [["1", "1"]], "asks": [["2", "1"]]}
+        with (
+            mock.patch.object(
+                _okx_market_feature_recovery,
+                "_safe_batch",
+                side_effect=[
+                    {symbols[0]: book, symbols[1]: {}},
+                    {symbols[1]: book},
+                ],
+            ) as fetch,
+            mock.patch.object(_okx_market_feature_recovery.time, "sleep"),
+        ):
+            result = (
+                _okx_market_feature_recovery.fetch_orderbooks_batch_sync(
+                    symbols, 50
+                )
+            )
+        self.assertEqual(book, result[symbols[0]])
+        self.assertEqual(book, result[symbols[1]])
+        self.assertEqual(symbols, list(fetch.call_args_list[0].args[0]))
+        self.assertEqual([symbols[1]], list(fetch.call_args_list[1].args[0]))
+        self.assertEqual(2, fetch.call_args_list[0].kwargs["request_retries"])
+        self.assertEqual(0, fetch.call_args_list[1].kwargs["request_retries"])
+        stats = _okx_market_feature_recovery.transport_snapshot()["orderbooks"]
+        self.assertEqual(2, stats["attempts"])
+        self.assertEqual(1, stats["recovered_after_cold_retry"])
+        self.assertEqual(1.0, stats["final_coverage_rate"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_collect_slow_connections_support_named_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "regime.db"
@@ -255,11 +442,279 @@ class ProcGuardTests(unittest.TestCase):
 
 
 class FastCollectRegressionTests(unittest.TestCase):
+
+    def test_half_hour_positioning_is_isolated_before_market_features(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, list(sargs), timeout))
+            return {
+                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
+                "payload": {}, "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T14:30",
+                "--no-universe-shadow", "--no-model-shadow",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, fast_collect.main())
+
+        self.assertEqual(
+            [
+                "collect_data", "live_account_check", "contract_statistics",
+                "official_positioning", "market_features",
+            ],
+            [name for name, _script, _args, _timeout in calls],
+        )
+        positioning_script, positioning_args = next(
+            (script, args) for name, script, args, _timeout in calls
+            if name == "official_positioning"
+        )
+        self.assertEqual(
+            "collect_positioning_current.py", positioning_script.name)
+        self.assertNotIn("--positioning-only", positioning_args)
+        market_args = next(
+            args for name, _script, args, _timeout in calls
+            if name == "market_features"
+        )
+        self.assertIn("--positioning", market_args)
+        self.assertIn("off", market_args)
+        self.assertEqual(
+            [25, 75, 60, 75],
+            [timeout for _, _script, _args, timeout in calls[1:]],
+        )
+
+        self.assertTrue(fast_collect.official_positioning_due(
+            "2026-08-12T14:00"))
+        self.assertTrue(fast_collect.official_positioning_due(
+            "2026-08-12T14:30"))
+        self.assertFalse(fast_collect.official_positioning_due(
+            "2026-08-12T14:15"))
+        self.assertFalse(fast_collect.official_positioning_due(
+            "2026-08-12T14:45"))
+
+    def test_positioning_batch_requires_99pct_whole_universe_coverage(self):
+        self.assertTrue(collect_market_features.positioning_batch_passed(
+            selected_count=431, positioning_rows=427,
+        ))
+        self.assertFalse(collect_market_features.positioning_batch_passed(
+            selected_count=431, positioning_rows=426,
+        ))
+        self.assertFalse(collect_market_features.positioning_batch_passed(
+            selected_count=0, positioning_rows=0,
+        ))
+
+    def test_positioning_freshness_uses_upstream_ts_at_collection(self):
+        def row(source_ts, collected_ts, symbol="BTC-USDT-SWAP"):
+            return (
+                source_ts, collected_ts, "2026-08-12T02:00", symbol, "1H",
+                0.6, 0.4, 1.5, "{}",
+                "okx_rest_contract_long_short_ratio",
+            )
+
+        fresh = collect_market_features.positioning_source_freshness([
+            row("2026-08-11T17:00:00Z", "2026-08-11T18:01:00Z")
+        ])
+        stale = collect_market_features.positioning_source_freshness([
+            row("2026-08-11T16:00:00Z", "2026-08-11T18:01:00Z")
+        ])
+        future = collect_market_features.positioning_source_freshness([
+            row("2026-08-11T18:03:00Z", "2026-08-11T18:01:00Z")
+        ])
+        self.assertTrue(fresh["passed"])
+        self.assertAlmostEqual(fresh["maximum_source_age_minutes"], 61.0)
+        self.assertFalse(stale["passed"])
+        self.assertFalse(future["passed"])
+
+    def test_positioning_retries_only_initial_invalid_symbols_once(self):
+        cycle = "2026-08-13T09:30"
+        collected = "2026-08-13T01:31:41Z"
+        first = {
+            "AAA-USDT-SWAP": [["1786582800000", "1.5"]],
+            "BBB-USDT-SWAP": [],
+            "CCC-USDT-SWAP": [["bad-time", "1.2"]],
+        }
+        retry_one = {
+            "BBB-USDT-SWAP": [["1786582800000", "0.8"]],
+            "CCC-USDT-SWAP": [],
+        }
+        retry_two = {
+            "CCC-USDT-SWAP": [["1786582800000", "1.2"]],
+        }
+        with (
+            mock.patch.object(
+                collect_positioning_current._okx_http,
+                "_batch",
+                side_effect=[first, retry_one, retry_two],
+            ) as batch_fetch,
+            mock.patch.object(
+                collect_positioning_current, "utc_now_iso",
+                return_value=collected,
+            ),
+        ):
+            rows, errors, stats = (
+                collect_positioning_current.fetch_positioning_rows_bounded(
+                    list(first), cycle))
+
+        self.assertEqual([row[3] for row in rows], [
+            "AAA-USDT-SWAP", "BBB-USDT-SWAP", "CCC-USDT-SWAP",
+        ])
+        self.assertEqual(errors, [])
+        self.assertEqual(batch_fetch.call_count, 3)
+        initial_fetch, retry_fetch, second_retry_fetch = (
+            batch_fetch.call_args_list)
+        self.assertEqual(initial_fetch.args[0], list(first))
+        self.assertEqual(
+            initial_fetch.kwargs["batch_timeout_s"],
+            collect_positioning_current.INITIAL_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            initial_fetch.kwargs["workers"],
+            collect_positioning_current.INITIAL_WORKERS,
+        )
+        self.assertEqual(
+            initial_fetch.kwargs["request_retries"],
+            collect_positioning_current.INITIAL_REQUEST_RETRIES,
+        )
+        self.assertEqual(retry_fetch.args[0], [
+            "BBB-USDT-SWAP", "CCC-USDT-SWAP"])
+        self.assertEqual(
+            retry_fetch.kwargs["batch_timeout_s"],
+            collect_positioning_current.RETRY_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(retry_fetch.kwargs["request_retries"], 0)
+        self.assertEqual(
+            retry_fetch.kwargs["workers"],
+            collect_positioning_current.RETRY_WORKERS,
+        )
+        self.assertEqual(second_retry_fetch.args[0], ["CCC-USDT-SWAP"])
+        self.assertEqual(second_retry_fetch.kwargs["request_retries"], 0)
+        self.assertEqual(stats["initial_valid_symbols"], 1)
+        self.assertEqual(stats["retry_requested_symbols"], 2)
+        self.assertEqual(stats["retry_recovered_symbols"], 2)
+        self.assertEqual(stats["retry_recovered_symbol_values"], [
+            "BBB-USDT-SWAP", "CCC-USDT-SWAP"])
+        self.assertEqual(stats["final_failed_symbols"], 0)
+        self.assertEqual(stats["final_failed_symbol_values"], [])
+        self.assertEqual(stats["retry_wave_count"], 2)
+        self.assertEqual(
+            stats["retry_waves"][1]["requested_symbol_values"],
+            ["CCC-USDT-SWAP"],
+        )
+        self.assertEqual(stats["maximum_network_budget_seconds"], 54.0)
+        self.assertEqual(stats["maximum_official_requests_per_symbol"], 4)
+        self.assertFalse(stats["unbounded_retry"])
+        self.assertEqual({row[1] for row in rows}, {collected})
+
+    def test_positioning_complete_initial_batch_does_not_retry(self):
+        payload = {
+            "AAA-USDT-SWAP": [["1786582800000", "1.5"]],
+            "BBB-USDT-SWAP": [["1786582800000", "0.8"]],
+        }
+        with (
+            mock.patch.object(
+                collect_positioning_current._okx_http,
+                "_batch",
+                return_value=payload,
+            ) as batch_fetch,
+            mock.patch.object(
+                collect_positioning_current, "utc_now_iso",
+                return_value="2026-08-13T01:31:41Z",
+            ),
+        ):
+            rows, errors, stats = (
+                collect_positioning_current.fetch_positioning_rows_bounded(
+                    list(payload), "2026-08-13T09:30"))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(batch_fetch.call_count, 1)
+        self.assertEqual(stats["retry_requested_symbols"], 0)
+        self.assertEqual(stats["final_failed_symbols"], 0)
+
+    def test_positioning_current_cycle_guard_rejects_historical_slots(self):
+        now = datetime.fromisoformat("2026-08-13T11:31:00+08:00")
+        accepted = collect_positioning_current.require_current_natural_cycle(
+            "2026-08-13T11:30", now=now)
+        self.assertEqual(accepted.minute, 30)
+        with self.assertRaisesRegex(ValueError, "historical/future"):
+            collect_positioning_current.require_current_natural_cycle(
+                "2026-08-13T11:00", now=now)
+        with self.assertRaisesRegex(ValueError, ":00/:30"):
+            collect_positioning_current.require_current_natural_cycle(
+                "2026-08-13T11:15", now=now)
+
+    def test_positioning_receipt_is_isolated_atomic_and_immutable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db_root = Path(temporary) / "db"
+            target = collect_positioning_current.positioning_receipt_path(
+                db_root, "2026-08-13T11:30")
+            self.assertFalse(str(target).startswith(str(db_root)))
+            receipt = collect_positioning_current.write_new_json(
+                target, {"cycle": "2026-08-13T11:30", "ok": True})
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8"))["cycle"],
+                "2026-08-13T11:30",
+            )
+            self.assertEqual(receipt["bytes"], target.stat().st_size)
+            with self.assertRaises(FileExistsError):
+                collect_positioning_current.write_new_json(
+                    target, {"cycle": "different"})
+
+    def test_positioning_registry_and_health_use_real_source_timestamp(self):
+        registry = json.loads(
+            (ROOT / "collectors" / "sources" / "registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        sources = {item["id"]: item for item in registry["sources"]}
+        self.assertEqual(
+            sources["okx_top_long_short"]["staleness_sec"], 5400)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            con = sqlite3.connect(root / "market.db")
+            con.execute(
+                "CREATE TABLE market_positioning("
+                "ts TEXT,collected_ts TEXT,source TEXT)"
+            )
+            con.execute(
+                "INSERT INTO market_positioning VALUES(?,?,?)",
+                (
+                    "2026-08-12T01:00:00Z",
+                    "2026-08-12T03:02:14Z",
+                    "okx_rest_contract_long_short_ratio",
+                ),
+            )
+            con.execute(
+                "INSERT INTO market_positioning VALUES(?,?,?)",
+                (
+                    "2026-08-12T00:00:00Z",
+                    "2026-08-12T03:02:14Z",
+                    "okx_rest_contract_long_short_ratio",
+                ),
+            )
+            con.commit()
+            con.close()
+            last_seen = source_freshness.derive_last_seen(root)
+        self.assertEqual(
+            last_seen["okx_top_long_short"], "2026-08-12 08:00:00")
+        self.assertNotEqual(
+            last_seen["okx_top_long_short"], "2026-08-12 11:02:14")
     def test_budget_reservation_keeps_required_steps_ahead_of_enrichment(self):
         calls = []
 
         def fake_run(name, script, sargs, timeout):
-            calls.append((name, timeout))
+            calls.append((name, list(sargs), timeout))
             return {
                 "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
                 "payload": {}, "stderr_tail": "",
@@ -285,10 +740,16 @@ class FastCollectRegressionTests(unittest.TestCase):
                 "collect_data", "live_account_check",
                 "contract_statistics", "market_features",
             ],
-            [name for name, _timeout in calls],
+            [name for name, _args, _timeout in calls],
         )
-        self.assertIn(calls[0][1], (149, 150))
-        self.assertEqual([25, 75, 60], [timeout for _, timeout in calls[1:]])
+        collect_args = next(
+            args for name, args, _timeout in calls if name == "collect_data"
+        )
+        self.assertIn("--cycle", collect_args)
+        self.assertIn("2026-08-12T14:15", collect_args)
+        self.assertIn(calls[0][2], (149, 150))
+        self.assertEqual(
+            [25, 75, 75], [timeout for _, _args, timeout in calls[1:]])
 
     def test_budget_helper_never_borrows_reserved_seconds(self):
         self.assertEqual(
@@ -667,12 +1128,18 @@ class FastCollectRegressionTests(unittest.TestCase):
             "market_features: schema mismatch",
         )
 
-    def test_positioning_runs_only_on_hour_slot_by_default(self):
+    def test_positioning_runs_on_hour_and_half_hour_by_default(self):
         self.assertTrue(
             collect_market_features.positioning_due("2026-07-27T20:00", "auto")
         )
         self.assertFalse(
             collect_market_features.positioning_due("2026-07-27T20:15", "auto")
+        )
+        self.assertTrue(
+            collect_market_features.positioning_due("2026-07-27T20:30", "auto")
+        )
+        self.assertFalse(
+            collect_market_features.positioning_due("2026-07-27T20:45", "auto")
         )
         self.assertTrue(
             collect_market_features.positioning_due("2026-07-27T20:15", "always")
@@ -1651,9 +2118,9 @@ class ExecutionAndPushContractTests(unittest.TestCase):
         with patches[0], patches[1], patches[2], patches[3], patches[4]:
             rendered = render_push_report.render(payload)
         validation = validate_push_format.validate(rendered["content"])
-        self.assertLessEqual(
-            rendered["char_count"], render_push_report.MAX_CONTENT_CHARS
-        )
+        self.assertEqual(rendered["char_count"], len(rendered["content"]))
+        self.assertGreater(rendered["char_count"], 10_000)
+        self.assertGreaterEqual(rendered["content"].count(long_text), 2)
         self.assertTrue(validation["ok"], validation)
 
     def test_reconcile_prefers_matching_execution_journal_semantics(self):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import copy
+import json
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,22 @@ for module_path in (ROOT, CORE, COLLECTORS):
 
 import multitimeframe_gate as gate  # noqa: E402
 import order_executor as oe  # noqa: E402
+
+
+_DEADLINE_PATCHER = None
+
+
+def setUpModule() -> None:
+    """Historical fixtures isolate MTF behavior; deadline has dedicated tests."""
+    global _DEADLINE_PATCHER
+    _DEADLINE_PATCHER = mock.patch.object(
+        oe, "_cycle_side_effect_reject", return_value=None)
+    _DEADLINE_PATCHER.start()
+
+
+def tearDownModule() -> None:
+    if _DEADLINE_PATCHER is not None:
+        _DEADLINE_PATCHER.stop()
 
 
 CYCLE = "2026-08-12T18:30"
@@ -192,6 +209,104 @@ class MultitimeframeReadinessTests(unittest.TestCase):
             self.assertEqual(missing["error"], "market_db_missing")
             self.assertFalse(invalid["ready"])
             self.assertTrue(invalid["error"].startswith("cycle_invalid:"))
+
+    def test_post_analysis_market_revision_uses_persisted_writer_anchor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            market_db = self._create_market_db(root)
+            original = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)["evidence_contract"]
+            analysis_db = root / "analysis.db"
+            connection = sqlite3.connect(analysis_db)
+            try:
+                connection.execute(
+                    "CREATE TABLE analysis_signals("
+                    "cycle_id TEXT,symbol TEXT,action TEXT,side TEXT,"
+                    "decision_card TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO analysis_signals VALUES(?,?,?,?,?)",
+                    (
+                        CYCLE, "BTC-USDT-SWAP", "open_long", "long",
+                        json.dumps({"multitimeframe_analysis": {
+                            "evidence_contract": original}}),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            connection = sqlite3.connect(market_db)
+            try:
+                connection.execute(
+                    "UPDATE kline_cache SET ma20=98.5,rsi14=56.0 "
+                    "WHERE symbol=? AND tf='15m' AND ts=?",
+                    ("BTC-USDT-SWAP", "2026-08-12T10:15:00Z"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            current_result = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+            current = current_result["evidence_contract"]
+
+            resolved = gate.resolve_execution_evidence_anchor(
+                root, "BTC-USDT-SWAP", CYCLE, "long", original, current)
+
+            self.assertTrue(current_result["ready"])
+            self.assertNotEqual(original, current)
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertTrue(resolved["post_analysis_market_revision"])
+            self.assertEqual(
+                resolved["evidence_anchor"], "analysis_db_writer_validated")
+            self.assertEqual(
+                resolved["persisted_evidence_hash"],
+                original["evidence_hash"],
+            )
+
+    def test_revision_exception_rejects_missing_tampered_or_wrong_side_anchor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._create_market_db(root)
+            original = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)["evidence_contract"]
+            changed = copy.deepcopy(original)
+            changed["timeframes"]["15m"]["values"]["rsi14"] = 56.0
+            changed = gate.seal_evidence_contract(changed)
+
+            missing = gate.resolve_execution_evidence_anchor(
+                root, "BTC-USDT-SWAP", CYCLE, "long", original, changed)
+            tampered = copy.deepcopy(original)
+            tampered["timeframes"]["4H"]["values"]["rsi14"] = 70.0
+            invalid = gate.resolve_execution_evidence_anchor(
+                root, "BTC-USDT-SWAP", CYCLE, "long", tampered, changed)
+
+            analysis_db = root / "analysis.db"
+            connection = sqlite3.connect(analysis_db)
+            try:
+                connection.execute(
+                    "CREATE TABLE analysis_signals("
+                    "cycle_id TEXT,symbol TEXT,action TEXT,side TEXT,"
+                    "decision_card TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO analysis_signals VALUES(?,?,?,?,?)",
+                    (
+                        CYCLE, "BTC-USDT-SWAP", "open_short", "short",
+                        json.dumps({"multitimeframe_analysis": {
+                            "evidence_contract": original}}),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            wrong_side = gate.resolve_execution_evidence_anchor(
+                root, "BTC-USDT-SWAP", CYCLE, "long", original, changed)
+
+            self.assertFalse(missing["ok"], missing)
+            self.assertFalse(invalid["ok"], invalid)
+            self.assertFalse(wrong_side["ok"], wrong_side)
+            self.assertEqual(wrong_side["persisted_side"], "short")
 
 
 class OpenExecutionGateTests(unittest.TestCase):

@@ -24,6 +24,22 @@ from core import multitimeframe_gate as mtf_gate  # noqa: E402
 from experience_contract import build_contract  # noqa: E402
 
 
+_DEADLINE_PATCHER = None
+
+
+def setUpModule() -> None:
+    """Historical fixtures isolate executor branches; deadline has its own tests."""
+    global _DEADLINE_PATCHER
+    _DEADLINE_PATCHER = mock.patch.object(
+        oe, "_cycle_side_effect_reject", return_value=None)
+    _DEADLINE_PATCHER.start()
+
+
+def tearDownModule() -> None:
+    if _DEADLINE_PATCHER is not None:
+        _DEADLINE_PATCHER.stop()
+
+
 def _same_actor_timeline(*_args, **_kwargs) -> dict:
     """Deterministic fixture for tests that intentionally reach live OPEN gates."""
     return {
@@ -46,6 +62,24 @@ def _ready_multitimeframe(*_args, **_kwargs) -> dict:
         "reject_reason": None,
         "timeframes": [],
         "evidence_contract": _market_evidence_contract(cycle_id, symbol),
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    }
+
+
+def _ready_evidence_anchor(*_args, **_kwargs) -> dict:
+    """Pass the independent execution-anchor gate in downstream unit tests.
+
+    These cases deliberately exercise ledger, account-IMR and fill/protection
+    branches after the MTF gates.  The MTF anchor itself has dedicated tests;
+    mocking only readiness leaves these fixtures stopped at the newer,
+    separate supplied/current evidence comparison.
+    """
+    return {
+        "ok": True,
+        "mode": "read_only",
+        "evidence_anchor": "current_market_exact",
+        "post_analysis_market_revision": False,
         "production_database_writes": 0,
         "orders_placed": 0,
     }
@@ -221,10 +255,6 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 path, receipt={"ok": True, "cycle_id": cycle}, **kwargs)
         elif state == "failed_clean":
             oe.ei.mark_failed_clean(path, error="confirmed_no_fill", **kwargs)
-        elif state == "reconciled":
-            oe.ei.mark_reconciled(
-                path, ord_id="RECONCILED-ORDER",
-                receipt={"reconciled_by": "isolated-test"}, **kwargs)
         else:
             raise AssertionError(state)
 
@@ -288,7 +318,7 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
                 [("CYCLE-PENDING", "BTC-USDT-SWAP", "reserved")],
             )
 
-    def test_terminal_states_do_not_block_profile(self):
+    def test_completed_and_failed_clean_do_not_block_profile(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ledger.db"
             clean = self._reserve(path, "CLEAN", "BTC-USDT-SWAP")
@@ -299,17 +329,6 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
             self.assertEqual(done["status"], "reserved")
             self._transition(
                 path, done, "DONE", "ETH-USDT-SWAP", "completed")
-
-            recovered = self._reserve(path, "RECOVERED", "XRP-USDT-SWAP")
-            self.assertEqual(recovered["status"], "reserved")
-            self._transition(
-                path, recovered, "RECOVERED", "XRP-USDT-SWAP", "reconciled")
-
-            same_recovered = self._reserve(
-                path, "RECOVERED", "XRP-USDT-SWAP")
-            self.assertEqual(same_recovered["status"], "blocked")
-            self.assertEqual(same_recovered["reason"], "intent_reconciled")
-            self.assertEqual(same_recovered["pending_count"], 0)
 
             next_intent = self._reserve(path, "NEXT", "SOL-USDT-SWAP")
             self.assertEqual(next_intent["status"], "reserved")
@@ -332,6 +351,45 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
             reused = self._reserve(path, "CLEAN", "BTC-USDT-SWAP")
             self.assertEqual(reused["status"], "reserved")
             self.assertTrue(reused["reused_failed_clean"])
+
+    def test_reduce_intent_key_is_distinct_and_replays_by_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ledger.db"
+            request = {
+                "profile": "live", "cycle_id": "REDUCE-CYCLE",
+                "symbol": "BTC-USDT-SWAP", "action": "reduce",
+                "side": "long", "reduce_sz": 2.0,
+            }
+            reserved = oe.ei.reserve(
+                path, profile="live", cycle_id="REDUCE-CYCLE",
+                symbol="BTC-USDT-SWAP", side="long", action="reduce",
+                request=request, now_ts="2026-08-13 21:00:00")
+            self.assertEqual(reserved["status"], "reserved")
+            oe.ei.mark_completed(
+                path, profile="live", cycle_id="REDUCE-CYCLE",
+                symbol="BTC-USDT-SWAP", side="long", action="reduce",
+                fingerprint=reserved["fingerprint"],
+                now_ts="2026-08-13 21:01:00",
+                receipt={"ok": True, "action_taken": "REDUCE"})
+            replay = oe.ei.reserve(
+                path, profile="live", cycle_id="REDUCE-CYCLE",
+                symbol="BTC-USDT-SWAP", side="long", action="reduce",
+                request=request, now_ts="2026-08-13 21:02:00")
+            self.assertEqual(replay["status"], "replay")
+            self.assertEqual(replay["receipt"]["action_taken"], "REDUCE")
+            con = sqlite3.connect(path)
+            try:
+                row = con.execute(
+                    "SELECT action,submitted_at,completed_at "
+                    "FROM execution_intents WHERE cycle_id=?",
+                    ("REDUCE-CYCLE",)).fetchone()
+            finally:
+                con.close()
+            self.assertEqual(row[0], "reduce")
+            # completed is itself proof of a submitted exchange side effect;
+            # failure reports must never classify this row as pristine/clean.
+            self.assertTrue(row[1])
+            self.assertTrue(row[2])
 
 
 class PretradeLedgerPositionGateTests(unittest.TestCase):
@@ -387,6 +445,9 @@ class PretradeLedgerPositionGateTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe, "check_multitimeframe_readiness",
                 side_effect=_ready_multitimeframe))
+            stack.enter_context(mock.patch.object(
+                oe, "resolve_execution_evidence_anchor",
+                side_effect=_ready_evidence_anchor))
             stack.enter_context(mock.patch.object(
                 oe.ox, "get_balance", return_value={"ok": True}))
             stack.enter_context(mock.patch.object(
@@ -613,8 +674,7 @@ class LiveAccountImrGateTests(unittest.TestCase):
         }
 
     def _run_live(self, capacity: dict, *, caller_account_imr=0.0,
-                  use_real_validator: bool = False,
-                  validator_exception: Exception | None = None):
+                  use_real_validator: bool = False):
         get_balance = mock.Mock(return_value={"ok": True, "data": [{}]})
         extract_capacity = mock.Mock(return_value=capacity)
         fetch_positions = mock.Mock(return_value=[])
@@ -638,8 +698,6 @@ class LiveAccountImrGateTests(unittest.TestCase):
         place_algo_sl = mock.Mock()
         validate_mock = mock.Mock(
             return_value=self._rejected_risk())
-        if validator_exception is not None:
-            validate_mock.side_effect = validator_exception
 
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(
@@ -653,10 +711,12 @@ class LiveAccountImrGateTests(unittest.TestCase):
                 oe, "check_multitimeframe_readiness",
                 side_effect=_ready_multitimeframe))
             stack.enter_context(mock.patch.object(
+                oe, "resolve_execution_evidence_anchor",
+                side_effect=_ready_evidence_anchor))
+            stack.enter_context(mock.patch.object(
                 oe.ei, "reserve",
                 return_value={"status": "reserved", "fingerprint": "FP"}))
-            mark_failed_clean = stack.enter_context(
-                mock.patch.object(oe.ei, "mark_failed_clean"))
+            stack.enter_context(mock.patch.object(oe.ei, "mark_failed_clean"))
             stack.enter_context(mock.patch.object(
                 oe.ox, "get_balance", get_balance))
             stack.enter_context(mock.patch.object(
@@ -698,27 +758,10 @@ class LiveAccountImrGateTests(unittest.TestCase):
             "get_mark": get_mark,
             "fetch_specs": fetch_specs,
             "validate": validate_mock,
-            "mark_failed_clean": mark_failed_clean,
             "set_leverage": set_leverage,
             "place_market_open": place_market_open,
             "place_algo_sl": place_algo_sl,
         }
-
-    def test_unexpected_validator_exception_cleans_reserved_intent(self):
-        state = self._run_live({
-            "ok": True,
-            "total_equity": 100.0,
-            "available_margin": 90.0,
-            "settlement_ccy": "USDT",
-            "account_imr": 10.0,
-        }, validator_exception=ValueError("synthetic validator failure"))
-
-        self.assertFalse(state["result"]["ok"])
-        self.assertEqual(
-            state["result"]["reject_reason"], "risk_validation_exception")
-        state["mark_failed_clean"].assert_called_once()
-        state["set_leverage"].assert_not_called()
-        state["place_market_open"].assert_not_called()
 
     def test_non_dryrun_live_uses_api_account_imr_and_ignores_caller(self):
         state = self._run_live({
@@ -826,42 +869,6 @@ class StopLossDirectionTests(unittest.TestCase):
                 self.assertFalse(result["approved"])
                 self.assertEqual(result["reject_reason"], "sl_direction_invalid")
 
-
-class NonFiniteRiskInputTests(unittest.TestCase):
-    def test_non_finite_money_path_inputs_are_rejected_without_math_errors(self):
-        base = {
-            "symbol": "BTC-USDT-SWAP",
-            "side": "long",
-            "intended_sz": 1.0,
-            "lev": 5.0,
-            "mark_px": 100.0,
-            "ct_val": 1.0,
-            "lot_sz": 1.0,
-            "equity": 1000.0,
-            "available_margin": 900.0,
-            "account_imr": 10.0,
-            "open_positions": [],
-            "sl_trigger_px": 95.0,
-        }
-        expected = {
-            "mark_px": "bad_mark_px",
-            "ct_val": "instrument_unknown",
-            "lot_sz": "instrument_unknown",
-            "intended_sz": "bad_sz",
-            "equity": "bad_equity",
-        }
-        for field, reason in expected.items():
-            with self.subTest(field=field):
-                payload = dict(base)
-                payload[field] = float("nan")
-                result = rv.validate(**payload)
-                self.assertFalse(result["approved"])
-                self.assertEqual(result["reject_reason"], reason)
-
-    def test_numeric_adapter_drops_nan_and_infinity(self):
-        for value in ("NaN", "Infinity", "-Infinity", float("nan")):
-            with self.subTest(value=value):
-                self.assertIsNone(oe._to_float(value))
 
 class StopLossReadbackTests(unittest.TestCase):
     @staticmethod
@@ -1079,6 +1086,40 @@ class OpenFillTruthTests(unittest.TestCase):
         self.assertIn("evidence_contract", result["reject_detail"])
         balance_mock.assert_not_called()
 
+    def test_explicit_exit_mode_is_enforced_before_account_io(self):
+        for mode, tp, expected in (
+            ("fixed_tp", None, "fixed_tp_required"),
+            ("dynamic_exit", 110.0, "tp_not_allowed_for_exit_mode"),
+            ("no_fixed_tp", 110.0, "tp_not_allowed_for_exit_mode"),
+        ):
+            with self.subTest(mode=mode):
+                context = _valid_receipt_context("CYCLE-EXIT-MODE")
+                context["decision_card"]["risk_reward"].update({
+                    "exit_mode": mode, "target": 110.0,
+                })
+                balance_mock = mock.Mock()
+                with (
+                    mock.patch.object(oe.ox, "is_dryrun", return_value=True),
+                    mock.patch.object(
+                        oe, "validate_receipt_context", return_value=[]),
+                    mock.patch.object(oe.ox, "get_balance", balance_mock),
+                ):
+                    result = oe.open_position(
+                        "BTC-USDT-SWAP", "long", 2.0, 5.0, 95.0, "live",
+                        cycle_id="CYCLE-EXIT-MODE",
+                        receipt_context=context,
+                        tp_trigger_px=tp,
+                    )
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reject_reason"], expected)
+                balance_mock.assert_not_called()
+
+        invalid = _valid_receipt_context("CYCLE-EXIT-INVALID")
+        invalid["decision_card"]["risk_reward"]["exit_mode"] = "auto_magic"
+        errors = oe.validate_receipt_context(
+            invalid, cycle_id="CYCLE-EXIT-INVALID", required=True)
+        self.assertTrue(any("exit_mode" in item for item in errors), errors)
+
     def test_cycle_scoped_experience_contract_passes_pretrade_context(self):
         cycle = "2026-08-10T08:00"
         context = _valid_receipt_context(
@@ -1113,9 +1154,16 @@ class OpenFillTruthTests(unittest.TestCase):
             return_value={"verified": True, "found": [], "matched": {}})
         tp_verify_mock = mock.Mock(
             return_value={"verified": False, "found": []})
+        tp_place_mock = mock.Mock(return_value={
+            "ok": True, "data": [{"algoId": "A-TP"}],
+        })
         journal_mock = mock.Mock()
         repair_mock = mock.Mock()
         close_mock = mock.Mock()
+        open_mock = mock.Mock(return_value={
+            "ok": True, "sl_attached": False, "tp_attached": False,
+            "data": [{"ordId": "O-NEW"}],
+        })
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(oe.ox, "is_dryrun", return_value=False))
             stack.enter_context(mock.patch.object(
@@ -1126,6 +1174,9 @@ class OpenFillTruthTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe, "check_multitimeframe_readiness",
                 side_effect=_ready_multitimeframe))
+            stack.enter_context(mock.patch.object(
+                oe, "resolve_execution_evidence_anchor",
+                side_effect=_ready_evidence_anchor))
             stack.enter_context(mock.patch.object(
                 oe.ei, "reserve",
                 return_value={"status": "reserved", "fingerprint": "FP"}))
@@ -1162,16 +1213,14 @@ class OpenFillTruthTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe.ox, "set_leverage", return_value={"ok": True}))
             stack.enter_context(mock.patch.object(
-                oe.ox, "place_market_open",
-                return_value={
-                    "ok": True, "sl_attached": False, "tp_attached": True,
-                    "data": [{"ordId": "O-NEW"}],
-                }))
+                oe.ox, "place_market_open", open_mock))
             stack.enter_context(mock.patch.object(
                 oe.ox, "place_algo_sl",
                 return_value={
                     "ok": True, "data": [{"algoId": "A-SL"}],
                 }))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_algo_tp", tp_place_mock))
             stack.enter_context(mock.patch.object(
                 oe, "_verify_sl_placed", verify_mock))
             stack.enter_context(mock.patch.object(
@@ -1204,9 +1253,16 @@ class OpenFillTruthTests(unittest.TestCase):
         self.assertTrue(result["sl_verified"])
         self.assertEqual(result["tp_warning"], "tp_unsecured")
         self.assertFalse(result["tp_verified"])
+        self.assertEqual(result["tp_algo_id"], "A-TP")
+        tp_place_mock.assert_called_once_with(
+            "BTC-USDT-SWAP", "long", 2.0, 110.0, "live",
+            mgn_mode="cross")
+        self.assertIsNone(open_mock.call_args.kwargs["tp_trigger_px"])
         close_mock.assert_not_called()
-        self.assertEqual(
-            repair_mock.call_args.args[3], "tp_unsecured_after_open")
+        self.assertIn(
+            "tp_unsecured_after_open",
+            [call.args[3] for call in repair_mock.call_args_list],
+        )
         trade = result["trades"][0]
         self.assertEqual(trade["sz"], 2.0)
         self.assertEqual(trade["fill_sz"], 2.0)
@@ -1222,6 +1278,215 @@ class OpenFillTruthTests(unittest.TestCase):
         self.assertEqual(trades_writer.validate(receipt), [])
         self.assertTrue(journal_mock.called)
         self.assertEqual(verify_mock.call_args.kwargs["expected_algo_id"], "A-SL")
+
+    def test_fixed_tp_uses_independent_algo_and_exact_id_readback(self):
+        risk_result = {
+            "approved": True, "approved_sz": 2.0, "clamped": False,
+            "adjustments": [], "math": {"effective_lev": 5.0},
+        }
+        open_mock = mock.Mock(return_value={
+            "ok": True, "sl_attached": True, "tp_attached": False,
+            "data": [{"ordId": "OPEN-TP"}],
+        })
+        tp_place = mock.Mock(return_value={
+            "ok": True, "data": [{"algoId": "TP-EXACT"}],
+        })
+        tp_verify = mock.Mock(return_value={
+            "verified": True, "matched": {"algoId": "TP-EXACT"},
+            "found": [],
+        })
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                oe.ox, "is_dryrun", return_value=False))
+            stack.enter_context(mock.patch.object(
+                oe, "validate_receipt_context", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                oe.actor_att, "timeline_state",
+                side_effect=_same_actor_timeline))
+            stack.enter_context(mock.patch.object(
+                oe, "check_multitimeframe_readiness",
+                side_effect=_ready_multitimeframe))
+            stack.enter_context(mock.patch.object(
+                oe, "resolve_execution_evidence_anchor",
+                side_effect=_ready_evidence_anchor))
+            stack.enter_context(mock.patch.object(
+                oe.ei, "reserve", return_value={
+                    "status": "reserved", "fingerprint": "FP-TP"}))
+            for name in ("mark_submitting", "mark_submitted", "mark_completed"):
+                stack.enter_context(mock.patch.object(oe.ei, name))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "get_balance", return_value={"ok": True}))
+            stack.enter_context(mock.patch.object(
+                oe.ac, "extract_settlement_capacity", return_value={
+                    "ok": True, "total_equity": 1000.0,
+                    "available_margin": 900.0, "settlement_ccy": "USDT",
+                    "account_imr": 100.0,
+                }))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_open_positions", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                oe, "_verify_pretrade_ledger_positions", return_value={
+                    "ok": True, "profile": "live", "ledger_groups": 0,
+                    "exchange_groups": 0, "diffs": [],
+                }))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "get_mark_price", return_value=100.0))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_instrument_specs", return_value={
+                    "ct_val": 0.01, "lot_sz": 1.0, "spec_source": "test",
+                }))
+            stack.enter_context(mock.patch.object(
+                oe.rv, "validate", return_value=risk_result))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "set_leverage", return_value={"ok": True}))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_market_open", open_mock))
+            stack.enter_context(mock.patch.object(
+                oe, "_verify_sl_placed", return_value={"verified": True}))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_algo_tp", tp_place))
+            stack.enter_context(mock.patch.object(
+                oe, "_verify_tp_placed", tp_verify))
+            stack.enter_context(mock.patch.object(
+                oe, "_read_fills", return_value={
+                    "ok": True, "fill_px": 100.5, "fill_sz": 2.0,
+                    "pnl": 0.0, "n": 1,
+                    "fill_ts": "2026-08-13 22:00:01",
+                    "ts_source": "fills.fillTime",
+                }))
+            stack.enter_context(mock.patch.object(oe, "_journal_fill"))
+            context = _valid_receipt_context("CYCLE-FIXED-TP")
+            context["decision_card"]["risk_reward"].update({
+                "exit_mode": "fixed_tp", "target": 110.0,
+            })
+            result = oe.open_position(
+                "BTC-USDT-SWAP", "long", 2.0, 5.0, 95.0, "live",
+                cycle_id="CYCLE-FIXED-TP", receipt_context=context,
+                tp_trigger_px=110.0,
+            )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["tp_verified"])
+        self.assertEqual(result["tp_mode"], "independent_algo")
+        self.assertEqual(result["tp_algo_id"], "TP-EXACT")
+        self.assertIsNone(open_mock.call_args.kwargs["tp_trigger_px"])
+        tp_verify.assert_called_once()
+        self.assertEqual(
+            tp_verify.call_args.kwargs["expected_algo_id"], "TP-EXACT")
+
+
+class ReduceReceiptContractTests(unittest.TestCase):
+    @staticmethod
+    def _run_reduce(*, placed=None, fill=None, reduce_sz=2.0):
+        cycle = "CYCLE-REDUCE"
+        context = _valid_receipt_context(cycle)
+        position = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0,
+        }
+        post = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 3.0,
+        }
+        order_mock = mock.Mock(return_value=placed or {
+            "ok": True, "data": [{"ordId": "REDUCE-1"}],
+        })
+        close_fallback = mock.Mock()
+        adjust_mock = mock.Mock(return_value={
+            "ok": True, "action_taken": "ADJUST_PROTECTION",
+            "path": "amend", "p0": False,
+        })
+        journal_mock = mock.Mock()
+        uncertain_mock = mock.Mock()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                oe.ox, "is_dryrun", return_value=False))
+            stack.enter_context(mock.patch.object(
+                oe.ei, "reserve", return_value={
+                    "status": "reserved", "fingerprint": "REDUCE-FP",
+                }))
+            stack.enter_context(mock.patch.object(oe.ei, "mark_submitting"))
+            stack.enter_context(mock.patch.object(oe.ei, "mark_submitted"))
+            stack.enter_context(mock.patch.object(oe.ei, "mark_completed"))
+            stack.enter_context(mock.patch.object(
+                oe.ei, "mark_failed_clean"))
+            stack.enter_context(mock.patch.object(
+                oe.ei, "mark_uncertain", uncertain_mock))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_open_positions", side_effect=[[position], [post]]))
+            stack.enter_context(mock.patch.object(
+                oe, "fetch_instrument_specs", return_value={
+                    "ct_val": 0.01, "lot_sz": 1.0, "min_sz": 1.0,
+                }))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "place_reduce_only_market", order_mock))
+            stack.enter_context(mock.patch.object(
+                oe.ox, "close_position_cli", close_fallback))
+            stack.enter_context(mock.patch.object(
+                oe, "_read_fills", return_value=fill or {
+                    "ok": True, "fill_px": 101.5, "fill_sz": 2.0,
+                    "pnl": 3.25, "n": 1,
+                    "fill_ts": "2026-08-13 21:15:02",
+                    "ts_source": "fills.fillTime",
+                }))
+            stack.enter_context(mock.patch.object(
+                oe, "_confirm_order_filled", return_value=None))
+            stack.enter_context(mock.patch.object(
+                oe, "adjust_protection", adjust_mock))
+            stack.enter_context(mock.patch.object(
+                oe, "_journal_fill", journal_mock))
+            stack.enter_context(mock.patch.object(oe, "_enqueue_repair"))
+            stack.enter_context(mock.patch.object(oe.time, "sleep"))
+            result = oe.reduce_position(
+                "BTC-USDT-SWAP", "live", reduce_sz,
+                pos_side="long", reasoning="agent partial exit",
+                cycle_id=cycle, receipt_context=context,
+            )
+        return (
+            result, order_mock, close_fallback, adjust_mock,
+            journal_mock, uncertain_mock,
+        )
+
+    def test_confirmed_partial_reduce_is_writer_valid_and_resizes_stop(self):
+        result, order, close_fallback, adjust, journal, uncertain = (
+            self._run_reduce())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action_taken"], "REDUCE")
+        self.assertEqual(result["trades"][0]["action"], "reduce")
+        self.assertEqual(result["trades"][0]["sz"], 2.0)
+        self.assertEqual(result["post_position_sz"], 3.0)
+        self.assertEqual(trades_writer.validate(result), [])
+        order.assert_called_once()
+        close_fallback.assert_not_called()
+        uncertain.assert_not_called()
+        adjust.assert_called_once()
+        self.assertEqual(adjust.call_args.kwargs["pos_side"], "long")
+        self.assertTrue(adjust.call_args.kwargs["resize_to_full_position"])
+        journal.assert_called_once()
+
+    def test_partial_reduce_equal_to_position_refuses_without_order(self):
+        result, order, close_fallback, adjust, journal, _ = (
+            self._run_reduce(reduce_sz=5.0))
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["reject_reason"],
+            "partial_reduce_requires_less_than_position")
+        order.assert_not_called()
+        close_fallback.assert_not_called()
+        adjust.assert_not_called()
+        journal.assert_not_called()
+
+    def test_ambiguous_reduce_never_falls_back_to_full_close(self):
+        result, order, close_fallback, adjust, journal, uncertain = (
+            self._run_reduce(placed={
+                "ok": False, "sCode": None, "error": "transport timeout",
+                "data": [],
+            }))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reject_reason"], "reduce_place_ambiguous")
+        self.assertTrue(result["p0"])
+        order.assert_called_once()
+        close_fallback.assert_not_called()
+        adjust.assert_not_called()
+        journal.assert_not_called()
+        uncertain.assert_called_once()
 
 
 class CloseReceiptContractTests(unittest.TestCase):

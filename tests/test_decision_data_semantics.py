@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import sqlite3
 import sys
 import tempfile
@@ -150,6 +151,83 @@ class DecisionMarketDataSemanticsTests(unittest.TestCase):
             6_000_000,
         )
         self.assertIsNone(decision_briefing.quote_volume_usd(2, 300_000, None))
+
+    def test_positioning_evidence_fails_closed_on_stale_or_incomplete_rows(self):
+        expected = {
+            "AAA-USDT-SWAP", "BBB-USDT-SWAP", "CCC-USDT-SWAP"
+        }
+        rows = [
+            {
+                "symbol": symbol,
+                "ts": "2026-08-12T01:30:00Z",
+                "long_ratio": 0.6,
+                "short_ratio": 0.4,
+                "long_short_ratio": 1.5,
+            }
+            for symbol in sorted(expected)
+        ]
+        evaluated = datetime(2026, 8, 12, 2, 45, tzinfo=timezone.utc)
+        fresh = decision_briefing.positioning_evidence_quality(
+            rows, expected, now=evaluated)
+        stale_rows = [dict(row) for row in rows]
+        stale_rows[0]["ts"] = "2026-08-12T01:00:00Z"
+        stale = decision_briefing.positioning_evidence_quality(
+            stale_rows, expected, now=evaluated)
+        incomplete = decision_briefing.positioning_evidence_quality(
+            rows[:-1], expected, now=evaluated)
+
+        self.assertEqual("PASSED", fresh["status"])
+        self.assertEqual(75.0, fresh["maximum_source_age_minutes"])
+        self.assertEqual("NOT_MET", stale["status"])
+        self.assertIn(
+            "source_ts_stale_for_decision",
+            stale["invalid_rows"][0]["reasons"],
+        )
+        self.assertEqual("NOT_MET", incomplete["status"])
+        self.assertEqual(2 / 3, incomplete["coverage_rate"])
+
+    def test_candidate_soft_evidence_is_informative_but_never_a_gate(self):
+        result = decision_briefing.candidate_soft_evidence(
+            {
+                "spread_bps": 1.25,
+                "imbalance_25bp": -0.30,
+                "taker_buy_ratio": 0.62,
+                "cvd_notional_usd": 45_000,
+                "sample_count": 500,
+                "sample_span_ms": 120_000,
+                "buy_slippage_500usd_bps": 0.8,
+                "sell_slippage_500usd_bps": 1.1,
+            },
+            {"long_short_ratio": 1.4},
+            positioning_batch_passed=True,
+        )
+        self.assertTrue(result["micro_available"])
+        self.assertTrue(result["positioning_available"])
+        self.assertIn("spread=1.25bp", result["text"])
+        self.assertIn("imb=-0.30", result["text"])
+        self.assertIn("flowN/span=500/120s", result["text"])
+        self.assertIn("acctL/S=1.40", result["text"])
+
+        unavailable = decision_briefing.candidate_soft_evidence(
+            {"spread_bps": float("nan"), "imbalance_25bp": 0.0},
+            {"long_short_ratio": 1.4},
+            positioning_batch_passed=False,
+        )
+        self.assertFalse(unavailable["micro_available"])
+        self.assertFalse(unavailable["positioning_available"])
+        self.assertEqual("µ=N/A acctL/S=N/A", unavailable["text"])
+
+        stale_flow = decision_briefing.candidate_soft_evidence({
+            "spread_bps": 1.0,
+            "imbalance_25bp": 0.1,
+            "taker_buy_ratio": 0.9,
+            "cvd_notional_usd": 99_000,
+            "sample_count": 500,
+            "sample_span_ms": 31 * 60_000,
+        })
+        self.assertTrue(stale_flow["micro_available"])
+        self.assertIn("flow=N/A(stale_span)", stale_flow["text"])
+        self.assertNotIn("buy=90%", stale_flow["text"])
 
 
 class ExperienceRegimePointInTimeTests(unittest.TestCase):

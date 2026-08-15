@@ -36,7 +36,23 @@ REQUIRED_MARKERS = (
 # 段，重新校验旧报告时要按标签定位截断（见 _section 的截断注释）。它只是个
 # 解析用的标签表，不代表 demo 还在跑。
 PROFILE_LABELS = {"live": "🟢 实盘", "demo": "🟡 模拟盘"}
+
+# 2026-08-13 规格书四段（市场总览/全市场扫描/数据完善率/次日关注）——
+# 预注册激活边界起才要求，历史归档不反向加责（对齐 push 三周期段先例）。
+SPEC_SECTIONS_ACTIVATION_TS = "2026-08-14 00:00:00"
+# 退出质量段：预注册激活边界起的日报必须带；历史归档不反向加责。
+EXIT_QUALITY_ACTIVATION_TS = "2026-08-16 08:00:00"
+# 与 exit_quality/错失开仓池同款后验窗长度，独立声明防止单边改动。
+EXIT_QUALITY_OUTCOME_HOURS = 4
+SPEC_SECTION_MARKERS = (
+    "## 🛰 全市场扫描",
+    "## 📡 数据完善率",
+    "### 市场总览（writer 权威回读）",
+    "## 🔭 次日关注",
+)
+_FOCUS_PLACEHOLDER = "未填写"
 FINAL_RECONCILE = {"clean", "ok", "cleared", "final"}
+MISSED_OPPORTUNITY_OUTCOME_HOURS = 4
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
@@ -65,6 +81,18 @@ def _extract_report_ts(content: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _section_body(content: str, marker: str) -> str | None:
+    """返回 marker 段正文（到下一个同级 '## ' 或 '---' 为止）；缺段返回 None。"""
+    if marker not in content:
+        return None
+    tail = content.split(marker, 1)[1]
+    for stop in ("\n## ", "\n---"):
+        idx = tail.find(stop)
+        if idx != -1:
+            tail = tail[:idx]
+    return tail
+
+
 def _expected_daily_window(report_ts: str) -> tuple[str, str]:
     """Independently derive the fixed ``[前一日 08:00, 当日 08:00)`` contract.
 
@@ -81,6 +109,73 @@ def _expected_daily_window(report_ts: str) -> tuple[str, str]:
         start.strftime("%Y-%m-%d %H:%M:%S"),
         end.strftime("%Y-%m-%d %H:%M:%S"),
     )
+
+
+def _expected_missed_candidate_window(
+    report_start: str,
+    report_end: str,
+) -> tuple[str, str]:
+    """Independently derive the continuous window with mature 4H outcomes."""
+    shift = timedelta(hours=MISSED_OPPORTUNITY_OUTCOME_HOURS)
+    start = trade_report_stats.parse_cst(report_start) - shift
+    end = trade_report_stats.parse_cst(report_end) - shift
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _expected_exit_quality_window(
+    report_start: str,
+    report_end: str,
+) -> tuple[str, str]:
+    """独立推导退出质量候选窗（与错失开仓池同款后验窗前移）。"""
+    shift = timedelta(hours=EXIT_QUALITY_OUTCOME_HOURS)
+    start = trade_report_stats.parse_cst(report_start) - shift
+    end = trade_report_stats.parse_cst(report_end) - shift
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _independent_exit_quality_counts(
+    account_db: Path,
+    candidate_start: str,
+    candidate_end: str,
+) -> dict[str, int] | None:
+    """独立重算「已成熟平仓」与「错失止盈池」两个可对账数字。"""
+    if not Path(account_db).exists():
+        return None
+    con = _open_readonly(Path(account_db))
+    try:
+        rows = con.execute(
+            "SELECT mfe_r,realized_r_net,path_coverage FROM trade_experiences "
+            "WHERE status='closed' AND closed_at IS NOT NULL "
+            "AND datetime(closed_at)>=datetime(?) "
+            "AND datetime(closed_at)<datetime(?)",
+            (candidate_start, candidate_end),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    closed = len(rows)
+    pool = 0
+    for row in rows:
+        peak, realized, coverage = row[0], row[1], row[2]
+        if peak is None or realized is None or coverage is None:
+            continue
+        try:
+            ratio = float(str(coverage).rsplit(":", 1)[-1])
+        except ValueError:
+            continue
+        if ratio < 0.9:
+            continue
+        if float(peak) >= 1.0 and float(realized) < 1.0:
+            pool += 1
+    return {"closed_rows": closed, "missed_take_profit_pool_size": pool}
+
 
 
 def _extract_period_window(content: str) -> tuple[str, str] | None:
@@ -180,6 +275,31 @@ def validate_report(
         return {"ok": False, "errors": errors, "checks": checks}
     if report_ts[:10] not in content.splitlines()[0]:
         errors.append("structure: title date differs from report ts")
+
+    # 2026-08-13 规格书四段：激活边界起硬性要求；历史归档不反向加责。
+    if report_ts >= SPEC_SECTIONS_ACTIVATION_TS:
+        spec_errors = 0
+        for marker in SPEC_SECTION_MARKERS:
+            if marker not in content:
+                errors.append(f"spec-sections: missing marker {marker}")
+                spec_errors += 1
+        focus_body = _section_body(content, "## 🔭 次日关注")
+        if focus_body is not None:
+            focus_clean = focus_body.strip()
+            if not focus_clean or _FOCUS_PLACEHOLDER in focus_clean:
+                errors.append(
+                    "spec-sections: focus_next_day must be filled by reviewer")
+                spec_errors += 1
+        completeness_body = _section_body(content, "## 📡 数据完善率")
+        if (completeness_body is not None
+                and "数据完善率不可用" in completeness_body
+                and ledger_db.exists()):
+            errors.append(
+                "spec-sections: completeness block unavailable while "
+                "ledger.db exists")
+            spec_errors += 1
+        if not spec_errors:
+            checks.append("spec_sections_v1")
     start_ts, end_ts = _expected_daily_window(report_ts)
     markdown_window = _extract_period_window(content)
     if markdown_window is None:
@@ -380,10 +500,31 @@ def validate_report(
                 f"账本 多{expect_long}/空{expect_short})")
         else:
             checks.append("side_counts")
-    missed_line = re.search(r"本窗口错失机会记录:\s*(\d+)\s*条", content)
+    matured_missed_line = re.search(
+        r"已完整成熟4小时的错失机会记录:\s*(\d+)\s*条"
+        r"（候选窗口 \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s*"
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\)，UTC\+8",
+        content,
+    )
+    legacy_missed_line = re.search(
+        r"本窗口错失机会记录:\s*(\d+)\s*条", content)
+    missed_line = matured_missed_line or legacy_missed_line
     if missed_line:
         lessons_db = Path(account_db).parent / "lessons.db"
         actual_missed = None
+        if matured_missed_line:
+            candidate_start, candidate_end = _expected_missed_candidate_window(
+                start_ts, end_ts)
+            if (
+                matured_missed_line.group(2),
+                matured_missed_line.group(3),
+            ) != (candidate_start, candidate_end):
+                errors.append(
+                    "missed_opps: markdown mature candidate window differs")
+        else:
+            # Historical format deliberately keeps its original full report
+            # window semantics; it is not silently reclassified as matured.
+            candidate_start, candidate_end = start_ts, end_ts
         if lessons_db.exists():
             lcon = _open_readonly(lessons_db)
             try:
@@ -394,7 +535,7 @@ def validate_report(
                         "SELECT COUNT(*) FROM missed_opportunities "
                         "WHERE ts LIKE '202%' AND datetime(ts)>=datetime(?) "
                         "AND datetime(ts)<datetime(?)",
-                        (start_ts, end_ts)).fetchone()[0])
+                        (candidate_start, candidate_end)).fetchone()[0])
             finally:
                 lcon.close()
         if actual_missed is not None:
@@ -409,6 +550,75 @@ def validate_report(
                     f"lessons.db 本窗口实有 {actual_missed} 条")
             else:
                 checks.append("missed_opps")
+        if matured_missed_line:
+            embedded_missed = (
+                audit_by_profile.get("live", {}).get(
+                    "missed_opportunity_metrics") or {}
+            )
+            expected_embedded = (
+                embedded_missed.get("candidate_window_start_ts")
+                == candidate_start,
+                embedded_missed.get("candidate_window_end_ts")
+                == candidate_end,
+                embedded_missed.get("candidate_window_end_exclusive") is True,
+                embedded_missed.get("outcome_horizon_hours")
+                == MISSED_OPPORTUNITY_OUTCOME_HOURS,
+                embedded_missed.get("required_15m_bars") == 16,
+                embedded_missed.get("count") == int(matured_missed_line.group(1)),
+            )
+            if not all(expected_embedded):
+                errors.append(
+                    "missed_opps: embedded mature outcome metrics differ")
+
+
+    # ---- 退出质量段（激活边界起硬性要求，历史归档不反向加责）----
+    exit_quality_header = "## 🚪 退出质量"
+    if report_ts >= EXIT_QUALITY_ACTIVATION_TS:
+        if exit_quality_header not in content:
+            errors.append("exit_quality: missing section marker")
+        else:
+            checks.append("exit_quality_section")
+    if exit_quality_header in content:
+        window_line = re.search(
+            r"候选窗口 \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s*"
+            r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\)，UTC\+8；报告窗整体前移 "
+            r"(\d+) 小时",
+            content,
+        )
+        matured_line = re.search(
+            r"已成熟平仓:\s*(\d+)\s*笔", content)
+        pool_line = re.search(
+            r"错失止盈池:\s*(\d+)\s*笔", content)
+        if not (window_line and matured_line and pool_line):
+            errors.append("exit_quality: section is present but unparseable")
+        else:
+            expected_start, expected_end = _expected_exit_quality_window(
+                start_ts, end_ts)
+            if (window_line.group(1), window_line.group(2)) != (
+                    expected_start, expected_end):
+                errors.append(
+                    "exit_quality: candidate window differs from the "
+                    "independently derived matured window")
+            elif int(window_line.group(3)) != EXIT_QUALITY_OUTCOME_HOURS:
+                errors.append("exit_quality: outcome horizon differs")
+            else:
+                actual = _independent_exit_quality_counts(
+                    account_db, expected_start, expected_end)
+                if actual is None:
+                    checks.append("exit_quality_window")
+                elif int(matured_line.group(1)) != actual["closed_rows"]:
+                    errors.append(
+                        "exit_quality: markdown 已成熟平仓数与 account.db 不符 "
+                        f"(markdown {matured_line.group(1)}, "
+                        f"库 {actual['closed_rows']})")
+                elif int(pool_line.group(1)) != actual[
+                        "missed_take_profit_pool_size"]:
+                    errors.append(
+                        "exit_quality: markdown 错失止盈池与 account.db 不符 "
+                        f"(markdown {pool_line.group(1)}, "
+                        f"库 {actual['missed_take_profit_pool_size']})")
+                else:
+                    checks.append("exit_quality")
 
     if not any(error.startswith("risk_reject:") for error in errors):
         checks.append("risk_reject")
@@ -430,7 +640,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="read-only reviewer daily report validator")
     parser.add_argument("--file", required=True)
-    parser.add_argument("--db-root", default=r"./db")
+    parser.add_argument("--db-root", default=r".\db")
     parser.add_argument("--account-db")
     parser.add_argument("--live-trades-db")
     # `--demo-trades-db` 随 2026-08-06 demo 全量下线删除：函数体早已不读它，

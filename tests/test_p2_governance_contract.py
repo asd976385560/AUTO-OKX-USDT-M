@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 import unittest
@@ -15,6 +16,23 @@ import daily_maintenance  # noqa: E402
 
 
 class P2GovernanceContractTests(unittest.TestCase):
+    def test_reference_override_repairs_are_not_public_active_scripts(self):
+        lifecycle = json.loads(
+            (SCRIPTS / "lifecycle.json").read_text(encoding="utf-8")
+        )
+        active_paths = {
+            str(path)
+            for group in lifecycle.get("groups", [])
+            if group.get("status") != "archived"
+            for path in group.get("paths", [])
+        }
+        for name in (
+            "_fix_live_ref_override.py",
+            "_fix_reference_overrides.py",
+        ):
+            self.assertFalse((SCRIPTS / name).exists())
+            self.assertNotIn(name, active_paths)
+
     def test_daily_log_rotation_includes_stage_status_for_seven_days(self):
         step = next(item for item in daily_maintenance.STEPS if item[0] == "log_rotate")
         argv = step[1]
@@ -119,6 +137,28 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertNotIn("--send", step[1])
         self.assertEqual(step[3], (0,))
 
+    def test_daily_maintenance_audits_periodic_reports_and_delivery(self):
+        names = [item[0] for item in daily_maintenance.STEPS]
+        self.assertIn("periodic_report_completeness", names)
+        self.assertGreater(
+            names.index("periodic_report_completeness"),
+            names.index("daily_report_completeness"),
+        )
+        self.assertLess(
+            names.index("periodic_report_completeness"),
+            names.index("push_completeness"),
+        )
+        step = next(
+            item for item in daily_maintenance.STEPS
+            if item[0] == "periodic_report_completeness"
+        )
+        self.assertIn("audit_periodic_report_completeness.py", step[1][0])
+        self.assertIn("--forward-weekly-start", step[1])
+        self.assertIn("--forward-monthly-start", step[1])
+        self.assertNotIn("--apply", step[1])
+        self.assertNotIn("--send", step[1])
+        self.assertEqual(step[3], (0,))
+
     def test_daily_maintenance_audits_production_analysis_signal_outcomes(self):
         names = [item[0] for item in daily_maintenance.STEPS]
         self.assertIn("analysis_signal_forward_quality", names)
@@ -168,6 +208,27 @@ class P2GovernanceContractTests(unittest.TestCase):
             if item[0] == "positioning_coverage"
         )
         self.assertIn("audit_positioning_coverage.py", step[1][0])
+        self.assertIn("--maximum-source-age-minutes", step[1])
+        self.assertIn("--forward-start", step[1])
+        self.assertIn("--forward-minimum-slots", step[1])
+        self.assertEqual(
+            "2026-08-13T03:00:00+08:00",
+            step[1][step[1].index("--forward-start") + 1],
+        )
+        self.assertEqual(
+            "24",
+            step[1][step[1].index("--forward-minimum-slots") + 1],
+        )
+        self.assertIn("--availability-forward-start", step[1])
+        self.assertIn("--availability-minimum-slots", step[1])
+        self.assertEqual(
+            "2026-08-13T03:00:00+08:00",
+            step[1][step[1].index("--availability-forward-start") + 1],
+        )
+        self.assertEqual(
+            "96",
+            step[1][step[1].index("--availability-minimum-slots") + 1],
+        )
         self.assertIn("--market-db", step[1])
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
@@ -237,7 +298,7 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertIn("multitimeframe_coverage", names)
         self.assertGreater(
             names.index("multitimeframe_coverage"),
-            names.index("contract_statistics_coverage"),
+            names.index("market_feature_coverage"),
         )
         step = next(
             item for item in daily_maintenance.STEPS
@@ -246,6 +307,56 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertIn("audit_multitimeframe_coverage.py", step[1][0])
         self.assertIn("--market-db", step[1])
         self.assertIn("--minimum-rate", step[1])
+        self.assertNotIn("--apply", step[1])
+        self.assertEqual(step[3], (0,))
+
+    def test_daily_maintenance_audits_dynamic_market_features_read_only(self):
+        names = [item[0] for item in daily_maintenance.STEPS]
+        self.assertIn("market_feature_coverage", names)
+        self.assertGreater(
+            names.index("market_feature_coverage"),
+            names.index("market_field_coverage"),
+        )
+        step = next(
+            item for item in daily_maintenance.STEPS
+            if item[0] == "market_feature_coverage"
+        )
+        self.assertIn("audit_market_feature_coverage.py", step[1][0])
+        self.assertEqual(
+            "2026-08-12T23:15:00+08:00",
+            step[1][step[1].index("--forward-start") + 1],
+        )
+        self.assertEqual(
+            "100",
+            step[1][step[1].index("--expected-symbols-per-slot") + 1],
+        )
+        self.assertEqual(
+            "96",
+            step[1][step[1].index("--minimum-slots") + 1],
+        )
+        self.assertNotIn("--apply", step[1])
+        self.assertEqual(step[3], (0,))
+
+    def test_daily_maintenance_audits_same_slot_market_fields_read_only(self):
+        names = [item[0] for item in daily_maintenance.STEPS]
+        self.assertIn("market_field_coverage", names)
+        self.assertGreater(
+            names.index("market_field_coverage"),
+            names.index("contract_statistics_coverage"),
+        )
+        step = next(
+            item for item in daily_maintenance.STEPS
+            if item[0] == "market_field_coverage"
+        )
+        self.assertIn("audit_market_field_coverage.py", step[1][0])
+        self.assertEqual(
+            "2026-08-12T22:45:00+08:00",
+            step[1][step[1].index("--forward-start") + 1],
+        )
+        self.assertEqual(
+            "96",
+            step[1][step[1].index("--minimum-slots") + 1],
+        )
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 

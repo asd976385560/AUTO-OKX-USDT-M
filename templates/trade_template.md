@@ -1,9 +1,9 @@
 <!--
 doc: trade_template
 doc-version: V2.0-template
-last-updated: 2026-08-11
-updated-by: Claude
-change-summary: 5% 风险预算定稿、接管时间线 fail-closed、附挂 TP 与回读审计。
+last-updated: 2026-08-14
+updated-by: Codex
+change-summary: 三周期执行闸增加 writer 已验证锚点，允许同槽后续行情修订但保留双时点 hash 审计。
 role: 交易回执模板（live trader -> live_trades.db）
 权威: skill.md（交易执行契约节）+ core/order_executor.py + core/risk_validator.py + collectors/trades_writer.py
 落点: <PROJECT_ROOT>\db\live_trades.db（trade_cycles + trades）
@@ -14,9 +14,9 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 
 # 交易回执模板 — live trader -> live_trades.db
 
-> live 下单**唯一路径** = `core/order_executor.open_position()` / `close_position()`，其内部**强制调** `core/risk_validator.validate()`（LLM 物理越不过闸，红线 #7）。
-> 执行器产出已携完整 cycle/决策卡的**回执 dict**。任何确认成交轮都必须在调用 executor 的同一确定性 Python 进程内立即调用 `collectors.trades_writer.commit_receipt(receipt, profile)`；禁止先退出、再由模型下一次工具调用补落账。HOLD/ADJUST 等无成交回执才可走 `--json-file`。
-> live trader 在交易阶段先运行 `scripts/live_decision_facts.py --cycle-id <cycle> --profile live --out-file <facts>`。持仓时长、ctVal/币数、实际 live SL、到 SL 损失和 `account.imr/totalEq` 只能引用该文件，不得手算。HOLD/ADJUST 的 CLI writer 必须带 `--facts-file <facts>`；有成交则将完整 `live_facts` 原样挂进 receipt 后在同进程提交。
+> live 交易所副作用**唯一路径** = `core/order_executor.open_position()` / `close_position()` / `reduce_position()` / `adjust_protection()`；OPEN/ADD 内部**强制调** `core/risk_validator.validate()`（LLM 物理越不过闸，红线 #7）。
+> 执行器产出已携完整 cycle/决策卡的**回执 dict**。任何成交或保护调整轮都必须在调用 executor 的同一确定性 Python 进程内立即调用 `collectors.trades_writer.commit_receipt(receipt, profile)`；禁止先退出、再由模型下一次工具调用补落账。只有 HOLD/WAIT 等无交易所副作用回执可走 `--json-file`。
+> live trader 在交易阶段先运行 `scripts/live_decision_facts.py --cycle-id <cycle> --profile live --out-file <facts>`。持仓时长、ctVal/币数、实际 live SL、到 SL 损失和 `account.imr/totalEq` 只能引用该文件，不得手算。HOLD/WAIT 的 CLI writer 必须带 `--facts-file <facts>`；有交易所副作用则将完整 `live_facts` 原样挂进 receipt 后在同进程提交。
 > 红线：写库必走 writer，禁手写 INSERT；现仓以 OKX API 为准（禁 position_snapshots GROUP BY）；Live 组合 IMR 只认同次 OKX `account.balance.imr/totalEq` 与本单增量，禁用 `mgnRatio`、gross、net 替代。零模型名。
 
 ## 1. order_executor 回执 dict（每笔执行产物）
@@ -25,10 +25,12 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 
 > `available_margin` 仅参与 Live 的实时可用保证金边界；Live OPEN/ADD 还必须用同次 `account.imr/totalEq` 计算预计成交后组合 IMR。
 `close_position(symbol, profile, pos_side, mgn_mode='cross', reasoning, db_root, cycle_id, receipt_context=None)`
+`reduce_position(symbol, profile, reduce_sz, pos_side, mgn_mode='cross', reasoning, db_root, cycle_id, receipt_context=None)`
+`adjust_protection(symbol, profile, pos_side, new_sl_trigger_px=None, new_tp_trigger_px=None, resize_to_full_position=False, reasoning, db_root, cycle_id, receipt_context=None)`
 
-> 非 dry-run 的 `cycle_id` 与 `receipt_context` 必传。`receipt_context` 必须是有效 JSON dict，含 `status=ok`、同一 `cycle_id`、`decision_protocol=decision_card_v1` 和完整 `decision_card`；执行器在任何 OKX I/O 前校验，失败直接 reject。**接管场景（2026-08-10 Wave1 序6）**：executor 会按 cycle 派生 session-key 独立重算本会话 actor 时间线（只算不透明指纹，零模型名）；分析与执行 actor epoch 不同（OPEN/ADD 路径）时，`receipt_context["actor_attestation"]` 必须携带 `scripts/actor_attestation.py` 的完整产物——缺失/hash 不符/重验包未全过/超 10 分钟时效/凭证生成后 actor 再变，均拒单 `handoff_attestation_required`。非 dry-run 时间线不可得时不能证明未接管，账户/订单 I/O 前拒单 `actor_timeline_required`；CLOSE/REDUCE 恒不受本闸约束。`tp_trigger_px` 若提供，必须与已验证卡内 target 一致且方向正确；TP 未回读只留 repair，不因 SL 已安全而 unwind。
+> 非 dry-run 的 `cycle_id` 与 `receipt_context` 必传。`receipt_context` 必须是有效 JSON dict，含 `status=ok`、同一 `cycle_id`、`decision_protocol=decision_card_v1` 和完整 `decision_card`；执行器在任何 OKX I/O 前校验，失败直接 reject。**接管场景（2026-08-10 Wave1 序6）**：executor 会按 cycle 派生 session-key 独立重算本会话 actor 时间线（只算不透明指纹，零模型名）；分析与执行 actor epoch 不同（OPEN/ADD 路径）时，`receipt_context["actor_attestation"]` 必须携带 `scripts/actor_attestation.py` 的完整产物——缺失/hash 不符/重验包未全过/超 10 分钟时效/凭证生成后 actor 再变，均拒单 `handoff_attestation_required`。非 dry-run 时间线不可得时不能证明未接管，账户/订单 I/O 前拒单 `actor_timeline_required`；CLOSE/REDUCE/ADJUST_PROTECTION 恒不受本闸约束。新开仓的 `risk_reward.exit_mode` 必须显式为 `fixed_tp|dynamic_exit|no_fixed_tp`；`fixed_tp` 的 `tp_trigger_px` 必须等于卡内 target，executor 先确认 SL，再按实际 fill_sz 独立挂 TP。TP 未回读只留 repair，不因 SL 已安全而 unwind。移动 TP 时使用新全仓 OCO 双腿确认后再撤旧保护，普通 conditional 不得同时承载 TP+SL。
 
-> OPEN/ADD 还必须原样携带 analysis 的 `decision_card.multitimeframe_analysis`：固定 cycle、15m/1H/4H 三周期逐项证据与唯一 rank 1/2/3、rank=1 的选择、`calibrated_confidence=null`、`confidence_claim_allowed=false`，以及 `multitimeframe_decision_evidence.py` 返回的完整 evidence_contract。executor 在任何 OKX 账户/订单 I/O 前只读重验 exact 已收盘三周期数据；未就绪拒绝 `multitimeframe_data_not_ready`，契约不一致拒绝 `multitimeframe_context_mismatch`。CLOSE/REDUCE 不受此开仓闸阻断。
+> OPEN/ADD 还必须原样携带 analysis 的 `decision_card.multitimeframe_analysis`：固定 cycle、15m/1H/4H 三周期逐项证据与唯一 rank 1/2/3、rank=1 的选择、`calibrated_confidence=null`、`confidence_claim_allowed=false`，以及 `multitimeframe_decision_evidence.py` 返回的完整 evidence_contract。executor 在任何 OKX 账户/订单 I/O 前只读重验当前 exact 已收盘三周期数据；未就绪拒绝 `multitimeframe_data_not_ready`。完全一致走 `current_market_exact`；若同槽后续采集修订已收盘数据，卡内契约必须逐字段命中同 cycle/symbol/side 的 `analysis.db` writer 已验证锚点 `analysis_db_writer_validated`，并在回执留 `post_analysis_market_revision=true` 与 supplied/current/persisted hash。否则拒绝 `multitimeframe_context_mismatch`；持久化锚点不能替代当前 readiness。CLOSE/REDUCE 不受此开仓闸阻断。
 
 返回统一回执（OPEN/CLOSE 同形）：
 
@@ -53,7 +55,7 @@ writer: <PROJECT_ROOT>\collectors\trades_writer.py（唯一通道，禁手写 IN
 |---|---|
 | `profile` | 固定 `'live'`（执行器硬拒其它值） |
 | `ok` | 本笔执行是否成功（true=已成交/已平/无仓可平；false=被拒/兜底失败） |
-| `action_taken` | `OPEN_LONG`/`OPEN_SHORT`/`CLOSE`/`REJECT`/`UNWIND`。**推送动作段正则只认** `OPEN_LONG OPEN_SHORT CLOSE STOP_LOSS ADJUST`（见 push 校验） |
+| `action_taken` | 执行回执使用 `OPEN_LONG`/`OPEN_SHORT`/`CLOSE`/`REDUCE`/`ADJUST_PROTECTION`/`REJECT`/`UNWIND`；无交易所副作用使用 `HOLD`/`WAIT`。`ADJUST` 仅是推送展示词，不得手写进 Live 回执；只有含 `protection_change`、受支持 `path`、`protection_state.ok=true` 与 `applied` 的成功 `ADJUST_PROTECTION` 回执才渲染为 `ADJUST`。 |
 | `symbol` / `side` | 标的 / 方向（CLOSE 回执 side 取自 OKX API 现仓确认的 posSide） |
 | `trades[]` | 真实成交明细（回读 fills 后），喂 trades_writer。被拒/无仓时为 `[]` |
 | `p0` | true=触发 P0（裸仓 unwind / fills 拉不到 / close+reduceOnly 兜底均败）。trader 见 p0 必走 P0 流程 |
@@ -305,7 +307,7 @@ if not result.get("ok") or result.get("refused"):
     raise RuntimeError(result)
 ```
 
-无成交 HOLD/ADJUST 才可把完整 cycle 回执**一次性整文件写入** `<PROJECT_ROOT>/tmp/_receipt_<profile>_YYYY-MM-DDTHH-MM.json`，再调 `trades_writer.py --json-file ... --facts-file <本轮 facts>`。顶层 `decision_card` 必须直接使用 §4 示例的九个固定键，不能改成摘要/候选/持仓列表。使用 `--facts-file` 时回执应省略 `live_facts` 让 writer 原样注入；若携带则必须与 facts 文件整份完全相同。文件名中的 `:` 必须换成 `-`，防止 NTFS ADS。禁止用 edit/局部补丁循环拼 JSON；schema 失败最多整文件重写一次，第二次仍失败即终止，不补派、不重推。
+只有 HOLD/WAIT 等无交易所副作用动作才可把完整 cycle 回执**一次性整文件写入** `<PROJECT_ROOT>/tmp/_receipt_<profile>_YYYY-MM-DDTHH-MM.json`，再调 `trades_writer.py --json-file ... --facts-file <本轮 facts>`。REDUCE/ADJUST_PROTECTION 即使没有普通成交行，也必须在 executor 同一进程中原样挂 facts 并提交 writer。顶层 `decision_card` 必须直接使用 §4 示例的九个固定键，不能改成摘要/候选/持仓列表。使用 `--facts-file` 时回执应省略 `live_facts` 让 writer 原样注入；若携带则必须与 facts 文件整份完全相同。文件名中的 `:` 必须换成 `-`，防止 NTFS ADS。禁止用 edit/局部补丁循环拼 JSON；schema 失败最多整文件重写一次，第二次仍失败即终止，不补派、不重推。
 
 | 校验项 | 由谁 | 失败行为 |
 |---|---|---|

@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import _acceptance_thresholds as thresholds
 import audit_source_health as scheduled
 
 
@@ -55,6 +56,11 @@ class NewsSourceSpec:
     role: str
     endpoint: str
     historical_eligible: bool
+    # 2026-08-13：新接入源的预注册前向起点（registry `audit_forward_start_cst`）。
+    # 源诞生前的槽不进分母（不反向加责），但也绝不缩短既有源的前向证据窗；
+    # 生效起点=max(全局 forward_start, 本源起点)，年轻源在攒满最小窗前只判
+    # INSUFFICIENT_EVIDENCE，不判 NOT_MET，也不判 PASSED。
+    forward_start_cst: str | None = None
 
     @property
     def critical(self) -> bool:
@@ -99,6 +105,10 @@ def _load_specs(registry_path: Path) -> list[NewsSourceSpec]:
             role=role,
             endpoint=str(item.get("endpoint") or ""),
             historical_eligible=True,
+            forward_start_cst=(
+                str(item.get("audit_forward_start_cst")).strip()
+                if item.get("audit_forward_start_cst") else None
+            ),
         ))
     parent_ids = {spec.source for spec in specs}
     if "rss_en" not in parent_ids or "okx_news" not in parent_ids:
@@ -269,12 +279,15 @@ def audit_news_source_health(
     as_of: datetime,
     forward_start: datetime,
     rolling_days: int = 14,
-    target_rate: float = 0.99,
+    target_rate: float | None = None,
     minimum_window_hours: int = 24,
     grace_minutes: int = 5,
 ) -> dict[str, Any]:
     if rolling_days <= 0 or minimum_window_hours <= 0:
         raise ValueError("window sizes must be positive")
+    # None = 按预注册激活边界解析；逐源 audit_forward_start_cst 前向起点不受影响。
+    if target_rate is None:
+        target_rate = thresholds.coverage_target_rate(as_of)
     if not 0 < target_rate <= 1:
         raise ValueError("target_rate must be in (0,1]")
     if not 0 <= grace_minutes < 15:
@@ -289,16 +302,31 @@ def audit_news_source_health(
     records = _read_records(
         ledger_db, [spec.source for spec in specs], earliest, end_exclusive)
 
+    def _spec_effective_start(spec: NewsSourceSpec, base: datetime) -> datetime:
+        """新接入源按其预注册起点收窄分母（诞生前不加责）；只可推迟不可提前。"""
+        if not spec.forward_start_cst:
+            return base
+        own = scheduled._parse_cst(spec.forward_start_cst)
+        own = own.astimezone(scheduled.CST)
+        scheduled._ensure_slot_aligned(
+            own, f"{spec.source}.audit_forward_start_cst")
+        return max(base, own)
+
     rolling_rows = []
     for spec in specs:
         if not spec.historical_eligible:
             continue
+        spec_rolling_start = _spec_effective_start(spec, rolling_start)
         minimum = len(_due_cycles(
             rolling_start, end_exclusive, spec.interval_minutes))
         rolling_rows.append(_summarize_source(
             spec,
-            start=rolling_start,
-            end_exclusive=end_exclusive,
+            start=spec_rolling_start,
+            # A preregistered source can have an activation time after the
+            # audit's current as-of boundary.  Its pre-activation denominator
+            # is exactly zero; represent that as an empty half-open window
+            # instead of asking the shared scheduler for a reversed window.
+            end_exclusive=max(spec_rolling_start, end_exclusive),
             records=records[spec.source],
             target_rate=target_rate,
             minimum_slots=minimum,
@@ -308,10 +336,11 @@ def audit_news_source_health(
     for spec in specs:
         slots_per_hour = 60 / spec.interval_minutes
         minimum = max(1, int(math.ceil(minimum_window_hours * slots_per_hour)))
+        spec_forward_start = _spec_effective_start(spec, forward_start)
         forward_rows.append(_summarize_source(
             spec,
-            start=forward_start,
-            end_exclusive=safe_forward_end,
+            start=spec_forward_start,
+            end_exclusive=max(spec_forward_start, safe_forward_end),
             records=records[spec.source],
             target_rate=target_rate,
             minimum_slots=minimum,
@@ -326,6 +355,12 @@ def audit_news_source_health(
         "as_of_cst": as_of.isoformat(),
         "forward_start_cst": forward_start.isoformat(),
         "target_rate": target_rate,
+        "target_rate_migration": thresholds.coverage_migration_facts(as_of),
+        "legacy_target_diagnostics": thresholds.legacy_rate_diagnostics({
+            f"{row['source']}.strict_complete_rate": row.get(
+                "strict_complete_rate")
+            for row in forward_rows
+        }),
         "minimum_window_hours": minimum_window_hours,
         "slot_grace_minutes": grace_minutes,
         "strict_complete_semantics": "status_ok_only; missing_and_degraded_are_in_denominator",
@@ -382,7 +417,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--as-of", default=None)
     parser.add_argument("--forward-start", default=DEFAULT_FORWARD_START)
     parser.add_argument("--rolling-days", type=int, default=14)
-    parser.add_argument("--target-rate", type=float, default=0.99)
+    parser.add_argument(
+        "--target-rate", type=float, default=None,
+        help="default: resolved from the pre-registered activation boundary")
     parser.add_argument("--minimum-window-hours", type=int, default=24)
     parser.add_argument("--grace-minutes", type=int, default=5)
     return parser.parse_args(argv)

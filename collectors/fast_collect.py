@@ -9,7 +9,7 @@
   2. （可选）X 搜索 → 写账本 'x_search'（失败不阻断快采主体，§2）
   3. 通过 _dispatch_nudge 通知 core/dispatcher.py；定时 dispatcher 负责兜底
 
-与生产隔离：默认 --db-root ./db；tmp 验证传临时目录。--dry-collect 跳过真采集
+与生产隔离：默认 --db-root .\\db；tmp 验证传临时目录。--dry-collect 跳过真采集
 （不联网、不写生产），只验账本+触发 plumbing。
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, r".\collectors")
 import ledger          # noqa: E402
 
 try:  # HANDOFF-4B 采集侧事件通知（可缺省，守卫式导入照 analyst_writer 惯例）
@@ -42,6 +42,7 @@ CST = timezone(timedelta(hours=8))
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MIN_STEP_BUDGET_SECONDS = 12
 CORE_FINALIZATION_RESERVE_SECONDS = 5
+CONTRACT_RECOVERY_TIMEOUT_SECONDS = 28
 
 
 def _last_json(text: str):
@@ -86,9 +87,25 @@ def _step_degraded_warning(step: dict) -> str | None:
     elif payload.get("degraded") is not True:
         return None
     else:
-        detail = json.dumps(
-            payload.get("quality") or {}, ensure_ascii=False, sort_keys=True
-        )
+        quality = payload.get("quality")
+        if isinstance(quality, dict) and quality:
+            detail = json.dumps(
+                quality, ensure_ascii=False, sort_keys=True)
+        elif "positioning_coverage_rate" in payload:
+            retry = payload.get("retry")
+            retry = retry if isinstance(retry, dict) else {}
+            try:
+                coverage = f"{float(payload['positioning_coverage_rate']):.6f}"
+            except (TypeError, ValueError):
+                coverage = "invalid"
+            detail = (
+                f"coverage={coverage} "
+                f"initial_invalid={retry.get('initial_invalid_symbols')} "
+                f"retry_recovered={retry.get('retry_recovered_symbols')} "
+                f"final_failed={retry.get('final_failed_symbols')}"
+            )
+        else:
+            detail = str(payload.get("error") or "degraded")
     return f"{step.get('name', 'unknown')}: {detail or 'degraded'}"[:500]
 
 
@@ -113,6 +130,20 @@ def frozen_model_shadow_due(cycle_id: str) -> bool:
     except (TypeError, ValueError):
         return False
     return value.minute == 0
+
+
+def official_positioning_due(cycle_id: str) -> bool:
+    """Collect the official 1H account ratio at :00/:30.
+
+    The upstream observation cadence remains hourly.  A second fetch at :30
+    prevents the oldest symbol-level source row from crossing the 90-minute
+    decision-freshness gate during the second half of an hour.
+    """
+    try:
+        value = datetime.strptime(cycle_id, "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError):
+        return False
+    return value.minute in (0, 30)
 
 
 def frozen_model_shadow_evaluation_due(cycle_id: str) -> bool:
@@ -224,15 +255,39 @@ def _collection_status(steps: list[dict]) -> str:
         return "degraded"
     if not bool(by_name.get("market_features", {}).get("ok")):
         return "degraded"
+    contract_step = by_name.get("contract_statistics")
+    recovery_step = by_name.get("contract_statistics_recovery")
+    effective_contract_step = contract_step
     if (
-        "contract_statistics" in by_name
-        and not bool(by_name["contract_statistics"].get("ok"))
+        contract_step is not None
+        and not bool(contract_step.get("ok"))
+        and recovery_step is not None
+        and bool(recovery_step.get("ok"))
+    ):
+        effective_contract_step = recovery_step
+    if (
+        effective_contract_step is not None
+        and not bool(effective_contract_step.get("ok"))
     ):
         return "degraded"
-    contract_payload = by_name.get("contract_statistics", {}).get("payload")
+    contract_payload = (
+        effective_contract_step.get("payload")
+        if effective_contract_step is not None else None
+    )
     if (
         isinstance(contract_payload, dict)
         and contract_payload.get("degraded") is True
+    ):
+        return "degraded"
+    if (
+        "official_positioning" in by_name
+        and not bool(by_name["official_positioning"].get("ok"))
+    ):
+        return "degraded"
+    positioning_payload = by_name.get("official_positioning", {}).get("payload")
+    if (
+        isinstance(positioning_payload, dict)
+        and positioning_payload.get("degraded") is True
     ):
         return "degraded"
     return "ok"
@@ -386,6 +441,10 @@ def _send_failure_alert(cycle: str, error_detail: str | None,
             str(content_file),
             "--dedupe-key",
             f"fast-collect:{cycle}",
+            # 快采总预算 320s、外层 collect_cycle 360s；把告警内部预算
+            # 固定为25s，给 wrapper/账本/进程收尾保留至少15s。
+            "--timeout",
+            "25",
         ],
         timeout=30,
     )
@@ -405,9 +464,17 @@ def main() -> int:
     ap.add_argument("--collect-timeout", type=int, default=150)
     # 2026-08-08~12的390个自然轮次：live账户P99=17.11s、最大17.66s。
     ap.add_argument("--account-timeout", type=int, default=25)
-    # 同一自然样本最大52.14s；60s避免把可恢复长尾误切成整轮degraded。
-    ap.add_argument("--features-timeout", type=int, default=60)
+    # 既有样本最大52.14s；2026-08-13又出现3个恰好在60s被外层终止的自然槽，
+    # 且终止时总预算仍有余量。放宽到75s覆盖网络长尾，仍受320s总预算钳与
+    # collect_cycle 360s硬上限约束，不借用最终落账余量。
+    ap.add_argument("--features-timeout", type=int, default=75)
     ap.add_argument("--contract-stats-timeout", type=int, default=75)
+    ap.add_argument(
+        "--contract-recovery-timeout",
+        type=int,
+        default=CONTRACT_RECOVERY_TIMEOUT_SECONDS,
+    )
+    ap.add_argument("--positioning-timeout", type=int, default=60)
     ap.add_argument("--shadow-timeout", type=int, default=20)
     ap.add_argument("--coverage-audit-timeout", type=int, default=15)
     ap.add_argument("--model-shadow-timeout", type=int, default=20)
@@ -434,6 +501,7 @@ def main() -> int:
 
     t0 = time.time()
     deadline = t0 + args.total_budget
+    positioning_due = official_positioning_due(cycle)
 
     def run_budgeted(
         name: str,
@@ -462,15 +530,20 @@ def main() -> int:
         core_reserve = (
             max(MIN_STEP_BUDGET_SECONDS, args.account_timeout)
             + max(MIN_STEP_BUDGET_SECONDS, args.contract_stats_timeout)
+            + (
+                max(MIN_STEP_BUDGET_SECONDS, args.positioning_timeout)
+                if positioning_due else 0
+            )
             + CORE_FINALIZATION_RESERVE_SECONDS
         )
-        steps.append(run_budgeted(
+        collect_step = run_budgeted(
             "collect_data", SCRIPTS / "collect_data.py",
             ["--profile", args.profile, "--db-root", str(db_root),
-             "--skip-news"],
+             "--cycle", cycle, "--skip-news"],
             args.collect_timeout,
             reserve_after=core_reserve,
-        ))
+        )
+        steps.append(collect_step)
         # live账户是dispatcher必需源，优先于全部影子增强数据。
         steps.append(run_budgeted(
             "live_account_check", SCRIPTS / "jobb_live_account_check.py",
@@ -478,26 +551,73 @@ def main() -> int:
             args.account_timeout,
             reserve_after=(
                 max(MIN_STEP_BUDGET_SECONDS, args.contract_stats_timeout)
+                + (
+                    max(MIN_STEP_BUDGET_SECONDS, args.positioning_timeout)
+                    if positioning_due else 0
+                )
                 + CORE_FINALIZATION_RESERVE_SECONDS
             ),
         ))
         # 全宇宙官方15m合约统计单独进程顺序执行，避免与盘口/逐笔的连接池竞争。
         # 低于99%时本步 rc=1，使 fast 显式 degraded，但不阻断必需行情和账户快照。
-        steps.append(run_budgeted(
+        contract_step = run_budgeted(
             "contract_statistics", SCRIPTS / "collect_market_features.py",
             [
                 "--db-root", str(db_root), "--cycle", cycle,
                 "--contract-stats", "always", "--contract-stats-only",
             ],
             args.contract_stats_timeout,
-            reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
-        ))
+            reserve_after=(
+                (
+                    max(MIN_STEP_BUDGET_SECONDS, args.positioning_timeout)
+                    if positioning_due else 0
+                )
+                + CORE_FINALIZATION_RESERVE_SECONDS
+            ),
+        )
+        steps.append(contract_step)
+        # 初次严格直采未过门时，在同一自然周期启一个新进程/新连接，只恢复
+        # 缺少直接官方行的精确标的集合。恢复器拒绝历史周期、每端点每币最多
+        # 一次请求且无循环；预算不足或恢复仍低于99%时继续明确 degraded。
+        if bool(collect_step.get("ok")) and not bool(contract_step.get("ok")):
+            recovery_step = run_budgeted(
+                "contract_statistics_recovery",
+                SCRIPTS / "recover_contract_statistics_current.py",
+                ["--db-root", str(db_root), "--cycle", cycle],
+                args.contract_recovery_timeout,
+                reserve_after=(
+                    (
+                        max(MIN_STEP_BUDGET_SECONDS, args.positioning_timeout)
+                        if positioning_due else 0
+                    )
+                    + MIN_STEP_BUDGET_SECONDS
+                    + CORE_FINALIZATION_RESERVE_SECONDS
+                ),
+            )
+            steps.append(recovery_step)
+            if recovery_step.get("ok"):
+                # 首次失败不能抹去；作为诊断 warning 留在本轮输出/日志，
+                # 但最终直采门由恢复器的独立复核结果决定。
+                contract_step["diagnostic_only"] = True
+                contract_step["recovered_by"] = "contract_statistics_recovery"
+        # :00/:30全宇宙账户多空比与盘口/逐笔分进程顺序执行。独立入口只接受
+        # 当前自然槽，并对首次无效标的做最多两波12秒递减精确恢复；不补历史。
+        # 低于99%时本步rc=1并显式降级。
+        if positioning_due:
+            steps.append(run_budgeted(
+                "official_positioning", SCRIPTS / "collect_positioning_current.py",
+                [
+                    "--db-root", str(db_root), "--cycle", cycle,
+                ],
+                args.positioning_timeout,
+                reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
+            ))
         # 50档订单簿与逐笔成交后置。预算不足时明确跳过，绝不借用记账余量。
         steps.append(run_budgeted(
-            "market_features", SCRIPTS / "collect_market_features.py",
+            "market_features", SCRIPTS / "collect_market_features_resilient.py",
             [
                 "--db-root", str(db_root), "--depth", "50",
-                "--cycle", cycle,
+                "--cycle", cycle, "--positioning", "off",
             ],
             args.features_timeout,
             reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
@@ -554,18 +674,33 @@ def main() -> int:
             not args.no_model_shadow
             and frozen_model_shadow_due(cycle)
         ):
-            model_shadow_out = frozen_model_shadow_path(db_root, cycle)
-            model_shadow_step = run_budgeted(
-                "frozen_model_shadow",
-                SCRIPTS / "score_multitimeframe_model_shadow.py",
-                [
-                    "--db-root", str(db_root),
-                    "--cycle-id", cycle,
-                    "--json-out", str(model_shadow_out),
-                ],
-                args.model_shadow_timeout,
-                reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
-            )
+            if collect_step.get("ok"):
+                model_shadow_out = frozen_model_shadow_path(db_root, cycle)
+                model_shadow_step = run_budgeted(
+                    "frozen_model_shadow",
+                    SCRIPTS / "score_multitimeframe_model_shadow.py",
+                    [
+                        "--db-root", str(db_root),
+                        "--cycle-id", cycle,
+                        "--json-out", str(model_shadow_out),
+                    ],
+                    args.model_shadow_timeout,
+                    reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
+                )
+            else:
+                # 没有本周期权威行情时，冻结评分器的输入契约必然不成立。
+                # 直接外显前置失败，避免在空 DataFrame 上产生二次 KeyError；
+                # 不触碰已冻结评分器及其清单哈希，也不改变 fast 的业务状态。
+                model_shadow_step = {
+                    "name": "frozen_model_shadow",
+                    "ok": False,
+                    "rc": 125,
+                    "dur_s": 0.0,
+                    "payload": None,
+                    "stderr_tail": (
+                        "prerequisite collect_data failed; scorer not started"
+                    ),
+                }
             # 研究模型离线门仍未通过；每小时评分只加快前瞻诊断，失败只告警，
             # 绝不影响主行情、账户快照、dispatcher、阈值或订单路径。
             model_shadow_step["diagnostic_only"] = True
@@ -630,6 +765,10 @@ def main() -> int:
         status = _collection_status(steps)
         rows = 0
         for step in steps:
+            # 恢复器只把同周期 carry/无效行替换为直接官方行，不增加该周期
+            # 的唯一业务行数；ledger rows 保持按最终分母计，避免重复计写次数。
+            if step.get("name") == "contract_statistics_recovery":
+                continue
             wrote = (step.get("payload") or {}).get("wrote")
             if isinstance(wrote, dict):
                 rows += sum(
@@ -695,9 +834,48 @@ def main() -> int:
         _nudge_mod.nudge_from_collector("fast_collect", args.db_root, [status],
                                         dry_collect=args.dry_collect)
 
+    collect_payload = next((
+        step.get("payload")
+        for step in steps
+        if step.get("name") == "collect_data"
+        and isinstance(step.get("payload"), dict)
+    ), None)
+    market_quality = (
+        collect_payload.get("quality")
+        if isinstance(collect_payload, dict) else None
+    )
+    data_quality = None
+    if isinstance(market_quality, dict):
+        # Keep a compact, non-secret transport receipt in the parent output.
+        # collect_cycle may safely retain this even when successful, while the
+        # full child payload remains trimmed from the long-lived JSONL.
+        data_quality = {
+            key: market_quality.get(key)
+            for key in (
+                "expected", "tickers", "ticker_coverage",
+                "candle_coverage", "funding_coverage", "ticker_transport",
+            )
+            if key in market_quality
+        }
+    feature_payload = next((
+        step.get("payload")
+        for step in steps
+        if step.get("name") == "market_features"
+        and isinstance(step.get("payload"), dict)
+    ), None)
+    feature_transport = (
+        feature_payload.get("market_feature_transport")
+        if isinstance(feature_payload, dict) else None
+    )
+    if isinstance(feature_transport, dict):
+        if data_quality is None:
+            data_quality = {}
+        data_quality["market_feature_transport"] = feature_transport
+
     out = {"ok": status in ledger.DONE_STATUS, "cycle": cycle, "source": "fast",
            "status": status, "error": error_detail, "latency_ms": latency_ms,
            "warnings": diagnostic_warnings,
+           "data_quality": data_quality,
            "steps": [
                {
                    **{k: s[k] for k in ("name", "ok", "rc", "dur_s")},

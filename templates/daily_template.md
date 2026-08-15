@@ -1,9 +1,9 @@
 <!--
 doc: daily_template
-doc-version: V2.0-template
-last-updated: 2026-08-08
-updated-by: Claude
-change-summary: 清「双盘 risk_reject_count」残余措辞（纯 live 单段）；demo 全量下线（2026-08-06）后日报只写 live 一段；复盘窗口仍为 08:00 锚点（日报窗 [前一日 08:00, 当日 08:00)，周报窗 [上周一 08:00, 本周一 08:00)）。
+doc-version: V2.1-template
+last-updated: 2026-08-13
+updated-by: Codex
+change-summary: 规格书四段：writer 自动渲染市场总览/全市场扫描/数据完善率，新增 reviewer 必填 focus_next_day 次日关注（2026-08-14 激活边界起 validator 硬性要求，历史归档不反向加责）。
 role: 日/周/月复盘模板（reviewer / okx-reviewer -> account.db + reports/daily-reports/ + reports/weekly/）
 权威: skill.md（复盘/推送相关节）+ scripts/daily_report_writer.py + scripts/validate_daily_report.py
 落点: account.db（daily_reports / weekly_reports / monthly_reports）+ reports/daily-reports/daily-YYYY-MM-DD.md + reports/weekly/weekly-YYYY-MM-DD.md
@@ -45,8 +45,14 @@ writer 按 profile 优先读 `live_` 前缀字段（`pf()`），兼容旧无前�
   "live_total_pnl": 12.4, "live_total_fees": 1.2,
   "live_best_trade": "BTC long +9.1", "live_worst_trade": "ETH long -3.0",
 
+  "focus_next_day": "- BTC 4H MA20 得失与 96k 区间上沿\n- 周四 20:30 美国 CPI（importance=3）事件窗 ±4H 谨慎开新仓\n- SOL 资金费连续 3 轮极端偏多，警惕回摆"
 }
 ```
+
+> **`focus_next_day`（2026-08-13 新增，激活边界 2026-08-14 起 validator 硬性要求非空）**：
+> 次日关注清单，reviewer 唯一判断型新增段——3~6 条，覆盖标的结构位、已排期高重要度
+> 事件窗（macro_events/公告/解锁）、需警惕的仓位或数据风险。只写观察与关注点，
+> **禁**写交易指令、禁伪造"可信度概率"（独立前向门未过时 confidence_claim_allowed=false）。
 
 | `daily_reports` 落库列 | 字段（前缀按 profile） | 说明 |
 |---|---|---|
@@ -111,11 +117,22 @@ writer 按 profile 优先读 `live_` 前缀字段（`pf()`），兼容旧无前�
 
 ## 教训 / 改进
 - error_patterns（lessons.db）本周期新增 / 复发
-- missed_opportunities（lessons.db）
+- missed_opportunities（lessons.db）：使用交易事实窗整体前移4小时的连续24小时候选窗；只统计已有16根连续15分钟K线的完整4小时后验，并外显候选窗
 
 ## 异常 / 数据降级
 - 当期 stale 源 / 降级权重=0 的源（data_source_quality）
 ```
+
+> **2026-08-13 规格书四段（writer 自动生成 + reviewer 判断段）**：日报 Markdown 由
+> `daily_report_writer` 额外渲染四段，激活边界 `2026-08-14 00:00:00` 起
+> `validate_daily_report.py` 硬性要求（历史归档不反向加责）：
+>
+> | 段 | 来源 | reviewer 职责 |
+> |---|---|---|
+> | `## 🛰 全市场扫描` | writer 确定性回读（tick 宇宙规模 + 窗口内 analysis 轮次/信号/动作分布 + 判断吞吐影子计数；不显示可信度分值） | 只读，不加工 |
+> | `## 📡 数据完善率` | writer 确定性回读 ledger.collection_runs 窗口完成率 + 失败源清单 | 只读；归因写进复盘观察 |
+> | `### 市场总览（writer 权威回读）` | cross_market + tick_snapshots（BTC/ETH、总市值、BTC.D、恐贪、TVL、regime） | 只读，不复算 |
+> | `## 🔭 次日关注` | **reviewer 判断**（payload `focus_next_day`） | 必填 3~6 条，见上方字段说明 |
 
 > 复盘一律经 `scripts/qq_push.py --content-file <UTF-8 文件> --dedupe-key reviewer:<YYYY-MM-DD>:<用途>`（禁 channels PUT、禁直接使用数字目标）。发送前执行 `scripts/validate_daily_report.py --file <日报 Markdown>`；日报/周报禁止复用 15M 战报专用 `validate_push_format.py`。正文中文只走 UTF-8 文件。
 

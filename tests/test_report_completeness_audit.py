@@ -1,7 +1,8 @@
 import sys
+import hashlib
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -83,6 +84,90 @@ class ReportCompletenessAuditTests(unittest.TestCase):
                 live_trades_db=Path("live.db"),
                 ledger_db=Path("ledger.db"),
             )
+
+    def test_forward_window_is_pre_registered_and_requires_30_days(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reports = root / "reports"
+            reports.mkdir()
+            required = {
+                "reports_dir": reports,
+                "account_db": root / "account.db",
+                "live_trades_db": root / "live.db",
+                "ledger_db": root / "ledger.db",
+                "validator": lambda **_: {"ok": True},
+            }
+            empty = audit_report_completeness.audit_forward_daily_reports(
+                start=date(2026, 8, 13),
+                end=date(2026, 8, 12),
+                minimum_days=30,
+                **required,
+            )
+            for offset in range(30):
+                day = date(2026, 8, 13) + timedelta(days=offset)
+                (reports / f"daily-{day.isoformat()}.md").touch()
+            complete = audit_report_completeness.audit_forward_daily_reports(
+                start=date(2026, 8, 13),
+                end=date(2026, 9, 11),
+                minimum_days=30,
+                **required,
+            )
+        self.assertEqual(empty["status"], "INSUFFICIENT_EVIDENCE")
+        self.assertEqual(empty["expected"], 0)
+        self.assertEqual(complete["status"], "PASSED")
+        self.assertEqual(complete["completeness_rate"], 1.0)
+
+    def test_one_invalid_day_fails_legacy_99_percent_forward_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reports = root / "reports"
+            reports.mkdir()
+            for offset in range(30):
+                day = date(2026, 8, 13) + timedelta(days=offset)
+                (reports / f"daily-{day.isoformat()}.md").touch()
+            result = audit_report_completeness.audit_forward_daily_reports(
+                start=date(2026, 8, 13),
+                end=date(2026, 9, 11),
+                minimum_days=30,
+                reports_dir=reports,
+                account_db=root / "account.db",
+                live_trades_db=root / "live.db",
+                ledger_db=root / "ledger.db",
+                evaluated_at="2026-08-15T19:59:59+08:00",
+                validator=lambda **kwargs: {
+                    "ok": not kwargs["report_path"].name.endswith("08-20.md")
+                },
+            )
+        self.assertEqual(result["valid"], 29)
+        self.assertEqual(result["status"], "NOT_MET")
+
+    def test_delivery_requires_matching_artifact_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reports = root / "reports"
+            reports.mkdir()
+            report = reports / "daily-2026-08-13.md"
+            report.write_text("canonical", encoding="utf-8")
+            identity = "reviewer:2026-08-13:daily"
+            digest = hashlib.sha256(report.read_bytes()).hexdigest()
+            common = {
+                "start": date(2026, 8, 13),
+                "end": date(2026, 8, 13),
+                "reports_dir": reports,
+                "account_db": root / "account.db",
+                "live_trades_db": root / "live.db",
+                "ledger_db": root / "ledger.db",
+                "marked_identities": {identity},
+                "validator": lambda **_: {"ok": True},
+            }
+            passed = audit_report_completeness.audit_daily_reports(
+                delivery_hashes={identity: {digest}}, **common)
+            failed = audit_report_completeness.audit_daily_reports(
+                delivery_hashes={identity: {"0" * 64}}, **common)
+        self.assertEqual(passed["delivery_status"], "PASSED")
+        self.assertEqual(passed["audit_status"], "PASSED")
+        self.assertEqual(failed["delivery_status"], "NOT_MET")
+        self.assertEqual(failed["audit_status"], "NOT_MET")
 
 
 if __name__ == "__main__":
