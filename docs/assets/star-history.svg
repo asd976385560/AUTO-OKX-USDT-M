@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-labelledby="title desc">
   <title id="title">GitHub star history for asd976385560/AUTO-OKX-USDT-M</title>
-  <desc id="desc">0 stars recorded through 2026-08-20</desc>
+  <desc id="desc">0 stars recorded through 2026-08-21</desc>
   <defs>
     <linearGradient id="area" x1="0" x2="0" y1="0" y2="1">
       <stop offset="0%" stop-color="#2f81f7" stop-opacity="0.40"/>
@@ -20,12 +20,12 @@
   <rect class="bg" width="960" height="360" rx="12"/>
   <text x="36" y="38" class="title">asd976385560/AUTO-OKX-USDT-M · Stars</text>
   <text x="924" y="40" text-anchor="end" class="metric">0</text>
-  <text x="924" y="58" text-anchor="end" class="subtle">checked 2026-08-20 UTC</text>
+  <text x="924" y="58" text-anchor="end" class="subtle">checked 2026-08-21 UTC</text>
   <line x1="78" y1="66.0" x2="902" y2="66.0" class="grid"/><text x="66" y="70.0" text-anchor="end" class="axis">4</text><line x1="78" y1="121.0" x2="902" y2="121.0" class="grid"/><text x="66" y="125.0" text-anchor="end" class="axis">3</text><line x1="78" y1="176.0" x2="902" y2="176.0" class="grid"/><text x="66" y="180.0" text-anchor="end" class="axis">2</text><line x1="78" y1="231.0" x2="902" y2="231.0" class="grid"/><text x="66" y="235.0" text-anchor="end" class="axis">1</text><line x1="78" y1="286.0" x2="902" y2="286.0" class="grid"/><text x="66" y="290.0" text-anchor="end" class="axis">0</text>
-  <polygon class="area" points="78,286 78.0,286.0 108.5,286.0 139.0,286.0 169.6,286.0 200.1,286.0 230.6,286.0 261.1,286.0 291.6,286.0 322.1,286.0 352.7,286.0 383.2,286.0 413.7,286.0 444.2,286.0 474.7,286.0 505.3,286.0 535.8,286.0 566.3,286.0 596.8,286.0 627.3,286.0 657.9,286.0 688.4,286.0 718.9,286.0 749.4,286.0 779.9,286.0 810.4,286.0 841.0,286.0 871.5,286.0 902.0,286.0 902,286"/>
-  <polyline class="line" points="78.0,286.0 108.5,286.0 139.0,286.0 169.6,286.0 200.1,286.0 230.6,286.0 261.1,286.0 291.6,286.0 322.1,286.0 352.7,286.0 383.2,286.0 413.7,286.0 444.2,286.0 474.7,286.0 505.3,286.0 535.8,286.0 566.3,286.0 596.8,286.0 627.3,286.0 657.9,286.0 688.4,286.0 718.9,286.0 749.4,286.0 779.9,286.0 810.4,286.0 841.0,286.0 871.5,286.0 902.0,286.0"/>
+  <polygon class="area" points="78,286 78.0,286.0 107.4,286.0 136.9,286.0 166.3,286.0 195.7,286.0 225.1,286.0 254.6,286.0 284.0,286.0 313.4,286.0 342.9,286.0 372.3,286.0 401.7,286.0 431.1,286.0 460.6,286.0 490.0,286.0 519.4,286.0 548.9,286.0 578.3,286.0 607.7,286.0 637.1,286.0 666.6,286.0 696.0,286.0 725.4,286.0 754.9,286.0 784.3,286.0 813.7,286.0 843.1,286.0 872.6,286.0 902.0,286.0 902,286"/>
+  <polyline class="line" points="78.0,286.0 107.4,286.0 136.9,286.0 166.3,286.0 195.7,286.0 225.1,286.0 254.6,286.0 284.0,286.0 313.4,286.0 342.9,286.0 372.3,286.0 401.7,286.0 431.1,286.0 460.6,286.0 490.0,286.0 519.4,286.0 548.9,286.0 578.3,286.0 607.7,286.0 637.1,286.0 666.6,286.0 696.0,286.0 725.4,286.0 754.9,286.0 784.3,286.0 813.7,286.0 843.1,286.0 872.6,286.0 902.0,286.0"/>
   <circle cx="902.0" cy="286.0" r="4.5" fill="#58a6ff"/>
   <text x="78" y="313" class="axis">2026-07-24</text>
-  <text x="902" y="313" text-anchor="end" class="axis">2026-08-20</text>
+  <text x="902" y="313" text-anchor="end" class="axis">2026-08-21</text>
   <text x="480" y="340" text-anchor="middle" class="subtle">Daily cumulative GitHub stars · no user identities stored</text>
 </svg>
