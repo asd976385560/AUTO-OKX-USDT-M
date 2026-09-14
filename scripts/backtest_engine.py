@@ -21,6 +21,15 @@ playbook 规则——把"等实盘 n≥10"的周/月级验证提速到分钟级�
       [--symbols top:22|BTC-USDT-SWAP,ETH-USDT-SWAP] [--tf 4H] [--workers 8]
       [--annotate-playbook 354 --apply]
 """
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse
 import json
 import re
@@ -145,7 +154,7 @@ def pick_symbols(db_root, spec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rule", required=True)
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--symbols", default="top:22")
     ap.add_argument("--tf", default="4H")
     ap.add_argument("--workers", type=int, default=8)

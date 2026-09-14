@@ -3,7 +3,7 @@
 
 输入：stdin JSON: {"content" 或 "content_file"(优先，UTF-8 文件交接), "ts": "2026-06-05 21:46:00", "title": "可选标题"}
 - ts 必填，决定归档文件名（V2.0 管道传 push_pipeline 的运行时刻 now_ts()）
-- 输出：./reports//agents//v2-push-{YYYYMMDD-HHMMSS}.md，
+- 输出：<PROJECT_ROOT>\\reports\\agents\\v2-push-{YYYYMMDD-HHMMSS}.md，
   并以同内容覆盖 v2-push-latest.md。
 
 调用方（V2.0 现役）：scripts/push_pipeline.py 在 qq_push 之前完成归档与内容硬校验；
@@ -11,10 +11,19 @@
   --no-send 时 --reports-dir 指向 dev 目录，不碰生产 latest.md。
 手动调试：中文 JSON 禁走 echo 管道（GBK 坏码），先写 tmp/*.json 再 --json-file，或用 content_file。
 
-退出码：0=成功；2=已归档但内容缺渲染模板指纹（<300 字符 / 缺『第N轮』/ 缺📊 段——T4 存证闸，
-        pipeline 将其视为硬校验失败并禁止外发）；其余非0=归档失败
+退出码：0=成功；2=内容缺渲染模板指纹（<300 字符 / 缺『第N轮』/ 缺📊 段——T4 硬闸，
+        不覆盖 canonical/latest，pipeline 禁止外发）；其余非0=归档失败
 """
-import argparse, json, os, re, sys
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+import argparse, json, os, re, sys, tempfile
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -53,7 +62,7 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:
-        fail(f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 ./tmp//*.json 再用 --json-file")
+        fail((f"输入 JSON 解析失败: {e}；含中文/特殊符号时建议先写 <PROJECT_ROOT>\\tmp\\*.json 再用 --json-file").replace('<PROJECT_ROOT>', _public_project_path()))
 
 def parse_stamp(ts: str) -> str:
     # ts 格式: "2026-06-05 21:46:00" → 文件名 20260605-214600
@@ -82,9 +91,39 @@ def extract_cycle(content: str):
     return None
 
 
+def _atomic_write_text(path: str, content: str) -> None:
+    """Write one complete UTF-8 artifact via same-directory atomic replace."""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=parent,
+            prefix=f".{os.path.basename(target)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def main():
     p = argparse.ArgumentParser(description="推送归档")
-    p.add_argument("--reports-dir", default=r"./reports/agents")
+    p.add_argument("--reports-dir", default=_public_project_path('reports', 'agents'))
     g = p.add_mutually_exclusive_group()
     g.add_argument("--stdin", action="store_true")
     g.add_argument("--json-file")
@@ -111,23 +150,13 @@ def main():
         stamp = parse_stamp(ts)
     except Exception as e:
         fail(f"ts 格式无法解析: {ts} ({e})")
-    os.makedirs(args.reports_dir, exist_ok=True)
     out_path = os.path.join(args.reports_dir, f"v2-push-{stamp}.md")
     cycle = data.get("cycle_count") or data.get("cycle") or extract_cycle(content) or stamp
     title = data.get("title", "")
     header = f"# OKX V2.0 Push — Cycle {cycle}\n\n" if title == "" else f"# {title}\n\n"
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(header)
-            f.write(content)
-        latest_path = os.path.join(args.reports_dir, "v2-push-latest.md")
-        with open(latest_path, "w", encoding="utf-8") as f:
-            f.write(header)
-            f.write(content)
-    except Exception as e:
-        fail(f"写入失败: {e}")
-    # T4 硬闸（2026-06-12 #2295 推送塌缩事故）：归档永远完成（审计底线），
-    # 但内容缺渲染模板指纹时 rc=2 提醒 agent 重走 render→validate，不得外发当前内容。
+    latest_path = os.path.join(args.reports_dir, "v2-push-latest.md")
+    # T4 必须先于 canonical/latest 的任何写入。无效正文由上游工作文件和
+    # pipeline runlog 留证，不得污染正式归档或 latest。
     degraded_reasons = []
     if len(content) < 300:
         degraded_reasons.append(f"内容仅 {len(content)} 字符(<300)")
@@ -135,15 +164,35 @@ def main():
         degraded_reasons.append("缺『第N轮』header")
     if "📊" not in content:
         degraded_reasons.append("缺『📊 资产』段")
-    result = {"ok": True, "path": out_path, "latest": latest_path, "cycle": cycle, "stamp": stamp,
-              "bytes": os.path.getsize(out_path)}
     if degraded_reasons:
-        result["degraded"] = True
-        result["degraded_reasons"] = degraded_reasons
+        result = {
+            "ok": False,
+            "path": out_path,
+            "latest": latest_path,
+            "cycle": cycle,
+            "stamp": stamp,
+            "bytes": 0,
+            "degraded": True,
+            "degraded_reasons": degraded_reasons,
+            "canonical_written": False,
+        }
         print(json.dumps(result, ensure_ascii=False))
-        print(f"[push_archive][P2] 内容非渲染模板：{'；'.join(degraded_reasons)}。已归档存证，"
-              f"但禁止外发——请回 render_push_report.py 重渲染并过 validate_push_format.py。", file=sys.stderr)
+        print(f"[push_archive][P2] 内容非渲染模板：{'；'.join(degraded_reasons)}。"
+              "未覆盖 canonical/latest，禁止外发——请回 render_push_report.py "
+              "重渲染并过 validate_push_format.py。", file=sys.stderr)
         sys.exit(2)
+    artifact = header + content
+    try:
+        # 时间戳归档先落；latest 后落。任一步失败都不会留下半文件，且 latest
+        # 失败时仍保留完整时间戳归档供审计与幂等重试。
+        _atomic_write_text(out_path, artifact)
+        _atomic_write_text(latest_path, artifact)
+    except Exception as e:
+        fail(f"写入失败: {e}")
+    result = {"ok": True, "path": out_path, "latest": latest_path,
+              "cycle": cycle, "stamp": stamp,
+              "bytes": os.path.getsize(out_path),
+              "canonical_written": True}
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(0)
 

@@ -12,6 +12,8 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import audit_report_completeness  # noqa: E402
+import _acceptance_thresholds as thresholds  # noqa: E402
+import validate_daily_report  # noqa: E402
 
 
 class ReportCompletenessAuditTests(unittest.TestCase):
@@ -22,6 +24,7 @@ class ReportCompletenessAuditTests(unittest.TestCase):
             reports.mkdir()
             for name in ("account.db", "live_trades.db", "ledger.db"):
                 (root / name).touch()
+            (root / "market.db").touch()
             (reports / "daily-2026-08-01.md").write_text(
                 "fixture", encoding="utf-8")
             (reports / "daily-2026-08-03.md").write_text(
@@ -43,6 +46,7 @@ class ReportCompletenessAuditTests(unittest.TestCase):
                 account_db=root / "account.db",
                 live_trades_db=root / "live_trades.db",
                 ledger_db=root / "ledger.db",
+                market_db=root / "market.db",
                 validator=validator,
                 evaluated_at="2026-08-12 01:00:00",
             )
@@ -55,6 +59,65 @@ class ReportCompletenessAuditTests(unittest.TestCase):
         self.assertIn("missing", result["rows"][1]["errors"][0])
         self.assertFalse(result["auto_send"])
         self.assertFalse(result["database_write"])
+
+    def test_market_db_is_forwarded_and_validator_warnings_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reports = root / "reports"
+            reports.mkdir()
+            report = reports / "daily-2026-08-13.md"
+            report.write_text("fixture", encoding="utf-8")
+            market = root / "market.db"
+            market.touch()
+            lessons = root / "lessons.db"
+            lessons.touch()
+            observed = {}
+
+            def validator(**kwargs):
+                observed.update(kwargs)
+                return {
+                    "ok": True,
+                    "warnings": ["window: preserved missing daily report gap"],
+                }
+
+            result = audit_report_completeness.audit_daily_reports(
+                start=date(2026, 8, 13),
+                end=date(2026, 8, 13),
+                reports_dir=reports,
+                account_db=root / "account.db",
+                live_trades_db=root / "live.db",
+                ledger_db=root / "ledger.db",
+                market_db=market,
+                lessons_db=lessons,
+                validator=validator,
+            )
+        self.assertEqual(observed["market_db"], market)
+        self.assertEqual(observed["lessons_db"], lessons)
+        self.assertEqual(
+            result["rows"][0]["warnings"],
+            ["window: preserved missing daily report gap"],
+        )
+
+    def test_missed_opportunity_evidence_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing = root / "missing-lessons.db"
+            with self.assertRaisesRegex(ValueError, "lessons database missing"):
+                validate_daily_report._missed_opportunity_count(
+                    missing,
+                    "2026-08-12 04:00:00",
+                    "2026-08-13 04:00:00",
+                )
+            empty = root / "lessons.db"
+            import sqlite3
+            sqlite3.connect(empty).close()
+            with self.assertRaisesRegex(
+                    ValueError, "missing missed_opportunities table"):
+                validate_daily_report._missed_opportunity_count(
+                    empty,
+                    "2026-08-12 04:00:00",
+                    "2026-08-13 04:00:00",
+                )
 
     def test_target_passes_only_at_or_above_99_percent(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -117,7 +180,7 @@ class ReportCompletenessAuditTests(unittest.TestCase):
         self.assertEqual(complete["status"], "PASSED")
         self.assertEqual(complete["completeness_rate"], 1.0)
 
-    def test_one_invalid_day_fails_legacy_99_percent_forward_window(self):
+    def test_one_invalid_day_uses_the_pre_registered_boundary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             reports = root / "reports"
@@ -125,21 +188,32 @@ class ReportCompletenessAuditTests(unittest.TestCase):
             for offset in range(30):
                 day = date(2026, 8, 13) + timedelta(days=offset)
                 (reports / f"daily-{day.isoformat()}.md").touch()
-            result = audit_report_completeness.audit_forward_daily_reports(
-                start=date(2026, 8, 13),
-                end=date(2026, 9, 11),
-                minimum_days=30,
-                reports_dir=reports,
-                account_db=root / "account.db",
-                live_trades_db=root / "live.db",
-                ledger_db=root / "ledger.db",
-                evaluated_at="2026-08-15T19:59:59+08:00",
-                validator=lambda **kwargs: {
+            common = {
+                "start": date(2026, 8, 13),
+                "end": date(2026, 9, 11),
+                "minimum_days": 30,
+                "reports_dir": reports,
+                "account_db": root / "account.db",
+                "live_trades_db": root / "live.db",
+                "ledger_db": root / "ledger.db",
+                "validator": lambda **kwargs: {
                     "ok": not kwargs["report_path"].name.endswith("08-20.md")
                 },
+            }
+            activation = thresholds.parse_cst(
+                thresholds.COVERAGE_TARGET_ACTIVATION_CST)
+            before = audit_report_completeness.audit_forward_daily_reports(
+                evaluated_at=(activation - timedelta(seconds=1)).isoformat(),
+                **common,
             )
-        self.assertEqual(result["valid"], 29)
-        self.assertEqual(result["status"], "NOT_MET")
+            after = audit_report_completeness.audit_forward_daily_reports(
+                evaluated_at=activation.isoformat(),
+                **common,
+            )
+        self.assertEqual(before["valid"], 29)
+        self.assertEqual(after["valid"], 29)
+        self.assertEqual(before["status"], "NOT_MET")
+        self.assertEqual(after["status"], "PASSED")
 
     def test_delivery_requires_matching_artifact_hash(self):
         with tempfile.TemporaryDirectory() as temp:

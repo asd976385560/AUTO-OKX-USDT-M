@@ -11,10 +11,19 @@
   3. 默认通过 _dispatch_nudge 通知 core/dispatcher.py；聚合 hourly runner 传
      --defer-dispatch-nudge 时只落账，由 runner 等 news+slow 都收口后单次通知
 
-与生产隔离：默认 --db-root .\\db；tmp 验证传临时目录。--dry-collect 跳过真采集
-（不联网、不写生产），只验账本+触发 plumbing。
+与生产隔离：默认 --db-root <PROJECT_ROOT>\\db；tmp 验证传临时目录。--dry-collect 仅允许
+非生产 db-root；生产根在建表/落账前 rc64 拒绝。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -25,7 +34,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, r".\collectors")
+sys.path.insert(0, _public_project_path('collectors'))
 import ledger          # noqa: E402
 
 try:  # HANDOFF-4B 采集侧事件通知（可缺省，守卫式导入照 analyst_writer 惯例）
@@ -37,11 +46,27 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 SCRIPTS = ROOT / "scripts"
 CST = timezone(timedelta(hours=8))
 # 子进程隐藏窗口：本脚本被 wscript 以无窗口起，console 子进程(pwsh)默认会新开可见窗口——加此 flag 抑制
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _python_child_env() -> dict[str, str]:
+    """Match the UTF-8 decoder used for captured collect_slow output."""
+    child_env = dict(os.environ)
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    return child_env
+
+
+def _is_production_db_root(db_root: Path) -> bool:
+    try:
+        return db_root.resolve() == (ROOT / "db").resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(db_root))) == os.path.normcase(
+            os.path.abspath(str(ROOT / "db")))
 
 
 def _hour_cycle_id(now: datetime | None = None) -> str:
@@ -137,6 +162,7 @@ def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_python_child_env(),
             creationflags=CREATE_NO_WINDOW,
         )
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -150,6 +176,16 @@ def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
                       if "[WARN]" in ln or "[FAIL]" in ln]
         if warn_lines:
             out["warn_tail"] = warn_lines[-5:]
+        for line in reversed((stdout or "").splitlines()):
+            if not line.lstrip().startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                out["payload"] = payload
+                break
         return out
     except subprocess.TimeoutExpired as exc:
         partial_stdout = exc.stdout or ""
@@ -206,7 +242,7 @@ def main() -> int:
     # + regime 验证/记账/nudge ~1s，最坏 <460s < 480s 必能走到落账（正常 ~220s 不受影响）。
     ap.add_argument("--collect-timeout", type=int, default=450)
     ap.add_argument("--dry-collect", action="store_true",
-                    help="跳过真采集（不联网/不写生产），只验账本+触发")
+                    help="仅隔离db-root可用；生产根在任何账本写入前拒绝")
     ap.add_argument(
         "--defer-dispatch-nudge",
         action="store_true",
@@ -217,9 +253,20 @@ def main() -> int:
     args = ap.parse_args()
 
     db_root = Path(args.db_root)
+    cycle = args.cycle or _hour_cycle_id()
+    if args.dry_collect and _is_production_db_root(db_root):
+        print(json.dumps({
+            "ok": False,
+            "cycle": cycle,
+            "source": "slow",
+            "status_slow": "error",
+            "status_regime": "error",
+            "error": "dry_collect_production_db_root_forbidden",
+            "production_database_writes": 0,
+        }, ensure_ascii=False))
+        return 64
     ledger_db = db_root / "ledger.db"
     ledger.init_ledger(ledger_db)
-    cycle = args.cycle or _hour_cycle_id()
 
     t0 = time.time()
     steps = []
@@ -233,11 +280,32 @@ def main() -> int:
                                args.collect_timeout)
         steps.append(step_result)
         rc = step_result["rc"]
+        collector_payload = (
+            step_result.get("payload")
+            if isinstance(step_result.get("payload"), dict)
+            else {}
+        )
         # collect_slow.py rc 契约：0=ok；2=degraded（部分块失败但不阻断）；其他=error。
         if rc == 0:
             slow_status = "ok"
         elif rc == 2:
             slow_status = "degraded"
+            degraded_items = collector_payload.get("degraded")
+            if not isinstance(degraded_items, list):
+                degraded_items = []
+            warn_tail = step_result.get("warn_tail")
+            if not isinstance(warn_tail, list):
+                warn_tail = []
+            parts = []
+            if degraded_items:
+                parts.append(
+                    "blocks=" + ",".join(str(item) for item in degraded_items)
+                )
+            if warn_tail:
+                parts.append("warnings=" + " | ".join(str(item) for item in warn_tail))
+            slow_err = (
+                "collect_slow degraded: " + ("; ".join(parts) or "rc=2")
+            )[:500]
         else:
             slow_status = "error"
             slow_err = (step_result.get("stderr_tail")
@@ -284,6 +352,35 @@ def main() -> int:
                           "name", "ok", "rc", "dur_s", "warn_tail", "stderr_tail")
                       if k in s} for s in steps],
            "dispatch": dispatch_result}
+    if steps and isinstance(steps[0].get("payload"), dict):
+        collector_payload = steps[0]["payload"]
+        timing = collector_payload.get("timing_s")
+        if isinstance(timing, dict):
+            out["collector_timing_s"] = timing
+        degraded_items = collector_payload.get("degraded")
+        if isinstance(degraded_items, list):
+            out["collector_degraded"] = [
+                str(item) for item in degraded_items
+            ]
+        degradation_details = collector_payload.get("degradation_details")
+        if isinstance(degradation_details, dict):
+            out["collector_degradation_details"] = degradation_details
+        wrote = collector_payload.get("wrote")
+        if isinstance(wrote, dict):
+            out["collector_wrote"] = wrote
+        symbols_count = collector_payload.get("symbols_count")
+        if isinstance(symbols_count, int):
+            out["collector_symbols_count"] = symbols_count
+        priority_symbols = collector_payload.get("position_priority_symbols")
+        if isinstance(priority_symbols, list):
+            out["collector_position_priority_symbols"] = [
+                str(item) for item in priority_symbols if str(item).strip()
+            ]
+        collector_warnings = steps[0].get("warn_tail")
+        if isinstance(collector_warnings, list):
+            out["collector_warnings"] = [
+                str(item) for item in collector_warnings[-5:]
+            ]
     print(json.dumps(out, ensure_ascii=False))
     return 0 if slow_status in ledger.DONE_STATUS else 1
 

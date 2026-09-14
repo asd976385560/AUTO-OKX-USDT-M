@@ -26,6 +26,15 @@ r_source=sl_from_open_raw 时计算，其余输出 null（未知不冒充 0）�
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import collections
 import json
@@ -73,7 +82,7 @@ def classify(reason: str, raw: dict, sl_px: float | None,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="平仓出口互斥分类（只读）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--since", default="2026-07-01")
     ap.add_argument("--until", default="2099-01-01")
     ap.add_argument("--out-dir", default=None,

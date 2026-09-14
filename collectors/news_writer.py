@@ -20,6 +20,15 @@ event_occurred_at 派生。8/7 事件被 8/10 转发刷成"4 分钟前"是 DOT �
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import hashlib
 import json
 import os
@@ -38,7 +47,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_NEWS_DB = Path(os.environ.get("OKX_DB_ROOT", r"./db")) / "news.db"
+DEFAULT_NEWS_DB = Path(os.environ.get("OKX_DB_ROOT", _public_project_path('db'))) / "news.db"
 
 VALID_LEVELS = {"A", "B", "C"}
 VALID_SEVERITY = {"critical", "high", "medium", "low"}
@@ -60,6 +69,33 @@ def compute_hash(source: str, title: str, url: Optional[str],
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:32]
 
 
+_X_STATUS_RE = re.compile(
+    r"(?:^|//)(?:www\.)?(?:x|twitter)\.com/(?:[^/]+/)+status/(\d+)", re.IGNORECASE)
+
+
+def x_status_id(url: Optional[str]) -> Optional[str]:
+    """取 X 帖文的 status id（帖文不变标识）；非 X 帖文链接返回 None。"""
+    m = _X_STATUS_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def dedupe_hash_for(source: str, title: str, url: Optional[str],
+                    event_time: Optional[str]) -> str:
+    """去重指纹。X 帖文按 status id 定键，其余来源保持 title 指纹不变。
+
+    2026-09-12：同一条 X 帖子每轮被模型重新概括，title 随措辞变化 → 旧的
+    title 指纹判为新事件，把同帖反复入库（实测整体约 8.9 行/帖，最严重的
+    status/2096940695416344942 入库 58 次、tokenomist_ai 58 行仅 1 条帖）。
+    status id 是帖文的不变标识，故 X 类改用它；非 X 源仍需 title+event_time
+    区分「同标题不同时刻」，行为刻意不动。
+    """
+    sid = x_status_id(url)
+    if sid:
+        return hashlib.sha256(
+            ("x_status|" + sid).encode("utf-8")).hexdigest()[:32]
+    return compute_hash(source, title, url, event_time)
+
+
 # ── 2026-08-10 Wave0-4 时间与来源分层（终稿 T1）────────────────────────────
 # 三层时间：event_occurred_at（事件真实发生）/ published_at（媒体发布，=旧
 # event_time 语义）/ first_seen_at（事件簇首次入库）。决策侧“催化新鲜度”只准用
@@ -70,6 +106,11 @@ PRIMARY_DOMAINS = (
     "sec.gov", "federalreserve.gov", "treasury.gov", "ecb.europa.eu",
     "bis.org", "imf.org", "cftc.gov", "justice.gov", "whitehouse.gov",
     "okx.com", "grayscale.com",
+    # 2026-08-18 A3-lite：解锁日历所有者=该数据类的「指标所有者官方网页」
+    # （来源优先级第三档）。仅在 scout 把日历页/原始排期 URL 写入
+    # primary_source_url 时生效，用于解锁催化过「一级源核实」门；
+    # 转述性媒体贴不得附（见 news_scout.md 解锁条目）。
+    "tokenomist.ai", "defillama.com",
 )
 AGGREGATOR_DOMAINS = ("x.com", "twitter.com", "t.me")
 
@@ -83,6 +124,32 @@ _EN_DATE_RE = re.compile(
     r"(\d{1,2})\b\)?")
 _CN_DATE_RE = re.compile(r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 _ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+
+# 2026-08-20：相对日期层。此前只认显式日期，实测近 7 天 source_grade=primary 且
+# 带标的的 509 条里 421 条（82.7%）拿不到 event_occurred_at——因为币圈标题绝大多数
+# 用「yesterday / in the past 24 hours / 今日」这类相对表述。而角色契约规定「事件日
+# 未知不得写 fresh」「负 EV 候选只有经一级源核实的新鲜催化才可 ev_override」，于是
+# 催化通道实际上被自己的抽取覆盖率掐死。
+#
+# 只收**能唯一钉到某一天**的表述，仍守「宁缺勿假」：
+#   - 明确指日的（today/yesterday/今日/昨日）；
+#   - 明确以观察时刻为界的滚动 24h 聚合事件（past 24 hours/过去24小时）——这类
+#     事件本身跨两天，锚到观察日是它唯一可判定的口径；
+#   - 「recently/近期/本周/this week」一律不收，太粗，钉不到天。
+# 相对层的 event_date_source 单独打标（relative_title / relative_raw.<key>），因此
+# event_time_confidence 也随之可区分，审计能把它和显式日期分开统计。
+_RELATIVE_DAY_PATTERNS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"\byesterday\b", re.IGNORECASE), -1),
+    (re.compile(r"昨[日天]"), -1),
+    (re.compile(r"\btoday\b", re.IGNORECASE), 0),
+    (re.compile(r"今[日天]"), 0),
+    (re.compile(
+        r"\b(?:in|over|during)\s+the\s+(?:past|last)\s+24\s*h(?:ours?)?\b",
+        re.IGNORECASE), 0),
+    (re.compile(r"\bpast\s+24\s*h(?:ours?)?\b", re.IGNORECASE), 0),
+    (re.compile(r"(?:过去|近|最近)\s*24\s*小时"), 0),
+    (re.compile(r"24\s*小时内"), 0),
+)
 
 
 def source_grade(url: Optional[str], source: Optional[str]) -> str:
@@ -206,11 +273,41 @@ def extract_event_date(title: str, ref_ts: str) -> Optional[str]:
     return None
 
 
-def extract_event_date_with_source(title: str, raw: Any,
-                                   ref_ts: str) -> tuple[Optional[str], str]:
+def extract_relative_event_date(text: str, ref_ts: str) -> Optional[str]:
+    """从相对表述钉出事件日（'yesterday' / '今日' / 'past 24 hours'）。
+
+    取不出返回 None。锚点是调用方给的参考时刻（优先媒体发布时刻，缺则采集时刻）；
+    只回落到「当天」或「前一天」，绝不产生未来日期。
+    """
+    body = str(text or "")
+    if not body:
+        return None
+    try:
+        ref = datetime.strptime(str(ref_ts)[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+    for pattern, delta_days in _RELATIVE_DAY_PATTERNS:
+        if pattern.search(body):
+            return (ref + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+    return None
+
+
+def extract_event_date_with_source(
+        title: str, raw: Any, ref_ts: str,
+        relative_ref_ts: Optional[str] = None) -> tuple[Optional[str], str]:
+    """事件日 + 来源标签。优先级：标题显式 > 标题相对 > 正文显式 > 正文相对。
+
+    标题相对刻意排在正文显式之前：正文里的日期常是预测目标日、解锁日或引用的旧
+    事件日，实测出现过「今天突破的行情」被正文里一个未来日期覆盖成 scheduled 的
+    情况；而标题里的 'yesterday/今日' 说的就是本条新闻自己的事件日。
+    """
+    rel_ref = relative_ref_ts or ref_ts
     occurred = extract_event_date(title, ref_ts)
     if occurred:
         return occurred, "extracted_title"
+    occurred = extract_relative_event_date(title, rel_ref)
+    if occurred:
+        return occurred, "relative_title"
     value = raw
     if isinstance(value, str):
         try:
@@ -222,6 +319,11 @@ def extract_event_date_with_source(title: str, raw: Any,
             occurred = extract_event_date(str(value.get(key) or ""), ref_ts)
             if occurred:
                 return occurred, f"extracted_raw.{key}"
+        for key in ("content", "body", "summary", "description", "text"):
+            occurred = extract_relative_event_date(
+                str(value.get(key) or ""), rel_ref)
+            if occurred:
+                return occurred, f"relative_raw.{key}"
     return None, "unknown"
 
 
@@ -230,6 +332,14 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     title = str(item.get("title") or "").strip()
     source = str(item.get("source") or "").strip()
     url = item.get("url")
+    # 2026-09-13 来源可信度防护：x_search 不可用时 scout 会降级走 web_search，
+    # 但旧契约要求每条都标 source="x_search"，实测近 36h 465 行里 382 行(82%)
+    # 其实是 cointelegraph/binance/coinmarketcap 等网页。url 不是 X 帖文链接的
+    # 一律确定性重标为 web_search（V3 的 6acef28 同一做法），原始自报保留在 raw。
+    provenance_relabeled = False
+    if source == "x_search" and x_status_id(url) is None:
+        source = "web_search"
+        provenance_relabeled = True
     event_time = item.get("event_time") or None   # 缺则 NULL，**禁** now
     level = item.get("level") or "C"
     if level not in VALID_LEVELS:
@@ -265,15 +375,28 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
         # 迁移旧采集路径时可传既有稳定指纹，避免切 writer 当轮重复落同一事件。
         # 仅接受 32..64 位十六进制；普通 adapter 仍由本 writer 统一计算。
         "dedupe_hash": dedupe_hash,
+        "provenance_relabeled": provenance_relabeled,
     }
 
 
 def write_news(items: list[dict[str, Any]], db_path: str | os.PathLike = DEFAULT_NEWS_DB
                ) -> dict[str, Any]:
-    """批量写 news_items（去重）+ 多币进 news_events_index。返回 {inserted, deduped, ...}。"""
+    """批量写新闻；任一空 source 在连接数据库前整批 fail-closed。"""
     db_path = Path(str(db_path))
     if not db_path.exists():
         return {"ok": False, "error": f"news.db 不存在: {db_path}"}
+    normalized_items = [normalize_item(item) for item in items]
+    invalid_source_indices = [
+        index for index, item in enumerate(normalized_items)
+        if not item["source"]
+    ]
+    if invalid_source_indices:
+        return {
+            "ok": False,
+            "error": "news_source_required",
+            "inserted": 0,
+            "invalid_source_indices": invalid_source_indices,
+        }
     ingested = now_cst()
     con = ledger.connect(db_path)
     try:
@@ -283,14 +406,15 @@ def write_news(items: list[dict[str, Any]], db_path: str | os.PathLike = DEFAULT
             "AND name='news_events_index'").fetchone())
         inserted = deduped = idx_rows = 0
         skipped_empty = 0
+        relabeled = sum(1 for it in normalized_items if it.get("provenance_relabeled"))
         time_layers_active = "first_seen_at" in cols and "cluster_id" in cols
-        for raw_item in items:
-            it = normalize_item(raw_item)
+        for it in normalized_items:
             if not it["title"]:
                 skipped_empty += 1
                 continue
             h = (it["dedupe_hash"]
-                 or compute_hash(it["source"], it["title"], it["url"], it["event_time"]))
+                 or dedupe_hash_for(it["source"], it["title"], it["url"],
+                                    it["event_time"]))
             # 组装列（只写存在的列，migration-aware）
             row = {
                 "ts": ingested,  # 老列 ts 保持（采集落库时刻）
@@ -312,8 +436,11 @@ def write_news(items: list[dict[str, Any]], db_path: str | os.PathLike = DEFAULT
                 # 绝不用于催化新鲜度；新鲜度只由 event_occurred_at 派生。
                 cid = cluster_id_for(it["url"], h)
                 grade = source_grade(it["url"], it["source"])
+                # 相对表述锚到媒体发布时刻更准（采集可能跨过零点），缺则用采集
+                # 时刻；显式日期仍以采集时刻为参考年，行为不变。
                 occurred, date_source = extract_event_date_with_source(
-                    it["title"], it["raw"], ingested)
+                    it["title"], it["raw"], ingested,
+                    relative_ref_ts=(it["event_time"] or ingested))
                 confidence = (
                     date_source if occurred
                     else ("published_fallback" if it["event_time"] else "unknown"))
@@ -354,6 +481,27 @@ def write_news(items: list[dict[str, Any]], db_path: str | os.PathLike = DEFAULT
                 con.execute(
                     "UPDATE news_items SET last_seen_at=? WHERE hash=?",
                     (ingested, h))
+            if not (cur.rowcount and cur.rowcount > 0) and has_idx:
+                # 去重命中仍要并入多币索引：同一条帖子跨轮可能带出新币种，
+                # 按 status id 定键后这些条目会被判重，若不在此补索引就会丢。
+                # news_events_index 主键含 ts，INSERT OR IGNORE 拦不住不同 ts
+                # 的重复，故先显式查 (symbol, news_id) 是否已存在。
+                hit = con.execute(
+                    "SELECT id FROM news_items WHERE hash=?", (h,)).fetchone()
+                if hit:
+                    for sym in it["symbols"]:
+                        if not sym:
+                            continue
+                        if con.execute(
+                                "SELECT 1 FROM news_events_index "
+                                "WHERE symbol=? AND news_id=? LIMIT 1",
+                                (sym, hit[0])).fetchone():
+                            continue
+                        con.execute(
+                            "INSERT OR IGNORE INTO news_events_index "
+                            "(symbol, ts, news_id) VALUES (?,?,?)",
+                            (sym, ingested, hit[0]))
+                        idx_rows += 1
             if cur.rowcount and cur.rowcount > 0:
                 inserted += 1
                 news_id = cur.lastrowid
@@ -371,6 +519,7 @@ def write_news(items: list[dict[str, Any]], db_path: str | os.PathLike = DEFAULT
         con.commit()
         return {"ok": True, "inserted": inserted, "deduped": deduped,
                 "index_rows": idx_rows, "skipped_empty": skipped_empty,
+                "relabeled_web": relabeled,
                 "new_cols_active": sorted(
                     c for c in ("ingested_at", "event_time", "severity", "tags",
                                 "event_occurred_at", "published_at",

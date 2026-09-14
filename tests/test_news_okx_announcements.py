@@ -2,10 +2,13 @@
 """okx_announcements adapter 契约回归：类型映射 / symbol 提取 / 失败隔离 / writer 落库。"""
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +21,42 @@ for _p in (str(SOURCES), str(COLLECTORS), str(ROOT / "scripts")):
 
 import news_okx_announcements as ann  # noqa: E402
 import news_writer  # noqa: E402
+
+
+class _IsolatedTypesCacheTests(unittest.TestCase):
+    """每个用例一份独立的 types 缓存目录。
+
+    ``news_okx_announcements._TYPES_CACHE_DEFAULT`` 指向**生产文件**
+    ``<PROJECT_ROOT>\\logs\\collect\\okx_announcement_types_cache.json``，而本套件
+    既写它（成功取到 types 就落缓存）也读它（types 失败时降级）。2026-08-19
+    实证不隔离的两个后果：
+
+    1. 跑一次测试就把生产缓存覆盖成夹具里的 3 个类型（New listings /
+       Delistings / P2P）。真 types 端点抖动时公告采集会**静默只抓这 3 类**，
+       且下次成功前一直如此。
+    2. ``test_types_endpoint_failure_returns_failed_result`` 在「有缓存 + 网络
+       通」的生产机上必红：08-18 加的 types 缓存降级本就允许该场景继续采集
+       （见 adapter 顶部注释「把 types 单点失败杀全轮降为只损失失败类别」），
+       该用例断言的是**无缓存**时的 fail-closed 行为，必须在无缓存前提下跑。
+       桥/容器侧没网所以一直是绿的，掩盖了这个环境依赖。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.types_cache_path = (
+            Path(tmp.name) / "okx_announcement_types_cache.json")
+        previous = os.environ.get(ann._TYPES_CACHE_ENV)
+        os.environ[ann._TYPES_CACHE_ENV] = str(self.types_cache_path)
+
+        def _restore() -> None:
+            if previous is None:
+                os.environ.pop(ann._TYPES_CACHE_ENV, None)
+            else:
+                os.environ[ann._TYPES_CACHE_ENV] = previous
+
+        self.addCleanup(_restore)
 
 
 def _make_news_db(path: Path) -> None:
@@ -110,7 +149,7 @@ class ExtractSymbolsTests(unittest.TestCase):
         self.assertIsNone(news["event_time"])
 
 
-class SupportTransportFallbackTests(unittest.TestCase):
+class SupportTransportFallbackTests(_IsolatedTypesCacheTests):
     def test_transport_failure_uses_one_exact_url_schannel_fallback(self) -> None:
         support = ann._okx_http
         httpx = support._okx_http.httpx
@@ -183,7 +222,7 @@ class SupportTransportFallbackTests(unittest.TestCase):
         native.assert_not_called()
 
 
-class FetchAndCollectTests(unittest.TestCase):
+class FetchAndCollectTests(_IsolatedTypesCacheTests):
     def _types(self):
         return [
             {"annType": "announcements-new-listings", "annTypeDesc": "New listings"},
@@ -225,6 +264,52 @@ class FetchAndCollectTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["fetched"], 0)
         self.assertIn("types:", res["err"])
+
+    def test_types_failure_falls_back_to_cache_and_keeps_collecting(
+        self,
+    ) -> None:
+        """有缓存时 types 双失败应降级续采（08-18 起的既定行为，此前无覆盖）。
+
+        与 ``test_types_endpoint_failure_returns_failed_result``（无缓存 →
+        fail-closed）成对，两条一起把 ``_load_types_cache`` 的两个分支钉死。
+        缺这条覆盖，正是 08-19 那次「生产机红、桥上绿」没被提前发现的原因。
+        """
+        self.types_cache_path.write_text(
+            json.dumps({
+                "schema": "okx_announcement_types_cache_v1",
+                "fetched_at_cst": datetime.now(ann.CST).strftime(ann.TS_FMT),
+                "types": self._types(),
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        def pages(ann_type, page=1, request_timeout_s=None,
+                  transport_stats=None):
+            return {"details": [{
+                "annType": ann_type,
+                "title": "OKX to list AEON/USDT for spot trading",
+                "url": "https://www.okx.com/help/x",
+                "pTime": "1785121210459",
+            }], "totalPage": "1"}
+
+        stats: dict = {}
+        errors: list[str] = []
+        with mock.patch.object(
+            ann._okx_http, "fetch_support_announcement_types_sync",
+            side_effect=RuntimeError("okx GET failed"),
+        ), mock.patch.object(
+            ann._okx_http, "fetch_support_announcements_sync",
+            side_effect=pages,
+        ), mock.patch.object(ann.time, "sleep"):
+            items = ann.fetch_items(errors=errors, retry_stats=stats)
+
+        self.assertTrue(items, "cached types must keep the round collecting")
+        self.assertEqual(stats.get("types_source"), "cached")
+        self.assertTrue(errors and "fallback=types_cache" in errors[0])
+        # 降级不得反噬缓存：这一轮不能把缓存改写成本轮内容。
+        cached = json.loads(
+            self.types_cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(cached["types"]), len(self._types()))
 
     def test_types_endpoint_recovers_with_one_cold_new_call(self) -> None:
         stats: dict = {}

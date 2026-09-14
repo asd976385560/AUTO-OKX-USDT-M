@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree
 
-from _http import get_json
+from _http import get_json, load_sosovalue_key
 
 METRIC_FEAR_GREED = "crypto_fear_greed"
 METRIC_DXY_ECB = "dxy_calc_ecb"
@@ -49,6 +48,12 @@ ICE_DXY_CONSTANT = 50.14348112
 REQUIRED_ECB_CURRENCIES = ("USD", "JPY", "GBP", "CAD", "SEK", "CHF")
 ETF_TOLERANCE_USD = 5_000_000.0
 ETF_TOLERANCE_RATIO = 0.01
+CST = timezone(timedelta(hours=8))
+# New authoritative-supplement schemas are accepted forward-only.  Older rows
+# remain diagnostic evidence until a separately approved historical repair.
+ETF_EVIDENCE_SCHEMA_VARIANT_FORWARD_START_CST = (
+    datetime.fromisoformat("2026-08-18T03:00:00+08:00")
+)
 
 TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS macro_observations (
@@ -126,6 +131,53 @@ def upsert_observations(
         "INSERT OR REPLACE INTO macro_observations "
         "(metric,observation_date,source,collected_at,value,unit,label,status,"
         "source_url,raw) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        payload,
+    )
+    return len(payload)
+
+
+def upsert_macro_events(con: sqlite3.Connection, rows: Iterable[dict]) -> int:
+    """macro_events 唯一硬化写入口（2026-08-19 D1）。
+
+    幂等 upsert：**只补不抹**。回查窗返回的 actual 覆盖旧 NULL，但任何
+    excluded 侧为 NULL/'' 的字段一律保留库内既有值 —— 旧写法是
+    ``INSERT OR REPLACE``，一次未来窗刷新就能把已采到的 forecast/previous
+    整行冲成 NULL（且属手写 INSERT，违反 writer 红线）。
+    """
+    payload = []
+    for row in rows:
+        cid = str(row.get("calendar_id") or "").strip()
+        ets = str(row.get("event_ts") or "").strip()
+        event = str(row.get("event") or "").strip()
+        if not cid or len(ets) < 10 or not event:
+            continue
+        payload.append((
+            cid, ets, row.get("region"), row.get("category"), event,
+            int(row.get("importance") or 0), row.get("forecast"),
+            row.get("previous"), row.get("actual"), row.get("unit"),
+            row.get("ref_date"), row.get("updated_at"),
+            str(row.get("fetched_at") or utc_now_iso()),
+            str(row.get("source") or "okx_economic_calendar"),
+            _json(row.get("raw") or {}),
+        ))
+    if not payload:
+        return 0
+    con.executemany(
+        "INSERT INTO macro_events (calendar_id,event_ts,region,category,event,"
+        "importance,forecast,previous,actual,unit,ref_date,updated_at,"
+        "fetched_at,source,raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(calendar_id) DO UPDATE SET "
+        "event_ts=excluded.event_ts, importance=excluded.importance, "
+        "region=COALESCE(NULLIF(excluded.region,''),region), "
+        "category=COALESCE(NULLIF(excluded.category,''),category), "
+        "event=excluded.event, "
+        "forecast=COALESCE(NULLIF(excluded.forecast,''),forecast), "
+        "previous=COALESCE(NULLIF(excluded.previous,''),previous), "
+        "actual=COALESCE(NULLIF(excluded.actual,''),actual), "
+        "unit=COALESCE(NULLIF(excluded.unit,''),unit), "
+        "ref_date=COALESCE(NULLIF(excluded.ref_date,''),ref_date), "
+        "updated_at=excluded.updated_at, fetched_at=excluded.fetched_at, "
+        "raw=excluded.raw",
         payload,
     )
     return len(payload)
@@ -288,11 +340,11 @@ def ecb_rows(
     return out
 
 
-def fetch_ecb_dxy(client) -> list[dict[str, Any]]:
+def fetch_ecb_dxy(client, *, timeout: float = 30.0) -> list[dict[str, Any]]:
     response = client.get(
         ECB_90D_URL,
         headers={"accept": "application/xml,text/xml;q=0.9,*/*;q=0.8"},
-        timeout=30.0,
+        timeout=timeout,
     )
     response.raise_for_status()
     rows = ecb_rows(response.text)
@@ -315,9 +367,42 @@ def _usd_value(value: Any, unit: Any) -> float | None:
     if number is None:
         return None
     norm = str(unit or "USD").strip().lower().replace(" ", "")
-    if norm in {"us$m", "usdm", "usd_m", "millionusd", "usdmm"}:
+    if norm in {
+        "us$m",
+        "usdm",
+        "usd_m",
+        "usd_million",
+        "usdmillion",
+        "usd_mn",
+        "millionusd",
+        "usdmm",
+    }:
         return number * 1_000_000.0
     return number
+
+
+def _variant_schema_allowed(record: sqlite3.Row | dict[str, Any]) -> bool:
+    """True only for evidence born after the registered forward boundary."""
+    try:
+        raw_ts = record["evidence_ingested_at"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    value = str(raw_ts or "").strip()
+    if not value:
+        return False
+    try:
+        if value.endswith("Z") or "T" in value:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=CST)
+            parsed = parsed.astimezone(CST)
+        else:
+            parsed = datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=CST
+            )
+    except (TypeError, ValueError):
+        return False
+    return parsed >= ETF_EVIDENCE_SCHEMA_VARIANT_FORWARD_START_CST
 
 
 def evidence_rows(
@@ -345,7 +430,13 @@ def evidence_rows(
             "btc_etf_net_flow",
         }:
             continue
-        observed = str(raw.get("as_of") or "")[:10]
+        variant_allowed = _variant_schema_allowed(record)
+        observed = str(
+            raw.get("as_of")
+            or (raw.get("trading_day") if variant_allowed else None)
+            or (raw.get("trade_date") if variant_allowed else None)
+            or ""
+        )[:10]
         if len(observed) != 10:
             continue
         candidates: list[dict[str, Any]] = []
@@ -361,6 +452,27 @@ def evidence_rows(
         for item in raw.get("source_values") or []:
             if isinstance(item, dict):
                 candidates.append(item)
+        if variant_allowed:
+            for item in raw.get("sources") or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("value_usd") is not None:
+                    value = item.get("value_usd")
+                    unit = "USD"
+                elif item.get("value_usd_million") is not None:
+                    value = item.get("value_usd_million")
+                    unit = "USD_million"
+                else:
+                    value = item.get("value")
+                    unit = item.get("unit") or raw.get("unit")
+                candidates.append(
+                    {
+                        "source": item.get("source") or item.get("name"),
+                        "value": value,
+                        "unit": unit,
+                        "url": item.get("url"),
+                    }
+                )
         for item in candidates:
             source = _source_id(item.get("source"))
             value = _usd_value(item.get("value"), item.get("unit") or raw.get("unit"))
@@ -404,7 +516,8 @@ def import_xsearch_etf(
 ) -> int:
     try:
         records = news_con.execute(
-            "SELECT raw FROM news_items WHERE source='x_search' "
+            "SELECT raw,COALESCE(ingested_at,ts) AS evidence_ingested_at "
+            "FROM news_items WHERE source='x_search' "
             "AND tags LIKE '%authoritative_data%' AND raw IS NOT NULL "
             "ORDER BY id DESC LIMIT 500"
         ).fetchall()
@@ -413,12 +526,32 @@ def import_xsearch_etf(
     return upsert_observations(regime_con, evidence_rows(records))
 
 
+def sosovalue_items(payload: dict[str, Any]) -> list:
+    """从 SoSoValue 响应里取记录数组，兼容两种 data 形状。
+
+    2026-08-19 实测（收据 payload_probe）：openapi v2 的
+    `historicalInflowChart` 返回 `{"code":0,"data":[...],"msg":...,"tid":...,
+    "traceId":...}` —— **data 直接是数组**；而原解析只认 `data["list"]`，
+    于是 HTTP 200 + code 0 也恒解析出 0 行（key 有效却像没配）。
+    这里同时接受 data=list 与 data={list|records|rows|items:[...]}，
+    取不到就返回 []（宁缺勿假，绝不猜数值）。
+    """
+    data = payload.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("list", "records", "rows", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
 def parse_sosovalue_payload(
     payload: dict[str, Any], collected_at: str | None = None
 ) -> list[dict[str, Any]]:
     collected_at = collected_at or utc_now_iso()
-    data = payload.get("data") or {}
-    items = data.get("list") if isinstance(data, dict) else None
+    items = sosovalue_items(payload)
     out = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -444,9 +577,21 @@ def parse_sosovalue_payload(
     return out
 
 
-def fetch_sosovalue(client, api_key: str | None = None) -> list[dict[str, Any]]:
-    key = (api_key or os.environ.get("SOSOVALUE_API_KEY") or "").strip()
+def fetch_sosovalue(
+    client,
+    api_key: str | None = None,
+    *,
+    diagnostic: dict | None = None,
+) -> list[dict[str, Any]]:
+    # key 解析顺序（2026-08-19）：显式入参 > env SOSOVALUE_API_KEY > config.md §4.6b，
+    # 与 FRED/CoinGecko 同款走 _http.load_sosovalue_key()。缺 key 仍返回 []，
+    # 由 collect_public_macro 记 skipped，不阻断其余公开宏观源。
+    # diagnostic：可选出参，0 行时回填响应"形状"（不含数值与 key），供调用方自证
+    # 到底是没 key 还是结构/权限不符——只读元信息，不改变任何返回或异常语义。
+    key = (api_key or load_sosovalue_key() or "").strip()
     if not key:
+        if diagnostic is not None:
+            diagnostic.update({"key_resolved": False})
         return []
     response = client.post(
         SOSOVALUE_URL,
@@ -458,7 +603,29 @@ def fetch_sosovalue(client, api_key: str | None = None) -> list[dict[str, Any]]:
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("code") not in (0, "0", None):
         raise RuntimeError(f"SoSoValue API error: {payload.get('msg')}")
-    return parse_sosovalue_payload(payload)
+    rows = parse_sosovalue_payload(payload)
+    if diagnostic is not None:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        # 用与解析同一个取数器，诊断才不会和实际口径脱节（2026-08-19：
+        # 原诊断只看 data["list"]，data 是数组时 list_len/first_item_keys
+        # 全为 null，等于把最关键的字段名藏起来）。
+        items = sosovalue_items(payload)
+        sample = items[0] if items else None
+        diagnostic.update({
+            "key_resolved": True,
+            "http_code": getattr(response, "status_code", None),
+            "payload_code": payload.get("code"),
+            "payload_msg": payload.get("msg"),
+            "payload_keys": sorted(payload)[:8],
+            "data_shape": (
+                f"dict{sorted(data)[:8]}" if isinstance(data, dict)
+                else type(data).__name__),
+            "list_len": len(items),
+            "first_item_keys": (
+                sorted(sample)[:16] if isinstance(sample, dict) else None),
+            "parsed_rows": len(rows),
+        })
+    return rows
 
 
 def reconcile_etf_consensus(con: sqlite3.Connection) -> dict[str, int]:

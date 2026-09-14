@@ -7,19 +7,31 @@ places orders and never writes a business database.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import hashlib
 import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -33,10 +45,12 @@ from core.risk_validator import (  # noqa: E402  单笔闸常量单一真源
     RISK_SLIPPAGE_BUFFER_PCT,
     SINGLE_ORDER_SIZING_HEADROOM_PCT,
 )
+from scripts import _acceptance_thresholds as thresholds  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 SCHEMA_VERSION = 1
 SOURCE = "okx_private_api"
+DEFAULT_ANALYSIS_DB = ROOT / "db" / "analysis.db"
 _CYCLE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:(?:00|15|30|45)$")
 
 
@@ -107,6 +121,63 @@ def _atomic_write_json(path: Path, payload: dict, *, pretty: bool = False) -> No
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def analysis_authority(
+    cycle_id: str, analysis_db: str | Path = DEFAULT_ANALYSIS_DB,
+) -> dict[str, Any]:
+    """Require the same-cycle successful analysis before any OKX fact read.
+
+    The unified pipeline deliberately separates pre-facts market analysis from
+    position-aware trade judgment.  Returning a small stdout-only refusal here
+    prevents an accidental early CLI call from creating ``live_facts`` and
+    tripping the supervisor's ordering guard.  It performs no exchange I/O and
+    never writes or deletes the requested output file.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "cycle_id": str(cycle_id),
+        "analysis_db": str(Path(analysis_db)),
+        "production_database_writes": 0,
+        "orders_placed": 0,
+    }
+    if not _CYCLE_RE.fullmatch(str(cycle_id)):
+        result["reason"] = "cycle_invalid"
+        return result
+    path = Path(analysis_db)
+    if not path.is_file():
+        result["reason"] = "analysis_db_missing"
+        return result
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        row = connection.execute(
+            "SELECT status,ts FROM analysis_runs WHERE cycle_id=? LIMIT 1",
+            (str(cycle_id),),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        result["reason"] = "analysis_db_unreadable"
+        result["error_type"] = type(exc).__name__
+        return result
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        result["reason"] = "analysis_missing"
+        return result
+    status = str(row[0] or "").strip().lower()
+    result["analysis_status"] = status or None
+    result["analysis_ts"] = str(row[1] or "").strip() or None
+    if status != "ok":
+        result["reason"] = "analysis_not_ok"
+        return result
+    result["ok"] = True
+    result["reason"] = "same_cycle_analysis_ok"
+    return result
 
 
 def _position_side(row: dict) -> str | None:
@@ -479,6 +550,10 @@ def derive_facts(
                 "hold", "close", "reduce", "adjust_protection",
             ],
             "decision_basis": (
+                "current_exchange_facts_plus_original_exit_plan_"
+                "and_portfolio_opportunity_cost"
+                if thresholds.minimal_contract_closure_active(cycle_id)
+                else
                 "current_exchange_facts_plus_position_15m_1H_4H_"
                 "plus_original_exit_plan_and_portfolio_opportunity_cost"
             ),
@@ -517,6 +592,57 @@ def _response_data(response: dict, label: str,
     return [row for row in data if isinstance(row, dict)]
 
 
+FACTS_READ_BUDGET_SECONDS = 100.0
+FACTS_READ_WORKERS = 4
+
+
+class _BoundedFactsClient:
+    """The same private/public reads, under one budget below the 120s supervisor."""
+    def __init__(self, client, deadline: float):
+        self.client = client
+        self.deadline = deadline
+        self.algo_lock = threading.Lock()
+        self.last_algo_start = 0.0
+
+    def _read(self, *args, profile):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0.05:
+            raise TimeoutError("facts_read_budget_exhausted")
+        # One extra read retry remains within this call's remaining share.
+        result = self.client._call(
+            *args, profile=profile, timeout_sec=min(6.0, remaining/2), retries=1)
+        if time.monotonic() > self.deadline:
+            raise TimeoutError("late_facts_read_response")
+        return result
+
+    def get_positions(self, profile):
+        return self._read("account", "positions", "--instType", "SWAP", profile=profile)
+
+    def get_balance(self, profile):
+        return self._read("account", "balance", profile=profile)
+
+    def get_instrument(self, symbol, profile):
+        response = self._read("market", "instruments", "--instType", "SWAP", "--instId", symbol, profile=profile)
+        if response.get("ok") is not True:
+            raise RuntimeError(response.get("error") or response.get("sMsg") or "instrument_read_failed")
+        found = [r for r in response.get("data", []) if isinstance(r, dict) and r.get("instId") == symbol]
+        return found[0] if len(found) == 1 else None
+
+    def get_algo_orders(self, symbol, profile):
+        # CLI fans out to three algo types; avoid launch bursts across workers.
+        with self.algo_lock:
+            wait = 0.4 - (time.monotonic() - self.last_algo_start)
+            if wait > 0:
+                if time.monotonic()+wait >= self.deadline:
+                    raise TimeoutError("facts_read_budget_exhausted")
+                time.sleep(wait)
+            self.last_algo_start = time.monotonic()
+        response = self._read("swap", "algo", "orders", "--instId", symbol, profile=profile)
+        if response.get("ok") is not True or not isinstance(response.get("data"), list):
+            raise RuntimeError(response.get("error") or response.get("sMsg") or "algo_read_failed")
+        return response["data"]
+
+
 def build_facts(cycle_id: str, profile: str = "live", *,
                 as_of_ms: int | None = None, client=ox) -> dict:
     if not _CYCLE_RE.fullmatch(str(cycle_id)):
@@ -524,6 +650,8 @@ def build_facts(cycle_id: str, profile: str = "live", *,
     if profile != "live":
         raise ValueError("仅支持 profile=live")
     source_errors: list[str] = []
+    if client is ox:
+        client = _BoundedFactsClient(client, time.monotonic()+FACTS_READ_BUDGET_SECONDS)
     try:
         positions_response = client.get_positions(profile)
     except Exception as exc:  # noqa: BLE001
@@ -539,28 +667,79 @@ def build_facts(cycle_id: str, profile: str = "live", *,
 
     instruments: dict[str, dict] = {}
     algos: dict[str, list[dict]] = {}
-    for row in positions:
-        pos = _number(row.get("pos"))
-        if pos is None or abs(pos) == 0:
-            continue
-        symbol = str(row.get("instId") or "")
-        if not symbol:
-            continue
+    symbols = sorted({str(row.get("instId")) for row in positions
+                      if row.get("instId") and _number(row.get("pos")) not in (None, 0)})
+
+    def read_symbol(symbol):
+        errors = []
         try:
             instrument = client.get_instrument(symbol, profile)
         except Exception as exc:  # noqa: BLE001
             instrument = None
-            source_errors.append(f"instrument_query_failed:{symbol}:{exc}")
-        if isinstance(instrument, dict):
-            instruments[symbol] = instrument
-        else:
-            source_errors.append(f"instrument_missing:{symbol}")
+            errors.append(f"instrument_query_failed:{symbol}:{exc}")
+        if not isinstance(instrument, dict):
+            errors.append(f"instrument_missing:{symbol}")
         try:
             rows = client.get_algo_orders(symbol, profile)
         except Exception as exc:  # noqa: BLE001
             rows = []
-            source_errors.append(f"algo_orders_query_failed:{symbol}:{exc}")
-        algos[symbol] = [item for item in rows if isinstance(item, dict)]
+            errors.append(f"algo_orders_query_failed:{symbol}:{exc}")
+        return symbol, instrument, [item for item in rows if isinstance(item, dict)], errors
+
+    # Only independent reads overlap. Merge in symbol order so hashes and
+    # error lists remain deterministic; neither writer nor executor is called.
+    with ThreadPoolExecutor(max_workers=FACTS_READ_WORKERS) as pool:
+        for symbol, instrument, rows, errors in pool.map(read_symbol, symbols):
+            if isinstance(instrument, dict):
+                instruments[symbol] = instrument
+            algos[symbol] = rows
+            source_errors.extend(errors)
+    from scripts.ledger_recovery import enabled as recovery_enabled
+    missing_sl = [row for row in positions
+                  if _number(row.get("pos")) not in (None, 0)
+                  and not _select_live_sl(
+                      row, algos.get(str(row.get("instId") or ""), []))["verified"]]
+    if recovery_enabled(cycle_id) and missing_sl and not source_errors:
+        # An exchange SL may fill between the position read and algo read.
+        # Refresh the snapshot once before freezing facts. Remaining exposure
+        # still requires real full-size protection; no missing SL is invented.
+        before = positions
+        try:
+            fresh_response = client.get_positions(profile)
+        except Exception as exc:
+            fresh_response = {"ok": False, "error": str(exc), "data": []}
+        refresh_errors: list[str] = []
+        refreshed = _response_data(fresh_response, "positions", refresh_errors)
+        if not refresh_errors:
+            def identities(rows):
+                return {(str(r.get("instId") or ""), _position_side(r)):
+                        (r.get("posId"), str(r.get("cTime") or ""), _number(r.get("pos")))
+                        for r in rows if _number(r.get("pos")) not in (None, 0)}
+            old_ids, new_ids = identities(before), identities(refreshed)
+            retry_symbols = {str(r.get("instId") or "") for r in missing_sl}
+            retry_symbols.update(k[0] for k, v in new_ids.items() if old_ids.get(k) != v)
+            retry_symbols.intersection_update(k[0] for k in new_ids)
+            positions = refreshed
+            with ThreadPoolExecutor(max_workers=FACTS_READ_WORKERS) as pool:
+                for symbol, instrument, rows, errors in pool.map(read_symbol, sorted(retry_symbols)):
+                    if isinstance(instrument, dict): instruments[symbol] = instrument
+                    algos[symbol] = rows
+                    refresh_errors.extend(errors)
+            try:
+                fresh_balance = client.get_balance(profile)
+            except Exception as exc:
+                fresh_balance = {"ok": False, "error": str(exc), "data": []}
+            balance = _response_data(fresh_balance, "balance", refresh_errors)
+            print(json.dumps({"event": "facts_snapshot_rechecked", "cycle": cycle_id,
+                              "before_missing_sl": len(missing_sl),
+                              "vanished_targets": [list(k) for k in sorted(set(old_ids)-set(new_ids))],
+                              "refreshed_symbols": sorted(retry_symbols),
+                              "exchange_writes": 0}, ensure_ascii=False), file=sys.stderr)
+        source_errors.extend(refresh_errors)
+    if isinstance(client, _BoundedFactsClient) and time.monotonic() >= client.deadline:
+        # A spent process budget is a failed preparation, never a successful
+        # empty-position HOLD manufactured from missing reads.
+        raise TimeoutError("facts_read_budget_exhausted")
     return derive_facts(
         cycle_id,
         profile,
@@ -646,10 +825,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cycle-id", required=True)
     parser.add_argument("--profile", choices=["live"], default="live")
     parser.add_argument("--out-file", required=True)
+    parser.add_argument("--analysis-db", default=str(DEFAULT_ANALYSIS_DB))
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args(argv)
     try:
+        authority = analysis_authority(args.cycle_id, args.analysis_db)
+        if authority.get("ok") is not True:
+            print(json.dumps({
+                "ok": False,
+                "error": "analysis_authority_required_before_live_facts",
+                "authority": authority,
+                "out_file_written": False,
+                "production_database_writes": 0,
+                "orders_placed": 0,
+            }, ensure_ascii=False, sort_keys=True))
+            return 3
+        build_started = time.monotonic()
         payload = build_facts(args.cycle_id, args.profile)
+        build_seconds = round(time.monotonic()-build_started, 3)
+        # The deterministic stage handoff must never publish an artifact that
+        # only *looks* complete.  Rebuild/hash validation is deliberately done
+        # before the atomic replace so a malformed private-API response cannot
+        # become the canonical input observed by the Agent or runner.
+        validation_errors = validate_facts(
+            payload,
+            expected_cycle=args.cycle_id,
+            expected_profile=args.profile,
+        )
+        if validation_errors:
+            print(json.dumps({
+                "ok": False,
+                "error": "live_facts_self_validation_failed",
+                "validation_errors": validation_errors,
+                "out_file_written": False,
+                "production_database_writes": 0,
+                "orders_placed": 0,
+            }, ensure_ascii=False, sort_keys=True))
+            return 4
         _atomic_write_json(Path(args.out_file), payload, pretty=args.pretty)
         result = {
             "ok": payload["status"] == "ok",
@@ -659,6 +871,9 @@ def main(argv: list[str] | None = None) -> int:
             "errors": payload["errors"],
             "out_file": str(Path(args.out_file)),
             "facts_hash": payload["facts_hash"],
+            "build_seconds": build_seconds,
+            "read_workers": FACTS_READ_WORKERS,
+            "read_budget_seconds": FACTS_READ_BUDGET_SECONDS,
         }
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result["ok"] else 2

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """V2.0 快采脚本（系统层，零 agent）。
 
-由聚合 runner `collect_cycle.py`（cron `okx-collect-hourly` :00 / `okx-collect-quarter`
+由聚合 runner `collect_cycle.py`（Windows All-Slots-Guard 主调度 + 兜底 cron `okx-collect` --tier auto，2026-08-26 二合一；层级语义 :00=hourly / 其余
 :15,:30,:45）作为首步串行调用（2026-08-08 整并前：独立 cron `okx-fast-collect`）。
 
 组合调用 collect_data.py + jobb_live_account_check.py，结尾：
@@ -9,21 +9,32 @@
   2. （可选）X 搜索 → 写账本 'x_search'（失败不阻断快采主体，§2）
   3. 通过 _dispatch_nudge 通知 core/dispatcher.py；定时 dispatcher 负责兜底
 
-与生产隔离：默认 --db-root .\\db；tmp 验证传临时目录。--dry-collect 跳过真采集
-（不联网、不写生产），只验账本+触发 plumbing。
+与生产隔离：默认 --db-root <PROJECT_ROOT>\\db；tmp 验证传临时目录。--dry-collect 仅允许
+非生产 db-root；生产根在建表/落账前 rc64 拒绝。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, r".\collectors")
+sys.path.insert(0, _public_project_path('collectors'))
 import ledger          # noqa: E402
 
 try:  # HANDOFF-4B 采集侧事件通知（可缺省，守卫式导入照 analyst_writer 惯例）
@@ -35,7 +46,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 SCRIPTS = ROOT / "scripts"
 CST = timezone(timedelta(hours=8))
 # 子进程隐藏窗口：本脚本被 wscript 以无窗口起，console 子进程(pwsh)默认会新开可见窗口——加此 flag 抑制
@@ -43,6 +54,25 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MIN_STEP_BUDGET_SECONDS = 12
 CORE_FINALIZATION_RESERVE_SECONDS = 5
 CONTRACT_RECOVERY_TIMEOUT_SECONDS = 28
+EXPECTED_OFFICIAL_SNAPSHOT_SOURCE = (
+    "okx_public_instruments_live_usdt_linear_swap"
+)
+
+
+def _python_child_env() -> dict[str, str]:
+    """Match the UTF-8 decoder used for captured child output."""
+    child_env = dict(os.environ)
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    return child_env
+
+
+def _is_production_db_root(db_root: Path) -> bool:
+    try:
+        return db_root.resolve() == (ROOT / "db").resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(db_root))) == os.path.normcase(
+            os.path.abspath(str(ROOT / "db")))
 
 
 def _last_json(text: str):
@@ -63,6 +93,16 @@ def _step_error(step: dict) -> str | None:
         return None
     payload = step.get("payload")
     detail = payload.get("error") if isinstance(payload, dict) else None
+    if not detail and isinstance(payload, dict):
+        payload_errors = payload.get("errors")
+        if isinstance(payload_errors, list):
+            detail = "; ".join(
+                str(item).strip()
+                for item in payload_errors
+                if str(item).strip()
+            )
+        elif payload_errors:
+            detail = str(payload_errors).strip()
     if not detail:
         detail = (step.get("stderr_tail") or "").strip()
     if not detail:
@@ -144,6 +184,139 @@ def official_positioning_due(cycle_id: str) -> bool:
     except (TypeError, ValueError):
         return False
     return value.minute in (0, 30)
+
+
+def _contract_official_universe_alignment(
+    db_root: Path,
+    cycle_id: str,
+    collect_step: dict,
+    contract_step: dict,
+) -> dict[str, object]:
+    """Compare the frozen collector's selection with the same-slot authority.
+
+    ``collect_market_features.py`` is frozen, so its ticker-ranked selection is
+    left untouched.  A newly listed instrument may not have an aggregate ticker
+    yet; when the otherwise successful primary step used a smaller denominator,
+    the existing current-cycle recovery must become the authoritative gate.
+    """
+    collect_payload = collect_step.get("payload")
+    official_receipt = (
+        collect_payload.get("official_instrument_snapshot")
+        if isinstance(collect_payload, dict) else None
+    )
+    if not isinstance(official_receipt, dict) or any((
+        official_receipt.get("complete") is not True,
+        not isinstance(official_receipt.get("symbol_count"), int),
+    )):
+        return {
+            "checked": False,
+            "required_recovery": False,
+            "reason": "official_snapshot_receipt_unavailable",
+        }
+
+    contract_payload = contract_step.get("payload")
+    selected = (
+        contract_payload.get("selected")
+        if isinstance(contract_payload, dict) else None
+    )
+    if not isinstance(selected, list) or any(
+        not isinstance(symbol, str) or not symbol for symbol in selected
+    ):
+        return {
+            "checked": True,
+            "required_recovery": True,
+            "reason": "primary_selected_universe_invalid",
+            "official_symbols": int(official_receipt["symbol_count"]),
+        }
+
+    try:
+        db_path = (db_root / "market.db").resolve()
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=10)
+        try:
+            run = connection.execute(
+                "SELECT symbol_count,payload_sha256,complete,source "
+                "FROM official_instrument_snapshot_runs WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT symbol,list_time_utc,state,settle_ccy,ct_type,"
+                "inst_category,ct_val,lot_sz "
+                "FROM official_instrument_snapshot_rows WHERE cycle_id=? "
+                "ORDER BY symbol",
+                (cycle_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        if run is None:
+            raise RuntimeError("same-slot official snapshot missing")
+        expected_count = int(run[0])
+        payload_sha256 = str(run[1] or "")
+        complete = int(run[2])
+        source = str(run[3])
+        official = [str(row[0]) for row in rows]
+        observed_payload_sha256 = hashlib.sha256(json.dumps(
+            [
+                {
+                    "symbol": str(row[0] or "").strip().upper(),
+                    "list_time_utc": row[1],
+                    "state": row[2],
+                    "settle_ccy": row[3],
+                    "ct_type": row[4],
+                    "inst_category": row[5],
+                    "ct_val": row[6],
+                    "lot_sz": row[7],
+                }
+                for row in rows
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        if any((
+            complete != 1,
+            source != EXPECTED_OFFICIAL_SNAPSHOT_SOURCE,
+            expected_count != int(official_receipt["symbol_count"]),
+            len(rows) != expected_count,
+            len(official) != len(set(official)),
+            observed_payload_sha256 != payload_sha256,
+            any(
+                str(row[2]).lower() != "live"
+                or str(row[3]).upper() != "USDT"
+                or str(row[4]).lower() != "linear"
+                for row in rows
+            ),
+        )):
+            raise RuntimeError("same-slot official snapshot invalid")
+        selected_set = set(selected)
+        official_set = set(official)
+        missing = sorted(official_set - selected_set)
+        extra = sorted(selected_set - official_set)
+        aligned = (
+            len(selected) == len(selected_set)
+            and not missing
+            and not extra
+        )
+        return {
+            "checked": True,
+            "required_recovery": not aligned,
+            "reason": "aligned" if aligned else "same_slot_universe_mismatch",
+            "official_symbols": len(official_set),
+            "primary_selected_symbols": len(selected_set),
+            "official_payload_sha256": payload_sha256,
+            "missing_symbols": missing,
+            "extra_symbols": extra,
+        }
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        return {
+            "checked": True,
+            "required_recovery": True,
+            "reason": "same_slot_universe_check_failed",
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+            "official_symbols": int(official_receipt["symbol_count"]),
+            "primary_selected_symbols": len(set(selected)),
+        }
 
 
 def frozen_model_shadow_evaluation_due(cycle_id: str) -> bool:
@@ -258,16 +431,21 @@ def _collection_status(steps: list[dict]) -> str:
     contract_step = by_name.get("contract_statistics")
     recovery_step = by_name.get("contract_statistics_recovery")
     effective_contract_step = contract_step
-    if (
-        contract_step is not None
-        and not bool(contract_step.get("ok"))
-        and recovery_step is not None
-        and bool(recovery_step.get("ok"))
-    ):
-        effective_contract_step = recovery_step
-    if (
-        effective_contract_step is not None
-        and not bool(effective_contract_step.get("ok"))
+    if contract_step is not None:
+        alignment = contract_step.get("official_universe_alignment")
+        alignment_requires_recovery = (
+            isinstance(alignment, dict)
+            and alignment.get("required_recovery") is True
+        )
+        primary_requires_recovery = (
+            not bool(contract_step.get("ok"))
+            or alignment_requires_recovery
+        )
+        if primary_requires_recovery:
+            effective_contract_step = recovery_step
+    if contract_step is not None and (
+        effective_contract_step is None
+        or not bool(effective_contract_step.get("ok"))
     ):
         return "degraded"
     contract_payload = (
@@ -291,6 +469,17 @@ def _collection_status(steps: list[dict]) -> str:
     ):
         return "degraded"
     return "ok"
+
+
+def _contract_carry_recovery_requested(step: dict | None) -> bool:
+    """Return true when a passed primary batch still has non-direct rows."""
+    payload = step.get("payload") if isinstance(step, dict) else None
+    if not isinstance(payload, dict):
+        return False
+    try:
+        return int(payload.get("carried_forward_symbols") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
@@ -337,6 +526,7 @@ def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
         proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
+            env=_python_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -426,8 +616,8 @@ def _send_failure_alert(cycle: str, error_detail: str | None,
     content_file.write_text(
         (
             f"【P1 快采失败】cycle={cycle}\n"
-            f"latency={latency_ms / 1000:.1f}s\n"
-            f"detail={error_detail or 'unknown'}\n"
+            f"耗时={latency_ms / 1000:.1f}s\n"
+            f"失败明细（异常/步骤stderr原文，保留英文）={error_detail or '未知'}\n"
             "本轮已 fail-closed，不派发分析/交易；不会自动补跑或补派。"
         ),
         encoding="utf-8",
@@ -485,9 +675,17 @@ def main() -> int:
                         "全部采集步骤总预算（秒）；须低于collect_cycle的"
                         "fast-timeout=360并为记账、清理、失败告警留余量"))
     ap.add_argument("--dry-collect", action="store_true",
-                    help="跳过真采集（不联网/不写生产），只验账本+触发")
+                    help="仅隔离db-root可用；生产根在任何账本写入前拒绝")
     ap.add_argument("--no-universe-shadow", action="store_true",
                     help="显式关闭每日三次全市场影子判断（应急回退）")
+    ap.add_argument(
+        "--defer-multitimeframe-coverage",
+        action="store_true",
+        help=(
+            "由collect_cycle在小时slow分支完成后发布MTF覆盖工件；"
+            "只延后诊断，不改变采集闸或影子判断"
+        ),
+    )
     ap.add_argument("--no-model-shadow", action="store_true",
                     help="显式关闭每小时冻结增强模型未来影子评分（应急回退）")
     # 生产 cron 仍可能携带该历史参数；保留为无副作用兼容参数，派发始终走 nudge+dispatcher。
@@ -495,9 +693,19 @@ def main() -> int:
     args = ap.parse_args()
 
     db_root = Path(args.db_root)
+    cycle = args.cycle or ledger.cycle_id_for()
+    if args.dry_collect and _is_production_db_root(db_root):
+        print(json.dumps({
+            "ok": False,
+            "cycle": cycle,
+            "source": "fast",
+            "status": "error",
+            "error": "dry_collect_production_db_root_forbidden",
+            "production_database_writes": 0,
+        }, ensure_ascii=False))
+        return 64
     ledger_db = db_root / "ledger.db"
     ledger.init_ledger(ledger_db)
-    cycle = args.cycle or ledger.cycle_id_for()
 
     t0 = time.time()
     deadline = t0 + args.total_budget
@@ -576,10 +784,33 @@ def main() -> int:
             ),
         )
         steps.append(contract_step)
+        alignment = _contract_official_universe_alignment(
+            db_root, cycle, collect_step, contract_step,
+        )
+        contract_step["official_universe_alignment"] = alignment
+        alignment_requires_recovery = (
+            alignment.get("required_recovery") is True
+        )
+        carry_recovery_requested = _contract_carry_recovery_requested(
+            contract_step)
+        if alignment_requires_recovery:
+            contract_payload = contract_step.get("payload")
+            if isinstance(contract_payload, dict):
+                warnings = contract_payload.setdefault("warnings", [])
+                if isinstance(warnings, list):
+                    warnings.append(
+                        "primary contract-statistics denominator did not match "
+                        "the same-slot official universe; bounded current-cycle "
+                        "recovery is authoritative"
+                    )
         # 初次严格直采未过门时，在同一自然周期启一个新进程/新连接，只恢复
         # 缺少直接官方行的精确标的集合。恢复器拒绝历史周期、每端点每币最多
         # 一次请求且无循环；预算不足或恢复仍低于99%时继续明确 degraded。
-        if bool(collect_step.get("ok")) and not bool(contract_step.get("ok")):
+        if bool(collect_step.get("ok")) and (
+            not bool(contract_step.get("ok"))
+            or alignment_requires_recovery
+            or carry_recovery_requested
+        ):
             recovery_step = run_budgeted(
                 "contract_statistics_recovery",
                 SCRIPTS / "recover_contract_statistics_current.py",
@@ -598,8 +829,11 @@ def main() -> int:
             if recovery_step.get("ok"):
                 # 首次失败不能抹去；作为诊断 warning 留在本轮输出/日志，
                 # 但最终直采门由恢复器的独立复核结果决定。
-                contract_step["diagnostic_only"] = True
+                if not bool(contract_step.get("ok")) or alignment_requires_recovery:
+                    contract_step["diagnostic_only"] = True
                 contract_step["recovered_by"] = "contract_statistics_recovery"
+            if carry_recovery_requested:
+                contract_step["carry_recovery_attempted"] = True
         # :00/:30全宇宙账户多空比与盘口/逐笔分进程顺序执行。独立入口只接受
         # 当前自然槽，并对首次无效标的做最多两波12秒递减精确恢复；不补历史。
         # 低于99%时本步rc=1并显式降级。
@@ -641,35 +875,37 @@ def main() -> int:
             # 影子质量门不阻断行情/账户采集或 dispatcher；rc=2 会进入 warnings。
             shadow_step["diagnostic_only"] = True
             steps.append(shadow_step)
-            coverage_step = run_budgeted(
-                "multitimeframe_coverage_audit",
-                SCRIPTS / "audit_multitimeframe_coverage.py",
-                [
-                    "--market-db", str(db_root / "market.db"),
-                    "--minimum-rate", "0.99",
-                    "--json-out", str(multitimeframe_coverage_path(db_root)),
-                ],
-                args.coverage_audit_timeout,
-                reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
-            )
-            # 质量未达只作为诊断告警：不改变快采、dispatcher或订单路径。
-            coverage_payload = coverage_step.get("payload")
-            if (
-                coverage_step.get("ok")
-                and isinstance(coverage_payload, dict)
-                and coverage_payload.get("status") != "PASSED"
-            ):
-                coverage_step["ok"] = False
-                coverage_step["stderr_tail"] = (
-                    "quality_status="
-                    f"{coverage_payload.get('status', 'UNKNOWN')}; "
-                    "data_completeness_status="
-                    f"{coverage_payload.get('data_completeness_status', 'UNKNOWN')}; "
-                    "analysis_readiness_status="
-                    f"{coverage_payload.get('analysis_readiness_status', 'UNKNOWN')}"
+            if not args.defer_multitimeframe_coverage:
+                coverage_step = run_budgeted(
+                    "multitimeframe_coverage_audit",
+                    SCRIPTS / "audit_multitimeframe_coverage.py",
+                    [
+                        "--market-db", str(db_root / "market.db"),
+                        "--minimum-rate", "0.99",
+                        "--json-out", str(multitimeframe_coverage_path(db_root)),
+                        "--execution-context", "production",
+                    ],
+                    args.coverage_audit_timeout,
+                    reserve_after=CORE_FINALIZATION_RESERVE_SECONDS,
                 )
-            coverage_step["diagnostic_only"] = True
-            steps.append(coverage_step)
+                # 质量未达只作为诊断告警：不改变快采、dispatcher或订单路径。
+                coverage_payload = coverage_step.get("payload")
+                if (
+                    coverage_step.get("ok")
+                    and isinstance(coverage_payload, dict)
+                    and coverage_payload.get("status") != "PASSED"
+                ):
+                    coverage_step["ok"] = False
+                    coverage_step["stderr_tail"] = (
+                        "quality_status="
+                        f"{coverage_payload.get('status', 'UNKNOWN')}; "
+                        "data_completeness_status="
+                        f"{coverage_payload.get('data_completeness_status', 'UNKNOWN')}; "
+                        "analysis_readiness_status="
+                        f"{coverage_payload.get('analysis_readiness_status', 'UNKNOWN')}"
+                    )
+                coverage_step["diagnostic_only"] = True
+                steps.append(coverage_step)
         if (
             not args.no_model_shadow
             and frozen_model_shadow_due(cycle)
@@ -802,10 +1038,7 @@ def main() -> int:
 
     # OpenClaw isolated cron 的隐式 failureAlert 可能因目标不唯一而静默失败；业务层
     # 对生产 fast error 使用明确 --alert(C2C) 路由。隔离 DB、dry-run 与 degraded 均不外发。
-    try:
-        production_db = db_root.resolve() == (ROOT / "db").resolve()
-    except OSError:
-        production_db = False
+    production_db = _is_production_db_root(db_root)
     if status == "error" and production_db and not args.dry_collect:
         try:
             steps.append(_send_failure_alert(cycle, error_detail, latency_ms))
@@ -830,9 +1063,10 @@ def main() -> int:
     # HANDOFF-4B（2026-07-17）：落账后事件通知 dispatcher——消「采集完成→analyst 派发」的
     # 0-2min tick 等待。三道采集侧门（dry-collect/非生产 db-root/status 非 ok|degraded 不发）
     # + nudge() 四道守护闸都在 _dispatch_nudge 内；非致命，不改本脚本退出码。
+    dispatch_result = {"nudged": False, "reason": "module_unavailable"}
     if _nudge_mod is not None:
-        _nudge_mod.nudge_from_collector("fast_collect", args.db_root, [status],
-                                        dry_collect=args.dry_collect)
+        dispatch_result = _nudge_mod.nudge_from_collector(
+            "fast_collect", args.db_root, [status], dry_collect=args.dry_collect)
 
     collect_payload = next((
         step.get("payload")
@@ -853,7 +1087,9 @@ def main() -> int:
             key: market_quality.get(key)
             for key in (
                 "expected", "tickers", "ticker_coverage",
-                "candle_coverage", "funding_coverage", "ticker_transport",
+                "candle_coverage", "funding_coverage", "open_interest",
+                "open_interest_coverage", "ticker_transport",
+                "candle_transport",
             )
             if key in market_quality
         }
@@ -871,6 +1107,81 @@ def main() -> int:
         if data_quality is None:
             data_quality = {}
         data_quality["market_feature_transport"] = feature_transport
+    contract_alignment = next((
+        step.get("official_universe_alignment")
+        for step in steps
+        if step.get("name") == "contract_statistics"
+        and isinstance(step.get("official_universe_alignment"), dict)
+    ), None)
+    if isinstance(contract_alignment, dict):
+        if data_quality is None:
+            data_quality = {}
+        data_quality["contract_official_universe_alignment"] = {
+            key: contract_alignment.get(key)
+            for key in (
+                "checked",
+                "required_recovery",
+                "reason",
+                "official_symbols",
+                "primary_selected_symbols",
+                "official_payload_sha256",
+            )
+            if key in contract_alignment
+        }
+        data_quality["contract_official_universe_alignment"].update({
+            "missing_symbol_count": len(
+                contract_alignment.get("missing_symbols") or []
+            ),
+            "extra_symbol_count": len(
+                contract_alignment.get("extra_symbols") or []
+            ),
+        })
+    contract_primary_payload = next((
+        step.get("payload")
+        for step in steps
+        if step.get("name") == "contract_statistics"
+        and isinstance(step.get("payload"), dict)
+    ), None)
+    contract_fallback_diagnostics = (
+        contract_primary_payload.get(
+            "contract_statistics_fallback_diagnostics")
+        if isinstance(contract_primary_payload, dict) else None
+    )
+    if isinstance(contract_fallback_diagnostics, dict):
+        if data_quality is None:
+            data_quality = {}
+        data_quality["contract_statistics_fallback_diagnostics"] = {
+            key: contract_fallback_diagnostics.get(key)
+            for key in (
+                "failure_count", "error_type_counts", "samples",
+                "sample_limit", "truncated",
+            )
+            if key in contract_fallback_diagnostics
+        }
+    contract_recovery_payload = next((
+        step.get("payload")
+        for step in steps
+        if step.get("name") == "contract_statistics_recovery"
+        and isinstance(step.get("payload"), dict)
+    ), None)
+    if isinstance(contract_recovery_payload, dict):
+        if data_quality is None:
+            data_quality = {}
+        data_quality["contract_statistics_recovery"] = {
+            key: contract_recovery_payload.get(key)
+            for key in (
+                "status",
+                "attempted_symbols",
+                "attempted_symbol_values",
+                "recovered_symbols",
+                "remaining_symbols",
+                "final_direct_symbols",
+                "final_direct_coverage_rate",
+                "transport",
+                "row_failure_diagnostics",
+            )
+            if key in contract_recovery_payload
+        }
 
     out = {"ok": status in ledger.DONE_STATUS, "cycle": cycle, "source": "fast",
            "status": status, "error": error_detail, "latency_ms": latency_ms,
@@ -883,7 +1194,7 @@ def main() -> int:
                }
                for s in steps
            ],
-           "dispatch": None}
+           "dispatch": dispatch_result}
     print(json.dumps(out, ensure_ascii=False))
     return 0 if status in ledger.DONE_STATUS else 1
 

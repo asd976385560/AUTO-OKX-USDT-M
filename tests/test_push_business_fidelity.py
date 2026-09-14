@@ -49,6 +49,45 @@ CREATE TABLE execution_intents(
 
 
 class PushBusinessFidelityTests(unittest.TestCase):
+    def test_stale_confirmed_etf_is_n_a_with_diagnostic_as_of(self):
+        state = build_push_payload._etf_push_state(
+            {"etf_confirmed": {
+                "value": 170_100_000,
+                "observation_date": "2026-08-03",
+            }},
+            {},
+            None,
+            "2026-08-31T01:00",
+        )
+        self.assertEqual("STALE/N/A", state["status"])
+        self.assertIsNone(state["hard"])
+        self.assertEqual("2026-08-03", state["as_of"])
+        self.assertEqual(28, state["age_days"])
+        self.assertEqual(170_100_000, state["diagnostic_hard"])
+        line = render_push_report.etf_macro_line({
+            "btc_etf_flow_status": state["status"],
+            "btc_etf_flow_as_of": state["as_of"],
+            "btc_etf_diagnostic_hard_value_usd": "+170.1M",
+        })
+        self.assertIn("BTC ETF净流 STALE/N/A", line)
+        self.assertIn("as_of 2026-08-03", line)
+        self.assertIn("历史诊断值 +170.1M", line)
+
+    def test_recent_confirmed_etf_remains_cross_checked(self):
+        state = build_push_payload._etf_push_state(
+            {"etf_confirmed": {
+                "value": -201_800_000,
+                "observation_date": "2026-08-28",
+            }},
+            {},
+            None,
+            "2026-08-31T01:00",
+        )
+        self.assertEqual("cross_checked", state["status"])
+        self.assertEqual(-201_800_000, state["hard"])
+        self.assertEqual(3, state["age_days"])
+        self.assertIsNone(state["diagnostic_hard"])
+
     def _root(self, tmp: str, *, active_lease: bool = False) -> Path:
         root = Path(tmp)
         con = sqlite3.connect(root / "live_trades.db")
@@ -510,7 +549,7 @@ class PushBusinessFidelityTests(unittest.TestCase):
                 mock.patch.object(
                     push_pipeline, "STAGE_STATUS_DIR", status_dir),
                 self.assertRaisesRegex(
-                    ValueError, "non-clean execution intents"),
+                    RuntimeError, "upstream failure is missing"),
             ):
                 push_pipeline._verify_business_attestation(
                     payload, str(root), CYCLE,
@@ -539,7 +578,8 @@ class PushBusinessFidelityTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     push_pipeline, "STAGE_STATUS_DIR", status_dir),
-                self.assertRaisesRegex(ValueError, "late business terminal"),
+                self.assertRaisesRegex(
+                    RuntimeError, "upstream failure is missing"),
             ):
                 push_pipeline._verify_business_attestation(
                     payload, str(root), CYCLE,

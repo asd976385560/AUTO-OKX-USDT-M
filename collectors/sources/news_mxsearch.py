@@ -13,7 +13,13 @@ if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 
 import news_writer  # noqa: E402
-from _mx_news_common import MX_QUERY, api_key, normalize, search  # noqa: E402
+from _mx_news_common import (  # noqa: E402
+    MX_QUERY,
+    MXQuotaExceeded,
+    api_key,
+    normalize,
+    search,
+)
 
 
 def fetch_items(errors: list[str] | None = None,
@@ -25,24 +31,38 @@ def fetch_items(errors: list[str] | None = None,
         return []
     rows: list[dict] = []
     last_error: Exception | None = None
+    succeeded = False
+    attempts = 0
+    quota_exhausted = False
     for attempt, timeout_sec in ((1, 6.0), (2, 4.0)):
+        attempts = attempt
         if attempt == 2:
             time.sleep(0.5)
         try:
             rows = search(MX_QUERY, key=key, timeout_sec=timeout_sec)
+            succeeded = True
             if retry_stats is not None:
                 retry_stats.update({
                     "attempts": attempt,
                     "recovered_after_retry": attempt == 2,
                 })
             break
+        except MXQuotaExceeded as exc:
+            last_error = exc
+            quota_exhausted = True
+            break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-    else:
+    if not succeeded:
         if errors is not None:
             errors.append(f"{type(last_error).__name__}: {last_error}"[:150])
         if retry_stats is not None:
-            retry_stats.update({"attempts": 2, "final_failed": True})
+            retry_stats.update({
+                "attempts": attempts,
+                "final_failed": True,
+                "quota_exhausted": quota_exhausted,
+                "retry_skipped_non_retryable": quota_exhausted,
+            })
         return []
     items = []
     for row in rows:

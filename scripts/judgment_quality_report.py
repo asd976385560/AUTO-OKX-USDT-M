@@ -7,9 +7,18 @@
   3. 轮次可靠性（cron 运行成功率 / 丢轮 / provider 分布，读 openclaw.sqlite 只读）
   4. 推送健康（归档数量 / 劣化计数）
 
-用法: pwsh ... run_okx_python.ps1 scripts/judgment_quality_report.py [--db-root ./db] [--days 7]
+用法: pwsh ... run_okx_python.ps1 scripts/judgment_quality_report.py [--db-root <PROJECT_ROOT>\\db] [--days 7]
 任何子段失败标 N/A 不中断。退出码恒 0（报告性质）。
 """
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse
 import json
 import os
@@ -19,15 +28,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import trade_report_stats
+import _acceptance_thresholds as thresholds
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-OPENCLAW_DB = str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite")
+OPENCLAW_DB = '<USER_HOME>\\.openclaw\\state\\openclaw.sqlite'.replace('<USER_HOME>', str(__import__('pathlib').Path.home()))
 # trader 统一由 dispatcher 按业务产物就绪条件派发，无独立 cron。
 # 轮次可靠性/效率改聚合核心周期 cron。job_id 是 UUID、随 cron 重建会变——按 name 动态解析。
 # 2026-08-08 采集整并：fast/slow/news-rss 三条 cron 合为 quarter/hourly 两条聚合。
-CYCLE_CRON_NAMES = ("okx-collect-quarter", "okx-collect-hourly", "okx-analyst-cron", "okx-dispatcher")
-REPORTS_DIR = r"./reports/agents"
+CYCLE_CRON_NAMES = (
+    # 2026-08-26 兜底 cron 二合一：okx-collect 取代 quarter/hourly 两条；
+    # 旧名保留用于读取边界前的历史 run 记录。
+    "okx-collect", "okx-collect-quarter", "okx-collect-hourly",
+    "okx-analyst-cron", "okx-dispatcher",
+)
+REPORTS_DIR = _public_project_path('reports', 'agents')
 REQUIRED_DECISION_CARD_FIELDS = frozenset({
     "direction_evidence",
     "opposing_evidence",
@@ -72,11 +87,27 @@ def _has_content(value) -> bool:
 
 
 def decision_card_quality(rows) -> dict:
-    """Return four non-overlapping weekly decision-card quality metrics."""
+    """Return epoch-safe decision-contract quality metrics.
+
+    Rows at/after the owner-approved minimal-policy boundary are intentionally
+    excluded from the legacy six-field-card denominator.  A row without a
+    cycle_id remains legacy for backward-compatible callers and old fixtures.
+    """
     total_signals = len(rows)
+    legacy_rows = []
+    minimal_rows = []
+    for row in rows:
+        try:
+            cycle = str(row["cycle_id"] or "")
+        except (KeyError, IndexError, TypeError):
+            cycle = ""
+        if cycle and thresholds.minimal_decision_contract_active(cycle):
+            minimal_rows.append(row)
+        else:
+            legacy_rows.append(row)
     card_rows = 0
     complete_rows = 0
-    for row in rows:
+    for row in legacy_rows:
         try:
             raw = row["decision_card"]
             card = json.loads(raw) if raw else None
@@ -100,11 +131,15 @@ def decision_card_quality(rows) -> dict:
 
     return {
         "total_signals": total_signals,
+        "legacy_signals": len(legacy_rows),
+        "minimal_policy_signals": len(minimal_rows),
         "decision_card_rows": card_rows,
         "complete_card_rows": complete_rows,
-        "decision_card_coverage_pct": pct(card_rows, total_signals),
+        "decision_card_coverage_pct": pct(card_rows, len(legacy_rows)),
         "within_card_completeness_pct": pct(complete_rows, card_rows),
-        "overall_completeness_pct": pct(complete_rows, total_signals),
+        "overall_completeness_pct": pct(complete_rows, len(legacy_rows)),
+        "minimal_policy_missing_card_is_failure": False,
+        "historical_rejudgement": False,
     }
 
 
@@ -114,7 +149,7 @@ def _format_pct(value) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument(
         "--as-of",
@@ -127,24 +162,34 @@ def main():
 
     print(f"## 判断质量周报 @ {as_of[:16]} (UTC+8)")
 
-    # 1) 六项卡与历史经验取舍
+    # 1) 分代决策合同；minimal 周期不再消费六项卡。
     def s_decision_cards():
         ana = ro(os.path.join(root, "analysis.db"))
+        window_start = trade_report_stats.fmt_ts(
+            trade_report_stats.parse_cst(as_of) - timedelta(days=30))
         rows = ana.execute(
-            "SELECT decision_card FROM analysis_signals "
-            "WHERE cycle_id>=date('now','-30 days')"
+            "SELECT cycle_id,decision_card FROM analysis_signals "
+            "WHERE cycle_id>=? AND cycle_id<?",
+            (window_start[:16].replace(" ", "T"), as_of[:16].replace(" ", "T")),
         ).fetchall()
         ana.close()
         quality = decision_card_quality(rows)
         total = quality["total_signals"]
+        legacy = quality["legacy_signals"]
+        minimal = quality["minimal_policy_signals"]
         card_rows = quality["decision_card_rows"]
         complete = quality["complete_card_rows"]
         print("| 质量指标 | 分子 | 分母 | 结果 |")
         print("|---|---:|---:|---:|")
         print(f"| 总信号数 | {total} | — | {total} 行 |")
         print(
+            "| 新最小合同信号（六项卡不适用） | "
+            f"{minimal} | {total} | {minimal} 行 |"
+        )
+        print(f"| 历史六项卡适用信号 | {legacy} | {total} | {legacy} 行 |")
+        print(
             "| 决策卡覆盖率 | "
-            f"{card_rows} | {total} | "
+            f"{card_rows} | {legacy} | "
             f"{_format_pct(quality['decision_card_coverage_pct'])} |"
         )
         print(
@@ -154,7 +199,7 @@ def main():
         )
         print(
             "| 全体六项完整率 | "
-            f"{complete} | {total} | "
+            f"{complete} | {legacy} | "
             f"{_format_pct(quality['overall_completeness_pct'])} |"
         )
 
@@ -171,7 +216,17 @@ def main():
                 raw = json.loads(row["raw"] or "{}")
                 card = raw.get("decision_card") if isinstance(raw, dict) else None
                 hist = card.get("historical_experience") if isinstance(card, dict) else None
-                usage = str(hist.get("usage") or "none") if isinstance(hist, dict) else "legacy"
+                protocol = str(raw.get("decision_protocol") or "")
+                cycle = str(raw.get("cycle_id") or "")
+                minimal_policy = (
+                    protocol == "minimal_decision_v2"
+                    or bool(cycle and thresholds.minimal_decision_contract_active(cycle))
+                )
+                usage = (
+                    "not_applicable_minimal_policy" if minimal_policy else
+                    str(hist.get("usage") or "none")
+                    if isinstance(hist, dict) else "legacy"
+                )
             except (json.JSONDecodeError, TypeError):
                 usage = "legacy"
             bucket = stats.setdefault(usage, {"n": 0, "wins": 0, "pnl": 0.0})
@@ -183,9 +238,11 @@ def main():
         for usage, item in sorted(stats.items()):
             n = item["n"]
             print(f"| {usage} | {n} | {item['wins']/n:.0%} | {item['pnl']/n:+.2f}% |")
-        print("以上仅用于复盘 Agent 的取舍质量，不形成未来交易阈值。")
+        print(
+            "六项卡统计只覆盖历史适用周期；新最小合同缺卡不计失败。"
+            "历史取舍仅用于旧样本复盘，不形成未来交易阈值。")
 
-    safe("六项决策卡与历史经验取舍（30 天）", s_decision_cards)
+    safe("决策合同质量（30 天；历史六项卡 / 新最小合同分代）", s_decision_cards)
 
     # 2) regime vs BTC 实际
     def s_regime():

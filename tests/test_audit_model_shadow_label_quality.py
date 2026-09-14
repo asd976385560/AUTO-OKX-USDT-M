@@ -73,11 +73,41 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
         self.assertEqual(result["status"], "PASSED")
         self.assertTrue(result["safe_for_credibility_research"])
         self.assertEqual(result["row_profile"]["observed_labels"], 1)
+        self.assertEqual(1, len(result["model_gate_results"]))
+        self.assertEqual(
+            result["model_gate_results"][0]["status"], "NOT_MEASURABLE")
         self.assertTrue(all(result["checks"].values()))
         self.assertTrue(all(result["safety_checks"].values()))
         self.assertTrue(result["safety_checks"]["confidence_claim_disallowed"])
         self.assertFalse(result["production_execution_authorized"])
         self.assertEqual(result["orders_placed"], 0)
+
+    def test_post_evaluation_artifact_is_excluded_from_frozen_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            later = _artifact(generated="2026-08-12T01:00:00Z")
+            later["cycle_id"] = "2026-08-12T09:00"
+            (shadow / "later.json").write_text(
+                json.dumps(later), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "PASSED")
+        self.assertTrue(result["checks"]["artifact_count_matches"])
+        self.assertEqual(
+            result["inputs"]["artifact_snapshot_rule"],
+            "generated_at_utc <= evaluation.as_of_utc",
+        )
+        self.assertEqual(result["row_profile"]["artifacts_discovered_in_root"], 2)
+        self.assertEqual(result["row_profile"]["artifacts_loaded"], 1)
+        self.assertEqual(result["row_profile"]["post_snapshot_artifacts_ignored"], 1)
+        self.assertEqual(
+            result["evidence"]["post_snapshot_artifact_samples"],
+            ["later.json"],
+        )
 
     def test_tampered_executable_price_and_return_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -133,6 +163,22 @@ class ModelShadowLabelQualityAuditTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "NOT_MET")
         self.assertFalse(result["checks"]["acceptance_thresholds_not_weakened"])
+
+    def test_missing_evaluator_migration_facts_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation, labels, shadow, market = _fixture(Path(temp))
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["acceptance_contract"].pop("target_precision_migration")
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            result = auditor.audit(
+                evaluation_path=evaluation,
+                labels_path=labels,
+                shadow_root=shadow,
+                market_db=market,
+            )
+        self.assertEqual(result["status"], "NOT_MET")
+        self.assertFalse(
+            result["checks"]["acceptance_threshold_migration_exact"])
 
     def test_tampered_side_diagnostic_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

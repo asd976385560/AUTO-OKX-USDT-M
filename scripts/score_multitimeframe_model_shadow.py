@@ -11,6 +11,15 @@ for evaluation but never as a production confidence claim or order authority.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -26,7 +35,7 @@ import pandas as pd
 import offline_multitimeframe_calibration as calibration
 
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 UTC = timezone.utc
 CST = timezone(timedelta(hours=8))
 DEFAULT_MANIFEST = (

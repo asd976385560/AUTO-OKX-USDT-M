@@ -16,6 +16,15 @@ production execution.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -34,7 +43,7 @@ import offline_multitimeframe_calibration as calibration
 
 
 DEFAULT_DIR = Path(
-    r"./reports/quality/goal-selective-multitimeframe-v1-20260812"
+    _public_project_path('reports', 'quality', 'goal-selective-multitimeframe-v1-20260812')
 )
 DEFAULT_PANEL = DEFAULT_DIR / "research_panel.csv"
 DEFAULT_JSON = DEFAULT_DIR / "ranking_diagnostic.json"
@@ -49,6 +58,17 @@ TARGET_TYPES = ("uniform_positive", "best_positive_utility")
 CONFIDENCE_TYPES = ("top_softmax", "top_margin")
 LISTWISE_L2 = (0.0001, 0.001, 0.01)
 RIDGE_L2 = (0.1, 1.0, 10.0, 100.0)
+
+
+def _label_price_mode(panel: pd.DataFrame) -> str:
+    side_columns = {
+        f"{timeframe}_{side}_return"
+        for timeframe, side in CANDIDATE_KEYS
+    }
+    present = side_columns & set(panel.columns)
+    if present and present != side_columns:
+        raise ValueError("partial side-specific return contract")
+    return "executable" if present == side_columns else "last"
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -332,6 +352,20 @@ def _return_candidate_scores(
     return scores
 
 
+def _residual_scale_details(residual_scale: np.ndarray) -> dict[str, float]:
+    if len(residual_scale) == len(CANDIDATE_KEYS):
+        return {
+            f"residual_scale_{timeframe}_{side}": float(residual_scale[index])
+            for index, (timeframe, side) in enumerate(CANDIDATE_KEYS)
+        }
+    if len(residual_scale) == len(baseline.TIMEFRAMES):
+        return {
+            f"residual_scale_{timeframe}": float(residual_scale[index])
+            for index, timeframe in enumerate(baseline.TIMEFRAMES)
+        }
+    raise ValueError("unexpected residual scale width")
+
+
 def _raw_confidence(
     scores: np.ndarray,
     confidence_type: str,
@@ -529,6 +563,7 @@ def diagnose(
     dict[str, Any], dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame,
 ]:
     panel = baseline._load_panel(panel_path)
+    label_price_mode = _label_price_mode(panel)
     feature_columns = baseline._feature_columns(panel)
     complete = baseline._complete_outcome_mask(panel)
     tuning, threshold_mask, confirmation, nested_contract = (
@@ -632,9 +667,7 @@ def diagnose(
                 details={
                     "regularization": regularization,
                     "confidence_type": confidence_type,
-                    "residual_scale_15m": float(residual_scale[0]),
-                    "residual_scale_1H": float(residual_scale[1]),
-                    "residual_scale_4H": float(residual_scale[2]),
+                    **_residual_scale_details(residual_scale),
                 },
                 selected=selected,
                 calibrator=calibrator,
@@ -701,12 +734,20 @@ def diagnose(
             == "target_reached_on_threshold_window"),
         "confirmation_precision_at_least_90pct": (
             (confirmation_metrics["precision"] or 0.0) >= 0.90),
+        "confirmation_wilson_95_low_at_least_90pct": (
+            (confirmation_metrics["wilson_95_low"] or 0.0) >= 0.90),
         "confirmation_n_at_least_100": confirmation_metrics["n"] >= 100,
         "confirmation_ece_at_most_5pp": (
             confirmation_metrics["ece"] is not None
             and confirmation_metrics["ece"] <= 0.05),
+        "confirmation_days_at_least_2": (
+            confirmation_metrics["distinct_days"] >= 2),
+        "confirmation_cycles_at_least_20": (
+            confirmation_metrics["distinct_cycles"] >= 20),
         "historical_holdout_precision_at_least_90pct": (
             (holdout_metrics["precision"] or 0.0) >= 0.90),
+        "historical_holdout_wilson_95_low_at_least_90pct": (
+            (holdout_metrics["wilson_95_low"] or 0.0) >= 0.90),
         "historical_holdout_n_at_least_100": holdout_metrics["n"] >= 100,
         "historical_holdout_ece_at_most_5pp": (
             holdout_metrics["ece"] is not None
@@ -720,8 +761,11 @@ def diagnose(
     internal_candidate = all(requirements[name] for name in (
         "threshold_window_reached_90pct",
         "confirmation_precision_at_least_90pct",
+        "confirmation_wilson_95_low_at_least_90pct",
         "confirmation_n_at_least_100",
         "confirmation_ece_at_most_5pp",
+        "confirmation_days_at_least_2",
+        "confirmation_cycles_at_least_20",
     ))
     label_profile = _profile_labels(
         usable, labels, named_masks_with_train)
@@ -735,6 +779,12 @@ def diagnose(
         "point_in_time_contract": {
             "features": "train-only imputation, winsorization, and standardization; outcomes excluded",
             "candidate_set": "exactly 3 horizons x 2 directions per complete observation",
+            "label_price_mode": label_price_mode,
+            "historical_label_semantics": (
+                "long ask-to-bid and short bid-to-ask with no last fallback"
+                if label_price_mode == "executable"
+                else "last-price diagnostic only; it is not executable-price acceptance evidence"
+            ),
             "nested_calibration": nested_contract,
             "historical_holdout": "already inspected; retrospective diagnostic only",
             "cost_hurdle_bps": baseline.COST_HURDLE * 10_000,
@@ -769,7 +819,10 @@ def diagnose(
         "selected_subset_oracle_diagnostic": oracles,
         "acceptance": {
             "target_precision": 0.90,
+            "target_wilson_95_lower_bound": 0.90,
             "minimum_n": minimum_n,
+            "minimum_internal_days": 2,
+            "minimum_internal_cycles": 20,
             "maximum_ece": 0.05,
             "requirements": requirements,
             "internal_candidate_status": (
@@ -792,6 +845,7 @@ def diagnose(
     model_payload = {
         "schema_version": 1,
         "research_only": True,
+        "label_price_mode": label_price_mode,
         "selected_model": chosen_row["model"],
         "family": chosen["family"],
         "confidence_type": chosen["confidence_type"],

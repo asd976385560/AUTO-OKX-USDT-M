@@ -16,6 +16,15 @@ r"""存量 `analysis_runs.missing_sources` 标签归一（2026-08-05·人工维�
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -23,7 +32,7 @@ import sys
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, _public_project_path('collectors'))
 
 from analyst_writer import (  # noqa: E402
     MISSING_SOURCE_ALIASES,
@@ -33,7 +42,7 @@ from analyst_writer import (  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="存量 missing_sources 标签归一")
-    ap.add_argument("--db", default=r"./db/analysis.db")
+    ap.add_argument("--db", default=_public_project_path('db', 'analysis.db'))
     ap.add_argument("--apply", action="store_true", help="真写（默认 dry-run）")
     args = ap.parse_args()
 

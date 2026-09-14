@@ -2,7 +2,8 @@
 """Audit deterministic news sources by expected Beijing-time schedule slots.
 
 The legacy source metric divides only by ledger rows that exist and treats
-``degraded`` as usable.  For a 99% completeness claim that is too permissive:
+``degraded`` as usable.  For the effective completeness claim (95% from the
+registered activation boundary; 99% before it) that is too permissive:
 missing schedule slots and partial publisher failures must remain visible.
 
 This audit reports two rates for every configured deterministic news source:
@@ -264,7 +265,7 @@ def _window_status(rows: list[dict[str, Any]], *, critical_only: bool) -> str:
 
 
 def _overall_status(all_sources_status: str) -> str:
-    """The 99% goal covers every enabled deterministic source, not a subset."""
+    """The effective goal covers every enabled deterministic source, not a subset."""
     if all_sources_status == "PASSED":
         return "PASSED"
     if all_sources_status == "INSUFFICIENT_EVIDENCE":

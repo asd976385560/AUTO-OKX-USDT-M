@@ -17,6 +17,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[2])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import re
@@ -25,8 +34,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
-_SCRIPTS = str(Path(r".\scripts"))
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
+_SCRIPTS = str(Path(_public_project_path('scripts')))
 for _p in (_COLLECTORS, _SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)

@@ -18,6 +18,21 @@ import collect_data  # noqa: E402
 
 
 class MarketFieldCoverageAuditTests(unittest.TestCase):
+    def test_missing_open_interest_is_visible_as_nonblocking_degradation(self) -> None:
+        complete = {
+            "ticker_coverage": 1.0,
+            "candle_coverage": 1.0,
+            "funding_coverage": 1.0,
+            "open_interest_coverage": 1.0,
+        }
+        missing_oi = {**complete, "open_interest_coverage": 0.0}
+
+        self.assertEqual([], collect_data.market_degraded_reasons(complete))
+        self.assertEqual(
+            ["open_interest_coverage=0.0%<99%"],
+            collect_data.market_degraded_reasons(missing_oi),
+        )
+
     def _db(self, root: str) -> Path:
         path = Path(root) / "market.db"
         connection = sqlite3.connect(path)

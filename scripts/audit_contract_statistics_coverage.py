@@ -9,6 +9,15 @@ atomically replaced.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -20,10 +29,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import _acceptance_thresholds as thresholds
+from _audit_artifact_context import resolve_audit_output
 
-DEFAULT_DB = Path(r"./db/market.db")
+
+DEFAULT_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_OUTPUT = Path(
-    r"./reports/quality/contract-statistics-coverage-audit.json")
+    _public_project_path('reports', 'quality', 'contract-statistics-coverage-audit.json'))
 SOURCE = "okx_rest_contract_oi_taker_15m"
 MAX_SOURCE_LAG_SECONDS = 5_400
 CST = timezone(timedelta(hours=8))
@@ -166,6 +178,7 @@ def _summarize_forward_window(
     start: datetime,
     end_exclusive: datetime,
     minimum_coverage: float,
+    target_rate: float,
     maximum_source_lag_seconds: int,
     minimum_slots: int,
 ) -> dict[str, Any]:
@@ -268,8 +281,8 @@ def _summarize_forward_window(
     if expected_slots < minimum_slots:
         status = "INSUFFICIENT_EVIDENCE"
     elif (
-        slot_pass_rate >= minimum_coverage
-        and availability_rate >= minimum_coverage
+        slot_pass_rate >= target_rate
+        and availability_rate >= target_rate
     ):
         status = "PASSED"
     else:
@@ -277,8 +290,8 @@ def _summarize_forward_window(
     if expected_slots < minimum_slots:
         analysis_ready_status = "INSUFFICIENT_EVIDENCE"
     elif (
-        direct_rate >= minimum_coverage
-        and analysis_ready_slot_pass_rate >= minimum_coverage
+        direct_rate >= target_rate
+        and analysis_ready_slot_pass_rate >= target_rate
     ):
         analysis_ready_status = "PASSED"
     else:
@@ -302,7 +315,8 @@ def _summarize_forward_window(
         "direct_coverage_rate": direct_rate,
         "carried_forward_valid_symbol_rows": carry_symbol_rows,
         "carry_forward_rate": carry_rate,
-        "target_rate": minimum_coverage,
+        "slot_minimum_coverage": minimum_coverage,
+        "target_rate": target_rate,
         "minimum_slots": minimum_slots,
         "missing_slot_semantics": "unavailable_and_in_denominator",
         "status": status,
@@ -316,6 +330,7 @@ def audit_contract_statistics(
     *,
     universe_db_path: Path | None = None,
     minimum_coverage: float = 0.99,
+    forward_target_rate: float | None = None,
     maximum_source_lag_seconds: int = MAX_SOURCE_LAG_SECONDS,
     history_limit: int = 8,
     cycle_id: str | None = None,
@@ -324,10 +339,15 @@ def audit_contract_statistics(
     forward_minimum_slots: int = 96,
     grace_minutes: int = 5,
 ) -> dict[str, Any]:
+    effective_as_of = _parse_cst(as_of or datetime.now(CST))
+    if forward_target_rate is None:
+        forward_target_rate = thresholds.coverage_target_rate(effective_as_of)
     if history_limit < 1:
         raise ValueError("history_limit must be positive")
     if not 0 < minimum_coverage <= 1:
         raise ValueError("minimum_coverage must be in (0,1]")
+    if not 0 < forward_target_rate <= 1:
+        raise ValueError("forward_target_rate must be in (0,1]")
     if forward_minimum_slots < 1:
         raise ValueError("forward_minimum_slots must be positive")
     if not 0 <= grace_minutes < SLOT_MINUTES:
@@ -649,6 +669,10 @@ def audit_contract_statistics(
         "latest_cycle_id": latest_cycle,
         "collected_ts": next(iter(collected_times)) if len(collected_times) == 1 else None,
         "minimum_coverage": minimum_coverage,
+        "forward_target_rate": forward_target_rate,
+        "forward_target_rate_migration": (
+            thresholds.coverage_migration_facts(effective_as_of)
+        ),
         "maximum_source_lag_seconds": maximum_source_lag_seconds,
         "universe_symbols": len(universe),
         "batch_rows": len(rows),
@@ -687,7 +711,6 @@ def audit_contract_statistics(
     if forward_start is not None:
         start = forward_start.astimezone(CST)
         _ensure_slot_aligned(start, "forward_start")
-        effective_as_of = (as_of or datetime.now(CST)).astimezone(CST)
         end_exclusive = _completed_end_exclusive(
             effective_as_of, grace_minutes)
         forward = _summarize_forward_window(
@@ -696,8 +719,26 @@ def audit_contract_statistics(
             start=start,
             end_exclusive=max(start, end_exclusive),
             minimum_coverage=minimum_coverage,
+            target_rate=forward_target_rate,
             maximum_source_lag_seconds=maximum_source_lag_seconds,
             minimum_slots=forward_minimum_slots,
+        )
+        forward["target_rate_migration"] = (
+            thresholds.coverage_migration_facts(effective_as_of)
+        )
+        forward["legacy_target_diagnostics"] = (
+            thresholds.legacy_rate_diagnostics(
+                {
+                    "slot_pass_rate": forward["slot_pass_rate"],
+                    "analysis_ready_slot_pass_rate": (
+                        forward["analysis_ready_slot_pass_rate"]
+                    ),
+                    "availability_coverage_rate": (
+                        forward["availability_coverage_rate"]
+                    ),
+                    "direct_coverage_rate": forward["direct_coverage_rate"],
+                },
+            )
         )
         payload["as_of_cst"] = effective_as_of.isoformat()
         payload["slot_grace_minutes"] = grace_minutes
@@ -726,6 +767,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-out", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--minimum-coverage", type=float, default=0.99)
     parser.add_argument(
+        "--forward-target-rate", type=float, default=None,
+        help="default: resolved from the pre-registered activation boundary",
+    )
+    parser.add_argument(
         "--maximum-source-lag-seconds", type=int,
         default=MAX_SOURCE_LAG_SECONDS,
     )
@@ -741,12 +786,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--as-of", help="CST/ISO timestamp; default now")
     parser.add_argument("--forward-minimum-slots", type=int, default=96)
     parser.add_argument("--grace-minutes", type=int, default=5)
+    parser.add_argument("--execution-context", choices=("production", "test", "probe"))
+    parser.add_argument("--artifact-root")
     args = parser.parse_args(argv)
     try:
+        output, context, context_fields = resolve_audit_output(
+            args.json_out,
+            tool_name="audit_contract_statistics_coverage",
+            execution_context=args.execution_context,
+            artifact_root=args.artifact_root,
+        )
         payload = audit_contract_statistics(
             args.db,
             universe_db_path=args.universe_db,
             minimum_coverage=args.minimum_coverage,
+            forward_target_rate=args.forward_target_rate,
             maximum_source_lag_seconds=args.maximum_source_lag_seconds,
             history_limit=args.history_limit,
             forward_start=(
@@ -755,7 +809,8 @@ def main(argv: list[str] | None = None) -> int:
             forward_minimum_slots=args.forward_minimum_slots,
             grace_minutes=args.grace_minutes,
         )
-        _atomic_json(args.json_out, payload)
+        payload["artifact_context"] = context_fields
+        _atomic_json(output, payload)
     except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
         print(json.dumps({
             "ok": False,
@@ -775,7 +830,8 @@ def main(argv: list[str] | None = None) -> int:
         "forward_expected_slots": (
             payload.get("forward_after_remediation", {}).get(
                 "expected_slots")),
-        "json_out": str(args.json_out),
+        "json_out": str(output),
+        "execution_context": context,
         "production_database_writes": 0,
         "orders_placed": 0,
     }, ensure_ascii=False))

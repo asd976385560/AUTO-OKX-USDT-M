@@ -27,13 +27,21 @@ r"""collection_monitor.py — within-day 采集/派单/推送健康监控（纯�
 账本不变量命中只同步 account.db.repair_queue 元数据（幂等开/闭工单），不改交易事实。
 
 用法：
-  collection_monitor.py --db-root ./db            # 真跑（超阈会真推 QQ）
-  collection_monitor.py --db-root ./db --dry-run  # 只检测+报告，不推 QQ、不写状态
+  collection_monitor.py --db-root <PROJECT_ROOT>\db            # 真跑（超阈会真推 QQ）
+  collection_monitor.py --db-root <PROJECT_ROOT>\db --dry-run  # 只检测+报告，不推 QQ、不写状态
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -45,19 +53,62 @@ from pathlib import Path
 
 import _proc  # 子进程超时整树杀（详见模块 docstring）
 import ledger_invariants as li
-from collectors.cycle_contract import (  # noqa: E402
-    cycle_session_token,
-    cycle_status_token,
-    validate_cycle_id,
-)
-
-_PROJECT_ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
 
 
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
+from collectors.cycle_contract import validate_cycle_id, cycle_session_token, cycle_status_token
+import hashlib
+
+
+def _ledger_mod():
+    """惰性导入 collectors/ledger（两条导入路都试，与 ledger 自身惯例一致）。
+
+    2026-08-19 G7：失败态判定只有一个真源（ledger.is_failure_status）。
+    wrapper 路径 <PROJECT_ROOT> 在 PYTHONPATH → ``collectors.ledger``；
+    dispatcher/tests 路径 collectors 目录在 sys.path → 顶层 ``ledger``。
+    """
+    try:
+        from collectors import ledger as mod
+        return mod
+    except Exception:
+        import ledger as mod
+        return mod
+
+
+def _root_namespace(db_root: str | Path) -> str:
+    resolved = Path(db_root).resolve()
+    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
+            os.fspath(Path(PROD_DB_ROOT).resolve())):
+        return ""
+    return "r" + hashlib.sha256(
+        os.path.normcase(os.fspath(resolved)).encode("utf-8")
+    ).hexdigest()[:10]
+
+
+def _is_production_db_root(db_root: str | Path) -> bool:
+    return _root_namespace(db_root) == ""
+
+
+def _configure_runtime_paths(db_root: str | Path) -> None:
+    global STATE_DIR, STATE_FILE, AUDIT_FILE, LOCK_FILE
+    namespace = _root_namespace(db_root)
+    STATE_DIR = STATE_DIR_BASE / namespace if namespace else STATE_DIR_BASE
+    STATE_FILE = STATE_DIR / "alert_state.json"
+    AUDIT_FILE = STATE_DIR / "audit.jsonl"
+    LOCK_FILE = STATE_DIR / "monitor.lock"
+
+
+_PROJECT_ROOT = Path(_public_project_path()).resolve()
+_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / 'db').resolve()
+PROD_DB_ROOT = _PRODUCTION_DB_ROOT
+
+def _is_failure_status(status) -> bool:
+    """失败态判定；拿不到 ledger 时回退本地元组（绝不放宽）。"""
+    try:
+        return _ledger_mod().is_failure_status(status)
+    except Exception:
+        text = str(status or "").strip().lower()
+        return (text in ("error", "timeout", "fail", "failed")
+                or text.startswith("stale"))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -66,8 +117,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 CST = timezone(timedelta(hours=8))
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
-WRAP = _project_path("scripts", "run_okx_python.ps1")
-STATE_DIR_BASE = Path(_project_path("logs", "monitor"))
+WRAP = _public_project_path('scripts', 'run_okx_python.ps1')
+STATE_DIR_BASE = Path(_public_project_path('logs', 'monitor'))
 STATE_DIR = STATE_DIR_BASE
 STATE_FILE = STATE_DIR / "alert_state.json"
 AUDIT_FILE = STATE_DIR / "audit.jsonl"
@@ -86,38 +137,14 @@ TRADER_GRACE_SEC = 900                          # trader 派后给 15min 写 tra
 UNIFIED_LIVE_GRACE_SEC = 1800                   # 合并分析+实盘首棒给 30min；full live/demo 仍 15min
 JOURNAL_GRACE_SEC = 900                         # journal 落痕后给 15min 让 trader 正常喂 writer，超则判未入账
 LOCK_STALE_SEC = 180                            # 锁陈旧阈（超此视为死锁可抢）
-TRADES_WRITER = _project_path("collectors", "trades_writer.py")
-PROD_DB_ROOT = _project_path("db")
+TRADES_WRITER = _public_project_path('collectors', 'trades_writer.py')
 # P13（2026-07-14）：trader launch-but-failed 三态归因的 audit 账本落点（OpenClaw 2026.7.1+；
 # 表不存在/库不可读一律 fail-safe 回退单态口径，不影响告警本体）
 OPENCLAW_STATE_DB = os.environ.get(
     "OKX_OPENCLAW_STATE_DB",
-    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"))
+    '<USER_HOME>\\.openclaw\\state\\openclaw.sqlite'.replace('<USER_HOME>', str(__import__('pathlib').Path.home())))
 STAGE_STATUS_DIR = Path(os.environ.get(
-    "OKX_STAGE_STATUS_DIR", _project_path("logs", "stage-status")))
-
-
-def _root_namespace(db_root: str | Path) -> str:
-    resolved = Path(db_root).resolve()
-    if os.path.normcase(os.fspath(resolved)) == os.path.normcase(
-            os.fspath(Path(PROD_DB_ROOT).resolve())):
-        return ""
-    return "r" + hashlib.sha256(
-        os.path.normcase(os.fspath(resolved)).encode("utf-8")
-    ).hexdigest()[:10]
-
-
-def _configure_runtime_paths(db_root: str | Path) -> None:
-    global STATE_DIR, STATE_FILE, AUDIT_FILE, LOCK_FILE
-    namespace = _root_namespace(db_root)
-    STATE_DIR = STATE_DIR_BASE / namespace if namespace else STATE_DIR_BASE
-    STATE_FILE = STATE_DIR / "alert_state.json"
-    AUDIT_FILE = STATE_DIR / "audit.jsonl"
-    LOCK_FILE = STATE_DIR / "monitor.lock"
-
-
-def _is_production_db_root(db_root: str | Path) -> bool:
-    return _root_namespace(db_root) == ""
+    "OKX_STAGE_STATUS_DIR", _public_project_path('logs', 'stage-status')))
 
 # 注入话术关键词（脚本级，非 LLM 语义）。匹配文本仅报"命中模式名"，不回灌原文（防自激）。
 INJECTION_PATTERNS = {
@@ -193,7 +220,7 @@ def _sig(key, sev, detail, *, cycles=None, source_like=False, audit_only=False,
 def detect_source_freshness(db_root: str) -> list[dict]:
     """B. 必需源断流/超时告警（abort_sources=required 缺 OR required present-but-stale）→ P0。
     非必需源 stale → audit-only，只标记调研不告警。"""
-    rc, out = run_script(r"./scripts/source_freshness.py", ["--db-root", db_root])
+    rc, out = run_script(_public_project_path('scripts', 'source_freshness.py'), ["--db-root", db_root])
     data = _parse_json(out)
     if data is None:
         return [_sig("source_freshness_unrunnable", "P2",
@@ -220,8 +247,14 @@ def detect_error_streak(db_root: str) -> list[dict]:
     if con is None:
         return []
     try:
+        # 2026-08-19 G7：cycle_id 是定宽 'YYYY-MM-DDTHH:MM'，字典序==业务槽序。
+        # 绝不能用 rowid —— 写方是 INSERT OR REPLACE（PK cycle_id,source），
+        # 任一次采集重试/回填都会把旧槽删+插顶到最大 rowid，污染「最近 300 行」
+        # 窗口（全表实测 16 处 rowid 反转）。同仓 _regime_read.py:28 早有反面结论。
         rows = con.execute(
-            "SELECT source, status FROM collection_runs ORDER BY rowid DESC LIMIT 300").fetchall()
+            "SELECT source, status FROM collection_runs "
+            "WHERE cycle_id NOT LIKE 'TEST-%' "
+            "ORDER BY cycle_id DESC, rowid DESC LIMIT 300").fetchall()
     finally:
         con.close()
     per_src: dict[str, list] = {}
@@ -231,7 +264,7 @@ def detect_error_streak(db_root: str) -> list[dict]:
     for src, statuses in per_src.items():
         streak = 0
         for st in statuses:
-            if st in ("error", "timeout", "fail", "failed"):
+            if _is_failure_status(st):   # 单一真源，含 stale(age=...) 前缀
                 streak += 1
             else:
                 break
@@ -252,7 +285,8 @@ def detect_completion(db_root: str, now: datetime) -> list[dict]:
         # 成片：最近 ~8 槽内，单 cycle_id 里 error/timeout 的 distinct 源数 ≥ 阈
         rows = con.execute(
             "SELECT cycle_id, source, status FROM collection_runs "
-            "WHERE cycle_id NOT LIKE 'TEST-%' ORDER BY rowid DESC LIMIT 300").fetchall()
+            "WHERE cycle_id NOT LIKE 'TEST-%' "
+            "ORDER BY cycle_id DESC, rowid DESC LIMIT 300").fetchall()
         by_cycle: dict[str, dict] = {}
         for r in rows:
             cy = r["cycle_id"]
@@ -261,7 +295,7 @@ def detect_completion(db_root: str, now: datetime) -> list[dict]:
                 continue  # 只看最近 2h，陈旧塌陷交每日复盘（避免反复触发已知历史丢轮）
             c = by_cycle.setdefault(cy, {"err": set(), "ok": set()})
             st = str(r["status"] or "").lower()
-            (c["err"] if st in ("error", "timeout", "fail", "failed") else c["ok"]).add(r["source"])
+            (c["err"] if _is_failure_status(st) else c["ok"]).add(r["source"])
         mass = [cy for cy, d in by_cycle.items() if len(d["err"]) >= SIMULTANEOUS_ERR_THRESHOLD]
         if mass:
             worst = max(mass, key=lambda cy: len(by_cycle[cy]["err"]))
@@ -293,7 +327,7 @@ def detect_completion(db_root: str, now: datetime) -> list[dict]:
 def detect_lost_cycles(db_root: str) -> list[dict]:
     """D1. 丢轮 form① decision_fired_no_analysis（复用 query_state --check lost_cycles）→ P1。
     只消费 lost_cycles，**不用 --check all**（避免 news/account/cycle_fresh/regime 越权误报）。"""
-    rc, out = run_script(r"./scripts/query_state.py",
+    rc, out = run_script(_public_project_path('scripts', 'query_state.py'),
                          ["--check", "lost_cycles", "--db-root", db_root, "--json"])
     data = _parse_json(out)
     if data is None:
@@ -423,7 +457,7 @@ def detect_trader_incomplete(db_root: str, now: datetime) -> list[dict]:
         finally:
             bcon.close()
         if n == 0:
-            missing.append((book, cyc, _audit_attribution(book, cyc, db_root)))
+            missing.append((book, cyc, _audit_attribution(book, cyc)))
     if not missing:
         return []
     cycles = sorted({cyc for _, cyc, _ in missing})
@@ -483,7 +517,7 @@ def detect_injection() -> list[dict]:
     """F. 注入话术脚本扫描：只扫 logs/trigger（**排除 logs/monitor 自身防自激**）；
     命中只报模式名 + 文件，**不回灌匹配原文** → P1。"""
     sigs = []
-    d = Path(r"./logs/trigger")
+    d = Path(_public_project_path('logs', 'trigger'))
     if not d.exists():
         return sigs
     files = sorted(d.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:12]
@@ -519,16 +553,8 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
         jf = jdir / f"exec_{profile}.jsonl"
         if not jf.exists():
             continue
-        resolved_root = str(Path(db_root).resolve())
-        rc, out = run_script(
-            TRADES_WRITER,
-            [
-                "--from-journal", str(jf),
-                "--profile", profile,
-                "--db-root", resolved_root,
-                "--replay-dry-run",
-            ],
-        )
+        rc, out = run_script(TRADES_WRITER, ["--from-journal", str(jf),
+                                             "--profile", profile, "--replay-dry-run"])
         plan = _parse_json(out)
         if rc != 0 or not isinstance(plan, dict):
             sigs.append(_sig(f"journal_scan_unrunnable:{profile}", "P2",
@@ -575,12 +601,9 @@ def detect_journal_unaccounted(db_root: str, now: datetime,
                 f"sz={e.get('sz')} ordId={e.get('ordId')}"
                 + ("[unwind]" if e.get("unwind") else "") for e in es[:6])
 
-        hint = (
-            f"｜逐笔人工核实 ordId 后重放: trades_writer.py "
-            f"--from-journal {jf} --profile {profile} "
-            f"--db-root {resolved_root} --replay-dry-run；"
-            f"确认单笔后再以 --ordid <ORD_ID> 定向处理"
-        )
+        hint = (f"｜人工逐笔核实后重放: trades_writer.py --from-journal {jf} "
+                f"--profile {profile} --db-root {Path(db_root).resolve()} --replay-dry-run "
+                "(apply requires one verified --ordid <ORD_ID>)")
         sigs.append(_sig("journal_unaccounted:live", "P1",
                          f"live 已成交未入账 {len(aged)} 笔(>15min): "
                          f"{_desc(aged)}{hint}"))
@@ -668,7 +691,7 @@ def triage_source_signals(sigs: list[dict]) -> None:
     """源类信号 health_check 三态分流：0=全通降级perf／1=某源不可达标疑真断／99=工具不可用标不确定。"""
     if not any(s.get("source_like") and not s.get("audit_only") for s in sigs):
         return
-    rc, _ = run_script(r"./scripts/health_check.py", [], timeout=60)
+    rc, _ = run_script(_public_project_path('scripts', 'health_check.py'), [], timeout=60)
     for s in sigs:
         if not s.get("source_like"):
             continue
@@ -826,18 +849,10 @@ def audit(record: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="within-day 采集/派单/推送健康监控（纯脚本）")
-    ap.add_argument("--db-root", default=_project_path("db"))
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--dry-run", action="store_true", help="只检测+报告，不推 QQ、不写状态")
     args = ap.parse_args()
-    db_root = Path(args.db_root).resolve()
-    args.db_root = str(db_root)
-    _configure_runtime_paths(db_root)
-    if not args.dry_run and not _is_production_db_root(db_root):
-        log(
-            "拒绝对非默认 DB root 执行可写监控；"
-            "隔离目录仅允许配合 --dry-run 使用"
-        )
-        return 2
+    _configure_runtime_paths(args.db_root)
     now = now_cst()
 
     if not args.dry_run and not acquire_lock(now):
@@ -900,7 +915,7 @@ def main() -> int:
         }
 
         if to_alert and not args.dry_run:
-            rc, out = send_alert(build_alert(to_alert, now), args.db_root)
+            rc, out = send_alert(build_alert(to_alert, now))
             report["alert_sent"] = {"rc": rc, "out": out}
             if rc == 0 or "messageid" in out.lower():   # 送达（含偶发 rc=1 带 messageId）才固化去重
                 save_state(state)

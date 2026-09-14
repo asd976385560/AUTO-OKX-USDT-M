@@ -55,6 +55,79 @@ class SelectiveMultitimeframeDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(diagnostic._feature_columns(panel), ["safe_feature"])
 
+    def test_expand_candidates_applies_side_direction_to_features(self) -> None:
+        panel = pd.DataFrame({
+            "obs_id": ["one"],
+            "obs_ts": pd.to_datetime(["2026-08-01T00:00:00Z"]),
+            "decision_ts": pd.to_datetime(["2026-08-01T00:00:00Z"]),
+            "entry_ts": pd.to_datetime(["2026-08-01T00:00:01Z"]),
+            "symbol": ["BTC-USDT-SWAP"],
+            "asset_class": ["crypto"],
+            "rule_direction": ["long"],
+            "split": ["train"],
+            "chg24h": [0.03],
+            **{
+                f"{timeframe}_{side}_success": [1.0]
+                for timeframe in diagnostic.TIMEFRAMES
+                for side in diagnostic.SIDES
+            },
+            **{
+                f"{timeframe}_{side}_return": [0.01]
+                for timeframe in diagnostic.TIMEFRAMES
+                for side in diagnostic.SIDES
+            },
+        })
+
+        candidates, candidate_features = diagnostic._expand_candidates(
+            panel, ["chg24h"], ["crypto"])
+        long_value = candidates.loc[
+            (candidates["horizon"] == "15m")
+            & (candidates["side"] == "long"),
+            "directional__chg24h",
+        ].iloc[0]
+        short_value = candidates.loc[
+            (candidates["horizon"] == "15m")
+            & (candidates["side"] == "short"),
+            "directional__chg24h",
+        ].iloc[0]
+
+        self.assertIn("directional__chg24h", candidate_features)
+        self.assertAlmostEqual(float(long_value), 0.03)
+        self.assertAlmostEqual(float(short_value), -0.03)
+
+    def test_quality_audit_rejects_long_short_success_overlap(self) -> None:
+        obs = pd.to_datetime([
+            "2026-08-01T00:00:00Z", "2026-08-01T01:00:00Z",
+        ])
+        panel = pd.DataFrame({
+            "obs_id": ["one", "two"],
+            "obs_ts": obs,
+            "decision_ts": obs + pd.Timedelta(seconds=1),
+            "entry_ts": obs + pd.Timedelta(seconds=2),
+            "symbol": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            "asset_class": ["crypto", "crypto"],
+            "rule_direction": ["long", "short"],
+            "split": ["train", "test"],
+            "safe_feature": [1.0, 2.0],
+            **{
+                f"{timeframe}_{side}_success": [0.0, 0.0]
+                for timeframe in diagnostic.TIMEFRAMES
+                for side in diagnostic.SIDES
+            },
+        })
+        panel.loc[0, "15m_long_success"] = 1.0
+        panel.loc[0, "15m_short_success"] = 1.0
+        false_mask = pd.Series(False, index=panel.index)
+
+        audit = diagnostic._quality_audit(
+            panel, ["safe_feature"], pd.Series(True, index=panel.index),
+            (false_mask, false_mask, false_mask),
+        )
+
+        self.assertEqual(
+            audit["critical_checks"]["long_short_success_overlap"], 1)
+        self.assertEqual(audit["status"], "NOT_MET")
+
     def test_nested_calibration_windows_are_disjoint_and_four_hour_purged(
         self,
     ) -> None:

@@ -5,6 +5,37 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-09-14
+
+### Added
+
+- Added the minimal full-closure decision protocol, side-neutral candidate manifests,
+  deterministic facts handoff, atomic position-plan publication and independent
+  refusal evidence that preserves failed actions while allowing unrelated actions.
+- Added optional public-market WebSocket cache and service, market-source diagnostics,
+  dated report artifacts, forward-window business and reporting audits, and isolated
+  tests for execution, protection, reconciliation and delivery contracts.
+
+### Changed
+
+- Synchronized collectors, writers, role manuals, templates and execution helpers
+  with the 2026-09-14 runtime source snapshot. Historical multitimeframe/card evidence
+  remains readable; new full-closure decisions use `open_execution_package_v1`.
+- Added official tick-size alignment, exact flat-side protection cleanup, bounded
+  mark-price read recovery, terminal-state diagnostics and failure-preserving receipts.
+- Updated report validation, missed-opportunity evidence, delivery timing and QQ
+  Gateway transport. Unknown delivery remains non-retryable and business failures
+  remain separate from delivery verification.
+
+### Security
+
+- Retained permanently read-only public autoheal, isolated database-root propagation,
+  fail-closed dry runs, explicit migration apply flags and verified SQLite backups.
+- Kept credentials, real destinations, runtime databases, incident repair tools,
+  host scheduler configuration and private report artifacts outside the release.
+- Published synthetic order identities in the close-reconciliation fixture and
+  retained the existing protected PR, CI and annotated-tag release workflow.
+
 ## [1.1.1] - 2026-08-16
 
 ### Added
@@ -125,7 +156,9 @@ All notable public-release changes are recorded here. Public versions follow
 - CI now scans the complete candidate tree for concrete delivery routes, private
   host paths and runtime artifacts without echoing matched values.
 
-[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/asd976385560/AUTO-OKX-USDT-M/compare/v1.1.2...HEAD
 [1.1.1]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.1
 [1.1.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.0
 [1.0.0]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.0.0
+
+[1.1.2]: https://github.com/asd976385560/AUTO-OKX-USDT-M/releases/tag/v1.1.2

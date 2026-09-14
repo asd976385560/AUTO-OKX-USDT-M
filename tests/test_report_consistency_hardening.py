@@ -92,8 +92,91 @@ class WeeklyQualityMetricTests(unittest.TestCase):
         self.assertEqual(result["within_card_completeness_pct"], 50.0)
         self.assertEqual(result["overall_completeness_pct"], 25.0)
 
+    def test_minimal_policy_signals_are_not_six_card_failures(self):
+        complete = {
+            field: {"evidence": "present"}
+            for field in judgment_quality_report.REQUIRED_DECISION_CARD_FIELDS
+        }
+        rows = [
+            {
+                "cycle_id": "2026-09-02T12:15",
+                "decision_card": json.dumps(complete),
+            },
+            {
+                "cycle_id": "2026-09-02T12:30",
+                "decision_card": None,
+            },
+        ]
+        with mock.patch.object(
+            judgment_quality_report.thresholds,
+            "MINIMAL_DECISION_CONTRACT_ACTIVATION_CST",
+            "2026-09-02T12:30:00+08:00",
+        ):
+            result = judgment_quality_report.decision_card_quality(rows)
+        self.assertEqual(1, result["legacy_signals"])
+        self.assertEqual(1, result["minimal_policy_signals"])
+        self.assertEqual(100.0, result["decision_card_coverage_pct"])
+        self.assertEqual(100.0, result["overall_completeness_pct"])
+        self.assertFalse(result["minimal_policy_missing_card_is_failure"])
+
 
 class DailyRevisionBackfillTests(unittest.TestCase):
+    def test_backfill_cli_accepts_live_profile_and_dry_run_is_byte_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "account.db"
+            report = root / "daily-2026-07-28.md"
+            con = sqlite3.connect(db)
+            try:
+                con.executescript(DAILY_SCHEMA)
+                raw = json.dumps({
+                    "report_audit": {
+                        "version": 1,
+                        "period_kind": "daily",
+                        "report_state": {"status": "final"},
+                        "trade_metrics": {"live": {}},
+                    },
+                }, ensure_ascii=False)
+                con.execute(
+                    "INSERT INTO daily_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "2026-07-28 08:05:00", "live", 0, 0, 0.0, 0.0,
+                        "", "", "summary", "lessons", raw, 65,
+                    ),
+                )
+                con.commit()
+            finally:
+                con.close()
+            report.write_text(
+                "# 📊 小灵日报 2026-07-28\n"
+                "> ts: 2026-07-28 08:05:00\n"
+                "> **报告状态：最终报告｜live 对账已清零**\n",
+                encoding="utf-8",
+            )
+            before_db = db.read_bytes()
+            before_report = report.read_bytes()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "daily_report_writer.py"),
+                    "--backfill-daily-revision",
+                    "--report-ts", "2026-07-28 08:05:00",
+                    "--db-path", str(db),
+                    "--reports-dir", str(root),
+                    "--profiles", "live",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertIn('"dry_run": true', completed.stdout)
+            self.assertEqual(before_db, db.read_bytes())
+            self.assertEqual(before_report, report.read_bytes())
+
     def test_backfill_is_dry_run_first_metadata_only_and_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -231,6 +314,70 @@ class DailyRevisionBackfillTests(unittest.TestCase):
 
 
 class ReviewerReadyTests(unittest.TestCase):
+    def test_preflight_accepts_forward_exit_quality_degradation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            business_date = "2026-08-21"
+            quality_path = root / f"quality_metrics_{business_date}.json"
+            quality_path.write_text(json.dumps({
+                "ts": f"{business_date} 08:00:00",
+                "metrics": {},
+            }), encoding="utf-8")
+            raw = quality_path.read_bytes()
+            manifest = {
+                "schema_version": 1,
+                "business_date": business_date,
+                "run_id": "r1",
+                "maintenance_started_at": f"{business_date} 07:55:00",
+                "critical_steps_completed_at": f"{business_date} 08:00:00",
+                "state": "ready",
+                "ready": True,
+                "auto_send": False,
+                "critical_steps": sorted(
+                    reviewer_preflight.REQUIRED_CRITICAL_STEPS),
+                "steps": {
+                    "reconcile": {
+                        "completed": True, "accepted": True, "rc": 0},
+                    "account_bills": {
+                        "completed": True, "accepted": True, "rc": 0},
+                    "missed_opportunities": {
+                        "completed": True, "accepted": True, "rc": 0},
+                    "ledger_invariants": {
+                        "completed": True, "accepted": True, "rc": 0},
+                    "exit_quality": {
+                        "completed": True, "accepted": False, "rc": 2},
+                    "quality_metrics": {
+                        "completed": True,
+                        "accepted": True,
+                        "rc": 0,
+                        "artifact": {
+                            "path": str(quality_path),
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                            "size_bytes": len(raw),
+                        },
+                    },
+                },
+                "provisional_required": True,
+                "provisional_reasons": [
+                    "critical_step_degraded:exit_quality"],
+                "degraded_critical_steps": ["exit_quality"],
+                "provisional_degrade_from": "2026-08-21",
+                "report_mode": "provisional",
+            }
+            result = reviewer_preflight.validate_manifest(
+                manifest, business_date)
+            self.assertTrue(result["ok"], result["errors"])
+            self.assertEqual("provisional", result["report_mode"])
+
+            tampered = dict(manifest)
+            tampered["degraded_critical_steps"] = []
+            rejected = reviewer_preflight.validate_manifest(
+                tampered, business_date)
+            self.assertFalse(rejected["ok"])
+            self.assertIn(
+                "degraded_critical_steps differ from step results",
+                rejected["errors"])
+
     def test_manifest_proves_artifact_and_forces_provisional_on_reconcile_rc1(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -258,6 +405,7 @@ class ReviewerReadyTests(unittest.TestCase):
                     "reconcile": {"rc": 1, "accepted": True},
                     "account_bills": {"rc": 0, "accepted": True},
                     "missed_opportunities": {"rc": 0, "accepted": True},
+                    "ledger_invariants": {"rc": 0, "accepted": True},
                     "quality_metrics": {
                         "rc": 0,
                         "accepted": True,
@@ -288,7 +436,11 @@ class ReviewerReadyTests(unittest.TestCase):
     def test_daily_maintenance_publishes_ready_only_after_critical_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            business_date = daily_maintenance.now_cst()[:10]
+            # Pin this before the exit-quality activation boundary while still
+            # requiring the current ledger-invariants critical step;
+            # exit-quality activation semantics are covered separately
+            # by test_exit_quality_closure.
+            business_date = "2026-08-15"
             quality_path = root / f"quality_metrics_{business_date}.json"
             quality_path.write_text(json.dumps({
                 "ts": f"{business_date} 07:56:00",
@@ -298,6 +450,7 @@ class ReviewerReadyTests(unittest.TestCase):
                 ("reconcile", ["reconcile.py"], 1, (0, 1)),
                 ("account_bills", ["account_bills.py"], 1, (0,)),
                 ("missed_opportunities", ["missed.py"], 1, (0,)),
+                ("ledger_invariants", ["ledger.py"], 1, (0,)),
                 ("quality_metrics", ["quality_metrics.py"], 1, (0,)),
                 ("noncritical", ["noncritical.py"], 1, (0,)),
             ]
@@ -325,6 +478,9 @@ class ReviewerReadyTests(unittest.TestCase):
                 mock.patch.object(
                     daily_maintenance.subprocess, "run",
                     side_effect=fake_run),
+                mock.patch.object(
+                    daily_maintenance, "now_cst",
+                    return_value="2026-08-15 07:55:00"),
             ):
                 rc = daily_maintenance.main([])
             self.assertEqual(rc, 1)

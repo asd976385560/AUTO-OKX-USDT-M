@@ -9,9 +9,18 @@
   3. 周度统计快照打印（有战绩/胜者/弃用计数）
 
 用法:
-  pwsh ... run_okx_python.ps1 scripts/playbook_checkup.py [--db-root ./db] [--apply]
+  pwsh ... run_okx_python.ps1 scripts/playbook_checkup.py [--db-root <PROJECT_ROOT>\\db] [--apply]
 默认 dry-run；退出码 0=成功（含 dry-run），1=异常。
 """
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse
 import sqlite3
 import sys
@@ -24,7 +33,7 @@ DEPRECATE_WR = 0.30
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true", help="执行降级写库（默认 dry-run）")
     ap.add_argument("--candidates", type=int, default=3)
     args = ap.parse_args()

@@ -15,6 +15,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -26,17 +35,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _okx_http import (
-    fetch_candles_batch_sync,
     fetch_contract_long_short_ratios_batch_sync,
     fetch_contract_open_interest_history_batch_sync,
     fetch_contract_taker_volumes_batch_sync,
+)
+from _okx_market_source import (
+    fetch_candles_batch_sync,
     fetch_open_interest_all_sync,
     fetch_orderbooks_batch_sync,
     fetch_recent_trades_batch_sync,
 )
 
 CST = timezone(timedelta(hours=8))
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 BASE_SYMBOLS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP")
 DEPTH_BPS = (10, 25, 50)
 SLIPPAGE_USD = (100, 500, 1000)
@@ -937,6 +948,55 @@ def contract_statistics_row_method(row: tuple | sqlite3.Row) -> str:
     return str(payload.get("method") or "rubik_common_bucket")
 
 
+def contract_statistics_fallback_diagnostics(
+    errors: list[str], *, sample_limit: int = 12,
+) -> dict[str, object]:
+    """Return bounded per-symbol reasons for strict public fallback failures.
+
+    The collector already records these failures in its bounded ``errors``
+    list.  This helper only gives that existing evidence a stable structure so
+    parent receipts do not collapse it to an unresolved-symbol count.
+    """
+    limit = max(0, min(int(sample_limit), 32))
+    samples: list[dict[str, str]] = []
+    error_type_counts: dict[str, int] = {}
+    seen_symbols: set[str] = set()
+    for value in errors:
+        text = str(value or "")
+        symbol = error_type = reason = ""
+        marker = ":contract_statistics_fallback:"
+        if marker in text:
+            symbol, detail = text.split(marker, 1)
+            error_type, separator, reason = detail.partition(":")
+            if not separator:
+                reason = "fallback unavailable"
+        elif ":contract_statistics:" in text and ";fallback=" in text:
+            symbol = text.split(":contract_statistics:", 1)[0]
+            detail = text.split(";fallback=", 1)[1]
+            error_type, separator, reason = detail.partition(":")
+            if not separator:
+                reason = "fallback unavailable"
+        if not symbol.endswith("-USDT-SWAP") or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        error_type = (error_type or "Unknown")[:80]
+        reason = (reason or "fallback unavailable")[:200]
+        error_type_counts[error_type] = error_type_counts.get(error_type, 0) + 1
+        if len(samples) < limit:
+            samples.append({
+                "symbol": symbol,
+                "error_type": error_type,
+                "reason": reason,
+            })
+    return {
+        "failure_count": len(seen_symbols),
+        "error_type_counts": dict(sorted(error_type_counts.items())),
+        "samples": samples,
+        "sample_limit": limit,
+        "truncated": len(seen_symbols) > len(samples),
+    }
+
+
 def contract_statistics_row_issues(
     row: tuple | sqlite3.Row,
     *,
@@ -1699,6 +1759,8 @@ def main() -> int:
                 "contract_statistics_due": True,
                 "contract_statistics_only": True,
                 "contract_statistics_transport": "okx_official_rest",
+                "contract_statistics_fallback_diagnostics": (
+                    contract_statistics_fallback_diagnostics(errors)),
                 "errors": errors[:20],
             }, ensure_ascii=False))
             return 0 if passed else 1
@@ -1924,6 +1986,8 @@ def main() -> int:
                 len(contract_stats_symbols) if do_contract_stats else 0),
             "contract_statistics_transport": "okx_official_rest",
             "contract_statistics_quality": contract_stats_quality,
+            "contract_statistics_fallback_diagnostics": (
+                contract_statistics_fallback_diagnostics(errors)),
             "depth_levels": 50,
             "retention_days": args.retention_days,
             "pruned": pruned,

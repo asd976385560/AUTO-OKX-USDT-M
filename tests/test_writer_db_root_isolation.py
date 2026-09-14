@@ -15,6 +15,42 @@ from collectors import _dispatch_nudge, analyst_writer, trades_writer
 
 
 class WriterDbRootIsolationTests(unittest.TestCase):
+    def test_deadline_placeholder_stays_in_explicit_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = Path(tmp) / "canonical.db"
+            isolated = Path(tmp) / "isolated.db"
+            for path in (canonical, isolated):
+                con = sqlite3.connect(path)
+                try:
+                    con.executescript(
+                        "CREATE TABLE analysis_runs(cycle_id TEXT PRIMARY KEY, ts TEXT, mode TEXT, "
+                        "regime TEXT, regime_stale INTEGER, market_summary TEXT, missing_sources TEXT, "
+                        "raw TEXT, status TEXT); CREATE TABLE analysis_signals(cycle_id TEXT);"
+                    )
+                finally:
+                    con.close()
+            before = canonical.read_bytes()
+            refusal = {"ok": False, "error": "analysis_deadline_exceeded"}
+            with mock.patch.object(analyst_writer, "DB_PATH", canonical), \
+                    mock.patch.object(analyst_writer, "analysis_deadline_refusal", return_value=refusal):
+                result = analyst_writer.write_analysis(
+                    {"cycle_id": "2026-09-14T11:15", "mode": "full"}, db_path=isolated
+                )
+            self.assertEqual(result, refusal)
+            self.assertEqual(canonical.read_bytes(), before)
+            con = sqlite3.connect(isolated)
+            try:
+                self.assertEqual(con.execute("SELECT status FROM analysis_runs").fetchall(), [("error",)])
+            finally:
+                con.close()
+
+    def test_price_preflight_receives_explicit_database_root(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(analyst_writer, "_validate_lightweight_open_prices", return_value=[]) as preflight:
+            root = Path(tmp).resolve()
+            analyst_writer.validate_receipt({"cycle_id": "2026-09-14T11:15"}, db_root=root)
+            self.assertEqual(preflight.call_args.kwargs["db_root"], root)
+
     @staticmethod
     def _empty_trade_db(db_root: Path, profile: str = "live") -> Path:
         db_root.mkdir(parents=True, exist_ok=True)

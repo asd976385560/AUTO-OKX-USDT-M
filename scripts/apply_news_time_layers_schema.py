@@ -30,6 +30,15 @@ first_seen_at = event_key 内最早 COALESCE(ingested_at, ts)；last_seen_at = �
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import os
@@ -68,19 +77,16 @@ def columns(con: sqlite3.Connection) -> set[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="news_items 时间/来源分层迁移（默认 dry-run）")
-    ap.add_argument("--db", default=r"./db/news.db")
+    ap.add_argument("--db", default=_public_project_path('db', 'news.db'))
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup-dir", default=None)
     args = ap.parse_args()
-    if args.apply and args.dry_run:
-        ap.error("--apply and --dry-run are mutually exclusive")
     db_path = Path(args.db)
     if not db_path.exists():
         print(json.dumps({"ok": False, "error": f"库不存在: {db_path}"}))
         return 2
 
-    con = sqlite3.connect(str(db_path), timeout=20)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=20)
     con.execute("PRAGMA busy_timeout=15000")
     con.row_factory = sqlite3.Row
     try:
@@ -138,6 +144,11 @@ def main() -> int:
                               "error": f"备份 quick_check={qc}，中止"},
                              ensure_ascii=False, indent=1))
             return 2
+
+        con.close()
+        con = sqlite3.connect(db_path, timeout=20)
+        con.execute("PRAGMA busy_timeout=30000")
+        con.row_factory = sqlite3.Row
 
         for col, typ in NEW_COLUMNS:
             if col not in have:

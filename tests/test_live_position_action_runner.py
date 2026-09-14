@@ -19,6 +19,12 @@ for module_path in (ROOT, ROOT / "scripts", ROOT / "collectors", ROOT / "core"):
         sys.path.insert(0, str(module_path))
 
 import live_position_action_runner as runner  # noqa: E402
+# The production wrapper seeds <PROJECT_ROOT>\scripts on sys.path.  This test is also
+# run from an isolated staging tree, so force the paired supervisor module from
+# the same tree instead of accepting a previously cached production import.
+sys.modules.pop("stage_runner", None)
+sys.path.insert(0, str(ROOT / "scripts"))
+import stage_runner  # noqa: E402
 
 
 CYCLE = "2026-08-15T15:15"
@@ -79,6 +85,27 @@ def _facts(*, status: str = "ok") -> dict:
     }
 
 
+def _position_exit_evidence(facts: dict) -> dict:
+    payload = {
+        "schema_version": 1,
+        "mode": "read_only",
+        "scope": "all_current_position_exit_review",
+        "cycle_id": CYCLE,
+        "facts_hash": facts["facts_hash"],
+        "positions": [
+            {"symbol": row["instId"], "side": row["posSide"]}
+            for row in facts["positions"]
+        ],
+        "production_database_writes": 0,
+        "orders_placed": 0,
+        "ok": True,
+        "status": "PASSED",
+        "position_count": len(facts["positions"]),
+    }
+    payload["evidence_hash"] = runner._canonical_hash(payload)
+    return payload
+
+
 def _plan(actions: list[dict]) -> dict:
     return {
         "cycle_id": CYCLE,
@@ -88,7 +115,6 @@ def _plan(actions: list[dict]) -> dict:
             "status": "ok",
             "decision_protocol": "decision_card_v1",
             "decision_card": _card(),
-            "equity": 1000.0,
             "regime": "range",
         },
         "actions": actions,
@@ -206,6 +232,53 @@ class LivePositionActionRunnerTests(unittest.TestCase):
             ),
         )
 
+    def test_missing_required_position_exit_fails_before_side_effects(self) -> None:
+        facts = _facts()
+        patches = self._patch_validation()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3]:
+            root = Path(tmp)
+            receipt = root / "receipt.json"
+            evidence = root / f"position_exit_{CYCLE.replace(':', '-')}.json"
+            with self.assertRaisesRegex(
+                    runner.PlanError, "position_exit_evidence_missing"):
+                runner.execute_position_plan(
+                    _plan([]), facts, cycle_id=CYCLE, db_root=root,
+                    receipt_file=receipt, position_exit_file=evidence,
+                    nudge=False,
+                )
+            marker = json.loads((
+                root / f"live_runner_state_{CYCLE.replace(':', '-')}.json"
+            ).read_text(encoding="utf-8"))
+        self.assertEqual("failed_preflight", marker["state"])
+        self.assertEqual(1, marker["preflight_attempts"])
+        self.assertIn("position_exit_evidence_missing", marker["error"])
+
+    def test_position_exit_evidence_requires_exact_facts_binding(self) -> None:
+        facts = _facts()
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "position_exit.json"
+            payload = _position_exit_evidence(facts)
+            evidence.write_text(json.dumps(payload), encoding="utf-8")
+            runner._validate_position_exit_evidence(
+                facts, cycle_id=CYCLE, evidence_file=evidence)
+            payload["facts_hash"] = "0" * 64
+            evidence.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                    runner.PlanError, "position_exit_evidence_invalid"):
+                runner._validate_position_exit_evidence(
+                    facts, cycle_id=CYCLE, evidence_file=evidence)
+
+    def test_position_exit_not_required_when_no_positions(self) -> None:
+        facts = _facts()
+        facts["positions"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            runner._validate_position_exit_evidence(
+                facts,
+                cycle_id=CYCLE,
+                evidence_file=Path(tmp) / "missing.json",
+            )
+
     def test_two_closes_execute_then_commit_once_in_same_call(self) -> None:
         plan = _plan([
             {"action": "CLOSE", "symbol": "BTC-USDT-SWAP",
@@ -259,6 +332,40 @@ class LivePositionActionRunnerTests(unittest.TestCase):
         self.assertEqual(len(receipt["position_action_results"]), 2)
         self.assertEqual(receipt["live_facts"], _facts())
         self.assertEqual(persisted, receipt)
+
+    def test_v4_business_terminal_is_stamped_before_writer_commit(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "thesis invalid",
+        }])
+        captured: dict = {}
+
+        def commit(receipt, _profile, **_kwargs):
+            captured.update(receipt)
+            return {"ok": True, "written": 1}
+
+        patches = self._patch_validation()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3], mock.patch.object(
+                    runner.thresholds,
+                    "complete_cycle_uses_business_terminal_stop",
+                    return_value=True,
+                ), mock.patch.object(runner.oe, "close_position", return_value={
+                    "profile": "live", "ok": True,
+                    "action_taken": "CLOSE", "side": "long", "p0": False,
+                    "trades": [_trade("BTC-USDT-SWAP", "long")],
+                }), mock.patch.object(
+                    runner.tw, "commit_receipt", side_effect=commit):
+            result = runner.execute_position_plan(
+                plan, _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                receipt_file=Path(tmp) / "receipt.json", nudge=False)
+
+        terminal = result["receipt"]["business_terminal"]
+        self.assertEqual(1, terminal["schema_version"])
+        self.assertEqual(CYCLE, terminal["cycle_id"])
+        self.assertEqual("completed", terminal["status"])
+        self.assertFalse(terminal["persistence_completed"])
+        self.assertEqual(terminal, captured["business_terminal"])
 
     def test_open_uses_canonical_card_and_deterministic_contract_size(self) -> None:
         card = _open_card(judgement="OPEN SOL from canonical analysis")
@@ -323,6 +430,68 @@ class LivePositionActionRunnerTests(unittest.TestCase):
         )
         opened.assert_called_once()
         commit.assert_called_once()
+
+    def test_open_replaces_retyped_cycle_card_before_context_validation(self) -> None:
+        canonical = _open_card(judgement="OPEN SOL canonical")
+        retyped = _card()
+        retyped["agent_judgement"] = (
+            "BTC-USDT-SWAP HOLD：保护有效；SOL-USDT-SWAP OPEN"
+        )
+        retyped["position_reviews"] = [{
+            "instId": "BTC-USDT-SWAP",
+            "action": "HOLD",
+            "reasoning": "保护有效",
+        }]
+        retyped["historical_experience"]["evidence_contract"] = {
+            "protocol": "experience_evidence_v2",
+            "summaries": {"cross_symbol_similar": {"n": 46}},
+            "evidence_hash": "stale-copy",
+        }
+        plan = _plan([{
+            "action": "OPEN",
+            "symbol": "SOL-USDT-SWAP",
+            "side": "long",
+            "target_stop_risk_pct_equity": 0.01,
+            "lev": 5,
+        }])
+        plan["receipt_context"]["decision_card"] = retyped
+
+        validated_cards = []
+
+        def validate_context(context, **_kwargs):
+            validated_cards.append(context["decision_card"])
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "validate_facts", return_value=[]), \
+                mock.patch.object(
+                    runner.oe, "validate_receipt_context",
+                    side_effect=validate_context,
+                ), \
+                mock.patch.object(
+                    runner, "_load_analysis_signal", return_value={
+                        "action": "open_long",
+                        "side": "long",
+                        "reasoning": "canonical reasoning",
+                        "decision_card": canonical,
+                    },
+                ) as load_signal:
+            context, actions = runner.preflight_plan(
+                plan,
+                _facts(),
+                cycle_id=CYCLE,
+                db_root=Path(tmp),
+            )
+
+        expected_cycle_card = dict(canonical)
+        expected_cycle_card["agent_judgement"] = retyped["agent_judgement"]
+        expected_cycle_card["position_reviews"] = retyped["position_reviews"]
+        self.assertEqual(expected_cycle_card, context["decision_card"])
+        self.assertEqual(canonical, actions[0]["_decision_card"])
+        self.assertEqual(retyped, plan["receipt_context"]["decision_card"])
+        self.assertEqual(expected_cycle_card, validated_cards[0])
+        self.assertEqual(canonical, validated_cards[1])
+        self.assertEqual(2, load_signal.call_count)
 
     def test_add_uses_same_open_entrypoint_but_aggregates_as_add(self) -> None:
         card = _open_card(judgement="ADD BTC from canonical analysis")
@@ -420,7 +589,8 @@ class LivePositionActionRunnerTests(unittest.TestCase):
 
         self.assertTrue(result["committed"])
         self.assertEqual(seen_states, ["started", "executing", "committed"])
-        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(
+            state["schema_version"], runner.RUNNER_STATE_SCHEMA_VERSION)
         self.assertEqual(state["cycle_id"], CYCLE)
         self.assertEqual(state["facts_hash"], "f" * 64)
         self.assertEqual(state["plan_sha256"], "a" * 64)
@@ -598,6 +768,25 @@ class LivePositionActionRunnerTests(unittest.TestCase):
         self.assertEqual(len(result["receipt"]["position_action_failures"]), 1)
         commit.assert_called_once()
 
+    def test_adjust_rejects_open_style_sl_field_before_executor(self) -> None:
+        plan = _plan([{
+            "action": "ADJUST_PROTECTION",
+            "symbol": "ETH-USDT-SWAP",
+            "pos_side": "short",
+            "sl_trigger_px": 105,
+            "reasoning": "wrong field name must fail closed",
+        }])
+        patches = self._patch_validation()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3], \
+                mock.patch.object(runner.oe, "adjust_protection") as adjusted:
+            with self.assertRaisesRegex(
+                    runner.PlanError, "未知字段: sl_trigger_px"):
+                runner.execute_position_plan(
+                    plan, _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                    receipt_file=Path(tmp) / "receipt.json", nudge=False)
+        adjusted.assert_not_called()
+
     def test_reduce_and_adjust_forward_exact_facts_position_fingerprint(self) -> None:
         plan = _plan([
             {
@@ -666,7 +855,7 @@ class LivePositionActionRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"
             state_file.write_text(json.dumps({
-                "schema_version": 1,
+                "schema_version": runner.RUNNER_STATE_SCHEMA_VERSION,
                 "cycle_id": CYCLE,
                 "state": "failed",
                 "facts_hash": "f" * 64,
@@ -678,6 +867,55 @@ class LivePositionActionRunnerTests(unittest.TestCase):
                         plan, _facts(), cycle_id=CYCLE, db_root=Path(tmp),
                         receipt_file=Path(tmp) / "receipt.json", nudge=False,
                         state_file=state_file, plan_sha256="a" * 64)
+            close.assert_not_called()
+
+    def test_legacy_v1_marker_fails_closed_before_executor(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "legacy marker fence",
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_file = root / "state.json"
+            state_file.write_text(json.dumps({
+                "schema_version": 1,
+                "cycle_id": CYCLE,
+                "state": "started",
+                "facts_hash": "f" * 64,
+                "plan_sha256": "a" * 64,
+            }), encoding="utf-8")
+            with mock.patch.object(runner.oe, "close_position") as close:
+                with self.assertRaisesRegex(
+                        runner.PlanError, "legacy/invalid schema"):
+                    runner.execute_position_plan(
+                        plan, _facts(), cycle_id=CYCLE, db_root=root,
+                        receipt_file=root / "receipt.json", nudge=False,
+                        state_file=state_file, plan_sha256="a" * 64)
+            close.assert_not_called()
+
+    def test_malformed_handoff_gate_fails_closed_before_executor(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "malformed gate fence",
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_file = root / "state.json"
+            handoff = runner._default_handoff_state_file(state_file, CYCLE)
+            handoff.write_text("{", encoding="utf-8")
+
+            def guard(_cycle):
+                return {"cycle_id": CYCLE, "stage_runner_pid": 12345}
+
+            with mock.patch.object(runner.oe, "close_position") as close:
+                with self.assertRaisesRegex(
+                        runner.PlanError, "handoff gate 不可校验"):
+                    runner.execute_position_plan(
+                        plan, _facts(), cycle_id=CYCLE, db_root=root,
+                        receipt_file=root / "receipt.json", nudge=False,
+                        state_file=state_file, plan_sha256="a" * 64,
+                        runtime_guard=guard)
+            self.assertFalse(state_file.exists())
             close.assert_not_called()
 
     def test_production_authority_accepts_running_owned_unexpired_lease(self) -> None:
@@ -692,6 +930,33 @@ class LivePositionActionRunnerTests(unittest.TestCase):
             )
         self.assertEqual("running", authority["stage_status"])
         self.assertEqual(CYCLE, authority["cycle_id"])
+
+    def test_runtime_guard_non_object_fails_closed_before_marker(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "authority shape fence",
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_file = root / "state.json"
+            with mock.patch.object(runner.oe, "close_position") as close:
+                with self.assertRaisesRegex(
+                        runner.PlanError, "authority object"):
+                    runner.execute_position_plan(
+                        plan, _facts(), cycle_id=CYCLE, db_root=root,
+                        receipt_file=root / "receipt.json", nudge=False,
+                        state_file=state_file, plan_sha256="a" * 64,
+                        runtime_guard=lambda _cycle: None)
+            self.assertFalse(state_file.exists())
+            close.assert_not_called()
+
+    def test_cycle_and_production_tmp_paths_are_canonical(self) -> None:
+        with self.assertRaisesRegex(runner.PlanError, "15 分钟自然槽"):
+            runner._validated_cycle_id("2026-08-15T15:17")
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "position_plan.json"
+            with self.assertRaisesRegex(runner.PlanError, "受控 tmp"):
+                runner._require_direct_tmp_path(outside, "plan-file")
 
     def test_production_authority_rejects_bad_analysis_before_marker_executor(
             self) -> None:
@@ -848,6 +1113,105 @@ class LivePositionActionRunnerTests(unittest.TestCase):
             self.assertFalse(state_file.exists())
             close.assert_not_called()
 
+    def test_supervisor_revocation_fences_still_running_late_runner(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "must lose revoked handoff",
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status_dir, db_root = _create_runtime_authority(root)
+            facts = _facts()
+            state_file = root / "live_runner_state_2026-08-15T15-15.json"
+            handoff_file = runner._default_handoff_state_file(
+                state_file, CYCLE)
+            handoff_file.write_text(json.dumps({
+                "schema_version": runner.HANDOFF_GATE_SCHEMA_VERSION,
+                "cycle_id": CYCLE,
+                "state": "revoked",
+                "reason": (
+                    "post_facts_runner_handoff_violation:"
+                    "no_valid_runner_marker"
+                ),
+                "session_key": runner._gateway_session_key(CYCLE),
+                "stage_runner_pid": 12345,
+                "facts_hash": "f" * 64,
+                "plan_sha256": "a" * 64,
+            }), encoding="utf-8")
+
+            def guard(cycle):
+                return runner.validate_live_runtime_authority(
+                    cycle,
+                    db_root=db_root,
+                    status_dir=status_dir,
+                    now=datetime(2026, 8, 15, 15, 20,
+                                 tzinfo=runner.CST),
+                )
+
+            with mock.patch.object(runner.oe, "close_position") as close:
+                with self.assertRaisesRegex(
+                        runner.PlanError, "supervisor 原子撤销"):
+                    runner.execute_position_plan(
+                        plan,
+                        facts,
+                        cycle_id=CYCLE,
+                        db_root=db_root,
+                        receipt_file=root / "receipt.json",
+                        nudge=False,
+                        state_file=state_file,
+                        plan_sha256="a" * 64,
+                        runtime_guard=guard,
+                    )
+
+            # Stage status and lease deliberately remain valid here.  The
+            # durable CAS fence alone must prevent marker/executor side effects.
+            stage = json.loads(
+                (status_dir / "live-2026-08-15T15-15.json").read_text(
+                    encoding="utf-8"))
+            self.assertEqual("running", stage["status"])
+            self.assertFalse(state_file.exists())
+            close.assert_not_called()
+
+    def test_runner_marker_preserves_cycle_session_and_stage_binding(self) -> None:
+        patches = self._patch_validation()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3], \
+                mock.patch.object(
+                    runner.tw, "commit_receipt", return_value={"ok": True}
+                ):
+            root = Path(tmp)
+            status_dir, db_root = _create_runtime_authority(root)
+            state_file = root / "state.json"
+
+            def guard(cycle):
+                return runner.validate_live_runtime_authority(
+                    cycle,
+                    db_root=db_root,
+                    status_dir=status_dir,
+                    now=datetime(2026, 8, 15, 15, 20,
+                                 tzinfo=runner.CST),
+                )
+
+            result = runner.execute_position_plan(
+                _plan([]),
+                _facts(),
+                cycle_id=CYCLE,
+                db_root=db_root,
+                receipt_file=root / "receipt.json",
+                nudge=False,
+                state_file=state_file,
+                plan_sha256="a" * 64,
+                runtime_guard=guard,
+            )
+            marker = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("committed", marker["state"])
+        self.assertEqual(CYCLE, marker["cycle_id"])
+        self.assertEqual(
+            runner._gateway_session_key(CYCLE), marker["session_key"])
+        self.assertEqual(12345, marker["stage_runner_pid"])
+
     def test_runtime_authority_rejects_at_absolute_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             status_dir, db_root = _create_runtime_authority(Path(tmp))
@@ -861,6 +1225,44 @@ class LivePositionActionRunnerTests(unittest.TestCase):
                                  tzinfo=runner.CST),
                 )
 
+    def test_final_handoff_lock_is_held_through_executor_call(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "linearized admission",
+        }])
+        patches = self._patch_validation()
+        observer_blocked = []
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3], \
+                mock.patch.object(runner.tw, "commit_receipt",
+                                  return_value={"ok": True}):
+            root = Path(tmp)
+            state_file = root / "state.json"
+            handoff_lock = runner._default_handoff_lock_file(state_file, CYCLE)
+
+            def close(*_args, **_kwargs):
+                with self.assertRaisesRegex(runner.PlanError, "进程锁"):
+                    with runner._runner_cycle_lock(handoff_lock, CYCLE):
+                        self.fail("observer acquired handoff during executor")
+                observer_blocked.append(True)
+                return {
+                    "ok": True, "action_taken": "CLOSE", "p0": False,
+                    "trades": [_trade("BTC-USDT-SWAP", "long")],
+                }
+
+            with mock.patch.object(
+                    runner.oe, "close_position", side_effect=close):
+                result = runner.execute_position_plan(
+                    plan, _facts(), cycle_id=CYCLE, db_root=root,
+                    receipt_file=root / "receipt.json", nudge=False,
+                    state_file=state_file, plan_sha256="a" * 64,
+                    runtime_guard=lambda cycle: {
+                        "cycle_id": cycle, "stage_runner_pid": 12345})
+            with runner._runner_cycle_lock(handoff_lock, CYCLE):
+                pass
+        self.assertEqual([True], observer_blocked)
+        self.assertTrue(result["committed"])
+
     def test_runtime_authority_is_rechecked_before_executor(self) -> None:
         plan = _plan([{
             "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
@@ -873,6 +1275,7 @@ class LivePositionActionRunnerTests(unittest.TestCase):
             calls += 1
             if calls > 1:
                 raise runner.PlanError("live stage status=stopping")
+            return {"cycle_id": CYCLE, "stage_runner_pid": 12345}
 
         patches = self._patch_validation()
         with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
@@ -894,6 +1297,38 @@ class LivePositionActionRunnerTests(unittest.TestCase):
                 )
             marker = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertEqual(2, calls)
+        self.assertEqual("failed", marker["state"])
+        close.assert_not_called()
+
+    def test_deadline_flip_at_true_executor_boundary_blocks_call(self) -> None:
+        plan = _plan([{
+            "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
+            "pos_side": "long", "reasoning": "deadline admission fence",
+        }])
+        calls = 0
+
+        def guard(_cycle):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise runner.PlanError("cycle_deadline_exceeded: flipped")
+            return {"cycle_id": CYCLE, "stage_runner_pid": 12345}
+
+        patches = self._patch_validation()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3], \
+                mock.patch.object(runner.oe, "close_position") as close:
+            root = Path(tmp)
+            state_file = root / "state.json"
+            with self.assertRaisesRegex(
+                    runner.PlanError, "cycle_deadline_exceeded"):
+                runner.execute_position_plan(
+                    plan, _facts(), cycle_id=CYCLE, db_root=root,
+                    receipt_file=root / "receipt.json", nudge=False,
+                    state_file=state_file, plan_sha256="a" * 64,
+                    runtime_guard=guard)
+            marker = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(3, calls)
         self.assertEqual("failed", marker["state"])
         close.assert_not_called()
 
@@ -933,6 +1368,137 @@ class LivePositionActionRunnerTests(unittest.TestCase):
                 for stream in (proc.stdin, proc.stdout, proc.stderr):
                     if stream is not None:
                         stream.close()
+
+    def test_two_process_handoff_cas_runner_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp) / "tmp"
+            tmp_root.mkdir()
+            safe_cycle = CYCLE.replace(":", "-")
+            facts_file = tmp_root / f"live_facts_{safe_cycle}.json"
+            plan_file = tmp_root / f"position_plan_{safe_cycle}.json"
+            state_file = tmp_root / f"live_runner_state_{safe_cycle}.json"
+            receipt_file = tmp_root / "receipt.json"
+            facts_file.write_text(
+                json.dumps({"facts_hash": "f" * 64}), encoding="utf-8")
+            plan_file.write_text('{"actions":[]}', encoding="utf-8")
+            plan_sha = runner.hashlib.sha256(plan_file.read_bytes()).hexdigest()
+            child = (
+                "import json,sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "import live_position_action_runner as r\n"
+                "def guard(cycle):\n"
+                " print('CLAIMING', flush=True)\n"
+                " sys.stdin.readline()\n"
+                " return {'cycle_id':cycle,'stage_runner_pid':12345}\n"
+                "try:\n"
+                " r.execute_position_plan({'actions':[]},"
+                " {'facts_hash':'f'*64}, cycle_id=sys.argv[1],"
+                " db_root=r.Path(sys.argv[2]), receipt_file=r.Path(sys.argv[3]),"
+                " state_file=r.Path(sys.argv[4]), plan_sha256=sys.argv[5],"
+                " runtime_guard=guard, nudge=False)\n"
+                "except Exception:\n"
+                " print('EXPECTED_TERMINAL', flush=True)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", child, CYCLE, str(tmp_root),
+                 str(receipt_file), str(state_file), plan_sha],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+                creationflags=(0x08000000 if sys.platform == "win32" else 0),
+            )
+            try:
+                self.assertEqual("CLAIMING", proc.stdout.readline().strip())
+                observer = stage_runner._LiveChildObserver(
+                    CYCLE, tmp_root=tmp_root, db_root=Path(tmp) / "db",
+                    now_fn=lambda: plan_file.stat().st_mtime + 31,
+                    expected_session_key=runner._gateway_session_key(CYCLE),
+                    expected_stage_runner_pid=12345,
+                )
+                self.assertIsNone(observer())
+                self.assertEqual(
+                    "claim_in_progress",
+                    observer.evidence["handoff_arbitration"],
+                )
+                self.assertFalse(observer.handoff_path.exists())
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.wait(timeout=10), 0, proc.stderr.read())
+                # 2026-08-24：首次预检拒不再直接终态——runner 留下
+                # failed_preflight 驻留 marker，观察者在重写窗口内继续等待，
+                # 窗口耗尽才由 supervisor 撤销交接并收口。
+                self.assertIsNone(observer())
+                self.assertEqual(
+                    "failed_preflight",
+                    observer.evidence["runner_state_value"])
+                late = stage_runner._LiveChildObserver(
+                    CYCLE, tmp_root=tmp_root, db_root=Path(tmp) / "db",
+                    now_fn=lambda: (
+                        state_file.stat().st_mtime
+                        + stage_runner._LIVE_PREFLIGHT_REWRITE_SECONDS + 1),
+                    expected_session_key=runner._gateway_session_key(CYCLE),
+                    expected_stage_runner_pid=12345,
+                )
+                self.assertEqual(
+                    "runner_terminal:failed_preflight_rewrite_timeout",
+                    late())
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_two_process_handoff_cas_supervisor_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp) / "tmp"
+            tmp_root.mkdir()
+            safe_cycle = CYCLE.replace(":", "-")
+            facts_file = tmp_root / f"live_facts_{safe_cycle}.json"
+            plan_file = tmp_root / f"position_plan_{safe_cycle}.json"
+            state_file = tmp_root / f"live_runner_state_{safe_cycle}.json"
+            facts_file.write_text(
+                json.dumps({"facts_hash": "f" * 64}), encoding="utf-8")
+            plan_file.write_text('{"actions":[]}', encoding="utf-8")
+            plan_sha = runner.hashlib.sha256(plan_file.read_bytes()).hexdigest()
+            observer = stage_runner._LiveChildObserver(
+                CYCLE, tmp_root=tmp_root, db_root=Path(tmp) / "db",
+                now_fn=lambda: plan_file.stat().st_mtime + 31,
+                expected_session_key=runner._gateway_session_key(CYCLE),
+                expected_stage_runner_pid=12345,
+            )
+            self.assertEqual(
+                "post_facts_runner_handoff_violation:no_valid_runner_marker",
+                observer(),
+            )
+            child = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "import live_position_action_runner as r\n"
+                "def guard(cycle):\n"
+                " return {'cycle_id':cycle,'stage_runner_pid':12345}\n"
+                "try:\n"
+                " r.execute_position_plan({'actions':[]},"
+                " {'facts_hash':'f'*64}, cycle_id=sys.argv[1],"
+                " db_root=r.Path(sys.argv[2]), receipt_file=r.Path(sys.argv[3]),"
+                " state_file=r.Path(sys.argv[4]), plan_sha256=sys.argv[5],"
+                " runtime_guard=guard, nudge=False)\n"
+                "except r.PlanError:\n"
+                " print('BLOCKED')\n"
+                "else:\n"
+                " raise SystemExit(7)\n"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", child, CYCLE, str(tmp_root),
+                 str(tmp_root / "receipt.json"), str(state_file), plan_sha],
+                capture_output=True, text=True, timeout=10,
+                creationflags=(0x08000000 if sys.platform == "win32" else 0),
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("BLOCKED", completed.stdout.strip())
+            self.assertFalse(state_file.exists())
 
     def test_contract_problem_with_confirmed_trade_commits_failed_superset(self) -> None:
         plan = _plan([{
@@ -1179,6 +1745,50 @@ class LivePositionActionRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(runner.PlanError, "严格小于"):
                 runner.preflight_plan(plan, _facts(), cycle_id=CYCLE)
 
+    def test_receipt_context_omits_equity_and_injects_canonical_fact(self) -> None:
+        plan = _plan([])
+        with mock.patch.object(
+            runner.oe, "validate_receipt_context", return_value=[]
+        ):
+            context = runner._normalize_context(plan, _facts(), CYCLE)
+        self.assertEqual(1000.0, context["equity"])
+        self.assertNotIn("equity", plan["receipt_context"])
+
+    def test_runner_owned_terminal_context_fields_are_ignored(self) -> None:
+        plan = _plan([])
+        plan["receipt_context"].update({
+            "decision": "hold",
+            "action_taken": "HOLD",
+            "n_orders": 999,
+            "trades": [{"fabricated": True}],
+            "errors": ["fabricated"],
+            "ok": True,
+        })
+        with mock.patch.object(
+            runner.oe, "validate_receipt_context", return_value=[]
+        ):
+            context = runner._normalize_context(plan, _facts(), CYCLE)
+
+        self.assertFalse(runner.TERMINAL_CONTEXT_KEYS & set(context))
+        self.assertEqual("hold", plan["receipt_context"]["decision"])
+        self.assertEqual(999, plan["receipt_context"]["n_orders"])
+
+    def test_equity_mismatch_keeps_specific_contract_error(self) -> None:
+        plan = _plan([])
+        plan["receipt_context"]["equity"] = 999.0
+        with self.assertRaisesRegex(
+            runner.PlanError, "receipt_context.equity 与 live_facts 不一致"
+        ):
+            runner._normalize_context(plan, _facts(), CYCLE)
+
+    def test_nonnumeric_equity_reports_number_error(self) -> None:
+        plan = _plan([])
+        plan["receipt_context"]["equity"] = "not-a-number"
+        with self.assertRaisesRegex(
+            runner.PlanError, "receipt_context.equity 必须是有效数字"
+        ):
+            runner._normalize_context(plan, _facts(), CYCLE)
+
     def test_unknown_action_field_is_not_silently_ignored(self) -> None:
         plan = _plan([{
             "action": "CLOSE", "symbol": "BTC-USDT-SWAP",
@@ -1190,6 +1800,191 @@ class LivePositionActionRunnerTests(unittest.TestCase):
                 ):
             with self.assertRaisesRegex(runner.PlanError, "未知字段"):
                 runner.preflight_plan(plan, _facts(), cycle_id=CYCLE)
+
+
+class PreflightRewriteRetryTests(unittest.TestCase):
+    """2026-08-24：预检拒（零副作用）允许且只允许一次整文件 plan 重写。"""
+
+    def _writer_patches(self):
+        # 保留真实 oe.validate_receipt_context —— 本组测试恰恰要验证真实
+        # 预检契约的拒绝/放行；只 mock facts 校验与 writer 落库面。
+        return (
+            mock.patch.object(runner, "validate_facts", return_value=[]),
+            mock.patch.object(runner.tw, "validate", return_value=[]),
+            mock.patch.object(
+                runner.tw, "validate_strict_live_receipt", return_value=[]
+            ),
+            mock.patch.object(
+                runner.tw, "commit_receipt", return_value={"ok": True}
+            ),
+        )
+
+    @staticmethod
+    def _bad_plan() -> dict:
+        plan = _plan([])
+        plan["receipt_context"]["decision_card"] = None
+        return plan
+
+    @staticmethod
+    def _marker(state_file: Path) -> dict:
+        return json.loads(state_file.read_text(encoding="utf-8"))
+
+    def test_preflight_rejection_parks_marker_then_one_rewrite_commits(
+            self) -> None:
+        patches = self._writer_patches()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3]:
+            state_file = Path(tmp) / "state.json"
+            with self.assertRaisesRegex(
+                    runner.PlanError, "decision_card 必须是 dict"):
+                runner.execute_position_plan(
+                    self._bad_plan(), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="a" * 64)
+            marker = self._marker(state_file)
+            self.assertEqual("failed_preflight", marker["state"])
+            self.assertEqual(1, marker["preflight_attempts"])
+            self.assertIn("预检失败", marker["error"])
+
+            result = runner.execute_position_plan(
+                _plan([]), _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                receipt_file=Path(tmp) / "receipt.json", nudge=False,
+                state_file=state_file, plan_sha256="b" * 64)
+            marker = self._marker(state_file)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["receipt"]["action_taken"], "HOLD")
+        self.assertEqual("committed", marker["state"])
+        self.assertEqual(2, marker["preflight_attempts"])
+
+    def test_second_preflight_rejection_is_sticky_terminal(self) -> None:
+        patches = self._writer_patches()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3]:
+            state_file = Path(tmp) / "state.json"
+            with self.assertRaisesRegex(runner.PlanError, "预检失败"):
+                runner.execute_position_plan(
+                    self._bad_plan(), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="a" * 64)
+            with self.assertRaisesRegex(runner.PlanError, "预检失败"):
+                runner.execute_position_plan(
+                    self._bad_plan(), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="c" * 64)
+            marker = self._marker(state_file)
+            self.assertEqual("failed", marker["state"])
+            self.assertEqual(2, marker["preflight_attempts"])
+            with self.assertRaisesRegex(runner.PlanError, "拒绝重复执行"):
+                runner.execute_position_plan(
+                    _plan([]), _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                    receipt_file=Path(tmp) / "receipt.json", nudge=False,
+                    state_file=state_file, plan_sha256="b" * 64)
+            self.assertEqual("failed", self._marker(state_file)["state"])
+
+    def test_same_plan_late_duplicate_does_not_consume_rewrite(self) -> None:
+        patches = self._writer_patches()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3]:
+            state_file = Path(tmp) / "state.json"
+            with self.assertRaisesRegex(runner.PlanError, "预检失败"):
+                runner.execute_position_plan(
+                    self._bad_plan(), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="a" * 64)
+
+            with self.assertRaisesRegex(
+                    runner.PlanError, "同一 plan 已预检失败") as raised:
+                runner.execute_position_plan(
+                    _plan([]), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="a" * 64)
+
+            marker = self._marker(state_file)
+        self.assertIn("首次错误=", str(raised.exception))
+        self.assertEqual("failed_preflight", marker["state"])
+        self.assertEqual(1, marker["preflight_attempts"])
+
+    def test_preflight_rewrite_requires_same_facts_identity(self) -> None:
+        patches = self._writer_patches()
+        with tempfile.TemporaryDirectory() as tmp, patches[0], patches[1], \
+                patches[2], patches[3]:
+            state_file = Path(tmp) / "state.json"
+            with self.assertRaisesRegex(runner.PlanError, "预检失败"):
+                runner.execute_position_plan(
+                    self._bad_plan(), _facts(), cycle_id=CYCLE,
+                    db_root=Path(tmp), receipt_file=Path(tmp) / "receipt.json",
+                    nudge=False, state_file=state_file,
+                    plan_sha256="a" * 64)
+            regenerated = _facts()
+            regenerated["facts_hash"] = "e" * 64
+            with self.assertRaisesRegex(
+                    runner.PlanError, "facts_hash 已变化"):
+                runner.execute_position_plan(
+                    _plan([]), regenerated, cycle_id=CYCLE, db_root=Path(tmp),
+                    receipt_file=Path(tmp) / "receipt.json", nudge=False,
+                    state_file=state_file, plan_sha256="b" * 64)
+            marker = self._marker(state_file)
+            self.assertEqual("failed_preflight", marker["state"])
+            self.assertEqual(1, marker["preflight_attempts"])
+
+    def test_post_preflight_writer_refusal_stays_sticky_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "validate_facts", return_value=[]), \
+                mock.patch.object(runner.tw, "validate", return_value=[]), \
+                mock.patch.object(
+                    runner.tw, "validate_strict_live_receipt",
+                    return_value=[]), \
+                mock.patch.object(
+                    runner.tw, "commit_receipt",
+                    return_value={"ok": False, "error": "refused"}):
+            state_file = Path(tmp) / "state.json"
+            result = runner.execute_position_plan(
+                _plan([]), _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                receipt_file=Path(tmp) / "receipt.json", nudge=False,
+                state_file=state_file, plan_sha256="a" * 64)
+            self.assertFalse(result["committed"])
+            marker = self._marker(state_file)
+            self.assertEqual("failed", marker["state"])
+            with self.assertRaisesRegex(runner.PlanError, "拒绝重复执行"):
+                runner.execute_position_plan(
+                    _plan([]), _facts(), cycle_id=CYCLE, db_root=Path(tmp),
+                    receipt_file=Path(tmp) / "receipt.json", nudge=False,
+                    state_file=state_file, plan_sha256="b" * 64)
+
+    def test_preflight_attempt_cap_twin_constant_matches_supervisor(
+            self) -> None:
+        self.assertEqual(
+            runner.PREFLIGHT_MAX_ATTEMPTS,
+            stage_runner._LIVE_PREFLIGHT_MAX_ATTEMPTS)
+
+    def test_atomic_json_retries_windows_share_violation_without_reexecuting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "state.json"
+            payload = {"cycle_id": CYCLE, "state": "committed"}
+            real_replace = runner.os.replace
+            calls = []
+
+            def flaky_replace(source, destination):
+                calls.append((source, destination))
+                if len(calls) < 3:
+                    raise PermissionError(13, "simulated Windows share violation")
+                return real_replace(source, destination)
+
+            with (
+                mock.patch.object(runner.os, "replace", side_effect=flaky_replace),
+                mock.patch.object(
+                    runner, "ATOMIC_REPLACE_RETRY_DELAYS_SECONDS", (0.0, 0.0)),
+            ):
+                runner._atomic_write_json(target, payload)
+
+            self.assertEqual(3, len(calls))
+            self.assertEqual(payload, json.loads(target.read_text(encoding="utf-8")))
+            self.assertEqual([], list(target.parent.glob(".*.tmp")))
 
 
 if __name__ == "__main__":

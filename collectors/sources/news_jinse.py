@@ -31,7 +31,7 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402

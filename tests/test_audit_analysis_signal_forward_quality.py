@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,6 +123,91 @@ class AnalysisSignalForwardQualityTests(unittest.TestCase):
         )
         con.close()
         self.assertEqual("immature", rows[0]["outcome_status"])
+
+    def test_current_policy_cohort_uses_registered_cycle_boundary(self) -> None:
+        rows = [
+            {"cycle_id": "2026-08-17T16:29", "horizon": "4H"},
+            {"cycle_id": "2026-08-17T16:30", "horizon": "4H"},
+            {"cycle_id": "not-a-cycle", "horizon": "4H"},
+        ]
+        selected, invalid = audit._rows_at_or_after_cycle_boundary(
+            rows,
+            audit._parse_time("2026-08-17T16:30:00+08:00"),
+        )
+        self.assertEqual(
+            ["2026-08-17T16:30"],
+            [row["cycle_id"] for row in selected],
+        )
+        self.assertEqual(1, invalid)
+
+    def test_matured_labels_survive_tick_retention(self) -> None:
+        populated = _market()
+        populated.executemany(
+            "INSERT INTO tick_snapshots VALUES(?,?,?,?,?)",
+            [
+                ("2026-08-11T00:15:00Z", "BTC-USDT-SWAP", 100, 99.9, 100.1),
+                ("2026-08-11T00:30:00Z", "BTC-USDT-SWAP", 101, 100.9, 101.1),
+                ("2026-08-11T01:15:00Z", "BTC-USDT-SWAP", 102, 101.9, 102.1),
+                ("2026-08-11T04:15:00Z", "BTC-USDT-SWAP", 105, 104.9, 105.1),
+            ],
+        )
+        prior = audit.label_signal(
+            populated,
+            _signal("long"),
+            cost_bps=20,
+            max_delay_minutes=20,
+            market_max_ts=datetime(2026, 8, 11, 5, tzinfo=timezone.utc),
+        )
+        populated.close()
+
+        pruned = _market()
+        current = audit.label_signal(
+            pruned,
+            _signal("long"),
+            cost_bps=20,
+            max_delay_minutes=20,
+            market_max_ts=datetime(2026, 8, 22, 5, tzinfo=timezone.utc),
+        )
+        pruned.close()
+        merged, diagnostic = audit._merge_prior_matured_labels(
+            current, prior, prior_sha256="a" * 64)
+
+        self.assertEqual(["matured"] * 3, [row["outcome_status"] for row in merged])
+        self.assertEqual(3, diagnostic["reused_after_market_retention"])
+        self.assertEqual(0, diagnostic["frozen_value_drift_rows"])
+        self.assertTrue(all(
+            row["label_evidence_source"]
+            == "prior_frozen_label_retention_reuse"
+            for row in merged
+        ))
+
+    def test_prior_label_csv_round_trip_preserves_types(self) -> None:
+        con = _market()
+        con.executemany(
+            "INSERT INTO tick_snapshots VALUES(?,?,?,?,?)",
+            [
+                ("2026-08-11T00:15:00Z", "BTC-USDT-SWAP", 100, 99.9, 100.1),
+                ("2026-08-11T00:30:00Z", "BTC-USDT-SWAP", 101, 100.9, 101.1),
+                ("2026-08-11T01:15:00Z", "BTC-USDT-SWAP", 102, 101.9, 102.1),
+                ("2026-08-11T04:15:00Z", "BTC-USDT-SWAP", 105, 104.9, 105.1),
+            ],
+        )
+        rows = audit.label_signal(
+            con,
+            _signal("long"),
+            cost_bps=20,
+            max_delay_minutes=20,
+            market_max_ts=datetime(2026, 8, 11, 5, tzinfo=timezone.utc),
+        )
+        con.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "labels.csv"
+            audit._atomic_csv(path, rows)
+            loaded, digest = audit._read_prior_labels(path)
+        self.assertEqual(3, len(loaded))
+        self.assertEqual(64, len(digest))
+        self.assertIsInstance(loaded[0]["entry_executable"], float)
+        self.assertIsInstance(loaded[0]["after_cost_hit"], bool)
 
 
 if __name__ == "__main__":

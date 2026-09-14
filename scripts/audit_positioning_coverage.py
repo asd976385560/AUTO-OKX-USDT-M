@@ -10,6 +10,15 @@ file is atomically replaced.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -25,11 +34,11 @@ import _acceptance_thresholds as thresholds
 
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_MARKET_DB = Path(r".\db\market.db")
+DEFAULT_MARKET_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_OUTPUT = Path(
-    r".\reports\quality\positioning-coverage-audit.json")
+    _public_project_path('reports', 'quality', 'positioning-coverage-audit.json'))
 DEFAULT_RECEIPT_ROOT = Path(
-    r".\reports\quality\positioning-current")
+    _public_project_path('reports', 'quality', 'positioning-current'))
 DEFAULT_SOURCE = "okx_rest_contract_long_short_ratio"
 DEFAULT_MAXIMUM_SOURCE_AGE_MINUTES = 90
 DEFAULT_FORWARD_START = "2026-08-13T03:00:00+08:00"
@@ -100,6 +109,34 @@ def _parse_cst(value: str | datetime) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=CST)
     return parsed.astimezone(CST)
+
+
+def _latest_timestamp_at_or_before(
+    connection: sqlite3.Connection,
+    query: str,
+    params: tuple[Any, ...],
+    as_of_utc: datetime,
+) -> str | None:
+    """Return the chronologically latest parseable timestamp not after as-of.
+
+    The audit supports historical ``--as-of`` reruns after newer production
+    rows already exist.  SQLite ``MAX`` over the live table would otherwise
+    select a future batch and falsely mark every source row as future-dated.
+    """
+    best: tuple[datetime, str] | None = None
+    for row in connection.execute(query, params):
+        value = row[0]
+        if value is None:
+            continue
+        try:
+            parsed = _parse_ts(str(value))
+        except (TypeError, ValueError):
+            continue
+        if parsed > as_of_utc:
+            continue
+        if best is None or parsed > best[0]:
+            best = (parsed, str(value))
+    return best[1] if best is not None else None
 
 
 def _hour_floor(value: datetime) -> datetime:
@@ -765,19 +802,25 @@ def audit_positioning_coverage(
         raise ValueError("maximum_source_age_minutes must be positive")
     connection = _ro(market_db)
     try:
-        latest_tick = connection.execute(
-            "SELECT MAX(ts) FROM tick_snapshots").fetchone()[0]
+        latest_tick = _latest_timestamp_at_or_before(
+            connection,
+            "SELECT DISTINCT ts FROM tick_snapshots",
+            (),
+            now_utc,
+        )
         universe_rows = connection.execute(
             "SELECT DISTINCT symbol FROM tick_snapshots "
             "WHERE ts=? AND symbol LIKE '%-USDT-SWAP' ORDER BY symbol",
             (latest_tick,),
         ).fetchall()
         universe = {str(row[0]) for row in universe_rows}
-        latest_collected = connection.execute(
-            "SELECT MAX(collected_ts) FROM market_positioning "
+        latest_collected = _latest_timestamp_at_or_before(
+            connection,
+            "SELECT DISTINCT collected_ts FROM market_positioning "
             "WHERE source=? AND timeframe='1H'",
             (source,),
-        ).fetchone()[0]
+            now_utc,
+        )
         rows = [] if latest_collected is None else connection.execute(
             "SELECT ts,collected_ts,cycle_id,symbol,timeframe,long_ratio,"
             "short_ratio,long_short_ratio,source FROM market_positioning "
@@ -1407,16 +1450,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt-grace-minutes", type=int, default=5)
     args = parser.parse_args(argv)
     try:
+        evaluated_at = (
+            _parse_cst(args.as_of) if args.as_of else datetime.now(CST)
+        )
         storage_contract = audit_positioning_storage_contract(args.market_db)
         payload = audit_positioning_coverage(
             args.market_db,
             minimum_rate=args.minimum_rate,
             source=args.source,
             maximum_source_age_minutes=args.maximum_source_age_minutes,
+            now=evaluated_at,
         )
         forward = audit_positioning_forward_coverage(
             args.market_db,
-            as_of=_parse_cst(args.as_of) if args.as_of else datetime.now(CST),
+            as_of=evaluated_at,
             forward_start=_parse_cst(args.forward_start),
             minimum_slots=args.forward_minimum_slots,
             target_rate=args.minimum_rate,
@@ -1426,7 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         availability = audit_positioning_decision_availability(
             args.market_db,
-            as_of=_parse_cst(args.as_of) if args.as_of else datetime.now(CST),
+            as_of=evaluated_at,
             forward_start=_parse_cst(args.availability_forward_start),
             minimum_slots=args.availability_minimum_slots,
             target_rate=args.minimum_rate,
@@ -1437,7 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
         receipt_forward = audit_positioning_collection_receipts(
             args.market_db,
             args.receipt_root,
-            as_of=_parse_cst(args.as_of) if args.as_of else datetime.now(CST),
+            as_of=evaluated_at,
             forward_start=_parse_cst(args.receipt_forward_start),
             minimum_slots=args.receipt_minimum_slots,
             target_rate=args.minimum_rate,
@@ -1480,8 +1527,9 @@ def main(argv: list[str] | None = None) -> int:
             "orders_placed": 0,
         }, ensure_ascii=False))
         return 2
+    gate_ok = payload["overall_status"] != "NOT_MET"
     print(json.dumps({
-        "ok": True,
+        "ok": gate_ok,
         "status": payload["status"],
         "coverage_rate": payload["coverage_rate"],
         "valid_symbols": payload["valid_symbols"],
@@ -1499,7 +1547,7 @@ def main(argv: list[str] | None = None) -> int:
         "production_database_writes": 0,
         "orders_placed": 0,
     }, ensure_ascii=False))
-    return 0
+    return 0 if gate_ok else 1
 
 
 if __name__ == "__main__":

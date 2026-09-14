@@ -14,6 +14,15 @@ threshold or configuration is changed by this script.
 
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -447,8 +456,11 @@ def _derive_indicators(bars: pd.DataFrame) -> pd.DataFrame:
             avg_gain = float(np.maximum(delta[:14], 0.0).mean())
             avg_loss = float(np.maximum(-delta[:14], 0.0).mean())
             for idx in range(14, len(delta) + 1):
-                ratio = avg_gain / avg_loss if avg_loss != 0 else 100.0
-                rsi[idx] = 100.0 - 100.0 / (1.0 + ratio)
+                # 2026-09-10 口径对齐 collect_data.py / collect_slow.py：
+                # 全涨窗口 RSI=100（旧写法把比值塞回公式得 99.01），
+                # 全平窗口不报超买而取中性 50。
+                rsi[idx] = (100.0 if avg_gain > 0 else 50.0) if avg_loss == 0 else (
+                    100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
                 if idx < len(delta):
                     avg_gain = (avg_gain * 13.0 + max(float(delta[idx]), 0.0)) / 14.0
                     avg_loss = (avg_loss * 13.0 + max(float(-delta[idx]), 0.0)) / 14.0
@@ -1607,8 +1619,8 @@ def run_calibration(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--market-db", type=Path, default=Path(r"./db/market.db"))
-    parser.add_argument("--news-db", type=Path, default=Path(r"./db/news.db"))
+    parser.add_argument("--market-db", type=Path, default=Path(_public_project_path('db', 'market.db')))
+    parser.add_argument("--news-db", type=Path, default=Path(_public_project_path('db', 'news.db')))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--start", default="2026-07-12T00:00:00Z")
     parser.add_argument("--end", default="2026-08-11T15:01:00Z")

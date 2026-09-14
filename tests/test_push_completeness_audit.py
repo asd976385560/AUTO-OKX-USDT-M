@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +22,8 @@ class PushCompletenessAuditTests(unittest.TestCase):
     def _fixture(self, root: Path) -> dict[str, Path]:
         reports = root / "reports" / "agents"
         reports.mkdir(parents=True)
+        stage_status = root / "stage-status"
+        stage_status.mkdir()
         pipeline = root / "pipeline.jsonl"
         events = root / "events.jsonl"
         dedupe = root / "dedupe.db"
@@ -41,6 +44,7 @@ class PushCompletenessAuditTests(unittest.TestCase):
             "pipeline_log": pipeline,
             "event_log": events,
             "dedupe_db": dedupe,
+            "stage_status_dir": stage_status,
         }
 
     def _archive_attempt(
@@ -145,6 +149,35 @@ class PushCompletenessAuditTests(unittest.TestCase):
         self.assertEqual(95, result["daily"][0]["missing_pipeline_slots"])
         self.assertFalse(result["safety"]["auto_resend"])
         self.assertEqual(0, result["safety"]["production_database_writes"])
+
+    def test_nonproduction_and_stale_legacy_probe_rows_are_not_pipeline_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pipeline.jsonl"
+            cycle = "2026-08-01T00:00"
+            rows = [
+                {
+                    "cycle": cycle,
+                    "ts": "2026-08-01 00:05:00",
+                    "execution_context": "test",
+                    "natural_production_evidence": False,
+                },
+                {
+                    "cycle": cycle,
+                    "ts": "2026-08-02 12:00:00",
+                },
+                {
+                    "cycle": cycle,
+                    "ts": "2026-08-01 00:10:00",
+                    "execution_context": "production",
+                    "natural_production_evidence": True,
+                },
+            ]
+            self._write_pipeline(path, rows)
+            attempts, diagnostics = audit_push_completeness._pipeline_attempts(
+                path, {cycle})
+        self.assertEqual(1, len(attempts[cycle]))
+        self.assertEqual(1, diagnostics["nonproduction_context_rows"])
+        self.assertEqual(1, diagnostics["stale_legacy_probe_rows"])
 
     def test_delivery_hash_must_match_an_independently_valid_archive(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -407,6 +440,42 @@ class PushCompletenessAuditTests(unittest.TestCase):
             )
             self.assertTrue(complete["complete"], complete)
 
+            schema_v2 = {
+                **pre_archive,
+                "inter_report_exchange_schema_version": 2,
+            }
+            row["steps"]["business_attestation_pre_archive"] = schema_v2
+            row["steps"]["business_attestation_pre_send"] = dict(schema_v2)
+            complete_v2 = audit_push_completeness._validate_archive_attempt(
+                row,
+                cycle=cycle,
+                reports_dir=fixture["reports_dir"],
+                validator=lambda text: {"ok": "valid body" in text},
+            )
+            self.assertTrue(complete_v2["complete"], complete_v2)
+
+            unknown_schema = {
+                **pre_archive,
+                "inter_report_exchange_schema_version": 3,
+            }
+            row["steps"]["business_attestation_pre_archive"] = unknown_schema
+            row["steps"]["business_attestation_pre_send"] = dict(
+                unknown_schema)
+            rejected_schema = (
+                audit_push_completeness._validate_archive_attempt(
+                    row,
+                    cycle=cycle,
+                    reports_dir=fixture["reports_dir"],
+                    validator=lambda text: {"ok": "valid body" in text},
+                )
+            )
+            self.assertFalse(rejected_schema["complete"])
+            self.assertIn(
+                "inter-report exchange attestation summary invalid",
+                rejected_schema["reasons"],
+            )
+
+            row["steps"]["business_attestation_pre_archive"] = pre_archive
             row["steps"]["business_attestation_pre_send"] = {
                 **pre_archive,
                 "inter_report_fill_count": 2,
@@ -542,6 +611,258 @@ class PushCompletenessAuditTests(unittest.TestCase):
         self.assertEqual(
             "PASSED", result["forward_after_remediation"]["status"])
         self.assertEqual("PASSED", result["overall_status"])
+
+    def test_registered_push_latency_uses_record_barrier_to_sent_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            status_dir = Path(temp)
+            cycles = ["2026-08-20T18:00", "2026-08-20T18:15"]
+            for cycle, finished in zip(
+                cycles,
+                ("2026-08-20 18:10:00", "2026-08-20 18:25:00"),
+            ):
+                (status_dir / f"live-{cycle.replace(':', '-')}.json").write_text(
+                    json.dumps({
+                        "cycle_id": cycle,
+                        "status": "succeeded",
+                        "returncode": 0,
+                        "report_reconcile_barrier": {
+                            "required": True,
+                            "profile": "live",
+                            "cycle_id": cycle,
+                            "status": "ok",
+                            "rc": 0,
+                            "contract_valid": True,
+                            "report_safe": True,
+                            "finished_at": finished,
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+            result = audit_push_completeness._push_delivery_latency(
+                expected_cycles=cycles,
+                delivered_at={
+                    cycles[0]: datetime(
+                        2026, 8, 20, 18, 10, 30, tzinfo=self.CST),
+                    cycles[1]: datetime(
+                        2026, 8, 20, 18, 25, 31, tzinfo=self.CST),
+                },
+                stage_status_dir=status_dir,
+                as_of=datetime(2026, 8, 20, 19, 0, tzinfo=self.CST),
+            )
+        self.assertEqual(30, result["registration"]["target_seconds"])
+        self.assertEqual(2, result["counts"]["measured_deliveries"])
+        self.assertEqual(1, result["counts"]["timely_deliveries"])
+        self.assertEqual(0.5, result["rates"]["timely_delivery_rate"])
+        self.assertEqual(31, result["latency_seconds"]["p95"])
+        self.assertEqual(
+            {"delivery_latency_above_target": 1},
+            result["failure_reason_counts"],
+        )
+        self.assertEqual("PENDING_FORWARD_EVIDENCE", result["status"])
+        projection = result["recovery_projection"]
+        self.assertTrue(projection["diagnostic_only"])
+        self.assertEqual(
+            94,
+            projection["additional_all_timely_cycles_to_minimum_slots"],
+        )
+        self.assertEqual(
+            18,
+            projection["minimum_additional_all_timely_cycles_to_target"],
+        )
+        self.assertEqual(
+            20,
+            projection["earliest_total_slots_at_target_if_no_more_failures"],
+        )
+
+    def test_rotated_stage_status_uses_two_matching_pipeline_attestations(self):
+        cycle = "2026-08-20T18:00"
+        finished = "2026-08-20 18:10:00"
+
+        def attestation():
+            return {
+                "ok": True,
+                "required": True,
+                "mode": "business_terminal",
+                "live_stage_terminal": {
+                    "status": "succeeded",
+                    "returncode": 0,
+                    "finished_at": "2026-08-20 18:09:58",
+                    "profile_lease_released": True,
+                    "same_cycle_active_lease": False,
+                    "report_reconcile_barrier": {
+                        "required": True,
+                        "profile": "live",
+                        "cycle_id": cycle,
+                        "status": "ok",
+                        "rc": 0,
+                        "blocking": False,
+                        "contract_valid": True,
+                        "report_safe": True,
+                        "finished_at": finished,
+                    },
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            result = audit_push_completeness._push_delivery_latency(
+                expected_cycles=[cycle],
+                delivered_at={
+                    cycle: datetime(
+                        2026, 8, 20, 18, 10, 20, tzinfo=self.CST),
+                },
+                stage_status_dir=Path(temp),
+                as_of=datetime(2026, 8, 20, 19, 0, tzinfo=self.CST),
+                pipeline_attempts={cycle: [{
+                    "cycle": cycle,
+                    "ok": True,
+                    "send_status": "sent",
+                    "steps": {
+                        "business_attestation_pre_archive": attestation(),
+                        "business_attestation_pre_send": attestation(),
+                    },
+                }]},
+            )
+
+        self.assertEqual(1, result["counts"]["measured_deliveries"])
+        self.assertEqual(1, result["counts"]["timely_deliveries"])
+        self.assertEqual(
+            {"pipeline_attestation_fallback": 1},
+            result["anchor_source_counts"],
+        )
+        self.assertEqual({}, result["failure_reason_counts"])
+
+    def test_failed_live_with_clean_reconcile_is_not_timely_delivery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            status_dir = Path(temp)
+            cycle = "2026-08-20T18:00"
+            (status_dir / f"live-{cycle.replace(':', '-')}.json").write_text(
+                json.dumps({
+                    "cycle_id": cycle,
+                    "status": "failed",
+                    "returncode": 1,
+                    "report_reconcile_barrier": {
+                        "required": True,
+                        "profile": "live",
+                        "cycle_id": cycle,
+                        "status": "ok",
+                        "rc": 0,
+                        "contract_valid": True,
+                        "report_safe": True,
+                        "finished_at": "2026-08-20 18:10:00",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            result = audit_push_completeness._push_delivery_latency(
+                expected_cycles=[cycle],
+                delivered_at={
+                    cycle: datetime(
+                        2026, 8, 20, 18, 10, 20, tzinfo=self.CST),
+                },
+                stage_status_dir=status_dir,
+                as_of=datetime(2026, 8, 20, 19, 0, tzinfo=self.CST),
+            )
+
+        self.assertEqual(0, result["counts"]["measured_deliveries"])
+        self.assertEqual(0, result["counts"]["timely_deliveries"])
+        self.assertEqual(1, result["counts"]["failures"])
+        self.assertEqual(
+            {"live_stage_not_succeeded": 1},
+            result["failure_reason_counts"],
+        )
+        self.assertEqual(
+            "live_stage_not_succeeded", result["failure_rows"][0]["reason"])
+
+    def test_push_latency_recovery_projection_keeps_failed_slots(self):
+        projection = audit_push_completeness._pass_rate_recovery_projection(
+            passes=57,
+            planned=65,
+            target_rate=0.95,
+            minimum_slots=96,
+        )
+
+        self.assertEqual(
+            31,
+            projection["additional_all_timely_cycles_to_minimum_slots"],
+        )
+        self.assertEqual({
+            "expected_slots": 96,
+            "timely_deliveries": 88,
+            "timely_delivery_rate": 0.916667,
+            "target_reachable": False,
+        }, projection["best_case_at_minimum_or_current_denominator"])
+        self.assertEqual(
+            95,
+            projection["minimum_additional_all_timely_cycles_to_target"],
+        )
+        self.assertEqual(
+            160,
+            projection["earliest_total_slots_at_target_if_no_more_failures"],
+        )
+        self.assertEqual(
+            152,
+            projection[
+                "earliest_timely_deliveries_at_target_if_no_more_failures"],
+        )
+
+    def test_push_completeness_recovery_projection_uses_exact_fraction(self):
+        projection = (
+            audit_push_completeness
+            ._delivered_complete_recovery_projection(
+                passes=1426,
+                planned=1506,
+                target_rate=0.95,
+                minimum_slots=96,
+            )
+        )
+
+        self.assertEqual(
+            94,
+            projection[
+                "minimum_additional_all_success_cycles_to_target"],
+        )
+        self.assertEqual(
+            1600,
+            projection["earliest_total_slots_at_target_if_no_more_failures"],
+        )
+        self.assertEqual(
+            1520,
+            projection[
+                "earliest_delivered_complete_at_target_if_no_more_failures"],
+        )
+
+    def test_pending_registered_latency_prevents_overall_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._fixture(Path(temp))
+            passed = {
+                "rates": {}, "counts": {}, "statuses": {}, "daily": [],
+                "failure_rows": [], "status": "PASSED",
+            }
+            pending_latency = {
+                "status": "PENDING_FORWARD_EVIDENCE",
+                "registration": {}, "window": {}, "counts": {},
+                "rates": {}, "latency_seconds": {},
+                "failure_reason_counts": {}, "failure_rows": [],
+            }
+            with mock.patch.object(
+                    audit_push_completeness, "_summarize_cycles",
+                    return_value=passed), mock.patch.object(
+                    audit_push_completeness, "_push_delivery_latency",
+                    return_value=pending_latency):
+                result = audit_push_completeness.audit_push_completeness(
+                    start=date(2026, 8, 20),
+                    end=date(2026, 8, 20),
+                    as_of=datetime(2026, 8, 21, 0, 0, tzinfo=self.CST),
+                    archive_validator=lambda text: {"ok": True},
+                    **fixture,
+                )
+        self.assertEqual("PASSED", result["status"])
+        self.assertEqual(
+            "PENDING_FORWARD_EVIDENCE",
+            result["delivery_latency"]["status"],
+        )
+        self.assertEqual(
+            "PENDING_FORWARD_EVIDENCE", result["overall_status"])
 
     def test_reversed_window_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "end date"):

@@ -7,6 +7,15 @@ r"""check_trader_docs_sync.py — 四角色上下文结构与 trader money-path 
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import re
 import sys
@@ -34,11 +43,13 @@ ROLE_FACTS = {
             "collectors/ledger.py",
             "collectors/analyst_writer.py",
             "scripts/decision_briefing.py",
-            "scripts/find_similar_experience.py",
         ),
         "doc_tokens": (
             "analysis.db.analysis_runs", "regime.db", "news.db",
-            "--stop-distance-pct", "--planned-rr", "event_occurred_at",
+            "lightweight_open_v1", "signals",
+            "entry_hint", "stop_hint", "tp_hint",
+            "minimal_contract_full_closure_v1",
+            "full manifest内任何symbol均可OPEN",
         ),
         "schema": {
             "analysis.db": ("analysis_runs", "analysis_signals"),
@@ -54,15 +65,21 @@ ROLE_FACTS = {
             "collectors/analyst_writer.py",
             "collectors/trades_writer.py",
             "scripts/live_decision_facts.py",
-            "scripts/multitimeframe_decision_evidence.py",
-            "core/multitimeframe_gate.py",
+            "scripts/live_position_action_runner.py",
         ),
-        # 15% 保证金、5% 止损风险、接管重验与可选 TP 都在真钱路径，手册必须同步。
+        # 15% 保证金、5% 止损风险、接管重验与 Agent 自主退出都在真钱路径。
         "doc_tokens": (
             "live_trades.db.trade_cycles", "ledger.db.execution_intents",
             "MAX_SINGLE_ORDER_IMR_RATIO", "MAX_SINGLE_ORDER_RISK_PCT_EQUITY",
-            "actor_attestation", "tp_trigger_px",
-            "multitimeframe_context_mismatch", "confidence_claim_allowed=false",
+            "actor_attestation", "target_stop_risk_pct_equity",
+            "live_runner_state_", "exit_mode", "new_sl_trigger_px",
+            "禁止写入 ADJUST_PROTECTION plan",
+            "lightweight_open_v1", "signals.analysis_signals",
+            "no_three_period_no_six_card_v1", "禁止 `memory_search`",
+            "minimal_decision_v2", "position_reviews",
+            "minimal_contract_full_closure_v1",
+            "open_execution_package_v1", "live_input_handoff_",
+            "机会分优先", "full manifest内任何symbol均可OPEN",
         ),
         "schema": {
             "analysis.db": ("analysis_runs", "analysis_signals"),
@@ -158,7 +175,7 @@ def structure_problems(label: str, text: str) -> list[str]:
     for token in ("READ", "VIA ", "DENY"):
         if token not in db_access:
             problems.append(f"{label} DB_ACCESS 缺权限态 {token.strip()}")
-    for token in ("<PROJECT_ROOT>/db/", "schema.sql", "<PROJECT_ROOT>/tmp/"):
+    for token in ("<PROJECT_ROOT>/db", "schema.sql", "<PROJECT_ROOT>/tmp"):
         if token not in text:
             problems.append(f"{label} 缺项目路径事实: {token}")
     if re.search(r"(?m)^##\s+\d+[.、]", text):
@@ -243,7 +260,7 @@ def receipt_contract_problems(label: str, text: str) -> list[str]:
     problems: list[str] = []
     required = {
         "安全文件名": "YYYY-MM-DDTHH-MM.json",
-        "同进程提交": "同一个临时 Python 进程",
+        "同进程提交": "同一个固定 Python 进程",
         "成交前上下文": "receipt_context",
         "执行入口": "order_executor",
         "止损输入": "sl_trigger_px",
@@ -257,6 +274,12 @@ def receipt_contract_problems(label: str, text: str) -> list[str]:
             "超限整单拒绝": "整笔 reject OPEN/ADD，不 clamp",
             "禁错误比率替代": "mgnRatio",
             "减仓不受开仓闸": "CLOSE/REDUCE",
+            "持仓动作 runner": "live_position_action_runner.py",
+            "逐笔确定性定仓": "target_stop_risk_pct_equity",
+            "runner 状态机": "live_runner_state_",
+            "批量部分失败": "batch_status=partial",
+            "禁止旧回执探查": "历史 `_receipt_live_*.json`",
+            "分析开仓方向": "side=long|short",
         })
 
     for name, token in required.items():
@@ -264,7 +287,7 @@ def receipt_contract_problems(label: str, text: str) -> list[str]:
             problems.append(f"{label} 契约缺 {name}: {token}")
 
     safe_write_tokens = (
-        f'Path("<PROJECT_ROOT>/tmp/_receipt_{label}_YYYY-MM-DDTHH-MM.json").write_text',
+        "position_plan_<cycle-colon-to-dash>.json",
         f"write path=<PROJECT_ROOT>/tmp/_receipt_{label}_YYYY-MM-DDTHH-MM.json",
     )
     if not any(token in text for token in safe_write_tokens):
@@ -295,8 +318,12 @@ def live_money_path_problems(text: str) -> list[str]:
     problems: list[str] = []
     if 'commit_receipt(receipt, "live")' not in section:
         problems.append('live RUN_OUTPUT 缺 commit_receipt(receipt, "live")')
-    if "同一个临时 Python 进程" not in section:
+    if "同一个固定 Python 进程" not in section:
         problems.append("live RUN_OUTPUT 缺同进程提交约束")
+    if "live_position_action_runner.py" not in section:
+        problems.append("live RUN_OUTPUT 缺确定性持仓动作 runner")
+    if "不论是否包含 OPEN/ADD" not in section:
+        problems.append("live RUN_OUTPUT 仍存在 OPEN/ADD 分支执行口径")
     if re.search(
         r"交易回执喂 writer[^\n]*trades_writer\.py --json-file "
         r"<tmp 回执文件>",

@@ -25,6 +25,15 @@ AUTOINCREMENT 的 sqlite_sequence 随显式 id 拷贝与 RENAME 自动跟随。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import re
@@ -157,14 +166,11 @@ def legacy_risk_rows(con: sqlite3.Connection, col: str) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="1R 假语义冻结迁移（默认 dry-run）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup-dir", default=None,
                     help="--apply 必填：备份 account.db/lessons.db 的目录")
     args = ap.parse_args()
-    if args.apply and args.dry_run:
-        ap.error("--apply and --dry-run are mutually exclusive")
     root = Path(args.db_root)
     acc_path, les_path = root / "account.db", root / "lessons.db"
     for p in (acc_path, les_path):
@@ -172,8 +178,8 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": f"库不存在: {p}"}))
             return 2
 
-    acc = sqlite3.connect(str(acc_path), timeout=15)
-    les = sqlite3.connect(str(les_path), timeout=15)
+    acc = sqlite3.connect(acc_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+    les = sqlite3.connect(les_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
     for con in (acc, les):
         con.execute("PRAGMA busy_timeout=10000")
     try:
@@ -222,14 +228,22 @@ def main() -> int:
         bdir.mkdir(parents=True, exist_ok=True)
         tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         applied: dict = {}
+        from migration_guard import backup_databases
+        verified_backups = backup_databases([acc_path, les_path], bdir, "r-semantics")
+        acc.close()
+        les.close()
+        acc = sqlite3.connect(acc_path, timeout=15)
+        les = sqlite3.connect(les_path, timeout=15)
+        for con in (acc, les):
+            con.execute("PRAGMA busy_timeout=10000")
 
         if not te_base_done:
-            applied["account_backup"] = str(backup(acc, bdir, "account.db", tag))
+            applied["account_backup"] = str(verified_backups[acc_path.resolve()])
             applied["trade_experiences_rows"] = rebuild(
                 acc, "trade_experiences", TE_NEW_DDL, TE_COLS, TE_OLD_COLS,
                 TE_INDEXES)
         elif not summary_version_done:
-            applied["account_backup"] = str(backup(acc, bdir, "account.db", tag))
+            applied["account_backup"] = str(verified_backups[acc_path.resolve()])
             acc.execute(
                 "ALTER TABLE trade_experiences "
                 "ADD COLUMN experience_summary_version INTEGER"
@@ -238,7 +252,7 @@ def main() -> int:
             applied["experience_summary_version_added"] = True
 
         if not mo_done:
-            applied["lessons_backup"] = str(backup(les, bdir, "lessons.db", tag))
+            applied["lessons_backup"] = str(verified_backups[les_path.resolve()])
             applied["missed_opportunities_rows"] = rebuild(
                 les, "missed_opportunities", MO_NEW_DDL, MO_COLS, MO_OLD_COLS,
                 MO_INDEXES)

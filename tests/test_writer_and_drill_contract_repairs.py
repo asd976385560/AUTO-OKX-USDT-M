@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for public writer ownership and collection status."""
+"""Regression tests for published writer ownership and collection contracts."""
 from __future__ import annotations
 
 import io
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,10 @@ for _p in (SCRIPTS, COLLECTORS):
         sys.path.insert(0, str(_p))
 
 import fast_collect  # noqa: E402
+
+
+
+
 
 
 class WriterOwnershipTests(unittest.TestCase):
@@ -193,6 +198,7 @@ class FastCollectionStatusTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             nudge = mock.Mock()
+            nudge.nudge_from_collector.return_value = {"nudged": False, "reason": "test"}
             argv = [
                 "fast_collect.py",
                 "--db-root",
@@ -217,6 +223,8 @@ class FastCollectionStatusTests(unittest.TestCase):
                 ["error"],
                 nudge.nudge_from_collector.call_args.args[2],
             )
+
+
 
 
 if __name__ == "__main__":

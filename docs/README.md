@@ -1,6 +1,6 @@
 <!--
 doc-version: V2.0-public-index
-last-updated: 2026-08-05
+last-updated: 2026-09-14
 updated-by: Codex
 change-summary: Link generated Stars artifacts from their dedicated data branch.
 -->

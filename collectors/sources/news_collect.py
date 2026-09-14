@@ -12,6 +12,15 @@ okx_news、mx_search、geo_political 均在本链通过各自 adapter 经 news_w
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[2])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import importlib
 import json
@@ -99,8 +108,12 @@ def collect_all(db_root: str, apply: bool = False,
             continue
         mod = _load_adapter(adapter)
         if mod is None or not hasattr(mod, "collect"):
-            results.append({"id": sid, "adapter": adapter, "status": "skipped",
-                            "why": "module-missing"})
+            entry = {"id": sid, "adapter": adapter, "status": "failed",
+                     "err": "module-missing"}
+            results.append(entry)
+            if apply:
+                ledger.record_collection(
+                    ledger_db, cycle_id, sid, "failed", err="module-missing")
             continue
         t0 = time.time()
         try:
@@ -159,7 +172,7 @@ def collect_all(db_root: str, apply: bool = False,
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="V2.0 registry 驱动新闻采集（迭代 enabled type=news 源）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true", help="真写（默认 dry-run）")
     ap.add_argument("--registry", default=None)
     args = ap.parse_args()

@@ -63,6 +63,7 @@ def _close_fill() -> list[dict]:
     return [{
         "ordId": "ORD-1", "fillSz": "1", "fillPx": "101",
         "fillPnl": "-1", "fillTime": str(CLOSE_MS),
+        "instId": SYM, "side": "buy", "posSide": "short", "tradeId": "FILL-1",
     }]
 
 
@@ -85,6 +86,11 @@ class PublicReadOnlyProducerTests(unittest.TestCase):
                 return_value=_close_fill()), \
              mock.patch.object(
                 ledger_autoheal.rec, "fetch_open_fills", return_value=[]), \
+             mock.patch.object(
+                ledger_autoheal.rec, "okx_json", return_value={"data": [{
+                    "ordId": "ORD-1", "instId": SYM, "side": "buy", "posSide": "short",
+                    "state": "filled", "accFillSz": "1", "avgPx": "101", "pnl": "-1",
+                }]}), \
              mock.patch.object(
                 ledger_autoheal, "active_runner", return_value=None):
             return ledger_autoheal.autoheal(

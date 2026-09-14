@@ -13,17 +13,21 @@ and validates row counts, the target primary key, indexes and ``quick_check``.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-from migration_guard import (
-    add_migration_arguments,
-    backup_databases,
-    resolve_apply,
-)
 
 
 TABLE = "market_positioning"
@@ -83,6 +87,25 @@ def _target_key_duplicates(connection: sqlite3.Connection) -> int:
         ")"
     ).fetchone()
     return int(row[0])
+
+
+def _backup(
+    source: sqlite3.Connection,
+    db_path: Path,
+    backup_dir: Path,
+) -> Path:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = backup_dir / f"{db_path.name}.bak_positioning-key_{stamp}"
+    destination = sqlite3.connect(str(target), timeout=30)
+    try:
+        source.backup(destination)
+        check = destination.execute("PRAGMA quick_check").fetchone()[0]
+    finally:
+        destination.close()
+    if check != "ok":
+        raise RuntimeError(f"backup quick_check={check}")
+    return target
 
 
 def _schema_state(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -161,17 +184,16 @@ def _validate_target(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default=r".\db\market.db")
-    add_migration_arguments(parser)
+    parser.add_argument("--db", default=_public_project_path('db', 'market.db'))
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--backup-dir")
     args = parser.parse_args(argv)
-    apply = resolve_apply(parser, args)
     db_path = Path(args.db)
     if not db_path.is_file():
         print(json.dumps({"ok": False, "error": f"db missing: {db_path}"}))
         return 2
 
-    connection: sqlite3.Connection | None = sqlite3.connect(
-        f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+    connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
     connection.execute("PRAGMA busy_timeout=20000")
     try:
         state = _schema_state(connection)
@@ -189,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({
                 "ok": True,
                 "db": str(db_path),
-                "dry_run": not apply,
+                "dry_run": not args.apply,
                 "action": "none",
                 "historical_backfill": False,
                 "validation": validation,
@@ -213,8 +235,8 @@ def main(argv: list[str] | None = None) -> int:
         plan = {
             "ok": duplicate_keys == 0 and precheck == "ok",
             "db": str(db_path),
-            "dry_run": not apply,
-            "action": "plan-only" if not apply else "apply",
+            "dry_run": not args.apply,
+            "action": "plan-only" if not args.apply else "apply",
             "legacy_primary_key": LEGACY_PRIMARY_KEY,
             "target_primary_key": TARGET_PRIMARY_KEY,
             "existing_rows": row_count,
@@ -229,32 +251,23 @@ def main(argv: list[str] | None = None) -> int:
                 "error": "pre-migration validation failed",
             }, ensure_ascii=False))
             return 2
-        if not apply:
+        if not args.apply:
             print(json.dumps(plan, ensure_ascii=False))
             return 0
+        if not args.backup_dir:
+            print(json.dumps({
+                **plan,
+                "ok": False,
+                "error": "--apply requires --backup-dir",
+            }, ensure_ascii=False))
+            return 2
 
-        # The public apply path must not open a writable target connection
-        # until a verified SQLite online backup has completed successfully.
+        backup_path = _backup(connection, db_path, Path(args.backup_dir))
         connection.close()
-        connection = None
-        backups = backup_databases(
-            [db_path], Path(args.backup_dir), "positioning-batch-key")
-        backup_path = backups[db_path.resolve()]
-        connection = sqlite3.connect(str(db_path), timeout=30)
-        connection.execute("PRAGMA busy_timeout=20000")
-        apply_state = _schema_state(connection)
-        apply_rows = int(connection.execute(
-            f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0])
-        apply_duplicates = _target_key_duplicates(connection)
-        apply_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-        if (
-            apply_state["state"] != "legacy"
-            or apply_state["temporary_table_exists"]
-            or apply_rows != row_count
-            or apply_duplicates != duplicate_keys
-            or apply_check != "ok"
-        ):
-            raise RuntimeError("schema changed between preflight and apply")
+        connection = sqlite3.connect(db_path, timeout=30)
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.row_factory = sqlite3.Row
+
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(TARGET_DDL)
         columns = ",".join(REQUIRED_COLUMNS)
@@ -286,16 +299,14 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False))
         return 0
     except (OSError, sqlite3.Error, RuntimeError) as exc:
-        if connection is not None:
-            connection.rollback()
+        connection.rollback()
         print(json.dumps({
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
         }, ensure_ascii=False))
         return 2
     finally:
-        if connection is not None:
-            connection.close()
+        connection.close()
 
 
 if __name__ == "__main__":

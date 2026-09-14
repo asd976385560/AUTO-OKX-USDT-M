@@ -69,6 +69,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import json
 import hashlib
 import math
@@ -127,14 +136,15 @@ def normalize_ts(ts: str) -> str:
 import sqlite3
 from pathlib import Path
 
-_PROJECT_ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-from core.decision_card import PROTOCOL as DECISION_PROTOCOL  # noqa: E402
+if _public_project_path() not in sys.path:
+    sys.path.insert(0, _public_project_path())
 from core.decision_card import (  # noqa: E402
-    EXIT_MODES,
+    MINIMAL_DECISION_PROTOCOL,
+    PROTOCOL as DECISION_PROTOCOL,
+)
+from core.decision_card import (  # noqa: E402
+    LIGHTWEIGHT_OPEN_CONTRACT,
+    is_lightweight_open_card,
     validate_card,
     validate_multitimeframe_analysis,
 )
@@ -144,18 +154,22 @@ from core.experience_contract import (  # noqa: E402
     validate_contract as validate_experience_contract,
 )
 from core.multitimeframe_gate import check_multitimeframe_readiness  # noqa: E402
+from core.candidate_quality_contract import (  # noqa: E402
+    normalize_candidate_quality,
+)
+from scripts import _acceptance_thresholds as thresholds  # noqa: E402
 
 # HANDOFF-4A（2026-07-16）：CLI 落库成功后 detached 拍一次 dispatcher（事件驱动派发）。
 # 守卫导入：任何异常→None→静默禁用——writer 落库优先，nudge 永不致命。守护闸详见模块 docstring。
 try:
-    if str(_PROJECT_ROOT / "collectors") not in sys.path:
-        sys.path.insert(0, str(_PROJECT_ROOT / "collectors"))
+    if _public_project_path('collectors') not in sys.path:
+        sys.path.insert(0, _public_project_path('collectors'))
     import _dispatch_nudge as _nudge_mod
 except Exception:  # noqa: BLE001
     _nudge_mod = None
 
-_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / "db").resolve()
-
+_PROJECT_ROOT = Path(_public_project_path()).resolve()
+_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / 'db').resolve()
 
 def _runtime_db_root(explicit: str | Path | None = None) -> Path:
     value = explicit if explicit is not None else os.environ.get("OKX_DB_ROOT")
@@ -165,14 +179,13 @@ def _runtime_db_root(explicit: str | Path | None = None) -> Path:
 DB_PATH = _runtime_db_root() / "analysis.db"
 VALIDATION_STATE_DIR = Path(os.environ.get(
     "OKX_ANALYSIS_VALIDATION_STATE_DIR",
-    str(_PROJECT_ROOT / "logs" / "analysis-validation"),
+    _public_project_path('logs', 'analysis-validation'),
 ))
 MAX_VALIDATION_FAILURES = 2
 # Deploy from the first natural slot after the 21:30 incident.  Older cycles
 # remain readable/replayable, but current automatic analysis can no longer
 # spend the trade budget after its advertised absolute cutoff.
 ANALYSIS_DEADLINE_GUARD_FROM = "2026-08-15T21:45"
-ANALYSIS_DEADLINE_SECONDS = 9 * 60 + 30
 
 
 def analysis_deadline_refusal(
@@ -180,7 +193,7 @@ def analysis_deadline_refusal(
     *,
     now: Optional[datetime] = None,
 ) -> Optional[dict]:
-    """Return a fail-closed refusal at/after ``cycle+09:30``.
+    """Return a fail-closed refusal at/after the registered analysis gate.
 
     The Agent prompt and stage supervisor use the same wall-clock contract.
     Keeping this check in the only writer prevents a late validate-only pass or
@@ -200,7 +213,8 @@ def analysis_deadline_refusal(
     if current.tzinfo is None:
         current = current.replace(tzinfo=CST)
     current = current.astimezone(CST)
-    deadline = cycle_start + timedelta(seconds=ANALYSIS_DEADLINE_SECONDS)
+    deadline = cycle_start + timedelta(
+        seconds=thresholds.sla_analysis_deadline_seconds(cycle))
     if current < deadline:
         return None
     return {
@@ -218,8 +232,8 @@ def connect(
     write: bool = False,
     db_path: Path | None = None,
 ) -> sqlite3.Connection:
-    target = Path(db_path or DB_PATH)
-    uri = f"file:{target}" + ("?mode=ro" if not write else "")
+    db_path = Path(db_path or DB_PATH)
+    uri = f"file:{db_path}" + ("?mode=ro" if not write else "")
     con = sqlite3.connect(uri, uri=True, timeout=10)
     con.row_factory = sqlite3.Row
     if write:
@@ -324,6 +338,7 @@ def _record_validation_failure(cycle_id: Any, payload_hash: str,
         "last_error_sha256": hashlib.sha256(
             "\n".join(errors).encode("utf-8")
         ).hexdigest(),
+        "last_errors": [" ".join(str(error).split())[:300] for error in errors[:3]],
         "updated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
     }
     return _save_validation_state(cycle_id, state)
@@ -439,6 +454,40 @@ def signal_raw_object(signal: dict, symbol: str) -> dict:
     }
 
 
+def _restriction_removal_active(cycle_id: Any) -> bool:
+    try:
+        return thresholds.decision_restriction_removal_active(str(cycle_id or ""))
+    except (TypeError, ValueError):
+        return False
+
+
+def _lightweight_open_card(signal: dict) -> dict:
+    existing = (
+        dict(signal.get("decision_card"))
+        if isinstance(signal.get("decision_card"), dict) else {})
+    old_risk = (
+        dict(existing.get("risk_reward"))
+        if isinstance(existing.get("risk_reward"), dict) else {})
+    side = str(signal.get("side") or "").strip().lower()
+    reasoning = str(
+        signal.get("reasoning") or existing.get("reasoning")
+        or existing.get("agent_judgement") or "").strip()
+    risk_reward = {
+        "entry": old_risk.get("entry", signal.get("entry_hint")),
+        "stop": old_risk.get("stop", signal.get("stop_hint")),
+        "target": old_risk.get("target", signal.get("tp_hint")),
+        "exit_mode": str(
+            old_risk.get("exit_mode") or signal.get("exit_mode")
+            or "no_fixed_tp").strip().lower(),
+    }
+    return {
+        "contract": LIGHTWEIGHT_OPEN_CONTRACT,
+        "side": side,
+        "reasoning": reasoning,
+        "risk_reward": risk_reward,
+    }
+
+
 def normalize_receipt(data: dict) -> dict:
     """Return a canonical copy used by both validation and persistence.
 
@@ -451,6 +500,8 @@ def normalize_receipt(data: dict) -> dict:
         value = normalized.get(key)
         if value is not None:
             normalized[key] = str(value).strip().lower()
+    lightweight_policy = _restriction_removal_active(
+        normalized.get("cycle_id"))
     signals = normalized.get("signals")
     if isinstance(signals, list):
         normalized_signals = []
@@ -499,8 +550,45 @@ def normalize_receipt(data: dict) -> dict:
                         canonical_mtf["timeframes"] = canonical_timeframes
                     canonical_card["multitimeframe_analysis"] = canonical_mtf
                 item["decision_card"] = canonical_card
+            if (
+                lightweight_policy
+                and action in {"open_long", "open_short"}
+            ):
+                item["decision_card"] = _lightweight_open_card(item)
             normalized_signals.append(item)
         normalized["signals"] = normalized_signals
+    try:
+        candidate_phase = thresholds.candidate_bundle_phase(
+            str(normalized.get("cycle_id") or ""))
+    except (TypeError, ValueError):
+        # Malformed/missing cycle identity belongs to the ordinary receipt
+        # validator.  The forward rollout resolver must not turn that bounded
+        # validation error into an uncaught exception.
+        candidate_phase = "off"
+    try:
+        funnel_active = thresholds.candidate_funnel_repair_active(
+            str(normalized.get("cycle_id") or ""))
+    except (TypeError, ValueError):
+        funnel_active = False
+    effective_candidate_phase = (
+        candidate_phase if candidate_phase in {"shadow", "consume"}
+        else "rollback" if candidate_phase == "rollback" and funnel_active
+        else "manifest_only" if funnel_active else "off")
+    if effective_candidate_phase != "off":
+        canonical_raw, safe_signals, candidate_quality = (
+            normalize_candidate_quality(
+                cycle_id=str(normalized.get("cycle_id") or ""),
+                raw=normalized.get("raw"),
+                signals=normalized.get("signals"),
+                phase=effective_candidate_phase,
+            )
+        )
+        # Structural insufficiency is a coverage NOT_MET, not a reason to
+        # block current-position exits.  The helper removes only consume-phase
+        # OPEN signals that lack an exact quality-valid deep dive.
+        normalized["raw"] = canonical_raw
+        normalized["signals"] = safe_signals
+        normalized["candidate_quality"] = candidate_quality
     return normalized
 
 
@@ -716,7 +804,7 @@ def _regime_scope_block(
     try:
         from core.instrument_context import build_instrument_context
         return build_instrument_context(
-            symbol, cycle_regime, cycle_id, _runtime_db_root(db_root))
+            symbol, cycle_regime, cycle_id, DB_PATH.parent)
     except Exception:  # noqa: BLE001  注入失败跳过，不阻断落库
         return None
 
@@ -740,6 +828,87 @@ def _scope_counts_from_contract(contract: Any) -> Optional[dict]:
     return out or None
 
 
+def _validate_lightweight_open_prices(
+    data: dict, *, db_root: Path | None = None, evidence_dir: Path | None = None,
+) -> list[str]:
+    """Reject wrong price units before committing immutable analysis.
+
+    Reuse the executor's existing maximum stop distance against the exact
+    briefing quote. This never substitutes prices, chooses stops, creates
+    orders, or treats a preflight pass as execution approval.
+    """
+    cycle = str(data.get("cycle_id") or "")
+    if not thresholds.open_price_preflight_active(cycle):
+        return []
+    signals = data.get("signals")
+    if not isinstance(signals, list):
+        return []
+    opens = [(i, sig) for i, sig in enumerate(signals)
+             if isinstance(sig, dict) and sig.get("action") in {"open_long", "open_short"}]
+    if not opens:
+        return []
+    from core.risk_validator import MAX_SL_DEVIATION
+    from scripts.multitimeframe_decision_evidence import (
+        candidate_evidence_paths, load_candidate_manifest,
+    )
+
+    def positive(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+
+    try:
+        manifest, _ = load_candidate_manifest(
+            candidate_evidence_paths(cycle, root=evidence_dir)["manifest"], cycle)
+        tick_ts = str(manifest.get("tick_ts") or "")
+        tick_at = datetime.fromisoformat(tick_ts.replace("Z", "+00:00"))
+        cycle_at = thresholds.parse_cst(cycle)
+        if tick_at.tzinfo is None or not cycle_at <= tick_at < cycle_at + timedelta(minutes=15):
+            raise ValueError("price_reference_timestamp_outside_cycle")
+        by_symbol = {str(item["symbol"]).strip().upper(): item for item in manifest["candidates"]}
+        market = (Path(db_root) if db_root is not None else DB_PATH.parent) / "market.db"
+        con = sqlite3.connect(market.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            con.execute("PRAGMA query_only=ON")
+            errors = []
+            for index, signal in opens:
+                symbol = normalize_symbol(signal.get("symbol") or "")
+                prefix = f"signals[{index}]({symbol})"
+                candidate = by_symbol.get(symbol) or {}
+                frozen_last = positive(candidate.get("last"))
+                quotes = con.execute(
+                    "SELECT last FROM tick_snapshots WHERE ts=? AND symbol=?",
+                    (tick_ts, symbol),
+                ).fetchall()
+                last = positive(quotes[0][0]) if len(quotes) == 1 else None
+                if frozen_last is None or last is None:
+                    errors.append(f"{prefix} price_reference_unavailable: 同轮绝对现价缺失，禁止猜价")
+                    continue
+                if last != frozen_last:
+                    errors.append(f"{prefix} price_reference_mismatch: manifest与同轮行情价格不一致")
+                    continue
+                card = signal.get("decision_card")
+                risk = card.get("risk_reward") if isinstance(card, dict) else None
+                stop = positive(risk.get("stop")) if isinstance(risk, dict) else None
+                if stop is None:
+                    continue  # The existing structural validator reports malformed OPEN prices.
+                distance = abs(stop - last) / last
+                if distance > MAX_SL_DEVIATION + 1e-9:
+                    errors.append(
+                        f"{prefix} sl_deviation_exceeds: stop={stop:.15g}, last={last:.15g} USDT, "
+                        f"tick_ts={tick_ts}, distance={distance:.6%}, limit={MAX_SL_DEVIATION:.0%}; "
+                        "请用该symbol的USDT绝对价格修正，禁止归一化占位价格")
+            return errors
+        finally:
+            con.close()
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+        return [f"open_price_reference_unavailable: {type(exc).__name__}: {exc}"]
+
+
 def validate_receipt(
     data: dict,
     db_root: str | Path | None = None,
@@ -748,14 +917,18 @@ def validate_receipt(
     if not isinstance(data, dict):
         return ["回执必须是 dict"]
     data = normalize_receipt(data)
-    validation_root = _runtime_db_root(db_root)
+    validation_root = _runtime_db_root(db_root) if db_root is not None else Path(DB_PATH).resolve().parent
     errors = []
     protocol = data.get("decision_protocol")
-    if protocol != DECISION_PROTOCOL:
+    minimal_policy = thresholds.minimal_decision_contract_active(
+        str(data.get("cycle_id") or ""))
+    expected_protocol = (
+        MINIMAL_DECISION_PROTOCOL if minimal_policy else DECISION_PROTOCOL)
+    if protocol != expected_protocol:
         errors.append(
-            f"decision_protocol 必须是 {DECISION_PROTOCOL}，got: {protocol!r}"
+            f"decision_protocol 必须是 {expected_protocol}，got: {protocol!r}"
         )
-    card_mode = protocol == DECISION_PROTOCOL
+    card_mode = protocol in {DECISION_PROTOCOL, MINIMAL_DECISION_PROTOCOL}
     for col in REQUIRED_RECEIPT_KEYS:
         if col not in data or data[col] is None:
             errors.append(f"缺少必填字段: {col}")
@@ -836,27 +1009,29 @@ def validate_receipt(
                     errors.append(
                         f"signals[{i}].action={action} 与 side={rendered} "
                         f"不一致（允许 {allowed}）")
-                if card_mode:
+                _is_open = action in {"open_long", "open_short"}
+                if card_mode and (not minimal_policy or _is_open):
+                    # 2026-08-20：open_* 的 exit_mode 存在性检查此前是本地手写的
+                    # 第二份实现，`trades_writer`/`order_executor`/`ledger_autoheal`
+                    # 共用的 validate_card 并不知道它 —— 规则只活在这一处。改为把
+                    # 意图传给共享校验器，本地重复实现退役（与 G6「必需源集合被
+                    # 第二次手写」同一治法：单一真源）。
                     errors.extend(
-                        validate_card(sig.get("decision_card"), f"signals[{i}].decision_card")
+                        validate_card(
+                            sig.get("decision_card"),
+                            f"signals[{i}].decision_card",
+                            require_exit_mode=_is_open,
+                        )
                     )
-                    if action in {"open_long", "open_short"}:
-                        card = sig.get("decision_card")
-                        risk_reward = (
-                            card.get("risk_reward")
-                            if isinstance(card, dict) else None
-                        )
-                        exit_mode = (
-                            str(risk_reward.get("exit_mode") or "")
-                            .strip().lower()
-                            if isinstance(risk_reward, dict) else ""
-                        )
-                        if exit_mode not in EXIT_MODES:
+                    if _is_open and is_lightweight_open_card(
+                            sig.get("decision_card")):
+                        if not _restriction_removal_active(data.get("cycle_id")):
                             errors.append(
-                                f"signals[{i}].decision_card.risk_reward."
-                                "exit_mode 开仓时必须显式为 "
-                                "fixed_tp|dynamic_exit|no_fixed_tp"
-                            )
+                                f"signals[{i}].decision_card lightweight OPEN "
+                                "尚未到前向激活边界")
+                        continue
+                    if _is_open:
+                        card = sig.get("decision_card")
                         canonical_symbol = normalize_symbol(
                             str(sig.get("symbol") or ""))
                         multitimeframe_errors = validate_multitimeframe_analysis(
@@ -972,7 +1147,7 @@ def validate_receipt(
                         )
                         expected_context = _regime_scope_block(
                             str(sig.get("symbol") or ""), data.get("regime"),
-                            str(data.get("cycle_id") or ""), validation_root)
+                            str(data.get("cycle_id") or ""), db_root=validation_root)
                         actual_context = (
                             (contract.get("query") or {}).get("instrument_context")
                             if isinstance(contract, dict) else None
@@ -1025,12 +1200,95 @@ def validate_receipt(
                         errors.append(
                             f"signals[{i}].action={action} 时价格提示必须全为 null，"
                             f"got: {','.join(non_null_hints)}")
+    if _restriction_removal_active(data.get("cycle_id")):
+        quality = data.get("candidate_quality")
+        blockers = (
+            quality.get("policy_blocking_errors")
+            if isinstance(quality, dict) else None)
+        if isinstance(blockers, list):
+            errors.extend(
+                "candidate_policy: " + str(item)
+                for item in blockers if str(item).strip())
+    errors.extend(_validate_lightweight_open_prices(data, db_root=validation_root))
     return errors
 
 
 # ---------------------------------------------------------------------------
 # 写入
 # ---------------------------------------------------------------------------
+def _commit_deadline_placeholder(cycle_id, mode, refusal, db_path: Path | None = None) -> None:
+    """分析硬闸越界时写一行 status='error' 占位，替代「整轮静默蒸发」。
+
+    2026-08-19 F1：越界此前一律 rollback / 直接 return，持久层零行 —— 实测
+    2026-08-16~08-18 共 287 个 cycle，dispatcher 派发 live 285 次，只有 233
+    轮写成 analysis 行，**54 轮（18.8%）对复盘/经验/错失池完全不可见**。
+    闸值按 cycle 从单点事实源解析；占位只补可见性，不改变该轮失败事实。
+
+    占位行不含任何业务结论：market_summary/regime 为 NULL、signals 清空，
+    raw 自证成因。永不覆盖已存在的 status='ok' 行。写入失败只吞异常——
+    可见性改进不得反过来制造新的 writer 失败面。调用方必须先释放写锁
+    （本函数自开连接、自持 BEGIN IMMEDIATE）。
+    """
+    cid = str(cycle_id or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", cid):
+        return
+    con = None
+    try:
+        con = connect(write=True, db_path=db_path) if db_path is not None else connect(write=True)
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            "SELECT status FROM analysis_runs WHERE cycle_id=?",
+            (cid,)).fetchone()
+        if existing and str(existing[0] or "") == "ok":
+            con.rollback()
+            return
+        written_at = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+        raw = dict(refusal) if isinstance(refusal, dict) else {
+            "refusal": str(refusal)}
+        raw["placeholder"] = "analysis_deadline_exceeded"
+        raw["placeholder_written_at"] = written_at
+        raw["placeholder_note"] = (
+            "analysis 绝对闸越界，本轮无业务结论；本行只为可见性，"
+            "不得被当作分析终态消费")
+        con.execute(
+            "INSERT OR REPLACE INTO analysis_runs"
+            "(cycle_id, ts, mode, regime, regime_stale, market_summary,"
+            " missing_sources, raw, status)"
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (cid, written_at, str(mode or "full"), None, 0, None, None,
+             json.dumps(raw, ensure_ascii=False), "error"),
+        )
+        con.execute(
+            "DELETE FROM analysis_signals WHERE cycle_id=?", (cid,))
+        con.commit()
+    except sqlite3.Error:
+        try:
+            if con is not None:
+                con.rollback()
+        except sqlite3.Error:
+            pass
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+
+def commit_deadline_placeholder(cycle_id, mode, refusal, db_path: Path | None = None) -> None:
+    """占位行的跨模块公开入口（2026-08-19 F1 补齐）。
+
+    F1 首版只在 analyst_writer 自己拒绝越界写入时落占位行，覆盖面比预期窄：
+    `stage_runner` 的 live observer 判 `analysis_deadline_exceeded:*` 时会
+    收口 Agent 子进程（现为先同连接取消、必要时整树兜底），analyst_writer
+    全程没被调用过，于是那些轮次连
+    error 占位行都没有（实测 2026-08-19 有 7 轮 live 已派发却零 analysis 行，
+    `query_state` 的 lost_cycles 因此长期 FAIL）。此入口让外部补写同一行，
+    语义与内部路径完全一致——不复制第二份占位逻辑。
+    """
+    _commit_deadline_placeholder(cycle_id, mode, refusal, db_path=db_path)
+
+
 def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     """写 analysis_runs + analysis_signals；成功返回 ok，失败返回错误 dict。
 
@@ -1039,14 +1297,17 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     - status='skipped'/'stale'/'error' 的旧行允许覆盖（失败重写是合法的）。
     - 写入用 INSERT OR REPLACE + 事务，保证原子性。
     """
+    db_path = Path(db_path or DB_PATH).resolve()
     if not isinstance(data, dict):
         return {"ok": False, "error": "回执必须是 dict"}
     deadline_refusal = analysis_deadline_refusal(data.get("cycle_id"))
     if deadline_refusal:
+        # F1：越界仍拒绝授权本轮 facts/order 阶段，但不再静默蒸发。
+        _commit_deadline_placeholder(
+            data.get("cycle_id"), data.get("mode"), deadline_refusal, db_path=db_path)
         return deadline_refusal
     data = normalize_receipt(data)
-    target = Path(db_path or DB_PATH)
-    errors = validate_receipt(data, db_root=target.parent)
+    errors = validate_receipt(data, db_root=db_path.parent)
     if errors:
         return {"ok": False, "error": "; ".join(errors)}
 
@@ -1067,8 +1328,9 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     # clock boundary.  Recheck immediately before the first write transaction.
     deadline_refusal = analysis_deadline_refusal(cycle_id)
     if deadline_refusal:
+        _commit_deadline_placeholder(cycle_id, mode, deadline_refusal, db_path=db_path)
         return deadline_refusal
-    con = connect(write=True, db_path=target)
+    con = connect(write=True, db_path=db_path)
     try:
         # 先拿 SQLite 写锁，再在同一事务内做 status=ok CAS。否则两个 writer
         # 都可能在无锁 SELECT 中看见空行后互相覆盖；同时锁等待也可能跨过本轮
@@ -1095,7 +1357,9 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
         # “准时完成”。越界返回前显式 rollback，持久层保持零业务改动。
         deadline_refusal = analysis_deadline_refusal(cycle_id)
         if deadline_refusal:
+            # 先释放写锁再写占位（占位走独立连接与独立事务）。
             con.rollback()
+            _commit_deadline_placeholder(cycle_id, mode, deadline_refusal, db_path=db_path)
             return deadline_refusal
         ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
         # analysis_runs.raw 的 schema 注释承诺“完整结构化报告 JSON”。保存
@@ -1129,17 +1393,18 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
             # 阶段已保证无算术错误，此处 errors 恒空。
             if (isinstance(decision_card, dict)
                     and sig.get("action") in ("open_long", "open_short")):
-                ev_block, ev_errs = build_ev_check(
-                    decision_card,
-                    "long" if sig.get("action") == "open_long" else "short")
-                if not ev_errs and ev_block:
-                    decision_card = {**decision_card, "ev_check": ev_block}
+                if not is_lightweight_open_card(decision_card):
+                    ev_block, ev_errs = build_ev_check(
+                        decision_card,
+                        "long" if sig.get("action") == "open_long" else "short")
+                    if not ev_errs and ev_block:
+                        decision_card = {**decision_card, "ev_check": ev_block}
                 try:
                     from core.news_context import build_news_context
                     decision_card = {
                         **decision_card,
                         "news_context": build_news_context(
-                            target.parent, cycle_id, window_hours=6),
+                            db_path.parent, cycle_id, window_hours=6),
                     }
                 except Exception as exc:  # noqa: BLE001  未知必须显式，不伪造空新闻
                     decision_card = {
@@ -1156,8 +1421,7 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
                     and sig.get("action") in (
                         "open_long", "open_short", "close", "reduce",
                         "adjust_protection")):
-                _rs = _regime_scope_block(
-                    sym, data.get("regime"), cycle_id, target.parent)
+                _rs = _regime_scope_block(sym, data.get("regime"), cycle_id)
                 if _rs:
                     decision_card = {**decision_card, "regime_scope": _rs}
             # Wave1 序8：历史经验计数的 canonical 块（scope_counts 由契约派生）
@@ -1213,7 +1477,10 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
         # analysis_runs/signals 暂存写提交；整事务回滚，stage 也不会读到旧 ts。
         deadline_refusal = analysis_deadline_refusal(cycle_id)
         if deadline_refusal:
+            # 先整事务回滚丢弃已暂存的 runs/signals（业务结论一律不提交），
+            # 再以独立连接写占位 —— 占位不是业务终态，只是可见性事实。
             con.rollback()
+            _commit_deadline_placeholder(cycle_id, mode, deadline_refusal)
             return deadline_refusal
         con.commit()
     finally:
@@ -1242,12 +1509,11 @@ def main() -> int:
             input_file = sys.argv[_i + 1]
     db_root = None
     if "--db-root" in sys.argv:
-        _i = sys.argv.index("--db-root")
-        if _i + 1 >= len(sys.argv) or sys.argv[_i + 1].startswith("--"):
-            print(json.dumps({"ok": False, "error": "--db-root 缺少目录参数"},
-                             ensure_ascii=False))
+        index = sys.argv.index("--db-root")
+        if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):
+            print(json.dumps({"ok": False, "error": "--db-root requires a directory"}))
             return 1
-        db_root = sys.argv[_i + 1]
+        db_root = sys.argv[index + 1]
     db_path = _runtime_db_root(db_root) / "analysis.db"
     try:
         if input_file:
@@ -1307,7 +1573,7 @@ def main() -> int:
         print(json.dumps(out, ensure_ascii=False))
         return 1
 
-    errors = validate_receipt(data, db_root=db_path.parent)
+    errors = validate_receipt(data)
     if errors:
         budget = (
             _record_validation_failure(data.get("cycle_id"), payload_hash, errors)

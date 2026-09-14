@@ -8,8 +8,8 @@ live_trades.db 的 trade_cycles + trades 表。
 
 用法：
     # 当前回执文件模式（推荐；receipt.json 必须满足下述完整契约）
-    pwsh -NoProfile -File ./scripts/run_okx_python.ps1 \
-        ./collectors/trades_writer.py --json-file receipt.json \
+    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 \
+        <PROJECT_ROOT>\collectors\trades_writer.py --json-file receipt.json \
         --cycle-id 2026-06-18T14:00 --profile live
 
     # stdin 模式（仅在调用方能保证 UTF-8 字节时使用）
@@ -83,6 +83,15 @@ live_trades.db 的 trade_cycles + trades 表。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -90,16 +99,25 @@ import math
 import os
 import re
 import sys
+import time
 from datetime import datetime as dt, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-_PROJECT_ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-from core.decision_card import validate_card  # noqa: E402
+if _public_project_path() not in sys.path:
+    sys.path.insert(0, _public_project_path())
+from core.decision_card import (  # noqa: E402
+    MINIMAL_DECISION_PROTOCOL,
+    OPEN_EXECUTION_PACKAGE_KEY,
+    canonical_open_execution_package,
+    closure_retired_structure_paths,
+    is_lightweight_open_card,
+    is_open_execution_package,
+    scrub_closure_retired_structures,
+    validate_card,
+    validate_open_execution_package,
+)
+from scripts import _acceptance_thresholds as thresholds  # noqa: E402
 from scripts.live_decision_facts import validate_facts as validate_live_facts  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
@@ -108,7 +126,19 @@ _TS_ISO_RE = re.compile(
 )
 RECONCILE_ANALYSIS_TERMINAL_FROM = "2026-08-14T04:00"
 LIVE_TERMINAL_DEADLINE_GUARD_FROM = "2026-08-15T09:15"
-LIVE_TERMINAL_DEADLINE_SECONDS = 13 * 60
+_RUNNER_FINALIZATION_BINDING_KEYS = (
+    "facts_hash",
+    "plan_sha256",
+    "position_action_plan_hash",
+)
+_TRUSTED_RECONCILE_TRADE_SOURCES = {
+    "exchange_fills_reconcile",
+    "execution_journal_recovery",
+}
+# Strict T1 UNRECORDED open backfill (ledger_autoheal -> apply_unrecorded).
+_TRUSTED_UNRECORDED_OPEN_SOURCE = "exchange_fills_unrecorded"
+# commit_side_effect_salvage quarantine of the runner's own filled receipt.
+_RUNNER_SALVAGE_QUARANTINE_KIND = "confirmed_trade_receipt_contract_invalid"
 
 
 def normalize_ts(ts: str) -> str:
@@ -182,7 +212,7 @@ def _late_no_side_effect_refusal(
     """Refuse only a late zero-side-effect terminal for active live cycles.
 
     A Gateway turn can outlive a locally killed CLI on Windows.  After the
-    cycle+13:00 business deadline, a delayed HOLD/WAIT must not create a late
+    registered business deadline, a delayed HOLD/WAIT must not create a late
     ``trade_cycles`` row that races the already-started failure report.  Any
     receipt that may represent an order, fill, close, reduce, or protection
     mutation remains writable so real exchange side effects are never hidden.
@@ -203,7 +233,28 @@ def _late_no_side_effect_refusal(
         current = current.replace(tzinfo=CST)
     current = current.astimezone(CST)
     deadline = cycle_start + timedelta(
-        seconds=LIVE_TERMINAL_DEADLINE_SECONDS)
+        seconds=thresholds.sla_business_terminal_deadline_seconds(cycle_id))
+    if thresholds.complete_cycle_uses_business_terminal_stop(cycle_id):
+        terminal = data.get("business_terminal")
+        if isinstance(terminal, dict):
+            try:
+                terminal_at = dt.strptime(
+                    str(terminal.get("completed_at_cst") or ""),
+                    "%Y-%m-%d %H:%M:%S",
+                ).replace(tzinfo=CST)
+            except ValueError:
+                terminal_at = None
+            if (
+                terminal.get("schema_version") == 1
+                and terminal.get("cycle_id") == cycle_id
+                and terminal.get("status") == "completed"
+                and terminal_at is not None
+                and cycle_start <= terminal_at < deadline
+            ):
+                # V4 stops before persistence.  A valid on-time business
+                # terminal may be committed after 870s without becoming a late
+                # trading decision; writer/report reliability is audited apart.
+                return None
     if current < deadline:
         return None
     return {
@@ -235,8 +286,8 @@ import sqlite3
 # HANDOFF-4A（2026-07-16）：CLI 落库成功后 detached 拍一次 dispatcher（事件驱动派发）。
 # 守卫导入：任何异常→None→静默禁用——writer 落库优先，nudge 永不致命。守护闸详见模块 docstring。
 try:
-    if str(_PROJECT_ROOT / "collectors") not in sys.path:
-        sys.path.insert(0, str(_PROJECT_ROOT / "collectors"))
+    if _public_project_path('collectors') not in sys.path:
+        sys.path.insert(0, _public_project_path('collectors'))
     import _dispatch_nudge as _nudge_mod
 except Exception:  # noqa: BLE001
     _nudge_mod = None
@@ -245,8 +296,8 @@ except Exception:  # noqa: BLE001
 # DB paths
 # ---------------------------------------------------------------------------
 # 2026-08-06 demo 全量下线：demo_trades.db 已不再是合法写入目标。
-_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / "db").resolve()
-
+_PROJECT_ROOT = Path(_public_project_path()).resolve()
+_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / 'db').resolve()
 
 def _runtime_db_root(explicit: str | Path | None = None) -> Path:
     value = explicit if explicit is not None else os.environ.get("OKX_DB_ROOT")
@@ -273,7 +324,9 @@ def _trade_db_path(
     return _runtime_db_path(filename, db_root) if filename else None
 
 
-DB_MAP = {"live": _trade_db_path("live")}
+DB_MAP = {
+    "live": Path(_public_project_path('db', 'live_trades.db')),
+}
 
 # ---------------------------------------------------------------------------
 # 连接
@@ -281,7 +334,22 @@ DB_MAP = {"live": _trade_db_path("live")}
 def connect(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(db_path), timeout=10)
     con.execute("PRAGMA busy_timeout=5000;")
-    con.execute("PRAGMA journal_mode=WAL;")
+    try:
+        for attempt, delay in enumerate((0.02, 0.05, 0.10, 0.20, None), 1):
+            try:
+                current_mode = str(
+                    con.execute("PRAGMA journal_mode;").fetchone()[0]
+                ).lower()
+                if current_mode != "wal":
+                    con.execute("PRAGMA journal_mode=WAL;")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or delay is None:
+                    raise
+                time.sleep(delay)
+    except Exception:
+        con.close()
+        raise
     con.row_factory = sqlite3.Row
     return con
 
@@ -454,6 +522,59 @@ def _position_action_policy_errors(
     ]
 
 
+def human_policy_errors(payload: dict) -> list[str]:
+    """Reject explicit retired/misstated policy claims, not prices or ratios.
+
+    These are prose-contract diagnostics. Executable risk limits remain owned
+    by risk_validator, not by any string or number in an Agent explanation.
+    """
+    fields = {key: payload.get(key) for key in (
+        "action", "action_taken", "decision", "note", "reasoning",
+        "decision_summary", OPEN_EXECUTION_PACKAGE_KEY, "decision_card")}
+    texts: list[str] = []
+    bad_structured_imr = False
+    def walk(value, path=()):
+        nonlocal bad_structured_imr
+        key = "_".join(str(x).lower() for x in path)
+        if ("imr" in key and re.search(r"max|cap|limit|threshold|上限|阈值", key)
+                and re.fullmatch(r"0\.0666(?:0+)?", str(value))):
+            bad_structured_imr = True
+        if isinstance(value, str): texts.append(value)
+        elif isinstance(value, dict):
+            for name, item in value.items(): walk(item, (*path, name))
+        elif isinstance(value, (list, tuple)):
+            for item in value: walk(item, path)
+    for key, value in fields.items(): walk(value, (key,))
+    imr = r"(?:IMR|初始保证金(?:比例|占比|率)?)"
+    limit = r"(?:硬性?|最大)?(?:上限|阈值|限制|cap|limit|threshold)"
+    link = r"\s*(?:(?:[:：=≤]|<=|为|是|设为|按|is|at)\s*)?"
+    bad = r"(?<![\d.])0\.0666(?:0+)?(?![\d.])"
+    patterns = [imr+r"[\s_-]*"+limit+link+bad,
+                limit+r"[\s_-]*"+imr+link+bad,
+                imr+r"\s*(?:不得超过|不超过|不能超过|必须低于)\s*"+bad,
+                r"(?:max(?:imum)?_portfolio_imr_ratio|(?:portfolio_)?imr_(?:cap|limit|threshold))"+link+bad]
+    concentration = r"(?:同侧(?:集中度)?|同向(?:集中度)?|集中度|concentration)"
+    retired = [concentration+r"\s*"+limit+link+r"60\s*%",
+               concentration+r"\s*60\s*%\s*"+limit,
+               concentration+r"\s*(?:不得超过|不超过)\s*60\s*%"]
+    def asserts(text, expressions):
+        for clause in re.split(r"[；;。\n]", text):
+            for expression in expressions:
+                for match in re.finditer(expression, clause, re.I):
+                    before = clause[max(0,match.start()-16):match.start()]
+                    after = clause[match.end():match.end()+16]
+                    if re.search(r"禁止使用|不得使用|不要使用|不能使用|切勿使用|纠正|修正|错误的|误写的|never\s+use|do\s+not\s+use", before, re.I): continue
+                    if re.match(r"\s*(?:是|为|is)?\s*(?:错误|不正确|已取消|不再使用|wrong|incorrect)", after, re.I): continue
+                    return True
+        return False
+    errors = []
+    if bad_structured_imr or any(asserts(t,patterns) for t in texts):
+        errors.append("检测到错误 IMR 阈值 0.0666；唯一硬阈值是 0.666")
+    if any(asserts(t,retired) for t in texts):
+        errors.append("检测到已取消的同侧/集中度 60% 硬闸")
+    return errors
+
+
 def _blocking_facts_authorize_action(
     facts: object,
     action_taken: object,
@@ -529,8 +650,8 @@ def normalize_receipt(data: dict) -> dict:
 # BTC=0.01 / ETH=0.1）系统性错尺度；正确公式：
 #     margin   = fill_px × sz × ctVal ÷ lev
 #     notional = fill_px × sz × ctVal
-# ctVal 从 market.db.instruments_cache 只读取（mode=ro），取不到回退 1.0 并 WARN
-# （fail-safe，绝不阻塞写库）。
+# ctVal 从 market.db.instruments_cache 只读取（mode=ro）。取不到时保持
+# margin/notional 为 NULL 并 WARN；已确认成交仍必须落库，禁止猜 1.0 伪造账本。
 # ---------------------------------------------------------------------------
 _CTVAL_CACHE: dict = {}
 
@@ -556,13 +677,14 @@ def _ctval_for(
             mkt.close()
         if row and row[0] is not None and float(row[0]) > 0:
             ctval = float(row[0])
-    except Exception as e:  # noqa: BLE001 —— 查失败回退 1.0，绝不阻塞写库
+    except Exception as e:  # noqa: BLE001 —— 查失败保留未知，绝不丢成交
         err = e
     if ctval is None:
         sys.stderr.write(
-            f"[trades_writer][WARN] ctVal 取不到（回退 1.0）: symbol={symbol}"
+            f"[trades_writer][WARN] ctVal 取不到（margin/notional 保持 NULL）: "
+            f"symbol={symbol}"
             + (f" err={err}" if err else "") + "\n")
-        ctval = 1.0
+        return None
     _CTVAL_CACHE[key] = ctval
     return ctval
 
@@ -690,6 +812,429 @@ def _duplicate_new_trade_identity(keys: list[tuple]) -> bool:
     return False
 
 
+def _is_exact_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{64}", value)
+    )
+
+
+def _runner_terminal_failure_receipt(incoming: dict) -> bool:
+    """Recognize the runner's own final receipt that recorded a failed action.
+
+    ``_aggregate_receipt`` marks any failed action ``partial`` with
+    ``batch_ok=False``, ``runner_in_progress=False`` and no business
+    terminal; ``commit_side_effect_salvage`` quarantines that same aggregate
+    as ``status=error``.  It is neither an interim nor a completed terminal.
+    """
+    if not (
+        incoming.get("batch_status") == "partial"
+        and incoming.get("batch_ok") is False
+        and incoming.get("runner_in_progress") is False
+        and incoming.get("business_terminal") in (None, {})
+    ):
+        return False
+    if incoming.get("status") == "ok":
+        return True
+    quarantine = incoming.get("contract_quarantine")
+    return bool(
+        incoming.get("status") == "error"
+        and isinstance(quarantine, dict)
+        and quarantine.get("kind") == _RUNNER_SALVAGE_QUARANTINE_KIND
+    )
+
+
+def _runner_same_plan_progression_kind(
+    old_raw: object,
+    incoming: dict,
+    cycle_id: str,
+) -> Optional[str]:
+    """Prove one runner is advancing its own same-plan interim receipt.
+
+    Returns ``"interim"``, ``"finalization"`` (completed terminal) or
+    ``"partial_finalization"`` (final receipt that recorded a failed action);
+    ``None`` when the receipt is not provably that runner's continuation.
+    """
+    if not isinstance(old_raw, dict):
+        return None
+    from core.independent_refusal import continuable_interim, validated_proofs
+    previous_refusals=validated_proofs(old_raw,cycle_id)
+    incoming_refusals=validated_proofs(incoming,cycle_id)
+    if (previous_refusals is None or incoming_refusals is None
+            or any(p not in incoming_refusals for p in previous_refusals)):
+        return None
+    if incoming_refusals and (incoming.get("batch_ok") is not False
+            or incoming.get("batch_status") != "partial" or incoming.get("business_terminal") not in (None, {})):
+        return None
+    if not (
+        old_raw.get("status") == "ok"
+        and old_raw.get("batch_status") == "partial"
+        and (old_raw.get("batch_ok") is True or continuable_interim(old_raw,cycle_id))
+        and old_raw.get("runner_in_progress") is True
+    ):
+        return None
+    terminal = incoming.get("business_terminal")
+    if (
+        incoming.get("status") == "ok"
+        and (incoming.get("batch_ok") is True or continuable_interim(incoming,cycle_id))
+        and incoming.get("batch_status") == "partial"
+        and incoming.get("runner_in_progress") is True
+        and terminal in (None, {})
+    ):
+        kind = "interim"
+    elif (
+        incoming.get("status") == "ok"
+        and incoming.get("batch_ok") is True
+        and incoming.get("batch_status") == "completed"
+        and incoming.get("runner_in_progress") is False
+        and isinstance(terminal, dict)
+        and terminal.get("cycle_id") == cycle_id
+        and terminal.get("status") == "completed"
+    ):
+        kind = "finalization"
+    elif _runner_terminal_failure_receipt(incoming):
+        kind = "partial_finalization"
+    else:
+        return None
+    for key in _RUNNER_FINALIZATION_BINDING_KEYS:
+        old_value = old_raw.get(key)
+        incoming_value = incoming.get(key)
+        if not (
+            _is_exact_sha256(old_value)
+            and incoming_value == old_value
+        ):
+            return None
+    return kind
+
+
+def _is_trusted_reconciled_close_row(row: object) -> bool:
+    """Recognize an unmatched close created by the private maintenance path."""
+    try:
+        if str(row["action"] or "").strip().lower() != "close":
+            return False
+        if not str(row["symbol"] or "").strip():
+            return False
+        if str(row["side"] or "").strip().lower() not in {"long", "short"}:
+            return False
+        if float(row["sz"]) <= 0 or float(row["fill_px"]) <= 0:
+            return False
+        raw = row["raw"]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("reconcile_source") not in _TRUSTED_RECONCILE_TRADE_SOURCES:
+        return False
+    fill_time_source = raw.get("ts_source") == "fills.fillTime"
+    if not fill_time_source and raw.get("ts_source") != "trusted_internal_override":
+        return False
+    if not str(raw.get("close_ts") or "").strip():
+        return False
+    if fill_time_source:
+        close_ts = strict_cst_ts(raw.get("close_ts"))
+        if (close_ts is None or strict_cst_ts(raw.get("fill_ts")) != close_ts
+                or strict_cst_ts(row["ts"]) != close_ts):
+            return False
+    ord_ids = {
+        str(value).strip()
+        for value in (raw.get("ord_ids") or [])
+        if str(value).strip()
+    }
+    fills = raw.get("fills")
+    if not ord_ids or not isinstance(fills, list) or not fills:
+        return False
+    fill_ord_ids: set[str] = set()
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return False
+        ord_id = str(fill.get("ordId") or "").strip()
+        if (
+            not ord_id
+            or ord_id not in ord_ids
+            or not str(fill.get("ts") or "").strip()
+            or not str(fill.get("px") or "").strip()
+            or not str(fill.get("sz") or "").strip()
+        ):
+            return False
+        fill_ord_ids.add(ord_id)
+    if fill_time_source:
+        # The maintenance writer now keeps exchange fill time instead of the
+        # legacy internal timestamp marker.  Admit only the same fully bound
+        # close: its raw fills must still explain the retained row exactly.
+        try:
+            sizes = [float(fill["sz"]) for fill in fills]
+            prices = [float(fill["px"]) for fill in fills]
+            times = [strict_cst_ts(fill["ts"]) for fill in fills]
+            if (any(not math.isfinite(v) or v <= 0 for v in sizes + prices)
+                    or any(value is None for value in times)
+                    or max(times) != close_ts):
+                return False
+            total = sum(sizes)
+            average = sum(sz * px for sz, px in zip(sizes, prices)) / total
+            if (not math.isclose(total, float(row["sz"]), rel_tol=1e-8, abs_tol=1e-8)
+                    or not math.isclose(average, float(row["fill_px"]), rel_tol=1e-8, abs_tol=1e-8)):
+                return False
+        except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return False
+    return bool(fill_ord_ids)
+
+
+def _row_raw_dict(row: object) -> Optional[dict]:
+    try:
+        raw = row["raw"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _is_identity_bound_unrecorded_open_row(row: object, cycle_id: str) -> bool:
+    """Recognize a strict T1 UNRECORDED open healed into this runner cycle.
+
+    ``apply_unrecorded`` binds exactly one exchange order: the same ordId in
+    ``raw.ordId``, ``raw.ord_ids``, every raw fill and the execution intent
+    that owns this cycle, and those fills explain the stored row exactly.
+    Legacy healed opens without that single identity stay fail-closed.
+    """
+    raw = _row_raw_dict(row)
+    if raw is None or raw.get("reconcile_source") != _TRUSTED_UNRECORDED_OPEN_SOURCE:
+        return False
+    try:
+        if str(row["action"] or "").strip().lower() not in {"open", "add"}:
+            return False
+        if not str(row["symbol"] or "").strip():
+            return False
+        if str(row["side"] or "").strip().lower() not in {"long", "short"}:
+            return False
+        size = float(row["sz"])
+        price = float(row["fill_px"])
+        row_ts = strict_cst_ts(row["ts"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    ord_id = str(raw.get("ordId") or "").strip()
+    ord_ids = raw.get("ord_ids")
+    intent = raw.get("intent")
+    fill_ts = strict_cst_ts(raw.get("fill_ts"))
+    if (
+        not ord_id
+        or not isinstance(ord_ids, list)
+        or [str(value).strip() for value in ord_ids] != [ord_id]
+        or not isinstance(intent, dict)
+        or str(intent.get("ord_id") or "").strip() != ord_id
+        or intent.get("cycle_id") != cycle_id
+        or raw.get("ts_source") != "fills.fillTime"
+        or fill_ts is None
+        or row_ts != fill_ts
+    ):
+        return False
+    fills = raw.get("fills")
+    if not isinstance(fills, list) or not fills:
+        return False
+    try:
+        if any(
+            not isinstance(fill, dict)
+            or str(fill.get("ordId") or "").strip() != ord_id
+            for fill in fills
+        ):
+            return False
+        sizes = [float(fill["sz"]) for fill in fills]
+        prices = [float(fill["px"]) for fill in fills]
+        times = [strict_cst_ts(fill["ts"]) for fill in fills]
+        if (any(not math.isfinite(v) or v <= 0
+                for v in sizes + prices + [size, price])
+                or any(value is None for value in times)
+                or max(times) != fill_ts):
+            return False
+        total = sum(sizes)
+        average = sum(sz * px for sz, px in zip(sizes, prices)) / total
+    except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return False
+    return (
+        math.isclose(total, size, rel_tol=1e-8, abs_tol=1e-8)
+        and math.isclose(average, price, rel_tol=1e-8, abs_tol=1e-8)
+    )
+
+
+def _matched_reconcile_economics_agree(row: object, trade: dict) -> bool:
+    """A receipt row may replace a reconciled row only for the same fill.
+
+    Order-id equality alone would let a smaller runner readback silently
+    replace fills that reconciliation already proved on the exchange.
+    """
+    try:
+        values = (
+            float(row["sz"]), float(row["fill_px"]),
+            float(trade.get("sz")), float(trade.get("fill_px")),
+        )
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        return False
+    old_size, old_price, new_size, new_price = values
+    return (
+        math.isclose(old_size, new_size, rel_tol=1e-8, abs_tol=1e-8)
+        and math.isclose(old_price, new_price, rel_tol=1e-6, abs_tol=1e-9)
+    )
+
+
+def _reconciled_row_order_ids(raw: dict) -> set[str]:
+    ids = raw.get("ord_ids")
+    values = list(ids) if isinstance(ids, (list, tuple)) else []
+    values.extend(
+        fill.get("ordId")
+        for fill in (raw.get("fills") or [])
+        if isinstance(fill, dict)
+    )
+    values.append(_extract_ordid(raw))
+    return {str(value).strip() for value in values if str(value or "").strip()}
+
+
+def _retained_reconcile_row_conflicts(
+    retained: list,
+    incoming_trades: list,
+    new_keys: list[tuple],
+    matched_new_indices: set[int],
+) -> bool:
+    """True when a kept reconciled row may be the same fill as a receipt row.
+
+    ``_rows_match`` compares a reconciled row without a top-level ordId by its
+    rounded content fingerprint, so a price-rounding difference can hide a
+    double record.  Reconciled rows carry their exchange order ids in
+    ``ord_ids``/``fills``: a receipt row claiming one of them, or a new receipt
+    row without any order id on the same symbol/side, is not provably distinct.
+    """
+    for row in retained:
+        raw = _row_raw_dict(row)
+        if raw is None:
+            return True
+        claimed = _reconciled_row_order_ids(raw)
+        try:
+            symbol = str(row["symbol"] or "").strip()
+            side = str(row["side"] or "").strip().lower()
+        except (KeyError, IndexError, TypeError):
+            return True
+        for index, trade in enumerate(incoming_trades):
+            incoming_oid = new_keys[index][0]
+            if incoming_oid:
+                if incoming_oid in claimed:
+                    return True
+            elif (
+                index not in matched_new_indices
+                and str(trade.get("symbol") or "").strip() == symbol
+                and str(trade.get("side") or "").strip().lower() == side
+            ):
+                return True
+    return False
+
+
+_RUNNER_PROGRESSION_MERGE_LABELS = {
+    "interim": ("interim progression", "runner_interim_reconcile_merge"),
+    "finalization": ("finalization", "runner_finalization_reconcile_merge"),
+    "partial_finalization": (
+        "partial finalization",
+        "runner_partial_finalization_reconcile_merge",
+    ),
+}
+
+
+def _runner_progression_reconcile_partition(
+    *,
+    old: object,
+    old_raw: object,
+    old_trades: list,
+    old_keys: list[tuple],
+    new_keys: list[tuple],
+    incoming: dict,
+    incoming_trades: list,
+    cycle_id: str,
+) -> dict | None:
+    """Partition a proven same-plan runner receipt against the stored cycle.
+
+    Returns ``{"kind", "merge_keep", "matched_new_indices",
+    "superseded_reconcile_ord_ids"}`` or ``None``.
+
+    This is deliberately narrower than the ordinary merge rules.  It only
+    advances a proven same-plan runner interim (to another interim, to the
+    completed final, or to the final that recorded a failed action), covers
+    every prior runner row exactly once, and retains only independently
+    proven exchange rows: reconciled closes and identity-bound UNRECORDED
+    opens.  A receipt row may replace a reconciled row only for the same
+    fill.  Any ambiguous identity remains fail-closed.
+    """
+    kind = _runner_same_plan_progression_kind(old_raw, incoming, cycle_id)
+    if kind is None:
+        return None
+    try:
+        if int(old["n_orders"]) != len(old_trades):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    matches_by_old: list[list[int]] = [
+        [
+            new_index
+            for new_index, new_key in enumerate(new_keys)
+            if _rows_match(old_key, new_key)
+        ]
+        for old_key in old_keys
+    ]
+    # A row matching more than one incoming identity, or an incoming identity
+    # matching more than one old row, is not a deterministic replacement.
+    if any(len(matches) > 1 for matches in matches_by_old):
+        return None
+    owners: dict[int, int] = {}
+    merge_keep: list = []
+    matched_new_indices: set[int] = set()
+    superseded: set[str] = set()
+    for old_index, matches in enumerate(matches_by_old):
+        row = old_trades[old_index]
+        if not matches:
+            if not (
+                _is_trusted_reconciled_close_row(row)
+                or _is_identity_bound_unrecorded_open_row(row, cycle_id)
+            ):
+                return None
+            merge_keep.append(row)
+            continue
+        new_index = matches[0]
+        if new_index in owners:
+            return None
+        row_raw = _row_raw_dict(row) or {}
+        if str(row_raw.get("reconcile_source") or "").strip():
+            if not _matched_reconcile_economics_agree(
+                    row, incoming_trades[new_index]):
+                return None
+            superseded.update(_reconciled_row_order_ids(row_raw))
+        owners[new_index] = old_index
+        matched_new_indices.add(new_index)
+    if not matched_new_indices or not merge_keep:
+        return None
+    if _retained_reconcile_row_conflicts(
+            merge_keep, incoming_trades, new_keys, matched_new_indices):
+        return None
+    return {
+        "kind": kind,
+        "merge_keep": merge_keep,
+        "matched_new_indices": matched_new_indices,
+        "superseded_reconcile_ord_ids": sorted(superseded),
+    }
+
+
+# 单条哈希存根 {"field","chars","sha256":<64hex>} 约 110 字符：小于它的字段
+# 一旦被"截断"，记录只会变大。阈值放到 512 留出余量 —— 操作事实（价格、
+# 张数、订单号、止损价）全部远小于它，不该为了一个塞不下的大字段陪葬。
+_SMALL_FIELD_KEEP_CHARS = 512
+
+
 def _bounded_json(value: object, max_chars: int, label: str) -> str:
     raw = json.dumps(value, ensure_ascii=False)
     if len(raw) <= max_chars:
@@ -708,8 +1253,11 @@ def _bounded_json(value: object, max_chars: int, label: str) -> str:
         "decision", "action_taken", "batch_status", "batch_ok",
         "runner_in_progress", "n_orders", "facts_hash", "plan_sha256",
         "position_action_plan_hash",
+        "independent_refusal_proofs",
+        "independent_refusal_rows_compacted",
     )
-    authority_keys = ("live_facts", "trades", "decision_card")
+    authority_keys = (
+        "live_facts", "trades", OPEN_EXECUTION_PACKAGE_KEY, "decision_card")
     priority = critical_keys + authority_keys + (
         "errors",
         "symbol", "action", "side", "pos_side", "sz", "fill_sz", "fill_px",
@@ -766,6 +1314,14 @@ def _bounded_json(value: object, max_chars: int, label: str) -> str:
                         row_raw.encode("utf-8")
                     ).hexdigest(),
                 })
+                if key=="position_action_failures":
+                    from core.independent_refusal import proof_for, validated_proofs
+                    refusal=proof_for(row,value.get("cycle_id"))
+                    if refusal:summaries[-1]["independent_refusal_sha256"]=refusal["failure_sha256"]
+                    elif row.get("independent_refusal_sha256") and any(
+                        p.get("failure_sha256")==row["independent_refusal_sha256"]
+                        for p in (validated_proofs(value,value.get("cycle_id")) or [])):
+                        summaries[-1]["independent_refusal_sha256"]=row["independent_refusal_sha256"]
             clipped[key] = summaries
             item_raw = json.dumps(item, ensure_ascii=False)
             clipped["raw_truncated_fields"].append({
@@ -780,6 +1336,16 @@ def _bounded_json(value: object, max_chars: int, label: str) -> str:
             clipped[key] = item
             continue
         item_raw = json.dumps(item, ensure_ascii=False)
+        # 2026-08-20：预算被权威字段吃光时（decision_card 可达 20KB，而它在预算
+        # 检查之前就被无条件拷入），上面的判据对**任何**字段都不成立，连 4 字符
+        # 的 sz 也会被换成约 110 字符的哈希存根 —— 记录反而更大（实测 id=436：
+        # 丢 41 个字段共 440 字符，落库从 21,347 涨到 25,211），代价是销毁
+        # sl_trigger_px/fill_px/ordId 等全部操作事实，只保住那张 20KB 的卡。
+        # 小字段一律留下：小于存根尺寸的丢了纯亏；略大一些的，省下的空间相对
+        # 被销毁的事实也完全不成比例。只有真正大的字段才值得换成哈希。
+        if len(item_raw) <= _SMALL_FIELD_KEEP_CHARS:
+            clipped[key] = item
+            continue
         clipped["raw_truncated_fields"].append({
             "field": key,
             "chars": len(item_raw),
@@ -877,9 +1443,74 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
             errors.append("ok 存在时必须是 bool")
         if data.get("ok") is False:
             errors.append("ok=false/rejected 执行回执不得写入交易账本")
-        if data.get("decision_protocol") != "decision_card_v1":
-            errors.append("decision_protocol 必须是 decision_card_v1")
-        errors.extend(validate_card(data.get("decision_card"), "decision_card"))
+        minimal_policy = thresholds.minimal_decision_contract_active(
+            str(data.get("cycle_id") or ""))
+        closure_policy = thresholds.minimal_contract_closure_active(
+            str(data.get("cycle_id") or ""))
+        if closure_policy:
+            retired_paths = _closure_mtf_paths(data)
+            if retired_paths:
+                errors.append(
+                    "closure receipt 禁止携带退役机器结构: "
+                    + ",".join(retired_paths[:12]))
+        expected_protocol = (
+            MINIMAL_DECISION_PROTOCOL if minimal_policy
+            else "decision_card_v1")
+        if data.get("decision_protocol") != expected_protocol:
+            errors.append(
+                f"decision_protocol 必须是 {expected_protocol}")
+        current_card = data.get("decision_card")
+        if minimal_policy:
+            if current_card not in (None, {}):
+                errors.append("minimal cycle receipt 禁止携带六项 decision_card")
+            if not str(data.get("reasoning") or data.get("reason") or "").strip():
+                errors.append("minimal cycle receipt reasoning 不能为空")
+            current_package = data.get(OPEN_EXECUTION_PACKAGE_KEY)
+            if closure_policy and current_package not in (None, {}):
+                errors.extend(validate_open_execution_package(
+                    current_package, OPEN_EXECUTION_PACKAGE_KEY))
+            for index, trade in enumerate(incoming_trades):
+                trade_action = str(trade.get("action") or "").lower()
+                if trade_action not in {"open", "add"}:
+                    if closure_policy and trade.get(
+                            OPEN_EXECUTION_PACKAGE_KEY) not in (None, {}):
+                        errors.append(
+                            f"trades[{index}] {trade_action or '<missing>'} "
+                            "禁止携带 open_execution_package")
+                    continue
+                if closure_policy:
+                    if trade.get("decision_card") not in (None, {}):
+                        errors.append(
+                            f"trades[{index}] closure OPEN/ADD 禁止使用 "
+                            "decision_card 键")
+                    trade_package = trade.get(OPEN_EXECUTION_PACKAGE_KEY)
+                    if not is_open_execution_package(trade_package):
+                        errors.append(
+                            f"trades[{index}] OPEN/ADD 必须携带 "
+                            "lightweight_open_v1 open_execution_package")
+                    else:
+                        errors.extend(validate_open_execution_package(
+                            trade_package,
+                            f"trades[{index}].{OPEN_EXECUTION_PACKAGE_KEY}",
+                            expected_side=trade.get("side")))
+                else:
+                    trade_card = trade.get("decision_card")
+                    if not is_lightweight_open_card(trade_card):
+                        errors.append(
+                            f"trades[{index}] OPEN/ADD 必须携带 "
+                            "lightweight_open_v1")
+                    else:
+                        errors.extend(validate_card(
+                            trade_card, f"trades[{index}].decision_card",
+                            require_exit_mode=True))
+        elif (
+            is_lightweight_open_card(current_card)
+            and not thresholds.decision_restriction_removal_active(
+                str(data.get("cycle_id") or ""))
+        ):
+            errors.append("lightweight OPEN 尚未到前向激活边界")
+        if not minimal_policy:
+            errors.extend(validate_card(current_card, "decision_card"))
 
         if status != "ok" and incoming_trades:
             errors.append(f"status={status or '<missing>'} 时 trades 必须为空")
@@ -925,12 +1556,67 @@ def validate(data: dict, *, maintenance: bool = False) -> list[str]:
                     f"{len(incoming_trades)}")
     else:
         protocol = data.get("decision_protocol")
-        if protocol not in (None, "", "decision_card_v1"):
-            errors.append(
-                f"decision_protocol 不支持: {protocol!r}")
-        elif protocol == "decision_card_v1":
-            errors.extend(
-                validate_card(data.get("decision_card"), "decision_card"))
+        minimal_policy = thresholds.minimal_decision_contract_active(
+            str(data.get("cycle_id") or ""))
+        closure_policy = thresholds.minimal_contract_closure_active(
+            str(data.get("cycle_id") or ""))
+        if minimal_policy:
+            if protocol not in (None, "", MINIMAL_DECISION_PROTOCOL):
+                errors.append(
+                    f"minimal maintenance decision_protocol 不支持: {protocol!r}")
+            if data.get("decision_card") not in (None, {}):
+                errors.append(
+                    "minimal maintenance cycle 禁止携带顶层六项 decision_card")
+            for index, trade in enumerate(incoming_trades):
+                action = str(trade.get("action") or "").lower()
+                if closure_policy:
+                    trade_package = trade.get(OPEN_EXECUTION_PACKAGE_KEY)
+                    if trade.get("decision_card") not in (None, {}):
+                        errors.append(
+                            f"trades[{index}] closure maintenance 禁止使用 "
+                            "decision_card 键")
+                    if action in {"open", "add"}:
+                        if trade_package is not None:
+                            if not is_open_execution_package(trade_package):
+                                errors.append(
+                                    f"trades[{index}] minimal OPEN/ADD 只允许 "
+                                    "lightweight_open_v1 "
+                                    "open_execution_package")
+                            else:
+                                errors.extend(validate_open_execution_package(
+                                    trade_package,
+                                    f"trades[{index}]."
+                                    f"{OPEN_EXECUTION_PACKAGE_KEY}",
+                                    expected_side=trade.get("side")))
+                    elif trade_package not in (None, {}):
+                        errors.append(
+                            f"trades[{index}] minimal {action or '<missing>'} "
+                            "禁止携带 open_execution_package")
+                else:
+                    trade_card = trade.get("decision_card")
+                    if action in {"open", "add"}:
+                        if trade_card is not None:
+                            if not is_lightweight_open_card(trade_card):
+                                errors.append(
+                                    f"trades[{index}] minimal OPEN/ADD 只允许 "
+                                    "lightweight_open_v1")
+                            else:
+                                errors.extend(validate_card(
+                                    trade_card,
+                                    f"trades[{index}].decision_card",
+                                    require_exit_mode=True,
+                                ))
+                    elif trade_card not in (None, {}):
+                        errors.append(
+                            f"trades[{index}] minimal {action or '<missing>'} "
+                            "禁止携带 decision_card")
+        else:
+            if protocol not in (None, "", "decision_card_v1"):
+                errors.append(
+                    f"decision_protocol 不支持: {protocol!r}")
+            elif protocol == "decision_card_v1":
+                errors.extend(
+                    validate_card(data.get("decision_card"), "decision_card"))
 
     if incoming_trades and decision != "traded":
         errors.append("trades 非空时 decision 必须是 traded")
@@ -1129,19 +1815,7 @@ def validate_strict_live_receipt(data: dict) -> list[str]:
             except (TypeError, ValueError):
                 errors.append("equity/live_facts.balance.totalEq 必须是有效数字")
 
-    human_fields = {
-        key: payload.get(key)
-        for key in (
-            "action", "action_taken", "decision", "note", "reasoning",
-            "decision_summary", "decision_card",
-        )
-        if key in payload
-    }
-    human_text = json.dumps(human_fields, ensure_ascii=False)
-    if "0.0666" in human_text:
-        errors.append("检测到错误 IMR 阈值 0.0666；唯一硬阈值是 0.666")
-    if re.search(r"60\s*%.{0,12}(?:硬上限|硬闸|上限|闸)", human_text):
-        errors.append("检测到已取消的同侧/集中度 60% 硬闸")
+    errors.extend(human_policy_errors(payload))
     return errors
 
 
@@ -1235,6 +1909,42 @@ def _analysis_context_for_cycle(
             f"[trades_writer][WARN] analysis_signals 回填源读取失败（保 NULL）: {e}\n")
         return {}
     return out
+
+
+def _closure_mtf_paths(value: object, path: str = "$") -> list[str]:
+    """Compatibility alias for the full closure structural scanner."""
+    return closure_retired_structure_paths(value, path)
+
+
+def _scrub_closure_mtf_fields(value: object) -> object:
+    """Compatibility alias for full closure persistence scrubbing."""
+    return scrub_closure_retired_structures(value)
+
+
+def _scrub_closure_stored_trade_raw(
+    value: object,
+    *,
+    label: str,
+) -> str | None:
+    """Scrub a retained same-cycle row without inventing malformed raw."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"{label} 非法JSON，closure merge拒绝重写") from exc
+    else:
+        raise ValueError(f"{label} 类型非法，closure merge拒绝重写")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} 顶层非object，closure merge拒绝重写")
+    cleaned = scrub_closure_retired_structures(parsed)
+    if not isinstance(cleaned, dict):
+        raise ValueError(f"{label} scrub结果非object，closure merge拒绝重写")
+    return _bounded_json(cleaned, 20000, label)
 
 
 # ---------------------------------------------------------------------------
@@ -1358,16 +2068,21 @@ def _write_trades(
     # 已备份的人工事实修复可通过维护专用入口保留历史 NULL，禁止用“修复执行时”
     # 的最新 account snapshot 污染旧 cycle；普通 receipt 字段无法开启该能力。
     if equity is None and not preserve_equity_none:
-        fb = _equity_snapshot_fallback(mode, db_path.parent)
+        fb = _equity_snapshot_fallback(mode, db_root=Path(db_path).parent)
         if fb is not None:
             equity = fb[0]
             equity_fallback_mark = {"equity_source": "account_snapshot_fallback",
                                     "equity_source_ts": fb[1]}
     pnl_session = data.get("pnl_session", 0.0)
     pnl_open = data.get("pnl_open", 0.0)
-    ana_context = _analysis_context_for_cycle(cycle_id, db_path.parent)
+    ana_context = _analysis_context_for_cycle(cycle_id, db_root=Path(db_path).parent)
     card_mode = (
-        data.get("decision_protocol") == "decision_card_v1"
+        data.get("decision_protocol") in {
+            "decision_card_v1", MINIMAL_DECISION_PROTOCOL}
+        or isinstance(data.get(OPEN_EXECUTION_PACKAGE_KEY), dict)
+        or any(
+            isinstance(t.get(OPEN_EXECUTION_PACKAGE_KEY), dict)
+            for t in incoming_trades)
         or isinstance(data.get("decision_card"), dict)
         or any(v.get("decision_card") for v in ana_context.values())
     )
@@ -1423,7 +2138,31 @@ def _write_trades(
             raw_obj["cycle_ts_source"] = "writer_commit"
     else:
         raw_obj["cycle_ts_source"] = "trusted_internal_override"
-    if isinstance(raw_obj, dict) and isinstance(data.get("decision_card"), dict):
+    minimal_policy = thresholds.minimal_decision_contract_active(cycle_id)
+    closure_policy = thresholds.minimal_contract_closure_active(cycle_id)
+    if minimal_policy:
+        # 新周期顶层只保留最小裁决协议。维护/补账载荷可能是从
+        # 旧 raw 拼回的，所以这里是所有持久化路径的最后一道防线：即使输入
+        # 还残留 decision_card_v1/六项卡，也不得把它重新写回当前周期。
+        raw_obj.pop("decision_card", None)
+        if closure_policy:
+            package = data.get(OPEN_EXECUTION_PACKAGE_KEY)
+            if (
+                not is_open_execution_package(package)
+                and isinstance(raw_obj, dict)
+                and is_open_execution_package(
+                    raw_obj.get(OPEN_EXECUTION_PACKAGE_KEY))
+            ):
+                # Exchange reconciliation preserves a bounded, previously
+                # validated business context under ``raw``.  Keep that exact
+                # machine package; never resurrect the retired card key.
+                package = raw_obj.get(OPEN_EXECUTION_PACKAGE_KEY)
+            raw_obj.pop(OPEN_EXECUTION_PACKAGE_KEY, None)
+            if is_open_execution_package(package):
+                raw_obj[OPEN_EXECUTION_PACKAGE_KEY] = package
+            raw_obj = _scrub_closure_mtf_fields(raw_obj)
+        raw_obj["decision_protocol"] = MINIMAL_DECISION_PROTOCOL
+    elif isinstance(data.get("decision_card"), dict):
         raw_obj = {
             **raw_obj,
             "decision_protocol": "decision_card_v1",
@@ -1442,6 +2181,8 @@ def _write_trades(
             "batch_ok",
             "runner_in_progress",
             "position_action_plan_hash",
+            "independent_refusal_proofs",
+            "position_action_failures",
             "facts_hash",
             "plan_sha256",
             "contract_quarantine",
@@ -1484,6 +2225,25 @@ def _write_trades(
                 old_raw_obj = json.loads(old["raw"])
             except (TypeError, ValueError, json.JSONDecodeError):
                 old_raw_obj = None
+        if isinstance(old_raw_obj, dict) and old_raw_obj.get("independent_refusal_proofs"):
+            from core.independent_refusal import validated_proofs
+            prior = validated_proofs(old_raw_obj, cycle_id)
+            if is_maintenance and prior:
+                # Maintenance adds factual fills; it cannot rewrite the prior
+                # decision failure or replace it with a successful terminal.
+                for key in ("independent_refusal_proofs", "position_action_failures", "batch_ok", "batch_status",
+                            "runner_in_progress", "status", "errors", "facts_hash", "plan_sha256", "position_action_plan_hash"):
+                    if key in old_raw_obj:raw_obj[key]=old_raw_obj[key]
+                if old_raw_obj.get("raw_structurally_truncated") or old_raw_obj.get("independent_refusal_rows_compacted"):
+                    raw_obj["independent_refusal_rows_compacted"]=True
+                raw_obj.pop("business_terminal", None)
+                raw = _bounded_json(raw_obj, 100000, "trade_cycles.raw")
+            current = validated_proofs(raw_obj, cycle_id) if isinstance(raw_obj, dict) else None
+            if (not prior or current is None or any(p not in current for p in prior)
+                    or raw_obj.get("batch_ok") is not False
+                    or raw_obj.get("business_terminal") not in (None, {})):
+                return {"ok": False, "cycle_id": cycle_id, "n_orders": old["n_orders"],
+                        "refused": "independent_refusal_history_conflict", "new_trades": []}
         old_is_reconcile_only = bool(
             not is_maintenance
             and str(cycle_id) >= RECONCILE_ANALYSIS_TERMINAL_FROM
@@ -1585,14 +2345,66 @@ def _write_trades(
                           f"existing rows -> merged (kept prior rows)",
                           file=sys.stderr)
                 else:
-                    print(f"[trades_writer] REFUSE ambiguous merge: cycle={cycle_id} "
-                          f"new receipt partially overlaps {len(old_trades)} existing "
-                          f"rows -- cannot tell resend from increment; rewrite with "
-                          f"ONE complete receipt containing ALL trades of this cycle",
+                    progression_partition = (
+                        _runner_progression_reconcile_partition(
+                            old=old,
+                            old_raw=old_raw_obj,
+                            old_trades=list(old_trades),
+                            old_keys=old_keys,
+                            new_keys=new_keys,
+                            incoming=data,
+                            incoming_trades=incoming_trades,
+                            cycle_id=cycle_id,
+                        )
+                        if closure_policy and not is_maintenance
+                        else None
+                    )
+                    if progression_partition is None:
+                        print(f"[trades_writer] REFUSE ambiguous merge: cycle={cycle_id} "
+                              f"new receipt partially overlaps {len(old_trades)} existing "
+                              f"rows -- cannot tell resend from increment; rewrite with "
+                              f"ONE complete receipt containing ALL trades of this cycle",
+                              file=sys.stderr)
+                        return {"ok": False, "cycle_id": cycle_id,
+                                "n_orders": (old["n_orders"] if old else None),
+                                "refused": "ambiguous_merge", "new_trades": []}
+                    merge_keep = progression_partition["merge_keep"]
+                    matched_new_indices = progression_partition[
+                        "matched_new_indices"]
+                    superseded_ord_ids = progression_partition[
+                        "superseded_reconcile_ord_ids"]
+                    progression_kind, progression_marker = (
+                        _RUNNER_PROGRESSION_MERGE_LABELS[
+                            progression_partition["kind"]])
+                    new_trades = [
+                        trade for index, trade in enumerate(incoming_trades)
+                        if index not in matched_new_indices
+                    ]
+                    n_orders = len(incoming_trades) + len(merge_keep)
+                    decision = "traded"
+                    note = (note + " | " if note else "") + (
+                        f"[merge-guard: runner {progression_kind} kept "
+                        f"{len(merge_keep)} reconciled rows]"
+                    )
+                    if isinstance(raw_obj, dict):
+                        raw_obj = {
+                            **raw_obj,
+                            "n_orders": n_orders,
+                            "merge_guard_kept_rows": len(merge_keep),
+                            "reconciled_close_preserved": True,
+                            progression_marker: True,
+                        }
+                        if superseded_ord_ids:
+                            raw_obj[
+                                "merge_guard_superseded_reconcile_ord_ids"
+                            ] = superseded_ord_ids
+                        raw = _bounded_json(
+                            raw_obj, 100000, "trade_cycles.raw")
+                    print(f"[trades_writer] MERGE guard: cycle={cycle_id} "
+                          f"runner {progression_kind} matched "
+                          f"{len(matched_new_indices)} prior runner rows and kept "
+                          f"{len(merge_keep)} reconciled rows",
                           file=sys.stderr)
-                    return {"ok": False, "cycle_id": cycle_id,
-                            "n_orders": (old["n_orders"] if old else None),
-                            "refused": "ambiguous_merge", "new_trades": []}
         cycle_completed_at = (
             str(old["ts"])
             if old and old["ts"] and not is_maintenance
@@ -1609,6 +2421,14 @@ def _write_trades(
         con.execute("DELETE FROM trades WHERE cycle_id=?", (cycle_id,))
         orders_written = 0
         for r in merge_keep:  # B：合并保留的旧行原样插回（原 ts/字段不动）
+            retained_raw = r["raw"]
+            if closure_policy:
+                retained_raw = _scrub_closure_stored_trade_raw(
+                    retained_raw,
+                    label=(
+                        "trades.raw merge_keep "
+                        f"{cycle_id}/{r['symbol']}/{r['action']}/{r['side']}"),
+                )
             con.execute(
                 "INSERT INTO trades"
                 "(cycle_id, ts, symbol, action, side, sz, fill_px, lev,"
@@ -1618,7 +2438,7 @@ def _write_trades(
                 (cycle_id, r["ts"], r["symbol"], r["action"], r["side"], r["sz"],
                  r["fill_px"], r["lev"], r["margin"], r["notional"],
                  r["score_total"], r["reasoning"], r["deviation"],
-                 r["degradation"], r["pnl"], r["raw"]))
+                 r["degradation"], r["pnl"], retained_raw))
             orders_written += 1
         # 行内 reasoning 缺失可从顶层 reasoning/reason 回填
         top_reason = data.get("reasoning") or data.get("reason")
@@ -1626,13 +2446,43 @@ def _write_trades(
             symbol = t.get("symbol")
             missing_meta = []
             ctx = ana_context.get(_norm_symbol(str(symbol or ""))) or {}
-            effective_card = (
-                t.get("decision_card")
-                or data.get("decision_card")
-                or ctx.get("decision_card")
-            )
+            trade_action = str(t.get("action") or "").strip().lower()
+            if minimal_policy:
+                # 六项卡已从 minimal 周期删除；只有 OPEN/ADD 可携带
+                # 供执行器绑定 entry/stop/target 的 lightweight_open_v1。
+                if closure_policy:
+                    effective_card = (
+                        t.get(OPEN_EXECUTION_PACKAGE_KEY)
+                        if trade_action in {"open", "add"}
+                        else None
+                    )
+                    if effective_card is None and trade_action in {"open", "add"}:
+                        # analysis.db intentionally retains the legacy column;
+                        # convert only at this trusted compatibility boundary.
+                        effective_card = canonical_open_execution_package(
+                            ctx.get("decision_card"))
+                    if not is_open_execution_package(effective_card):
+                        effective_card = None
+                else:
+                    effective_card = (
+                        t.get("decision_card") or ctx.get("decision_card")
+                        if trade_action in {"open", "add"}
+                        else None
+                    )
+                    if not is_lightweight_open_card(effective_card):
+                        effective_card = None
+            else:
+                effective_card = (
+                    t.get("decision_card")
+                    or data.get("decision_card")
+                    or ctx.get("decision_card")
+                )
             if card_mode and isinstance(effective_card, dict):
-                t["decision_card"] = effective_card
+                if closure_policy:
+                    t.pop("decision_card", None)
+                    t[OPEN_EXECUTION_PACKAGE_KEY] = effective_card
+                else:
+                    t["decision_card"] = effective_card
             # reasoning/raw 缺失不拒写（拒写丢真成交更糟），WARN 供巡检。
             # order_executor 行级 trade dict 使用 `reason`，这里保留 reasoning/reason 双键读取。
             reasoning = t.get("reasoning") or t.get("reason")
@@ -1676,7 +2526,30 @@ def _write_trades(
                 }
                 if fill_ts is not None:
                     row_raw_obj["fill_ts"] = fill_ts
-            if card_mode and isinstance(effective_card, dict) and isinstance(row_raw_obj, dict):
+            if isinstance(row_raw_obj, dict) and minimal_policy:
+                # 关仓/减仓/保护维护行不再携带决策卡。若是新开仓，仅冻结
+                # 机器执行包；从旧 journal/raw 回放的六项卡会在此被清除。
+                row_raw_obj.pop("decision_card", None)
+                if closure_policy:
+                    row_raw_obj.pop(OPEN_EXECUTION_PACKAGE_KEY, None)
+                if isinstance(effective_card, dict):
+                    row_raw_obj[
+                        OPEN_EXECUTION_PACKAGE_KEY
+                        if closure_policy else "decision_card"
+                    ] = effective_card
+                if closure_policy:
+                    row_raw_obj = _scrub_closure_mtf_fields(row_raw_obj)
+                if (
+                    trade_action in {"open", "add"}
+                    or row_raw_obj.get("decision_protocol") in {
+                        "decision_card_v1", MINIMAL_DECISION_PROTOCOL}
+                ):
+                    row_raw_obj["decision_protocol"] = MINIMAL_DECISION_PROTOCOL
+            elif (
+                card_mode
+                and isinstance(effective_card, dict)
+                and isinstance(row_raw_obj, dict)
+            ):
                 row_raw_obj = {
                     **row_raw_obj,
                     "decision_card": effective_card,
@@ -1694,16 +2567,22 @@ def _write_trades(
                     # 2026-07-07: 优先行内 ct_val（executor 回执带本环境真值——demo
                     # 分列合约与缓存的 live 口径可差 100x）；无行内值才查缓存
                     row_ctval = _as_pos_float(t.get("ct_val"))
-                    base = px * sz * (row_ctval if row_ctval is not None
-                                      else _ctval_for(
-                                          str(symbol), db_path.parent))
-                    if notional is None:
-                        notional = base
-                    if margin is None:
-                        if lev is not None:
-                            margin = base / lev
-                        else:
-                            missing_meta.append("margin(缺lev未补算)")
+                    resolved_ctval = (
+                        row_ctval if row_ctval is not None
+                        else _ctval_for(str(symbol), db_root=Path(db_path).parent)
+                    )
+                    if resolved_ctval is None:
+                        missing_meta.append(
+                            "margin/notional(缺ctVal保NULL，禁止回退1.0)")
+                    else:
+                        base = px * sz * resolved_ctval
+                        if notional is None:
+                            notional = base
+                        if margin is None:
+                            if lev is not None:
+                                margin = base / lev
+                            else:
+                                missing_meta.append("margin(缺lev未补算)")
                 else:
                     missing_meta.append("margin/notional(缺fill_px/sz未补算)")
             # 兼容格式：行级 score_total 缺失 → 该 symbol 的 signals.total → 顶层
@@ -1808,8 +2687,8 @@ def _regime_for_ts(
     宁可继续留 NULL，也不让 regime 查询失败连累交易记录。
     """
     try:
-        if str(_PROJECT_ROOT / "scripts") not in sys.path:
-            sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+        if _public_project_path('scripts') not in sys.path:
+            sys.path.insert(0, _public_project_path('scripts'))
         from _regime_read import regime_at as _regime_at  # noqa: E402
         # 与本模块 account.db 同源取库根：夹具把 OKX_ACCOUNT_DB 指到临时目录时，
         # regime 查询跟着落到同一目录，不会穿到生产 regime.db。
@@ -1846,8 +2725,8 @@ def write_experiences(
     # 传给历史 close 的“ts<=平仓时刻”匹配，会错误落入 fallback 而不闭合真实 open。
     now_ts = strict_cst_ts(now_ts) or now_cst()
     try:
-        if str(_PROJECT_ROOT / "scripts") not in sys.path:
-            sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+        if _public_project_path('scripts') not in sys.path:
+            sys.path.insert(0, _public_project_path('scripts'))
         import trade_experience_writer as _tew  # noqa: E402
         acc_path = _runtime_db_path("account.db", db_root, "OKX_ACCOUNT_DB")
         acc = sqlite3.connect(acc_path, timeout=10)
@@ -1861,7 +2740,10 @@ def write_experiences(
                 if at is None:
                     continue
                 is_card = (
-                    data.get("decision_protocol") == "decision_card_v1"
+                    data.get("decision_protocol") in {
+                        "decision_card_v1", MINIMAL_DECISION_PROTOCOL}
+                    or isinstance(
+                        t.get(OPEN_EXECUTION_PACKAGE_KEY), dict)
                     or isinstance(t.get("decision_card"), dict)
                 )
                 experience_ts = strict_cst_ts(t.get("fill_ts")) or now_ts
@@ -1871,7 +2753,7 @@ def write_experiences(
                 # NULL，不用"当前 regime"顶替（那是后见之明，会污染历史样本）。
                 cycle_regime = data.get("regime")
                 if cycle_regime in (None, ""):
-                    cycle_regime = _regime_for_ts(experience_ts, db_root)
+                    cycle_regime = _regime_for_ts(experience_ts, db_root=db_root)
                 payload = {
                     "cycle_id": data.get("cycle_id"),
                     "profile": profile,
@@ -1883,6 +2765,9 @@ def write_experiences(
                     "market_snapshot": data.get("market_snapshot"),
                     "hypothesis_id": data.get("hypothesis_id"),
                     "playbook_ref": data.get("playbook_ref"),
+                    # Persist the same flat execution package in experience
+                    # history.  Outcome attribution remains compatible while
+                    # retired card prose is never reintroduced.
                     "trades": [t],
                 }
                 _tew.insert_or_update_experiences(
@@ -2337,7 +3222,8 @@ def commit_side_effect_salvage(
                     seconds=_SALVAGE_CLOSE_WINDOW_SKEW_SECONDS)
                 window_end = cycle_start + timedelta(
                     seconds=(
-                        LIVE_TERMINAL_DEADLINE_SECONDS
+                        thresholds.sla_business_terminal_deadline_seconds(
+                            cycle_id)
                         + _SALVAGE_CLOSE_WINDOW_SKEW_SECONDS
                     ),
                 )
@@ -2519,8 +3405,7 @@ def commit_receipt(data: dict, profile: str,
     if (nudge and result.get("ok") and not result.get("refused")
             and _nudge_mod is not None):
         try:
-            _nudge_mod.nudge(
-                f"trades_writer:{profile}", db_root=target.parent)
+            _nudge_mod.nudge(f"trades_writer:{profile}", db_root=target.parent)
         except Exception as exc:  # nudge 永不反向拖垮已提交的账本
             sys.stderr.write(
                 f"[trades_writer][WARN] dispatcher nudge 跳过（非致命）: {exc}\n")
@@ -2533,10 +3418,7 @@ def main() -> int:
     parser.add_argument("--json-file", type=str, help="从 UTF-8 文件读 JSON 回执（方案A：杜绝 echo 管道外层 shell GBK 编码坏码）")
     parser.add_argument("--cycle-id", type=str, help="cycle_id")
     parser.add_argument("--profile", type=str, choices=["live"], required=True)
-    parser.add_argument(
-        "--db-root", default=str(_runtime_db_root()),
-        help="runtime database root; all writer and auxiliary DB access stays here",
-    )
+    parser.add_argument("--db-root", default=str(_runtime_db_root()))
     parser.add_argument(
         "--facts-file",
         type=str,
@@ -2606,7 +3488,7 @@ def main() -> int:
         }, ensure_ascii=False))
         return 1
 
-    db_path = _trade_db_path(args.profile, args.db_root)
+    db_path = _trade_db_path(args.profile, getattr(args, "db_root", None))
     if not db_path or not db_path.exists():
         print(json.dumps({"ok": False, "error": f"DB 不存在: {db_path}"}, ensure_ascii=False))
         return 1

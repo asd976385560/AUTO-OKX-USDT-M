@@ -16,6 +16,15 @@ self_review.py —— Job C 自省与学习脚本（每日一次，独立于 Job
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import re
@@ -110,11 +119,11 @@ def utc_now_iso() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run daily self-review and update lessons.db.")
     parser.add_argument("--date", dest="review_date", help="UTC+8 review date in YYYY-MM-DD, default=yesterday in Asia/Shanghai")
-    parser.add_argument("--db-root", default=r"./db", help=r"DB root, default ./db")
+    parser.add_argument("--db-root", default=_public_project_path('db'), help='DB root, default <PROJECT_ROOT>\\db'.replace('<PROJECT_ROOT>', _public_project_path()))
     parser.add_argument(
         "--okx-root",
         default=str(Path.home() / ".openclaw" / "workspace" / ".okx"),
-        help=r"Runtime root, default ~/.openclaw/workspace/.okx",
+        help=r"Runtime root, default %%USERPROFILE%%\.openclaw\workspace\.okx",
     )
     return parser.parse_args()
 
@@ -712,7 +721,7 @@ def scan_openclaw_runtime_logs(okx_root: Path, issues: list[dict[str, str]]) -> 
         return
     scan_started_ts = datetime.now().timestamp()
     since = scan_started_ts - 24 * 3600
-    include_markers = ("OKX-JobA", "OKX-JobB", "OKX-JobC", "OKX-JobE", r".", r".")
+    include_markers = ("OKX-JobA", "OKX-JobB", "OKX-JobC", "OKX-JobE", r"<PROJECT_ROOT>", _public_project_path())
     error_markers = (
         "edit failed", "oldtext must match", "could not find edits", "could not find the exact text",
         "file not found", "no such file", "permission denied", "command not found", "can't open file",

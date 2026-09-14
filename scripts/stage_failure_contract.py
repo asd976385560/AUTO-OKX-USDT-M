@@ -8,17 +8,53 @@ executor path existed, each behind its own future-only activation boundary.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import json
 import hashlib
+import importlib.util
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 
+@lru_cache(maxsize=1)
+def _ledger():
+    """惰性加载 collectors/ledger 的绝对路径（唯一事实源）。
+
+    2026-08-19 G6：必需源集合与完成状态只有一个真源。本模块曾内联手写过一份
+    （``required={"fast"}`` / ``{"ok","degraded"}``），值虽一致但属未爆的双份
+    真相 —— 而这段代码决定「能否发 collection_gate_failed 的 WAIT 报告」。
+    本模块是只读契约，取不到权威定义就抛，让调用方失败关闭。
+    2026-08-21 实盘 07:00 证明双导入 fallback 仍会用第二个异常覆盖第一因；
+    现按本文件位置加载唯一权威文件，不再依赖 cwd / PYTHONPATH。
+    """
+    path = Path(__file__).resolve().parents[1] / "collectors" / "ledger.py"
+    spec = importlib.util.spec_from_file_location(
+        "_okx_authoritative_collection_ledger", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load authoritative ledger: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for required in ("expected_sources", "DONE_STATUS", "is_failure_status"):
+        if not hasattr(mod, required):
+            raise ImportError(
+                f"authoritative ledger missing {required}: {path}")
+    return mod
+
+
 CST = timezone(timedelta(hours=8))
-DEFAULT_STATUS_DIR = Path(r".\logs\stage-status")
-DEFAULT_COLLECT_LOG_DIR = Path(r".\logs\collect")
+DEFAULT_STATUS_DIR = Path(_public_project_path('logs', 'stage-status'))
+DEFAULT_COLLECT_LOG_DIR = Path(_public_project_path('logs', 'collect'))
 FAILURE_REPORT_ACTIVATION_CYCLE = "2026-08-13T04:00"
 REPORT_RECONCILE_BARRIER_FROM = "2026-08-14T19:00"
 COLLECTION_FAILURE_REPORT_ACTIVATION_CYCLE = "2026-08-15T13:00"
@@ -211,8 +247,12 @@ def load_live_failure(
         "finished_at": raw["finished_at"],
         "profile_lease_released": True,
         "report_reconcile_barrier": report_barrier,
-        "production_database_writes": 0,
-        "orders_placed": 0,
+        # A terminal supervisor file alone cannot prove the absence of local
+        # execution writes or exchange side effects.  The db-root-aware
+        # load_upstream_failure path binds those facts before Push may proceed.
+        "side_effect_proof": "not_proven",
+        "production_database_writes": None,
+        "orders_placed": None,
     }
 
 
@@ -250,6 +290,74 @@ def _readonly_row(
         return connection.execute(sql, params).fetchone()
     finally:
         connection.close()
+
+
+def _live_execution_path_absence(
+    cycle: str,
+    db_root: Path | str,
+) -> dict | None:
+    """Prove no local trade/intent/journal path existed for a failed live slot."""
+    root = Path(db_root)
+    checks: list[dict] = []
+    try:
+        live_db = root / "live_trades.db"
+        ledger_db = root / "ledger.db"
+        if not live_db.is_file() or not ledger_db.is_file():
+            return None
+        for table in ("trade_cycles", "trades"):
+            found = _readonly_row(
+                live_db,
+                f"SELECT 1 FROM {table} WHERE cycle_id=? LIMIT 1",
+                (cycle,),
+            ) is not None
+            checks.append({
+                "db": "live_trades.db", "table": table, "found": found,
+            })
+        intent_table_present = _readonly_row(
+            ledger_db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("execution_intents",),
+        ) is not None
+        intent_found = (
+            _readonly_row(
+                ledger_db,
+                "SELECT 1 FROM execution_intents WHERE cycle_id=? LIMIT 1",
+                (cycle,),
+            ) is not None
+            if intent_table_present else False
+        )
+        checks.append({
+            "db": "ledger.db", "table": "execution_intents",
+            "found": intent_found, "table_present": intent_table_present,
+        })
+
+        journal_path = root / "journal" / "exec_live.jsonl"
+        journal_found = False
+        if journal_path.exists():
+            if not journal_path.is_file() or journal_path.stat().st_size > 64 * 1024 * 1024:
+                return None
+            for line in journal_path.read_text(
+                    encoding="utf-8", errors="strict").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return None
+                if str(row.get("cycle_id") or row.get("cycle") or "") == cycle:
+                    journal_found = True
+                    break
+        checks.append({
+            "path": "journal/exec_live.jsonl", "found": journal_found,
+        })
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, sqlite3.Error):
+        return None
+    if any(item["found"] for item in checks):
+        return None
+    return {
+        "ok": True,
+        "status": "proved_absent",
+        "checks": checks,
+    }
 
 
 def _collection_receipt(
@@ -360,13 +468,14 @@ def load_collection_failure(
                 "SELECT source,status FROM collection_runs WHERE cycle_id=?",
                 (cycle,),
             ).fetchall()
-            required = {"fast"}
-            if cycle.endswith(":00"):
-                required.update({"slow", "regime"})
+            # G6：必需源集合与完成状态一律取自 collectors/ledger，禁本地重写。
+            _led = _ledger()
+            required = set(_led.expected_sources(cycle))
+            _done = {str(s).lower() for s in _led.DONE_STATUS}
             ready = {
                 str(row["source"])
                 for row in rows
-                if str(row["status"] or "").strip().lower() in {"ok", "degraded"}
+                if str(row["status"] or "").strip().lower() in _done
             }
             missing = sorted(required - ready)
             if not missing:
@@ -473,7 +582,16 @@ def load_upstream_failure(
     live = load_live_failure(
         cycle, status_dir=status_dir, now=now)
     if live is not None:
-        return live
+        proof = _live_execution_path_absence(cycle, db_root)
+        if proof is None:
+            return None
+        return {
+            **live,
+            "side_effect_proof": "proved_absent",
+            "business_check": proof,
+            "production_database_writes": 0,
+            "orders_placed": 0,
+        }
     return load_collection_failure(
         cycle,
         db_root=db_root,

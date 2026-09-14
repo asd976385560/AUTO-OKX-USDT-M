@@ -2,12 +2,27 @@
 """Read-only ledger invariants plus deduplicated repair-queue synchronization."""
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
+import re
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 CST = timezone(timedelta(hours=8))
 LEDGERS = {"live": "live_trades.db"}
@@ -30,6 +45,13 @@ def _ordid(raw) -> str | None:
         value = obj.get(key)
         if value not in (None, "", 0):
             return str(value)
+    # 自愈/对账补的行只带 ord_ids 列表；恰好一个元素时就是该行的订单身份，
+    # 让同组内「不同订单」的重复意图也能被识别（2026-09-11）。注意：同一订单
+    # 被记两行在 duplicate_execution_findings 里仍看不见（它要求 ≥2 个不同
+    # ordId），那条防线在 writer 合并闸与 apply_unrecorded 的写前查重。
+    ids = obj.get("ord_ids")
+    if isinstance(ids, (list, tuple)) and len(ids) == 1 and ids[0] not in (None, "", 0):
+        return str(ids[0])
     return None
 
 
@@ -231,14 +253,70 @@ def experience_remaining(
     }
 
 
+def latest_trade_timestamps(
+    db_root: Path,
+    profile: str,
+) -> dict[tuple[str, str], str]:
+    """Latest ledger side effect per position key, using authoritative trade ts."""
+    con = _open_ro(db_root / LEDGERS[profile])
+    try:
+        rows = con.execute(
+            "SELECT symbol,LOWER(COALESCE(side,'')),MAX(ts) "
+            "FROM trades WHERE action IN "
+            "('open','add','close','reduce','stop','stop_loss','sl') "
+            "GROUP BY symbol,LOWER(COALESCE(side,''))"
+        ).fetchall()
+    finally:
+        con.close()
+    return {
+        (str(row[0]), str(row[1])): str(row[2])
+        for row in rows if row[2]
+    }
+
+
+def _cst_timestamp(raw: object) -> datetime | None:
+    try:
+        value = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=CST)
+    return value.astimezone(CST)
+
+
 def experience_position_findings(
     account: sqlite3.Connection,
     profile: str,
     actual: dict[tuple[str, str], float],
+    *,
+    snapshot_ts: str | None = None,
+    latest_trade_ts: dict[tuple[str, str], str] | None = None,
+    deferred: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     expected = experience_remaining(account, profile)
+    trade_times = latest_trade_ts or {}
+    snapshot_at = _cst_timestamp(snapshot_ts)
     findings = []
     for symbol, side in sorted(set(expected) | set(actual)):
+        key = (symbol, side)
+        trade_ts = trade_times.get(key)
+        trade_at = _cst_timestamp(trade_ts)
+        if (
+            snapshot_at is not None
+            and trade_at is not None
+            and trade_at > snapshot_at
+        ):
+            if deferred is not None:
+                deferred.append({
+                    "kind": "experience_position_check_deferred",
+                    "profile": profile,
+                    "symbol": symbol,
+                    "side": side,
+                    "snapshot_ts": snapshot_ts,
+                    "latest_trade_ts": trade_ts,
+                    "reason": "position_snapshot_precedes_latest_trade",
+                })
+            continue
         exp_sz = float(expected.get((symbol, side), 0.0))
         actual_sz = float(actual.get((symbol, side), 0.0))
         tolerance = max(_EPS, actual_sz * 1e-7)
@@ -256,6 +334,58 @@ def experience_position_findings(
             "fix_action": "以主账流水重建数量生命周期，再与 OKX 实仓复核；禁止改订单",
         })
     return findings
+
+
+# 2026-09-11：experience_position 族里 UNRECORDED 方向（经验剩余 < OKX 实仓）的行，
+# 会在交易所仓位后来被平掉时“平凡愈合”：经验与实仓同时归零，账本却从未记录过这笔
+# 持仓（2026-09-03 ENS 空 284 张、09-07 SOXL 因此整笔漏记）。这类行只有在经验库出现
+# 发现时刻附近的同 symbol/side 开仓记录后才准自动关单；否则保持 pending，并在 issue
+# 末尾追加一次说明，让漏记保持可见。GHOST 方向与其它族不受影响。
+_EXPERIENCE_ISSUE_RE = re.compile(r"经验剩余=([-+0-9.eE]+)，OKX 实仓=([-+0-9.eE]+)")
+UNRECORDED_OPEN_LOOKBACK = timedelta(minutes=60)
+UNRECORDED_OPEN_GRACE = timedelta(minutes=5)
+UNRECORDED_VANISHED_NOTE = (
+    "｜UNRECORDED 未闭环：OKX 仓位已消失，而经验库在发现时刻前后没有这笔开仓，"
+    "不是自愈；先按 ordId 查 trades——缺则按 fills 回填整笔"
+    "（repair_verified_journal_open 补 open + reconcile_exchange_closes --ordid "
+    "补 close），已在则只补经验行；处理完人工关单")
+
+
+def hold_unrecorded_vanished(
+    account: sqlite3.Connection, row: dict[str, Any]
+) -> str | None:
+    """``sync_repair_queue`` hold for vanished UNRECORDED experience rows.
+
+    Returns the note to append (the row stays pending) or ``None`` (normal
+    close).  Unparseable rows and read failures return ``None`` so a caller
+    such as the live account snapshot keeps its previous behavior.
+    """
+    parts = str(row.get("check_name") or "").split(":")
+    if len(parts) != 5 or parts[1] != "experience_position":
+        return None
+    match = _EXPERIENCE_ISSUE_RE.search(str(row.get("issue") or ""))
+    since = _cst_timestamp(row.get("ts"))
+    if match is None or since is None:
+        return None
+    try:
+        experience_then = float(match.group(1))
+        actual_then = float(match.group(2))
+    except ValueError:
+        return None
+    if not experience_then + _EPS < actual_then:
+        return None
+    profile, symbol, side = parts[2], parts[3], parts[4].lower()
+    try:
+        recorded = account.execute(
+            "SELECT 1 FROM trade_experiences WHERE profile=? AND symbol=? "
+            "AND LOWER(side)=? AND action='open' AND ts>=? AND ts<=? LIMIT 1",
+            (profile, symbol, side,
+             (since - UNRECORDED_OPEN_LOOKBACK).strftime("%Y-%m-%d %H:%M:%S"),
+             (since + UNRECORDED_OPEN_GRACE).strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if recorded else UNRECORDED_VANISHED_NOTE
 
 
 def latest_snapshot_positions(
@@ -285,6 +415,7 @@ def sync_repair_queue(
     ts: str,
     closed_by: str = "ledger_invariants",
     resolution: str = "invariant healed",
+    hold=None,
 ) -> dict[str, int]:
     """Upsert one explicitly owned repair-queue family.
 
@@ -292,6 +423,10 @@ def sync_repair_queue(
     deliberate: a narrow caller must never insert another owner's finding or
     close another owner's still-active row.  ``substr`` is used instead of
     ``LIKE`` because invariant names contain ``_`` (a SQL LIKE wildcard).
+
+    ``hold(account, row)`` may return a note for a row that would be
+    closed; the row then stays pending with the note appended once (see
+    ``hold_unrecorded_vanished``).  Without ``hold`` nothing changes.
     """
     family_prefix = str(family_prefix or "")
     closed_by = str(closed_by or "").strip()
@@ -313,12 +448,16 @@ def sync_repair_queue(
             )
         active[check_name] = finding
     rows = account.execute(
-        "SELECT id,check_name FROM repair_queue "
+        "SELECT id,check_name,issue,ts FROM repair_queue "
         "WHERE substr(check_name,1,?)=? "
         "AND status IN ('open','pending')",
         (len(family_prefix), family_prefix),).fetchall()
     existing = {str(r[1]): int(r[0]) for r in rows}
-    inserted = closed = 0
+    details = {
+        str(r[1]): {"id": int(r[0]), "check_name": str(r[1]),
+                    "issue": r[2], "ts": r[3]}
+        for r in rows}
+    inserted = closed = held = 0
     for check_name, finding in active.items():
         if check_name in existing:
             continue
@@ -332,6 +471,16 @@ def sync_repair_queue(
     for check_name, row_id in existing.items():
         if check_name in active:
             continue
+        note = hold(account, details[check_name]) if hold is not None else None
+        if note:
+            issue = str(details[check_name].get("issue") or "")
+            if note not in issue:
+                account.execute(
+                    "UPDATE repair_queue SET issue=? "
+                    "WHERE id=? AND status IN ('open','pending')",
+                    (issue + note, row_id))
+            held += 1
+            continue
         account.execute(
             "UPDATE repair_queue SET status='closed',closed_at=?,"
             "closed_by=?,resolution=? "
@@ -339,12 +488,15 @@ def sync_repair_queue(
             (ts, closed_by, resolution, row_id))
         if account.execute("SELECT changes()").fetchone()[0]:
             closed += 1
-    return {"inserted": inserted, "closed": closed}
+    result = {"inserted": inserted, "closed": closed}
+    if hold is not None:
+        result["held"] = held
+    return result
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     # `both` 是 demo 时代的遗留写法，**刻意继续接受**：daily_maintenance、
     # reviewer 角色文档和历史运维记录里都写着 `--profile both`，改成拒绝会让
     # 每日维护当场 rc≠0。这里把它降级为 live 的别名。
@@ -364,6 +516,7 @@ def main() -> int:
     since = (now - timedelta(minutes=max(1, args.window_min))).strftime(
         "%Y-%m-%d %H:%M:%S")
     findings = []
+    deferred_checks: list[dict[str, Any]] = []
     snapshot_ts = {}
     account = sqlite3.connect(str(db_root / "account.db"), timeout=8)
     for profile in profiles:
@@ -373,9 +526,25 @@ def main() -> int:
             db_root, profile, now, args.intent_stale_min))
         ts, actual = latest_snapshot_positions(account, profile)
         snapshot_ts[profile] = ts
+        if ts is None:
+            findings.append({
+                "kind": "position_snapshot_missing",
+                "profile": profile,
+                "check_name": (
+                    f"ledger_invariant:position_snapshot:{profile}"),
+                "issue": f"[{profile}] 无可用交易所持仓快照，无法核验经验数量",
+                "fix_action": "等待下一次自然账户采集；禁止把缺快照解释成零仓",
+            })
+            continue
         try:
             findings.extend(experience_position_findings(
-                account, profile, actual))
+                account,
+                profile,
+                actual,
+                snapshot_ts=ts,
+                latest_trade_ts=latest_trade_timestamps(db_root, profile),
+                deferred=deferred_checks,
+            ))
         except RuntimeError as exc:
             findings.append({
                 "kind": "experience_schema_missing", "profile": profile,
@@ -392,7 +561,8 @@ def main() -> int:
             account.execute("BEGIN IMMEDIATE")
             queue = sync_repair_queue(
                 account, family_prefix="ledger_invariant:",
-                findings=findings, ts=now.strftime("%Y-%m-%d %H:%M:%S"))
+                findings=findings, ts=now.strftime("%Y-%m-%d %H:%M:%S"),
+                hold=hold_unrecorded_vanished)
             account.commit()
         except Exception:
             account.rollback()
@@ -401,7 +571,9 @@ def main() -> int:
             account.close()
     payload = {
         "ok": True, "since": since, "findings": findings,
-        "latest_position_snapshot": snapshot_ts, "repair_queue": queue,
+        "latest_position_snapshot": snapshot_ts,
+        "deferred_checks": deferred_checks,
+        "repair_queue": queue,
     }
     print(json.dumps(
         payload, ensure_ascii=False,

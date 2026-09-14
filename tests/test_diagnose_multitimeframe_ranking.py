@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,19 @@ import diagnose_multitimeframe_ranking as ranking  # noqa: E402
 
 
 class MultitimeframeRankingDiagnosticTests(unittest.TestCase):
+    def test_label_price_mode_requires_complete_side_specific_contract(self) -> None:
+        legacy = pd.DataFrame({"15m_return": [0.1]})
+        executable = pd.DataFrame({
+            f"{timeframe}_{side}_return": [0.1]
+            for timeframe, side in ranking.CANDIDATE_KEYS
+        })
+        partial = pd.DataFrame({"15m_long_return": [0.1]})
+
+        self.assertEqual(ranking._label_price_mode(legacy), "last")
+        self.assertEqual(ranking._label_price_mode(executable), "executable")
+        with self.assertRaisesRegex(ValueError, "partial"):
+            ranking._label_price_mode(partial)
+
     def test_softmax_rows_sum_to_one(self) -> None:
         scores = np.array([
             [1000.0, 999.0, -1000.0, 0.0, 1.0, 2.0],
@@ -90,6 +104,14 @@ class MultitimeframeRankingDiagnosticTests(unittest.TestCase):
         scores = ranking._return_candidate_scores(x, weights, scale)
 
         np.testing.assert_allclose(scores, weights)
+
+    def test_residual_scale_details_preserve_all_six_candidates(self) -> None:
+        details = ranking._residual_scale_details(
+            np.arange(1.0, 7.0, dtype=float))
+
+        self.assertEqual(len(details), 6)
+        self.assertEqual(details["residual_scale_15m_long"], 1.0)
+        self.assertEqual(details["residual_scale_4H_short"], 6.0)
 
 
 if __name__ == "__main__":

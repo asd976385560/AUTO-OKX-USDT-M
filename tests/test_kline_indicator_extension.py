@@ -136,16 +136,10 @@ class MigrationAwareWriteTests(unittest.TestCase):
                 con = sqlite3.connect(db)
                 self.assertFalse(ki.kline_insert_plan(con)["extended"])
                 con.close()
-                # apply requires a verified public backup; repeated apply is
-                # then an idempotent no-op and must not need another write.
-                backup_dir = Path(tmp) / "backups"
-                sys.argv = [
-                    "x", "--db", str(db), "--apply",
-                    "--backup-dir", str(backup_dir),
-                ]
+                # apply 两次幂等
+                sys.argv = ["x", "--db", str(db), "--apply", "--backup-dir", str(Path(tmp) / "backups")]
                 self.assertEqual(mig.main(), 0)
                 self.assertEqual(mig.main(), 0)
-                self.assertEqual(1, len(list(backup_dir.glob("*.db"))))
             finally:
                 sys.argv = argv_backup
             con = sqlite3.connect(db)

@@ -77,6 +77,14 @@ class MultitimeframeReadinessTests(unittest.TestCase):
                     )
                     for offset in range(bars - 1, -1, -1)
                 ]
+                rows.append(
+                    _valid_row(
+                        (expected + timedelta(seconds=seconds))
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "BTC-USDT-SWAP",
+                        timeframe,
+                    )
+                )
                 connection.executemany(
                     "INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     rows,
@@ -85,6 +93,74 @@ class MultitimeframeReadinessTests(unittest.TestCase):
         finally:
             connection.close()
         return path
+
+    @staticmethod
+    def _create_ws_confirmation_cache(
+        root: Path,
+        *,
+        mode: str = "ws_first",
+        mismatch_timeframe: str | None = None,
+    ) -> Path:
+        cache = root / "ws_market_cache.db"
+        connection = sqlite3.connect(cache)
+        try:
+            connection.execute(
+                "CREATE TABLE candles("
+                "inst_id TEXT,timeframe TEXT,ts_ms INTEGER,"
+                "open TEXT,high TEXT,low TEXT,close TEXT,"
+                "volume TEXT,volume_ccy TEXT,volume_quote TEXT,"
+                "confirm INTEGER,bar_end_ms INTEGER,close_latency_ms INTEGER,"
+                "received_at TEXT,conn_epoch TEXT,source TEXT,"
+                "PRIMARY KEY(inst_id,timeframe,ts_ms))"
+            )
+            cycle = gate.parse_cycle_cst(CYCLE)
+            for timeframe in gate.TIMEFRAME_SECONDS:
+                expected = gate.expected_closed_bar_start(cycle, timeframe)
+                successor = gate.immediate_successor_bar_start(
+                    expected, timeframe)
+                close = "999.0" if timeframe == mismatch_timeframe else "101.0"
+                connection.execute(
+                    "INSERT INTO candles VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "BTC-USDT-SWAP",
+                        timeframe,
+                        gate._iso_utc_to_ms(expected),
+                        "100.0", "102.0", "99.0", close,
+                        "1000.0", "1000.0", "1000.0", 1,
+                        gate._iso_utc_to_ms(successor), 5,
+                        "2026-08-12T10:30:05Z", "epoch-1", "ws",
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        (root / "ws_market_source.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "mode": mode,
+                "pending_mode": None,
+                "cache_db": str(cache),
+            }),
+            encoding="utf-8",
+        )
+        return cache
+
+    @staticmethod
+    def _delete_successors(market_db: Path) -> None:
+        connection = sqlite3.connect(market_db)
+        try:
+            cycle = gate.parse_cycle_cst(CYCLE)
+            for timeframe in gate.TIMEFRAME_SECONDS:
+                expected = gate.expected_closed_bar_start(cycle, timeframe)
+                successor = gate.immediate_successor_bar_start(
+                    expected, timeframe)
+                connection.execute(
+                    "DELETE FROM kline_cache WHERE symbol=? AND tf=? AND ts=?",
+                    ("BTC-USDT-SWAP", timeframe, successor),
+                )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_exact_three_timeframes_with_full_history_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +186,29 @@ class MultitimeframeReadinessTests(unittest.TestCase):
             self.assertEqual(result["orders_placed"], 0)
             self.assertEqual(market_db.read_bytes(), before)
 
+    def test_batch_reuses_connections_and_preserves_single_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._create_market_db(root)
+            single = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+            with mock.patch.object(
+                gate,
+                "open_ws_confirmation_connection",
+                wraps=gate.open_ws_confirmation_connection,
+            ) as open_ws:
+                batch = gate.check_multitimeframe_readiness_batch(
+                    root,
+                    ["BTC-USDT-SWAP", "BTC-USDT-SWAP"],
+                    CYCLE,
+                )
+            self.assertEqual(open_ws.call_count, 1)
+            self.assertEqual(len(batch), 2)
+            self.assertEqual(
+                batch[0]["evidence_contract"], single["evidence_contract"])
+            self.assertEqual(
+                batch[1]["evidence_contract"], single["evidence_contract"])
+
     def test_missing_exact_bar_fails_even_when_an_older_bar_exists(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -133,6 +232,102 @@ class MultitimeframeReadinessTests(unittest.TestCase):
             self.assertFalse(result["ready"])
             self.assertEqual(four_hour["classification"], "source_data_invalid")
             self.assertIn("missing_closed_bar", four_hour["raw_errors"])
+
+    def test_forming_snapshot_without_successor_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            market_db = self._create_market_db(root)
+            connection = sqlite3.connect(market_db)
+            try:
+                connection.execute(
+                    "DELETE FROM kline_cache WHERE symbol=? AND tf='1H' AND ts=?",
+                    ("BTC-USDT-SWAP", "2026-08-12T10:00:00Z"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            result = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+            one_hour = next(
+                row for row in result["timeframes"]
+                if row["timeframe"] == "1H"
+            )
+
+            self.assertFalse(result["ready"])
+            self.assertEqual(
+                one_hour["observed_bar_ts"], "2026-08-12T09:00:00Z")
+            self.assertFalse(one_hour["closed_bar_proof"]["proven"])
+            self.assertIn(
+                "closed_state_unproven_no_successor_bar",
+                one_hour["raw_errors"],
+            )
+
+    def test_ws_first_confirmed_exact_candle_proves_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            market_db = self._create_market_db(root)
+            self._delete_successors(market_db)
+            self._create_ws_confirmation_cache(root)
+
+            result = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+
+            self.assertTrue(result["ready"])
+            self.assertEqual("PASSED", result["status"])
+            self.assertEqual("ws_first", result[
+                "closed_bar_proof_context"]["source_mode"])
+            for row in result["timeframes"]:
+                proof = row["closed_bar_proof"]
+                self.assertEqual(
+                    gate.WS_CONFIRMED_BAR_PROOF_METHOD, proof["method"])
+                self.assertTrue(proof["proven"])
+                self.assertTrue(proof["ws_confirmation"]["market_row_match"])
+                self.assertEqual([], proof["ws_confirmation"][
+                    "mismatched_fields"])
+            self.assertEqual([], gate.validate_evidence_contract(
+                result["evidence_contract"],
+                expected_symbol="BTC-USDT-SWAP",
+                expected_cycle=CYCLE,
+            ))
+
+    def test_ws_first_confirmation_requires_exact_market_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            market_db = self._create_market_db(root)
+            self._delete_successors(market_db)
+            self._create_ws_confirmation_cache(
+                root, mismatch_timeframe="1H")
+
+            result = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+            one_hour = next(
+                row for row in result["timeframes"]
+                if row["timeframe"] == "1H"
+            )
+
+            self.assertFalse(result["ready"])
+            self.assertFalse(one_hour["closed_bar_proof"]["proven"])
+            confirmation = one_hour["closed_bar_proof"]["ws_confirmation"]
+            self.assertEqual("market_ws_ohlcv_mismatch", confirmation["reason"])
+            self.assertEqual(["c"], confirmation["mismatched_fields"])
+
+    def test_non_ws_first_mode_keeps_successor_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            market_db = self._create_market_db(root)
+            self._delete_successors(market_db)
+            self._create_ws_confirmation_cache(root, mode="rest_only")
+
+            result = gate.check_multitimeframe_readiness(
+                root, "BTC-USDT-SWAP", CYCLE)
+
+            self.assertFalse(result["ready"])
+            self.assertTrue(all(
+                row["closed_bar_proof"]["method"]
+                == gate.CLOSED_BAR_PROOF_METHOD
+                for row in result["timeframes"]
+            ))
 
     def test_fabricated_indicators_cannot_bypass_history_warmup(self):
         with tempfile.TemporaryDirectory() as temporary:

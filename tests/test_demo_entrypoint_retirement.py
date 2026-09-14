@@ -15,7 +15,7 @@ for path in (ROOT / "scripts", ROOT / "collectors"):
         sys.path.insert(0, str(path))
 
 import collect_data  # noqa: E402
-import order_executor  # noqa: E402
+from core import order_executor  # noqa: E402
 
 
 class DemoEntrypointRetirementTests(unittest.TestCase):

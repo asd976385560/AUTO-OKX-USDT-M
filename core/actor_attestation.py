@@ -21,10 +21,20 @@ executor 前的确定性闸。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,18 +42,29 @@ from typing import Any, Optional
 
 CST = timezone(timedelta(hours=8))
 ATTESTATION_VERSION = "actor_attestation_v2"
+ATTESTATION_VERSION_LIGHTWEIGHT = "actor_attestation_v3_lightweight_open"
 ATTESTATION_MAX_AGE_S = 600  # 凭证时效：生成后 10 分钟内进 executor
 
 _OPENCLAW_AGENT_DIR = Path(
     os.environ.get(
         "OKX_OPENCLAW_AGENT_DIR",
-        str(Path.home() / ".openclaw" / "agents" / "okx-live-trader"),
+        '<USER_HOME>\\.openclaw\\agents\\okx-live-trader'.replace('<USER_HOME>', str(__import__('pathlib').Path.home())),
     )
 )
 
 
 def _fp(value: str) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _attestation_version(cycle_id: str) -> str:
+    try:
+        from scripts import _acceptance_thresholds as thresholds
+        if thresholds.decision_restriction_removal_active(cycle_id):
+            return ATTESTATION_VERSION_LIGHTWEIGHT
+    except (ImportError, TypeError, ValueError):
+        pass
+    return ATTESTATION_VERSION
 
 
 def session_key_for_cycle(cycle_id: str, stage: str = "live") -> Optional[str]:
@@ -121,6 +142,84 @@ def actor_chain_hash(epochs: list[dict[str, Any]]) -> str:
     ).hexdigest()[:16]
 
 
+def _sqlite_actor_epochs(cycle_id: str, stage: str) -> tuple[list[dict], str]:
+    """Read the authoritative session and raw events in one read transaction.
+
+    A present SQLite store is authoritative: corruption, an unsupported schema,
+    or an absent exact session must never fall back to stale migration exports.
+    Keep all raw assistant transitions, as the legacy JSONL reader did; a
+    rewritten branch must not silently erase evidence of an actor handoff.
+    """
+    key = session_key_for_cycle(cycle_id, stage)
+    if not key:
+        raise ValueError("invalid_cycle")
+    session_key = f"agent:okx-live-trader:{key}"
+    path = _OPENCLAW_AGENT_DIR / "agent" / "openclaw-agent.sqlite"
+    con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                          timeout=2)
+    try:
+        con.execute("PRAGMA query_only=ON")
+        con.execute("BEGIN")
+        if con.execute("PRAGMA user_version").fetchone()[0] not in (18, 19):
+            raise ValueError("unsupported_agent_schema")
+        row = con.execute(
+            "SELECT current_session_id,entry_valid FROM session_nodes "
+            "WHERE session_key=?", (session_key,)).fetchone()
+        if not row or not row[0] or row[1] != 1:
+            raise ValueError("session_unresolvable")
+        session_id = row[0]
+        window = con.execute(
+            "SELECT session_key FROM session_windows WHERE session_id=?",
+            (session_id,)).fetchone()
+        if not window or window[0] != session_key:
+            raise ValueError("session_window_mismatch")
+        epochs: list[dict[str, Any]] = []
+        event_count = 0
+        previous_seq = None
+        last_utc = None
+        for seq, raw in con.execute(
+            "SELECT seq,event_json FROM transcript_events "
+            "WHERE session_id=? ORDER BY seq", (session_id,)):
+            event_count += 1
+            if event_count > 20000 or (previous_seq is not None and seq <= previous_seq):
+                raise ValueError("transcript_sequence_invalid")
+            previous_seq = seq
+            event = json.loads(raw)
+            if not isinstance(event, dict):
+                raise ValueError("transcript_event_invalid")
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            identity = message.get("model")
+            # OpenClaw persists transport/abort publications as assistant text.
+            # They are not model actors and cannot issue execution tool calls.
+            if (message.get("provider") == "openclaw" and identity in (
+                    "gateway-injected", "gateway-publication", "delivery-mirror",
+                    "synthetic-empty-audio") and
+                    not any(isinstance(part, dict) and part.get("type") == "toolCall"
+                            for part in message.get("content", []))):
+                continue
+            if not isinstance(identity, str) or not identity.strip():
+                raise ValueError("assistant_identity_missing")
+            dt = datetime.fromisoformat(str(event.get("timestamp") or "").replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                raise ValueError("assistant_timestamp_ambiguous")
+            ts = dt.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            if last_utc is not None and ts < last_utc:
+                raise ValueError("assistant_timestamp_regressed")
+            last_utc = ts
+            fp = _fp(identity)
+            if epochs and epochs[-1]["actor_fp"] == fp:
+                epochs[-1]["last_utc"] = ts
+                epochs[-1]["turns"] += 1
+            else:
+                epochs.append({"epoch": len(epochs), "actor_fp": fp,
+                               "start_utc": ts, "last_utc": ts, "turns": 1})
+        return epochs, session_id
+    finally:
+        con.close()
+
+
 def _cst_to_utc_iso(ts_cst: str) -> Optional[str]:
     try:
         dt = datetime.strptime(str(ts_cst), "%Y-%m-%d %H:%M:%S")
@@ -146,17 +245,31 @@ def epoch_at(epochs: list[dict[str, Any]], utc_iso: Optional[str]) -> Optional[i
 def timeline_state(cycle_id: str, analysis_ts_cst: Optional[str],
                    stage: str = "live") -> dict[str, Any]:
     """当前时间线状态（executor 与凭证生成共用的独立重算入口）。"""
-    session_file = resolve_session_file(cycle_id, stage)
-    if session_file is None:
-        return {"available": False, "reason": "session_unresolvable"}
-    epochs = extract_actor_timeline(session_file)
+    sqlite_path = _OPENCLAW_AGENT_DIR / "agent" / "openclaw-agent.sqlite"
+    storage = {}
+    if sqlite_path.exists():
+        try:
+            epochs, session_id = _sqlite_actor_epochs(cycle_id, stage)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            return {"available": False, "reason": "sqlite_timeline_unavailable",
+                    "error_type": type(exc).__name__}
+        session_file = sqlite_path
+        storage = {"source_format": "sqlite", "session_id": session_id}
+    else:
+        session_file = resolve_session_file(cycle_id, stage)
+        if session_file is None:
+            return {"available": False, "reason": "session_unresolvable"}
+        epochs = extract_actor_timeline(session_file)
     if not epochs:
         return {"available": False, "reason": "no_assistant_turns"}
     analysis_utc = _cst_to_utc_iso(analysis_ts_cst) if analysis_ts_cst else None
+    if storage and (not analysis_utc or analysis_utc < epochs[0]["start_utc"]):
+        return {"available": False, "reason": "analysis_outside_session_timeline"}
     analysis_epoch = epoch_at(epochs, analysis_utc)
     current_epoch = epochs[-1]["epoch"]
     return {
         "available": True,
+        **storage,
         "session_file": str(session_file),
         "epoch_count": len(epochs),
         "actor_chain_hash": actor_chain_hash(epochs),
@@ -191,12 +304,16 @@ def _revalidate(cycle_id: str, db_root: Path) -> dict[str, Any]:
     finally:
         con.close()
 
-    try:
-        from core.experience_contract import validate_contract
-        from core.ev_calculator import build_ev_check
-    except ImportError:  # executor 语境：core/ 目录裸导入风格
-        from experience_contract import validate_contract
-        from ev_calculator import build_ev_check
+    from scripts import _acceptance_thresholds as thresholds
+    from core.decision_card import validate_card
+    relaxed_policy = thresholds.decision_restriction_removal_active(cycle_id)
+    if not relaxed_policy:
+        try:
+            from core.experience_contract import validate_contract
+            from core.ev_calculator import build_ev_check
+        except ImportError:  # executor 语境：core/ 目录裸导入风格
+            from experience_contract import validate_contract
+            from ev_calculator import build_ev_check
 
     contract_ok = True
     ev_ok = True
@@ -208,6 +325,10 @@ def _revalidate(cycle_id: str, db_root: Path) -> dict[str, Any]:
             contract_ok = False
             ev_ok = False
             news_ok = False
+            continue
+        if relaxed_policy:
+            if validate_card(card, "decision_card"):
+                contract_ok = False
             continue
         history = card.get("historical_experience") or {}
         errs = validate_contract(
@@ -236,6 +357,14 @@ def _revalidate(cycle_id: str, db_root: Path) -> dict[str, Any]:
     checks["evidence_contracts_ok"] = contract_ok
     checks["ev_recompute_ok"] = ev_ok
     checks["news_context_recompute_ok"] = news_ok
+    checks["decision_policy"] = (
+        thresholds.MINIMAL_CONTRACT_CLOSURE_POLICY
+        if thresholds.minimal_contract_closure_active(cycle_id)
+        else thresholds.MINIMAL_DECISION_CONTRACT_POLICY
+        if thresholds.minimal_decision_contract_active(cycle_id)
+        else thresholds.DECISION_RESTRICTION_REMOVAL_POLICY
+        if relaxed_policy else "legacy")
+    checks["soft_evidence_revalidation_required"] = not relaxed_policy
     ok = ok and contract_ok and ev_ok and news_ok
 
     facts_path = Path(db_root).parent / "tmp" / (
@@ -272,7 +401,7 @@ def _revalidate(cycle_id: str, db_root: Path) -> dict[str, Any]:
     return checks
 
 
-def build_attestation(cycle_id: str, db_root: str | os.PathLike = r"./db",
+def build_attestation(cycle_id: str, db_root: str | os.PathLike = _public_project_path('db'),
                       stage: str = "live") -> dict[str, Any]:
     """生成接管重验凭证（确定性；接管模型只能整体附上，不能改字段）。"""
     import sqlite3
@@ -295,7 +424,7 @@ def build_attestation(cycle_id: str, db_root: str | os.PathLike = r"./db",
 
     state = timeline_state(cycle_id, analysis_ts, stage)
     body: dict[str, Any] = {
-        "version": ATTESTATION_VERSION,
+        "version": _attestation_version(cycle_id),
         "cycle_id": cycle_id,
         "generated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
         "analysis_ts": analysis_ts,
@@ -310,14 +439,15 @@ def build_attestation(cycle_id: str, db_root: str | os.PathLike = r"./db",
 
 
 def verify_attestation(attestation: Any, cycle_id: str,
-                       db_root: str | os.PathLike = r"./db",
+                       db_root: str | os.PathLike = _public_project_path('db'),
                        stage: str = "live") -> list[str]:
     """executor 侧独立校验：指纹重算 + 时间线独立比对 + 重验结论 + 时效。"""
     errors: list[str] = []
     if not isinstance(attestation, dict):
         return ["actor_attestation 必须是 dict（由 scripts/actor_attestation.py 生成）"]
-    if attestation.get("version") != ATTESTATION_VERSION:
-        errors.append(f"attestation version 必须是 {ATTESTATION_VERSION}")
+    expected_version = _attestation_version(cycle_id)
+    if attestation.get("version") != expected_version:
+        errors.append(f"attestation version 必须是 {expected_version}")
     if str(attestation.get("cycle_id")) != str(cycle_id):
         errors.append(
             f"attestation cycle_id={attestation.get('cycle_id')!r} "
@@ -356,6 +486,10 @@ def verify_attestation(attestation: Any, cycle_id: str,
             errors.append(
                 "actor_chain_hash 与当前会话时间线不符"
                 "（凭证生成后 actor 再次变化，重新生成）")
+        if state.get("source_format") == "sqlite" and (
+                not isinstance(claimed, dict) or
+                claimed.get("session_id") != state.get("session_id")):
+            errors.append("attestation session_id 与当前权威会话不符")
         if state.get("handoff_detected"):
             reval = attestation.get("revalidation")
             if not isinstance(reval, dict) or not reval.get("all_ok"):
@@ -369,4 +503,6 @@ def verify_attestation(attestation: Any, cycle_id: str,
                         "接管重验包与 executor 当前独立重算不一致；"
                         "facts/news/EV/证据可能已变化，重新生成凭证"
                     )
+    else:
+        errors.append("actor_timeline_required: 当前身份时间线无法独立核实")
     return errors

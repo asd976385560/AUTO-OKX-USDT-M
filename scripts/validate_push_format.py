@@ -13,6 +13,15 @@ templates/push_template.md 的固定格式。
 QQ 平台若返回长度错误，视为 P2 推送失败，完整内容仍必须 push_archive.py 本地归档。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse
 import json
 import re
@@ -21,11 +30,19 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from scripts import _acceptance_thresholds as thresholds  # noqa: E402
+from scripts import _push_duration  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding='utf-8')
 
 CST = timezone(timedelta(hours=8))
-DB_PATH = Path(r'.\db\account.db')
+DB_PATH = Path(_public_project_path('db', 'account.db'))
 
 # 2026-08-12 20:00（北京时间）起的新报告契约。历史归档继续按原始
 # 16 项基线复核，禁止用后来新增的展示字段反向判坏既有送达证据。
@@ -33,6 +50,19 @@ MULTITIMEFRAME_REPORT_REQUIRED_FROM = '2026-08-12T20:00'
 EXECUTION_AUDIT_REQUIRED_FROM = '2026-08-14T02:15'
 BUSINESS_ATTESTATION_REQUIRED_FROM = '2026-08-14T07:00'
 INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = '2026-08-15T08:00'
+# 2026-08-19 G8③ 激活边界（只向前）：自该 cycle 起，执行段除「报告间交易所
+# 成交=N笔」外还必须写出「另M笔证据不足未计入」。此前不合格成交被静默丢弃
+# （8 月实测跨轮候选丢 11 笔），正文只显示一个更小的数字，validator 永远
+# 发现不了。边界前归档的报告无此字段，不反向加责。
+INTER_REPORT_RECONCILE_COUNT_REQUIRED_FROM = '2026-08-20T08:00'
+
+# P0-5 5b｜降级战报的三处留痕标记（render_push_report 写、本校验器反查）。
+# 刻意用中文横幅而非新增英文动作枚举：DEGRADED 这个词在本仓已被
+# trade_cycles.decision='degraded'（零成交零订单的业务终态）占用，复用它会让
+# 「无成交的降级终态」与「有成交但缺终态凭证」两件完全不同的事撞进同一个校验分支。
+DEGRADED_REPORT_BANNER = '⚠️降级战报'
+DEGRADED_REPORT_CAVEAT = 'live终态凭证未就绪'
+DEGRADED_REPORT_EXEC_TOKEN = 'report_barrier=not_ready'
 _CYCLE_ID_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:(?:00|15|30|45)$')
 _OPEN_REPORT_RE = re.compile(r'\b(?:OPEN_LONG|OPEN_SHORT|ADD)\b')
 _MTF_LINE_RE = re.compile(
@@ -192,11 +222,43 @@ def _validate_multitimeframe_section(
     return errors, missing
 
 
-def validate(content: str, *, cycle_id: str | None = None) -> dict:
+def validate(
+    content: str,
+    *,
+    cycle_id: str | None = None,
+    expect_degraded: bool = False,
+    db_root: str | Path = _public_project_path('db'),
+) -> dict:
     content = normalize_content(content)
     errors = []
     warnings = []
     missing = []
+
+    # P0-5 5b｜降级战报（有业务终态但 live 报告对账屏障未就绪）。
+    # 契约是**加法不是减法**：所有既有必填段照旧必填 —— 降级降的是裁决效力，
+    # 不是事实完整度。额外要求两处留痕：
+    #   ① 第 2 行横幅（紧贴头行，读者第一眼可见）；
+    #   ② 执行段 report_barrier=not_ready（机器可读，与账实成交/业务指纹并列）。
+    # expect_degraded 由 push_pipeline 在自认降级时传入 —— 少了横幅就是一份
+    # 「看起来完全正常、实则无终态凭证」的战报，比不发更危险，故 fail-closed。
+    degraded_declared = bool(
+        DEGRADED_REPORT_BANNER in content
+        and DEGRADED_REPORT_CAVEAT in content
+    )
+    if expect_degraded and not degraded_declared:
+        errors.append(
+            f'管道自认降级战报，正文却缺少降级横幅 '
+            f'（需同时含「{DEGRADED_REPORT_BANNER}」与「{DEGRADED_REPORT_CAVEAT}」）')
+        missing.append('降级战报横幅')
+    if degraded_declared:
+        _exec_section = content.split('⚙️ 执行', 1)[1] \
+            if '⚙️ 执行' in content else ''
+        if '⏰ 时间线' in _exec_section:
+            _exec_section = _exec_section.split('⏰ 时间线', 1)[0]
+        if DEGRADED_REPORT_EXEC_TOKEN not in _exec_section:
+            errors.append(
+                f'降级战报执行段缺少屏障标记 {DEGRADED_REPORT_EXEC_TOKEN}')
+            missing.append('降级屏障标记')
 
     line_count = content.count('\n') + 1 if content else 0
     hardbreak_lines = sum(1 for line in content.splitlines() if line.endswith('  '))
@@ -207,7 +269,13 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         errors.append(f"QQ Markdown 硬换行不足: 仅 {hardbreak_lines} 行以两个空格结尾，至少需要 {MIN_HARDBREAK_LINES} 行")
         missing.append('Markdown硬换行')
 
+    minimal_policy = bool(
+        cycle_id is not None
+        and _CYCLE_ID_RE.fullmatch(str(cycle_id))
+        and thresholds.minimal_decision_contract_active(str(cycle_id)))
     for pattern, name in REQUIRED_SECTIONS:
+        if minimal_policy and name in {"六项决策卡", "历史经验"}:
+            continue
         if not re.search(pattern, content):
             errors.append(f"缺少必填段/字段: {name} (pattern: {pattern})")
             missing.append(name)
@@ -220,6 +288,24 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         (ln for ln in content.splitlines() if re.search(r'第\d+轮', ln)),
         next((ln for ln in content.splitlines() if ln.strip()), ''),
     )
+    duration_evidence = None
+    if _push_duration.duration_contract_active(cycle_id):
+        duration_evidence = _push_duration.read_business_duration(db_root, cycle_id)
+        match = re.search(r'/\s*⏱(未知|\d+s)\s*/', first_line)
+        if match is None:
+            errors.append('耗时必须是经证实的整数秒或明确的「未知」')
+            missing.append('业务耗时')
+        elif match.group(1) == '未知':
+            warnings.append('本轮业务耗时未知，未以0秒替代')
+            if '本轮耗时未知：' not in content:
+                errors.append('未知耗时缺少原因说明')
+        elif duration_evidence['status'] == 'known':
+            if int(match.group(1)[:-1]) != duration_evidence['elapsed_seconds']:
+                errors.append('标题耗时与同轮业务完成证据不一致')
+        else:
+            errors.append('标题给出数字耗时，但同轮业务完成证据未能证实')
+        if _push_duration.DISPLAY_SEMANTICS not in content:
+            errors.append('缺少业务耗时口径说明')
     if 'UNKNOWN' in first_line:
         errors.append("标题含 UNKNOWN（symbol 未解析）——修正 payload symbol/trades 后重新渲染")
         missing.append('标题symbol')
@@ -233,12 +319,19 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
             errors.append('cycle_id 格式非法，必须为北京时间 YYYY-MM-DDTHH:00|15|30|45')
             missing.append('cycle_id')
         else:
-            versioned_required = str(cycle_id) >= MULTITIMEFRAME_REPORT_REQUIRED_FROM
+            versioned_required = (
+                str(cycle_id) >= MULTITIMEFRAME_REPORT_REQUIRED_FROM
+                and thresholds.open_multitimeframe_contract_required(
+                    str(cycle_id)))
     if versioned_required:
         mtf_errors, mtf_missing = _validate_multitimeframe_section(
             content, first_line)
         errors.extend(mtf_errors)
         missing.extend(mtf_missing)
+    if minimal_policy:
+        for retired in ("🧩 三周期判断", "🧭 六项决策卡"):
+            if retired in content:
+                errors.append(f"新策略禁止退役段: {retired}")
 
     execution_audit_required = bool(
         cycle_id is not None
@@ -309,6 +402,11 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         if not re.search(r'区间指纹=[0-9a-f]{64}\b', execution_section):
             errors.append('执行段缺少报告间交易所成交区间指纹')
             missing.append('区间指纹')
+        # G8③：未计入笔数必须外显（带独立激活边界）。
+        if str(cycle_id) >= INTER_REPORT_RECONCILE_COUNT_REQUIRED_FROM:
+            if not re.search(r'另\d+笔证据不足未计入', execution_section):
+                errors.append('执行段缺少报告间交易所成交未计入笔数')
+                missing.append('报告间未计入笔数')
 
     for pattern, msg in DEPRECATED_PATTERNS:
         if re.search(pattern, content):
@@ -322,10 +420,13 @@ def validate(content: str, *, cycle_id: str | None = None) -> dict:
         'errors': errors,
         'warnings': warnings,
         'missing_fields': missing,
+        'degraded_report_declared': degraded_declared,
+        'degraded_report_expected': bool(expect_degraded),
         'char_count': len(content),
         'line_count': line_count,
         'hardbreak_lines': hardbreak_lines,
         'cycle_id': cycle_id,
+        'cycle_duration_evidence': duration_evidence,
         'multitimeframe_contract_required': versioned_required,
         'multitimeframe_required_from': MULTITIMEFRAME_REPORT_REQUIRED_FROM,
         'execution_audit_required': execution_audit_required,
@@ -405,6 +506,12 @@ def main() -> int:
                     help='跳过 repair_queue 写入与自愈关单（隔离/开发干跑用，纯校验零写库）')
     ap.add_argument('--cycle-id', type=str,
                     help='北京时间 cycle；20:00 版本边界后启用三周期报告硬校验')
+    # P0-5 5b：由 push_pipeline 在自认降级战报时传入，反查渲染是否真打了横幅。
+    # 只做「声称降级 ⇒ 必须留痕」的单向断言，不反过来禁止独立复核归档内容。
+    ap.add_argument('--expect-degraded', action='store_true',
+                    help='断言正文必须带降级战报横幅与执行段屏障标记')
+    ap.add_argument('--db-root', default=_public_project_path('db'),
+                    help='业务耗时证据读取根目录；仅只读，不回退其他目录')
     args = ap.parse_args()
 
     if args.stdin:
@@ -427,7 +534,8 @@ def main() -> int:
         print(f"[validate_push][FAIL] 推送内容太短（{len(content)}字符）", file=sys.stderr)
         return 2
 
-    result = validate(content, cycle_id=args.cycle_id)
+    result = validate(content, cycle_id=args.cycle_id,
+                      expect_degraded=args.expect_degraded, db_root=args.db_root)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     if not result['ok']:

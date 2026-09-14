@@ -116,3 +116,12 @@ Thumbs.db
 # Local security scan artifacts
 /.gitleaks-*.json
 /.gitleaks-*.sarif
+
+# Deployment state and private operations
+/config/*.json
+!/config/*.example.json
+/_audit/
+/backups/
+/.claude/
+
+!/db/ws_market_cache_schema.sql

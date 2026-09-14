@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0-public-scope
-last-updated: 2026-08-16
+last-updated: 2026-09-14
 updated-by: Codex
-change-summary: Record the sanitized 2026-08-15 runtime synchronization, recovery evidence and retained public safety boundary.
+change-summary: Record the sanitized 2026-09-14 runtime synchronization, recovery evidence and retained public safety boundary.
 -->
 
 # Public release scope
@@ -15,7 +15,7 @@ This file records the intended V2.0 public synchronization boundary.
 - sanitized OKX announcement, official-history, market-feature recovery,
   complete-cycle SLA and deterministic live-position action tooling;
 - Agent role sources and report templates;
-- `db/schema.sql` without runtime databases;
+- `db/schema.sql` and the optional `db/ws_market_cache_schema.sql`, without runtime databases;
 - the public-only `scripts/lifecycle.json` and its read-only validator;
 - audited current schema migrations that default to read-only dry-run and require
   explicit `--apply --backup-dir` with verified SQLite online backups before writes;

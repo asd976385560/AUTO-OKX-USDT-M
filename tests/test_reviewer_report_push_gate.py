@@ -49,6 +49,8 @@ class ReviewerReportPushGateTests(unittest.TestCase):
             ]
             with (
                 mock.patch.object(qq_push, "ROOT", root),
+                mock.patch.object(
+                    qq_push, "EVENT_LOG", root / "logs" / "qq_push_test.jsonl"),
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(
                     validate_periodic_report,
@@ -90,6 +92,74 @@ class ReviewerReportPushGateTests(unittest.TestCase):
                     qq_push._validate_reviewer_report_before_push(
                         report.read_text(encoding="utf-8"),
                         "reviewer:2026-08-17:weekly",
+                    )
+
+    def test_valid_draft_is_rejected_before_dedupe_claim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "reports" / "weekly" / "weekly-2026-09-07.md"
+            report.parent.mkdir(parents=True)
+            report.write_text(
+                "# 小灵周报 2026-09-07\n> 报告状态：证据草稿｜SOURCE_LAG\n",
+                encoding="utf-8",
+            )
+            argv = [
+                "qq_push.py", "--content-file", str(report),
+                "--dedupe-key", "reviewer:2026-09-07:weekly",
+            ]
+            draft = {
+                "ok": False,
+                "artifact_valid": True,
+                "send_allowed": False,
+                "report_key": "2026-09-07 00:00:00",
+                "errors": [
+                    "release: missed-opportunity evidence status SOURCE_LAG"],
+            }
+            with (
+                mock.patch.object(qq_push, "ROOT", root),
+                mock.patch.object(
+                    qq_push, "EVENT_LOG", root / "logs" / "qq_push_test.jsonl"),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    validate_periodic_report,
+                    "validate_report",
+                    return_value=draft,
+                ),
+                mock.patch.object(qq_push, "_claim") as claim,
+            ):
+                self.assertEqual(qq_push.main(), 2)
+        claim.assert_not_called()
+
+    def test_error_draft_is_rejected_even_when_artifact_is_valid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "reports" / "monthly" / "monthly-2026-09-01.md"
+            report.parent.mkdir(parents=True)
+            report.write_text(
+                "# 小灵月报 2026-09-01\n> 报告状态：证据草稿｜ERROR\n",
+                encoding="utf-8",
+            )
+            argv = ["qq_push.py", "--content-file", str(report)]
+            with (
+                mock.patch.object(qq_push, "ROOT", root),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    validate_periodic_report,
+                    "validate_report",
+                    return_value={
+                        "ok": False,
+                        "artifact_valid": True,
+                        "send_allowed": False,
+                        "report_key": "2026-09-01 00:00:00",
+                        "errors": [
+                            "release: missed-opportunity evidence status ERROR"],
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "validator rejected"):
+                    qq_push._validate_reviewer_report_before_push(
+                        report.read_text(encoding="utf-8"),
+                        "reviewer:2026-09-01:monthly",
                     )
 
 

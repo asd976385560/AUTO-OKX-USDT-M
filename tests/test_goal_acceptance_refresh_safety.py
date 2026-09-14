@@ -1,6 +1,14 @@
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import copy
 import contextlib
-import copy
 import io
 import json
 import sys
@@ -14,22 +22,216 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import _acceptance_thresholds as thresholds  # noqa: E402
 from refresh_goal_acceptance_report import (  # noqa: E402
     main as refresh_main,
     refresh_asset_class_coverage,
     refresh_multitimeframe_coverage,
+    refresh_market_coverage_audit,
+    refresh_model_shadow_label_quality,
     refresh_news_source_health,
+    refresh_periodic_report_completeness,
     refresh_positioning_coverage,
     refresh_report_completeness,
     refresh_runtime_evidence,
 )
 
 
+def with_coverage_target(
+    payload: dict,
+    *,
+    as_of: str,
+    target_field: str = "target_rate",
+    migration_field: str = "target_rate_migration",
+) -> dict:
+    """Attach the shared boundary result without copying interlocked values."""
+    payload[target_field] = thresholds.coverage_target_rate(as_of)
+    payload[migration_field] = thresholds.coverage_migration_facts(as_of)
+    return payload
+
+
+def news_registry(*optional_sources: str) -> dict:
+    """Build registry evidence; per-source starts stay data, not copied gates."""
+    sources = [
+        {"id": "rss_en", "type": "news", "enabled": True,
+         "required": True, "adapter": "news_rss"},
+        {"id": "okx_news", "type": "news", "enabled": True,
+         "required": False, "adapter": "news_okx"},
+    ]
+    sources.extend({
+        "id": source, "type": "news", "enabled": True,
+        "required": False, "adapter": f"news_{source}",
+    } for source in optional_sources)
+    return {"sources": sources}
+
+
+def migrated_market_audit(family: str) -> dict:
+    as_of = "2026-08-15T20:15:00+08:00"
+    target = thresholds.coverage_target_rate(as_of)
+    base = {
+        "as_of_cst": as_of, "mode": "read_only", "minimum_slots": 96,
+        "status": "PASSED", "production_database_writes": 0,
+        "production_threshold_change_allowed": False,
+        "production_execution_authorized": False, "orders_placed": 0,
+    }
+    if family == "field":
+        base.update({
+            "artifact_type": "scheduled_market_field_coverage_audit",
+            "official_instrument_evidence": {
+                "expected_slots": 96, "passed_snapshot_slots": 96,
+                "snapshot_slot_rate": 1.0, "metadata_rows": 960,
+                "valid_metadata_rows": 960, "metadata_coverage_rate": 1.0,
+            },
+            "counts": {
+                "expected_slots": 96, "observed_slots": 96,
+                "missing_slots": 0, "timely_slots": 96,
+                "late_or_missing_slots": 0, "passed_slots": 96,
+                "failed_slots": 0, "expected_symbol_rows": 960,
+                "all_fields_valid_symbol_rows": 960,
+                "field_valid_symbol_rows": {"bid": 960, "ask": 960},
+            },
+            "rates": {
+                "field_coverage_rates": {"bid": 1.0, "ask": 1.0},
+                "all_fields_complete_rate": 1.0, "slot_pass_rate": 1.0,
+                "timely_snapshot_rate": 1.0,
+            },
+            "requirements": {
+                "minimum_slots_met": True,
+                "official_snapshot_slot_rate_at_least_target": True,
+                "official_metadata_rate_at_least_target": True,
+                "every_field_rate_at_least_target": True,
+                "all_fields_row_rate_at_least_target": True,
+                "slot_pass_rate_at_least_target": True,
+                "timely_snapshot_rate_at_least_target": True,
+            },
+        })
+    else:
+        base.update({
+            "artifact_type": "scheduled_market_feature_coverage_audit",
+            "expected_symbols_per_slot": 10,
+            "counts": {
+                "expected_slots": 96, "passed_selection_slots": 96,
+                "passed_official_snapshot_slots": 96,
+                "official_metadata_rows": 960,
+                "official_metadata_valid_rows": 960, "passed_slots": 96,
+                "failed_slots": 0, "expected_symbol_rows": 960,
+                "microstructure_valid_symbol_rows": 960,
+                "trade_flow_valid_symbol_rows": 960,
+                "combined_valid_symbol_rows": 960,
+            },
+            "rates": {key: 1.0 for key in (
+                "selection_snapshot_slot_rate", "official_snapshot_slot_rate",
+                "official_metadata_coverage_rate", "microstructure_coverage_rate",
+                "trade_flow_coverage_rate", "combined_coverage_rate",
+                "slot_pass_rate")},
+            "requirements": {key: True for key in (
+                "minimum_slots_met", "selection_snapshot_slot_rate_at_least_target",
+                "official_snapshot_slot_rate_at_least_target",
+                "official_metadata_coverage_rate_at_least_target",
+                "microstructure_coverage_rate_at_least_target",
+                "trade_flow_coverage_rate_at_least_target",
+                "combined_coverage_rate_at_least_target",
+                "slot_pass_rate_at_least_target")},
+        })
+    return with_coverage_target(base, as_of=as_of)
+
+
+def periodic_audit() -> dict:
+    as_of = "2026-09-02T00:00:00+08:00"
+    target = thresholds.coverage_target_rate(as_of)
+
+    def surface(expected: int, minimum: int | None) -> dict:
+        return {
+            "minimum_expected": minimum, "expected": expected,
+            "existing": expected, "valid": expected, "invalid": 0,
+            "delivery_confirmed": expected, "delivery_unconfirmed": 0,
+            "delivered_report_complete": expected,
+            "report_completeness_rate": 1.0,
+            "delivery_confirmation_rate": 1.0,
+            "delivered_report_completeness_rate": 1.0,
+            "target_rate": target, "status": "PASSED", "rows": [],
+        }
+
+    return with_coverage_target({
+        "artifact_type": "periodic_report_and_delivery_completeness_audit",
+        "as_of_cst": as_of, "mode": "read_only_business_data",
+        "delivery_evidence": {"integrity_status": "PASSED"},
+        "historical": {
+            "weekly": surface(12, None), "monthly": surface(6, None),
+            "status": "PASSED",
+        },
+        "forward_after_remediation": {
+            "weekly_start": "2026-08-17", "monthly_start": "2026-09-01",
+            "weekly": surface(12, 12), "monthly": surface(6, 6),
+            "status": "PASSED",
+        },
+        "overall_status": "PASSED",
+        "safety": {
+            "auto_resend": False, "historical_backfill": False,
+            "production_database_writes": 0,
+            "production_report_mutation": False,
+            "production_order_authorized": False, "orders_placed": 0,
+        },
+    }, as_of=as_of)
+
+
+def model_label_audit() -> dict:
+    as_of = "2026-08-15T12:15:00Z"
+    facts = thresholds.shadow_migration_facts(as_of)
+    target = facts["effective_target_precision"]
+    return {
+        "artifact_type": "frozen_model_shadow_label_quality_audit",
+        "mode": "read_only_business_databases",
+        "inputs": {"as_of_utc": as_of},
+        "calibration_gate_migration": {
+            **facts, "declared_target_precision": target,
+            "precision_floor_in_force": target,
+            "rebuilt_with_target_precision": target,
+        },
+        "model_gate_results": [{
+            "model_id": "fixture-model",
+            "model_parameters_sha256": "a" * 64,
+            "n_labeled": 0, "successes_after_cost": 0,
+            "precision_after_cost": None, "wilson_95_low": None,
+            "ece": None, "distinct_days": 0, "distinct_cycles": 0,
+            "side_counts": {},
+            "requirements": {
+                "minimum_sample_met": False, "minimum_days_met": False,
+                "minimum_cycles_met": False,
+                "precision_at_least_target": False,
+                "wilson_95_low_at_least_target": False,
+                "ece_at_most_5pp": False, "offline_gate_pass": False,
+                "minimum_long_labels_met": False,
+                "minimum_short_labels_met": False,
+            },
+            "status": "NOT_MEASURABLE",
+            "production_threshold_change_allowed": False,
+        }],
+        "checks": {key: True for key in (
+            "evaluation_schema_v2", "label_schema_v3",
+            "evaluation_artifact_type_valid",
+            "acceptance_thresholds_not_weakened",
+            "acceptance_threshold_migration_exact",
+            "cost_hurdle_not_weakened", "execution_price_contract_exact",
+            "all_safety_flags_closed", "label_columns_exact",
+            "label_key_set_exact", "all_label_fields_match_raw_evidence",
+            "model_key_set_exact", "aggregate_metrics_match_labels")},
+        "safety_checks": {"all_closed": True},
+        "failed_checks": [], "status": "PASSED",
+        "safe_for_credibility_research": True,
+        "confidence_claim_allowed": False,
+        "production_threshold_change_allowed": False,
+        "production_execution_authorized": False,
+        "production_database_writes": 0,
+        "production_mutation": False, "orders_placed": 0,
+    }
+
+
 def coverage_artifact() -> dict:
     return {
         "surface": "report",
         "manifest": {
-            "title": ". 四项目标实施与前向验收（old）",
+            "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
             "generatedAt": "old",
             "sources": [{
                 "id": "coverage_evidence",
@@ -71,7 +273,7 @@ def report_artifact() -> dict:
     return {
         "surface": "report",
         "manifest": {
-            "title": ". 四项目标实施与前向验收（old）",
+            "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
             "generatedAt": "2026-08-12T00:00:00Z",
             "sources": [{"id": "report_quality", "query": {}}],
             "cards": [{"id": "push_card", "metrics": []}],
@@ -99,13 +301,13 @@ def report_artifact() -> dict:
 
 
 def daily_report_audit() -> dict:
-    return {
-        "evaluated_at_cst": "2026-08-12 17:00:00",
+    as_of = "2026-08-12 17:00:00"
+    return with_coverage_target({
+        "evaluated_at_cst": as_of,
         "expected": 1,
         "valid": 1,
         "invalid": 0,
         "completeness_rate": 1.0,
-        "target_rate": 0.99,
         "status": "PASSED",
         "window": {
             "start_date": "2026-08-12",
@@ -114,18 +316,40 @@ def daily_report_audit() -> dict:
         "auto_send": False,
         "database_write": False,
         "production_order_authorized": False,
-    }
+        "delivery_evidence": {"integrity_status": "PASSED"},
+        "forward_after_remediation": {
+            "start_date": "2026-08-13",
+            "end_date": "2026-08-12",
+            "minimum_days": 30,
+            "expected": 30,
+            "existing": 30,
+            "valid": 30,
+            "invalid": 0,
+            "completeness_rate": 1.0,
+            "delivery_confirmed": 30,
+            "delivery_unconfirmed": 0,
+            "delivered_report_complete": 30,
+            "delivery_confirmation_rate": 1.0,
+            "delivered_report_completeness_rate": 1.0,
+            "delivery_status": "PASSED",
+            "status": "PASSED",
+            "rows": [],
+        },
+        "overall_status": "PASSED",
+    }, as_of=as_of)
 
 
 def push_report_audit(*, complete: int = 96) -> dict:
+    as_of = "2026-08-12T17:01:00+08:00"
+    target = thresholds.coverage_target_rate(as_of)
     expected = 96
     rate = complete / expected
-    status = "PASSED" if rate >= 0.99 else "NOT_MET"
+    status = "PASSED" if rate >= target else "NOT_MET"
     payload = {
         "artifact_type": "push_report_and_delivery_completeness_audit",
         "evaluated_at_cst": "2026-08-12 17:01:00",
         "mode": "read_only_business_data",
-        "as_of_cst": "2026-08-12T17:01:00+08:00",
+        "as_of_cst": as_of,
         "forward_start_cst": "2026-08-12T16:00:00+08:00",
         "slot_finality_grace_minutes": 45,
         "window": {
@@ -136,7 +360,7 @@ def push_report_audit(*, complete: int = 96) -> dict:
             "schedule_minutes": 15,
             "expected_slots": expected,
         },
-        "target_rate": 0.99,
+        "target_rate": target,
         "counts": {
             "expected_slots": expected,
             "pipeline_present": complete,
@@ -201,7 +425,7 @@ def push_report_audit(*, complete: int = 96) -> dict:
     payload["forward_after_remediation"] = {
         "start_cst": "2026-08-12T16:00:00+08:00",
         "end_exclusive_cst": "2026-08-12T16:30:00+08:00",
-        "target_rate": 0.99,
+        "target_rate": target,
         "minimum_slots": 96,
         "counts": {
             "expected_slots": 2,
@@ -244,10 +468,13 @@ def push_report_audit(*, complete: int = 96) -> dict:
         "failure_rows": [],
     }
     payload["overall_status"] = "PENDING_FORWARD_EVIDENCE"
-    return payload
+    return with_coverage_target(payload, as_of=as_of)
 
 
 def positioning_audit() -> dict:
+    as_of = "2026-08-12T19:06:00Z"
+    target = thresholds.coverage_target_rate(as_of)
+
     def window(*, schedule: int, minimum: int) -> dict:
         slot = {
             "cycle_id": "2026-08-13T03:00",
@@ -264,11 +491,11 @@ def positioning_audit() -> dict:
             "invalid_row_count": 0,
             "status": "PASSED",
         }
-        return {
+        return with_coverage_target({
             "start_cst": "2026-08-13T03:00:00+08:00",
+            "as_of_cst": as_of,
             "schedule_minutes": schedule,
             "minimum_slots": minimum,
-            "target_rate": 0.99,
             "expected_slots": 1,
             "passed_slots": 1,
             "expected_symbol_rows": 3,
@@ -284,14 +511,13 @@ def positioning_audit() -> dict:
             },
             "status": "INSUFFICIENT_EVIDENCE",
             "slots": [slot],
-        }
+        }, as_of=as_of)
 
-    return {
+    return with_coverage_target({
         "artifact_type": "positioning_coverage_audit",
         "source": "okx_rest_contract_long_short_ratio",
-        "generated_at_utc": "2026-08-12T19:06:00Z",
+        "generated_at_utc": as_of,
         "latest_batch_collected_ts": "2026-08-12T19:01:16Z",
-        "minimum_rate": 0.99,
         "coverage_rate": 1.0,
         "valid_symbols": 3,
         "universe_symbols": 3,
@@ -316,10 +542,60 @@ def positioning_audit() -> dict:
         "decision_availability_forward": window(
             schedule=15, minimum=96),
         "overall_status": "PENDING_FORWARD_EVIDENCE",
-    }
+    }, as_of=as_of, target_field="minimum_rate",
+       migration_field="minimum_rate_migration")
 
 
 class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
+    def test_migrated_market_and_periodic_audits_rebuild_status(self):
+        artifact = coverage_artifact()
+        for family in ("field", "feature"):
+            audit = migrated_market_audit(family)
+            artifact = refresh_market_coverage_audit(
+                artifact, audit, family=family,
+                audit_relative_path=f"{family}.json")
+        self.assertEqual(
+            "PASSED",
+            artifact["snapshot"]["datasets"]["headline"][0][
+                "market_feature_coverage_status"],
+        )
+        tampered = migrated_market_audit("field")
+        tampered["rates"]["slot_pass_rate"] = 0.5
+        with self.assertRaisesRegex(ValueError, "rates disagree"):
+            refresh_market_coverage_audit(
+                coverage_artifact(), tampered, family="field",
+                audit_relative_path="field.json")
+
+        reports = refresh_periodic_report_completeness(
+            report_artifact(), periodic_audit(),
+            audit_relative_path="periodic.json")
+        self.assertEqual(
+            "PASSED", reports["snapshot"]["datasets"]["headline"][0][
+                "periodic_report_gate_status"])
+        changed_layer = periodic_audit()
+        changed_layer["forward_after_remediation"]["weekly_start"] = "2026-08-18"
+        with self.assertRaisesRegex(ValueError, "activation layers"):
+            refresh_periodic_report_completeness(
+                report_artifact(), changed_layer,
+                audit_relative_path="periodic.json")
+
+    def test_model_label_quality_uses_artifact_as_of_migration(self):
+        audit = model_label_audit()
+        target = audit["calibration_gate_migration"][
+            "effective_target_precision"]
+        result = refresh_model_shadow_label_quality(
+            coverage_artifact(), audit, audit_relative_path="label-audit.json")
+        self.assertEqual(
+            target, result["snapshot"]["datasets"]["headline"][0][
+                "active_credibility_target_rate"])
+        tampered = copy.deepcopy(audit)
+        tampered["calibration_gate_migration"]["activation_cst"] = (
+            "2099-01-01T00:00:00+08:00")
+        with self.assertRaisesRegex(ValueError, "migration facts"):
+            refresh_model_shadow_label_quality(
+                coverage_artifact(), tampered,
+                audit_relative_path="label-audit.json")
+
     def test_positioning_latest_batch_never_substitutes_for_forward_windows(self):
         natural = positioning_audit()
         isolated = copy.deepcopy(natural)
@@ -389,6 +665,10 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
                     json.dumps(artifact, ensure_ascii=False),
                     json.dumps(audit, ensure_ascii=False),
                     json.dumps(push_audit, ensure_ascii=False),
+                    json.dumps(migrated_market_audit("field"), ensure_ascii=False),
+                    json.dumps(migrated_market_audit("feature"), ensure_ascii=False),
+                    json.dumps(periodic_audit(), ensure_ascii=False),
+                    json.dumps(model_label_audit(), ensure_ascii=False),
                 ]
                 status = refresh_main([
                     "--artifact", "artifact.json",
@@ -396,6 +676,14 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
                     "--audit-relative-path", "audit.json",
                     "--push-audit", "push.json",
                     "--push-audit-relative-path", "push.json",
+                    "--market-field-audit", "market-field.json",
+                    "--market-field-relative-path", "market-field.json",
+                    "--market-feature-audit", "market-feature.json",
+                    "--market-feature-relative-path", "market-feature.json",
+                    "--periodic-report-audit", "periodic.json",
+                    "--periodic-report-relative-path", "periodic.json",
+                    "--model-shadow-label-quality-audit", "model-label.json",
+                    "--model-shadow-label-quality-relative-path", "model-label.json",
                     "--dry-run",
                 ])
             self.assertEqual(0, status)
@@ -453,11 +741,44 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
                 push_audit_relative_path="push.json",
             )
 
+        lowered_daily = daily_report_audit()
+        lowered_push = push_report_audit()
+        lowered_daily["target_rate"] = 0.50
+        lowered_push["target_rate"] = 0.50
+        lowered_push["forward_after_remediation"]["target_rate"] = 0.50
+        with self.assertRaisesRegex(ValueError, "effective target"):
+            refresh_report_completeness(
+                report_artifact(), lowered_daily, lowered_push,
+                audit_relative_path="daily.json",
+                push_audit_relative_path="push.json",
+            )
+
+        tampered_migration = push_report_audit()
+        tampered_migration["target_rate_migration"]["activation_cst"] = (
+            "2099-01-01T00:00:00+08:00"
+        )
+        with self.assertRaisesRegex(ValueError, "migration facts"):
+            refresh_report_completeness(
+                report_artifact(), daily_report_audit(), tampered_migration,
+                audit_relative_path="daily.json",
+                push_audit_relative_path="push.json",
+            )
+
+        tampered_daily = daily_report_audit()
+        tampered_daily["forward_after_remediation"]["status"] = "NOT_MET"
+        tampered_daily["overall_status"] = "NOT_MET"
+        with self.assertRaisesRegex(ValueError, "forward/overall status"):
+            refresh_report_completeness(
+                report_artifact(), tampered_daily, push_report_audit(),
+                audit_relative_path="daily.json",
+                push_audit_relative_path="push.json",
+            )
+
     def test_news_refresh_recomputes_publishers_and_rejects_rate_tampering(self):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（old）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "sources": [],
                 "tables": [],
                 "blocks": [{"id": "data_section", "body": "old"}],
@@ -468,25 +789,31 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
             }},
         }
 
-        def source_row(source: str, role: str) -> dict:
+        as_of = "2026-08-12T17:24:50+08:00"
+        target = thresholds.coverage_target_rate(as_of)
+
+        def source_row(
+            source: str, role: str, *,
+            start: str = "2026-08-12T16:15:00+08:00", expected: int = 5,
+        ) -> dict:
             return {
                 "source": source,
                 "role": role,
                 "endpoint": "https://publisher.example/feed",
                 "schedule_minutes": 15,
-                "start_cst": "2026-08-12T16:15:00+08:00",
+                "start_cst": start,
                 "end_exclusive_cst": "2026-08-12T17:30:00+08:00",
-                "expected_slots": 5,
-                "observed_rows": 5,
+                "expected_slots": expected,
+                "observed_rows": expected,
                 "missing_slots": 0,
-                "complete_slots": 5,
+                "complete_slots": expected,
                 "degraded_or_failed_slots": 0,
                 "strict_complete_rate": 1.0,
                 "available_rate": 1.0,
-                "target_rate": 0.99,
+                "target_rate": target,
                 "minimum_slots": 96,
                 "status": "INSUFFICIENT_EVIDENCE",
-                "raw_status_counts": {"ok": 5},
+                "raw_status_counts": {"ok": expected},
                 "exception_count": 0,
             }
 
@@ -501,13 +828,21 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
                 )
             ],
             source_row("panews", "optional"),
+            source_row(
+                "okx_announcements", "optional",
+                start="2026-08-12T16:30:00+08:00", expected=4),
         ]
-        audit = {
+        registry = news_registry("panews")
+        registry["sources"].append({
+            "id": "okx_announcements", "type": "news", "enabled": True,
+            "required": False, "adapter": "news_okx_announcements",
+            "audit_forward_start_cst": "2026-08-12T16:30:00+08:00",
+        })
+        audit = with_coverage_target({
             "artifact_type": "scheduled_news_source_health_audit",
             "generated_at_cst": "2026-08-12T17:24:51+08:00",
-            "as_of_cst": "2026-08-12T17:24:50+08:00",
+            "as_of_cst": as_of,
             "forward_start_cst": "2026-08-12T16:15:00+08:00",
-            "target_rate": 0.99,
             "minimum_window_hours": 24,
             "forward_after_remediation": {
                 "critical_status": "INSUFFICIENT_EVIDENCE",
@@ -520,10 +855,11 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
             "stage_dispatch_triggered": False,
             "orders_placed": 0,
             "production_execution_authorized": False,
-        }
+        }, as_of=as_of)
         result = refresh_news_source_health(
             artifact, audit,
             audit_relative_path="news-source-health-audit.json",
+            registry=registry,
         )
         section = next(
             block for block in result["manifest"]["blocks"]
@@ -537,6 +873,10 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
                 "news_forward_start_cst"
             ],
         )
+        announcement = next(
+            row for row in result["snapshot"]["datasets"]["news_source_health"]
+            if row["source"] == "okx_announcements")
+        self.assertEqual("2026-08-12T16:30:00+08:00", announcement["start_cst"])
 
         tampered = copy.deepcopy(audit)
         tampered["forward_after_remediation"]["sources"][2][
@@ -546,6 +886,7 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
             refresh_news_source_health(
                 copy.deepcopy(artifact), tampered,
                 audit_relative_path="tampered.json",
+                registry=registry,
             )
 
     def test_asset_class_refresh_recomputes_counts_and_rejects_tampering(self):
@@ -682,7 +1023,7 @@ class GoalAcceptanceRefreshSafetyTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（2026-08-12 17:30）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（2026-08-12 17:30）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "generatedAt": "2026-08-12T09:30:00Z",
                 "sources": [],
                 "charts": [{"id": "throughput_chart"}],

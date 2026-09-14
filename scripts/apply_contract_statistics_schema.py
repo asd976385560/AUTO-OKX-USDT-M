@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": f"db missing: {db_path}"}))
         return 2
 
-    con = sqlite3.connect(str(db_path), timeout=30)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
     con.execute("PRAGMA busy_timeout=20000")
     try:
         exists = bool(con.execute(
@@ -129,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         backup_path = _backup(con, db_path, Path(args.backup_dir))
+        con.close()
+        con = sqlite3.connect(db_path, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+
         con.execute(DDL)
         for statement in INDEXES:
             con.execute(statement)

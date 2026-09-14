@@ -637,6 +637,8 @@ def evaluate(
     artifacts = _load_artifacts(shadow_root)
     con = _ro(market_db)
     labels: list[dict[str, Any]] = []
+    artifacts_loaded = 0
+    post_snapshot_artifacts_ignored = 0
     selected_records = 0
     invalid_records = 0
     missing_executable_price_records = 0
@@ -653,7 +655,9 @@ def evaluate(
             )
             generated = _parse_utc(str(payload["generated_at_utc"]))
             if generated > as_of_utc:
+                post_snapshot_artifacts_ignored += 1
                 continue
+            artifacts_loaded += 1
             artifact_records = list(payload.get("records") or [])
             cross_section_ranks = _selected_cross_section_ranks(
                 artifact_records)
@@ -893,7 +897,9 @@ def evaluate(
         "generated_at_utc": _iso(datetime.now(UTC)),
         "as_of_utc": _iso(as_of_utc),
         "shadow_root": str(shadow_root.resolve()),
-        "artifacts_loaded": len(artifacts),
+        "artifacts_discovered_in_root": len(artifacts),
+        "artifacts_loaded": artifacts_loaded,
+        "post_snapshot_artifacts_ignored": post_snapshot_artifacts_ignored,
         "selected_records": selected_records,
         "invalid_records": invalid_records,
         "missing_executable_price_records": missing_executable_price_records,

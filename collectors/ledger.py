@@ -21,6 +21,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import os
@@ -29,10 +38,6 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_PROJECT_ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
-
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -40,7 +45,7 @@ if hasattr(sys.stdout, "reconfigure"):
 CST = timezone(timedelta(hours=8))
 
 # 生产账本路径；测试传自己的 path 覆盖。
-DEFAULT_LEDGER = _PROJECT_ROOT / "db" / "ledger.db"
+DEFAULT_LEDGER = Path(_public_project_path('db', 'ledger.db'))
 
 # 每个采集器在一轮里的 source 标签。
 SRC_FAST = "fast"
@@ -51,14 +56,27 @@ SRC_XSEARCH = "x_search"
 # 计入"齐活"的状态（degraded 仍算完成——失败信源由分析员降级处理，不阻断派单）。
 DONE_STATUS = ("ok", "degraded")
 
+# 2026-08-19 G7：失败态单一真源。历史事实——'timeout' 全仓零 writer（死枚举，
+# 保留只为读旧行）；collectors/sources/news_collect.py 写未声明的 'failed'；
+# 早期 regime 写 'stale(age=NNNNs)'。后者既不在 DONE_STATUS（挡派发）又不在
+# 旧告警集（不告警）＝静默丢轮，故用前缀匹配收编。消费方一律 import 本函数，
+# 禁再在各处手写字面量元组。
+FAIL_STATUS = ("error", "timeout", "fail", "failed")
+FAIL_STATUS_PREFIXES = ("stale",)
+
+
+def is_failure_status(status: object) -> bool:
+    """status 是否属于失败态（含 'stale(age=NNNNs)' 这类带参前缀）。"""
+    text = str(status or "").strip().lower()
+    return text in FAIL_STATUS or text.startswith(FAIL_STATUS_PREFIXES)
+
+
+# 2026-08-19 G4 预注册激活边界（只向前）：此刻起，必需源 ts 不可解析一律判
+# stale（fail-closed）。边界前保持旧的静默跳过语义，历史脏数据不反向把派发
+# 闸打死；当前 collection_runs 实测 0 行 ts 格式异常，可安全前向切换。
+TS_FAIL_CLOSED_ACTIVATION_CST = "2026-08-20T08:00:00+08:00"
+
 SLOT_MINUTES = 15
-PROFILE_LEASE_COLUMNS = ("profile", "cycle_id", "acquired_at", "expires_at")
-PROFILE_LEASE_SCHEMA = (
-    ("profile", "TEXT", 0, 1),
-    ("cycle_id", "TEXT", 1, 0),
-    ("acquired_at", "TEXT", 1, 0),
-    ("expires_at", "TEXT", 1, 0),
-)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +139,13 @@ def connect(path: str | os.PathLike, readonly: bool = False) -> sqlite3.Connecti
     return con
 
 
+PROFILE_LEASE_SCHEMA = (
+    ("profile", "TEXT", 0, 1),
+    ("cycle_id", "TEXT", 1, 0),
+    ("acquired_at", "TEXT", 1, 0),
+    ("expires_at", "TEXT", 1, 0),
+)
+
 def _require_profile_lease_migrated(path: Path) -> None:
     """Refuse implicit schema upgrades of an existing ledger database."""
     con = sqlite3.connect(
@@ -155,23 +180,22 @@ def _require_profile_lease_migrated(path: Path) -> None:
 
 
 def init_ledger(path: str | os.PathLike = DEFAULT_LEDGER) -> None:
-    """Initialize a new ledger or verify an existing ledger before DDL.
-
-    Existing databases are never upgraded implicitly.  The profile-lease table
-    must have been installed through the backup-guarded migration.
-    """
-    ledger_path = Path(str(path))
-    if ledger_path.is_file():
-        _require_profile_lease_migrated(ledger_path)
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    con = connect(ledger_path)
+    """幂等建表。"""
+    if Path(path).is_file():
+        _require_profile_lease_migrated(Path(path))
+    Path(str(path)).parent.mkdir(parents=True, exist_ok=True)
+    con = connect(path)
     try:
         con.executescript(
             """
             CREATE TABLE IF NOT EXISTS collection_runs (
                 cycle_id   TEXT NOT NULL,   -- 槽位归一时间戳 'YYYY-MM-DDTHH:MM'（UTC+8）
                 source     TEXT NOT NULL,   -- 'fast' | 'slow' | 'regime' | 'x_search'
-                status     TEXT NOT NULL,   -- 'ok' | 'degraded' | 'timeout' | 'error'
+                status     TEXT NOT NULL,   -- 'ok'|'degraded'|'error'|'failed'|'stale(age=Ns)'
+                                             -- 2026-08-19 G7：'timeout' 全仓零 writer（死枚举，
+                                             -- 保留只为读旧行）；news_collect 写 'failed'；
+                                             -- 早期 regime 写 'stale(age=Ns)'。判定统一走
+                                             -- is_failure_status()，禁在消费方手写字面量。
                 ts         TEXT NOT NULL,   -- 实际完成时刻（UTC+8 'YYYY-MM-DD HH:MM:SS'）
                 rows       INTEGER,
                 latency_ms INTEGER,
@@ -264,7 +288,7 @@ def record_collection(
 def _load_registry_module():
     """惰性导入 collectors/sources/_registry。
 
-    ledger 有两种被 import 的身份：wrapper 路径（. 在 PYTHONPATH →
+    ledger 有两种被 import 的身份：wrapper 路径（<PROJECT_ROOT> 在 PYTHONPATH →
     `collectors.ledger`）和 dispatcher 路径（collectors 目录在 sys.path →
     顶层 `ledger`），两条导入路都试；任何失败返回 None（调用方回退 flat）。
     """
@@ -354,14 +378,19 @@ def gate_collection_fresh(
     if missing:
         return {"status": "abort", "missing": sorted(missing)}
 
-    # 逐必需源取 (age_sec, ts)；ts 解析失败时跳过，不计龄、不判 stale。
+    # 逐必需源取 (age_sec, ts)。G4：ts 不可解析 = 无法证明新鲜 → fail-closed
+    # 计入 unparsable（激活边界后直接判 stale），不再静默跳过 —— 旧写法在
+    # 「全部必需源 ts 损坏」时 ages 为空 → oldest_age=0 → 返回 status=ok，
+    # 恰恰在最该 fail-closed 的场景反向放行整轮实盘。
     now = datetime.now(CST)
     ages: dict[str, tuple[int, str]] = {}
+    unparsable: list[str] = []
     for r in rows:
         if r["source"] in need and r["status"] in DONE_STATUS:
             try:
                 t = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
             except (ValueError, TypeError):
+                unparsable.append(str(r["source"]))
                 continue
             ages[r["source"]] = (int((now - t).total_seconds()), r["ts"])
     oldest_age = max((a for a, _ in ages.values()), default=0)
@@ -390,11 +419,22 @@ def gate_collection_fresh(
         if stale:
             stale_sources.append(src)
 
+    # G4 过渡：unparsable 从第一天就外显（可观测），但只在预注册激活边界后
+    # 才真正 fail-closed —— 边界前历史脏数据不会追溯把生产打死。
+    try:
+        _ts_fail_closed = now >= datetime.fromisoformat(
+            TS_FAIL_CLOSED_ACTIVATION_CST)
+    except ValueError:
+        _ts_fail_closed = False
+    if unparsable and _ts_fail_closed:
+        stale_sources = sorted(set(stale_sources) | set(unparsable))
     if stale_sources:
         return {"status": "stale", "age_sec": oldest_age, "max_age_sec": max_age_sec,
                 "stale_sources": sorted(stale_sources), "per_source": per_source,
+                "unparsable_ts_sources": sorted(set(unparsable)),
                 "freshness_mode": freshness_mode}
     return {"status": "ok", "age_sec": oldest_age, "per_source": per_source,
+            "unparsable_ts_sources": sorted(set(unparsable)),
             "freshness_mode": freshness_mode}
 
 

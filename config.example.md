@@ -77,6 +77,8 @@ OKX API Key、Secret 和 Passphrase 由仓库外的 OKX CLI profile 或部署环
 |---|---|
 | `OKX_QQ_TARGET` | `group:<QQ_GROUP_OPENID>` |
 | `OKX_QQ_ALERT_TARGET` | `c2c:<QQ_USER_OPENID>` |
+| `OKX_QQ_REPORT_TARGET` | `c2c:<QQ_REPORT_OPENID>` |
+| `OKX_QQ_TRANSPORT` | `gateway` (explicit `cli` rollback only) |
 | `OKX_OPENCLAW_MJS` | `<PATH_TO_OPENCLAW_MJS>` |
 | `OKX_NODE_BIN` | `<PATH_TO_NODE>` |
 | `OKX_CLI_ENTRY` | `<PATH_TO_OKX_CLI_ENTRY>` |

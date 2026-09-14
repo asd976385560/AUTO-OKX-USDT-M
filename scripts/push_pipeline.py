@@ -9,8 +9,9 @@
 qq_push 层用显式 --dedupe-key push:{cycle}。
 故本脚本可安全重跑。
 
-每环节出详细报告：reports/push/pipeline-<cycle>.json + 追加 logs/push/pipeline_runs.jsonl，
-含 build/render/validate/send/archive/state 各步 rc 与关键指标。
+每环节出详细报告：激活前为 reports/push/pipeline-<cycle>.json，激活后为
+reports/push/YYYY/MM/DD/pipeline-<cycle>.json；旧平铺历史只读兼容、不搬移。
+另追加 logs/push/pipeline_runs.jsonl，含各步 rc 与关键指标。
 
 用法（阶段一开发，安全）:
   push_pipeline.py --cycle 2026-07-07T12:00 --no-send        # build→render→validate→archive，不外发
@@ -18,6 +19,15 @@ qq_push 层用显式 --dedupe-key push:{cycle}。
   push_pipeline.py --cycle 2026-07-07T12:00                  # 全链含外发
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import hashlib
@@ -30,13 +40,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_COLLECTORS_DIR = _PROJECT_ROOT / "collectors"
-if str(_COLLECTORS_DIR) not in sys.path:
-    sys.path.insert(0, str(_COLLECTORS_DIR))
-
 import _proc  # 子进程超时整树杀（详见模块 docstring）
-from cycle_contract import validate_cycle_id
+from _artifact_paths import (  # forward-only report storage; no file moves
+    REPORTS_PUSH_YMD_ACTIVATION_CYCLE,
+    UnsafeArtifactPathError,
+    layout_for_cycle,
+    write_forward_text_artifact,
+)
 from stage_failure_contract import (
     load_live_report_barrier,
     require_upstream_failure,
@@ -48,18 +58,23 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CST = timezone(timedelta(hours=8))
-OKX = r"."
-SCRIPTS = r".\scripts"
-WRAP = r".\scripts\run_okx_python.ps1"
+OKX = _public_project_path()
+SCRIPTS = _public_project_path('scripts')
+WRAP = _public_project_path('scripts', 'run_okx_python.ps1')
 # 绝对 pwsh 路径——对齐 okx-* cron（cron 进程 PATH 不保证有 pwsh）；env 可覆盖
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
 # 组装器（2026-07-07 已迁 scripts/）；env 可覆盖
-BUILD_PY = os.environ.get("OKX_BUILD_PY", r".\scripts\build_push_payload.py")
-WORK = Path(r".\tmp\push_pipeline")
-REPORT_DIR = Path(r".\reports\push")
-RUNLOG = Path(r".\logs\push\pipeline_runs.jsonl")
+BUILD_PY = os.environ.get("OKX_BUILD_PY", _public_project_path('scripts', 'build_push_payload.py'))
+_PRODUCTION_WORK = Path(_public_project_path('tmp', 'push_pipeline'))
+_PRODUCTION_REPORT_DIR = Path(_public_project_path('reports', 'push'))
+_PRODUCTION_RUNLOG = Path(_public_project_path('logs', 'push', 'pipeline_runs.jsonl'))
+# Public names stay patchable for isolated tests and existing callers.
+WORK = _PRODUCTION_WORK
+REPORT_DIR = _PRODUCTION_REPORT_DIR
+RUNLOG = _PRODUCTION_RUNLOG
+EXECUTION_CONTEXTS = {"production", "test", "probe"}
 STAGE_STATUS_DIR = Path(os.environ.get(
-    "OKX_STAGE_STATUS_DIR", r".\logs\stage-status"))
+    "OKX_STAGE_STATUS_DIR", _public_project_path('logs', 'stage-status')))
 BUSINESS_ATTESTATION_REQUIRED_FROM = "2026-08-14T07:00"
 INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = "2026-08-15T08:00"
 INTER_REPORT_WINDOW_MINUTES = 15
@@ -74,6 +89,134 @@ _CREATE_NO_WINDOW = 0x08000000
 
 def now_ts() -> str:
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _has_nonempty_message_id(output: str) -> bool:
+    """Return whether CLI output contains an actual non-empty JSON messageId.
+
+    ``qq_push_raw`` deliberately prints only the first part of OpenClaw's JSON,
+    so the enclosing document may be truncated and cannot always be decoded as
+    a whole.  Decode only the value following an unescaped JSON key; a bare key,
+    ``null``/empty value, or prose mentioning messageId is not a receipt.
+    """
+    text = str(output or "")
+    lowered = text.lower()
+    marker = '"messageid"'
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        key_at = lowered.find(marker, start)
+        if key_at < 0:
+            return False
+        start = key_at + len(marker)
+        backslashes = 0
+        cursor = key_at - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2:
+            continue
+        cursor = start
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != ":":
+            continue
+        cursor += 1
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        try:
+            value, _ = decoder.raw_decode(text, cursor)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, str) and value.strip():
+            return True
+
+
+def _cycle_in_current_production_window(
+    cycle: str,
+    *,
+    now: datetime | None = None,
+    maximum_age_minutes: int = 30,
+) -> bool:
+    """Only a current natural slot may write/send as production.
+
+    Historical test fixtures used a fixed production-like cycle and silently
+    appended to the natural-production audit log.  This guard is independent
+    of the dispatcher freshness gate so direct CLI/test callers cannot recreate
+    that contamination or accidentally send an old report.
+    """
+    try:
+        slot = datetime.strptime(str(cycle), "%Y-%m-%dT%H:%M").replace(
+            tzinfo=CST)
+    except (TypeError, ValueError):
+        return False
+    current = (now or datetime.now(CST)).astimezone(CST)
+    age_seconds = (current - slot).total_seconds()
+    return 0 <= age_seconds <= maximum_age_minutes * 60
+
+
+def _runtime_outputs(
+    cycle: str,
+    no_send: bool,
+    execution_context: str | None,
+    artifact_root: str | Path | None,
+) -> tuple[str, bool, Path, Path, Path]:
+    """Resolve execution context and its isolated write surfaces.
+
+    Production keeps the established paths.  ``--no-send``, stale direct
+    probes and tests receive a unique run root and are forced to no-send.
+    Existing tests that explicitly patch WORK/REPORT_DIR/RUNLOG retain those
+    already-isolated paths.
+    """
+    explicit = execution_context is not None
+    patched_outputs = (
+        WORK != _PRODUCTION_WORK
+        or REPORT_DIR != _PRODUCTION_REPORT_DIR
+        or RUNLOG != _PRODUCTION_RUNLOG
+    )
+    context = str(
+        execution_context
+        or ("test" if patched_outputs or no_send else "production"))
+    if context not in EXECUTION_CONTEXTS:
+        raise ValueError(
+            f"execution_context must be one of {sorted(EXECUTION_CONTEXTS)}")
+    if context == "production" and not _cycle_in_current_production_window(cycle):
+        if explicit:
+            raise ValueError(
+                "production push cycle is outside the current natural window")
+        context = "probe"
+    if context == "production":
+        if no_send:
+            raise ValueError("production execution_context cannot use --no-send")
+        return context, False, WORK, REPORT_DIR, RUNLOG
+
+    # Patched globals are an existing unittest seam: child execution is mocked,
+    # so preserve the requested send branch for coverage.  Real non-production
+    # CLI/probe runs are always forced to no-send.
+    effective_no_send = bool(no_send) if patched_outputs else True
+    if artifact_root is not None:
+        root = Path(artifact_root)
+        return (
+            context,
+            effective_no_send,
+            root / "work",
+            root / "reports" / "push",
+            root / "logs" / "pipeline_runs.jsonl",
+        )
+    if patched_outputs:
+        return context, effective_no_send, WORK, REPORT_DIR, RUNLOG
+    safe = cycle.replace(":", "").replace("T", "-")
+    root = (
+        WORK / "contexts" / context
+        / f"run-{safe}-{os.getpid()}-{time.time_ns()}"
+    )
+    return (
+        context,
+        effective_no_send,
+        root / "work",
+        root / "reports" / "push",
+        root / "logs" / "pipeline_runs.jsonl",
+    )
 
 
 def _run(script: str, args: list, stdin_text: str | None = None):
@@ -172,7 +315,22 @@ def _stable_inter_report_exchange_identity(
     ):
         proof_source = INTER_REPORT_DIRECT_FILL_SOURCE
     else:
-        return None
+        # 2026-08-19 G8③ 对齐：build_push_payload 侧已把「未证成」的行由静默
+        # 丢弃改为 _excluded 记录并计入 schema_version=2 的信封。核验侧是独立
+        # 重算（故意不 import 生成侧），两边必须同步改，否则 expected!=current
+        # 恒成立、business_attestation_pre_archive 永久失败（17:15~17:45 实测）。
+        return {
+            "_excluded": True,
+            "id": int(row["id"]),
+            "ts": str(row["ts"] or ""),
+            "symbol": str(row["symbol"] or ""),
+            "action": str(row["action"] or "").lower(),
+            "exclusion_reason": (
+                f"reconcile_source={reconcile_source or 'none'};"
+                f"fill_source={str(raw.get('fill_source') or 'none')};"
+                f"ts_source={str(raw.get('ts_source') or 'none')};"
+                f"ord_ids={len(ord_ids)}"),
+        }
 
     def number(value):
         try:
@@ -214,18 +372,29 @@ def _current_inter_report_exchange_attestation(
     finally:
         connection.close()
     fills = []
+    excluded_fills = []
     for row in rows:
         identity = _stable_inter_report_exchange_identity(row)
-        if identity is not None:
+        if identity is None:
+            continue
+        if identity.pop("_excluded", False):
+            excluded_fills.append(identity)
+        else:
             fills.append(identity)
+    # G8③ v2 对齐 build_push_payload：窗口内账本行数 = 计入 + 未计入，
+    # 三者闭合可被 validator 独立验真。键集/取值必须与生成侧逐字一致 ——
+    # 本函数是独立重算，比对用的是整个 dict 相等，不是只比 sha256。
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": profile,
         "cycle_id": str(cycle),
         "window_start_exclusive_cst": start,
         "window_end_inclusive_cst": end,
+        "candidate_count": len(rows),
         "fill_count": len(fills),
+        "excluded_count": len(excluded_fills),
         "fills": fills,
+        "excluded_fills": excluded_fills,
     }
     body["sha256"] = _canonical_hash(body)
     return body
@@ -480,12 +649,35 @@ def _verify_live_stage_terminal(
             time.sleep(0.1)
 
 
+def degraded_barrier_state(cycle: str) -> dict:
+    """独立复核 report reconcile barrier —— 降级战报的唯一合法依据。
+
+    P0-5 5b：dispatcher 传下来的 --degraded-report 只是**意图**，不是凭证。
+    发送前在这里重新读一次 barrier：
+      * 仍未就绪 → 允许降级（degraded=True），报告强制打横幅；
+      * 已就绪   → **升级**回完整业务报告，走原本的 live 终态硬闸。
+    这条「只能降级到事实、不能用 flag 把事实降级」的不对称，是本路径不会
+    变成绕开业务终态凭证的后门的原因。
+    """
+    try:
+        barrier = load_live_report_barrier(cycle, status_dir=STAGE_STATUS_DIR)
+    except Exception as exc:      # noqa: BLE001 - 探测异常按未就绪处理
+        return {"degraded": True, "reason": "barrier_probe_error",
+                "detail": f"{type(exc).__name__}: {exc}"}
+    if barrier is None:
+        return {"degraded": True, "reason": "report_barrier_not_ready",
+                "detail": "post-Agent report reconcile barrier missing or unsafe"}
+    return {"degraded": False, "reason": "report_barrier_ready",
+            "barrier": barrier}
+
+
 def _verify_business_attestation(
     payload: dict,
     db_root: str,
     cycle: str,
     *,
     upstream_failure_report: bool,
+    degraded_report: bool = False,
     terminal_wait_seconds: float = 0.0,
 ) -> dict:
     """Fail closed when the rendered business truth changed before send."""
@@ -499,13 +691,25 @@ def _verify_business_attestation(
             db_root=db_root,
             status_dir=STAGE_STATUS_DIR,
         )
-    stage_terminal = _verify_live_stage_terminal(
-        cycle,
-        db_root,
-        wait_seconds=terminal_wait_seconds,
-        upstream_failure_report=upstream_failure_report,
-        expected_failure_context=failure_context,
-    )
+    if degraded_report:
+        # 降级路径**刻意**不调 _verify_live_stage_terminal —— 它要证明的正是
+        # 此刻证明不了的那件事（live 阶段已发布干净终态且释放租约）。跳过它
+        # 不等于放宽：下面的 expected != current 漂移比对照跑，报告里也必须
+        # 带横幅明示「本轮成交事实未经 live 终态凭证背书」。
+        stage_terminal = {
+            "proved": False,
+            "reason": "report_barrier_not_ready",
+            "note": ("live stage terminal not provable at send time; "
+                     "fills reported as-read, not adjudicated as final"),
+        }
+    else:
+        stage_terminal = _verify_live_stage_terminal(
+            cycle,
+            db_root,
+            wait_seconds=terminal_wait_seconds,
+            upstream_failure_report=upstream_failure_report,
+            expected_failure_context=failure_context,
+        )
     expected = payload.get("business_report_attestation")
     if not isinstance(expected, dict):
         raise ValueError("payload business attestation missing")
@@ -546,6 +750,18 @@ def _verify_business_attestation(
         }
     if expected != current:
         raise ValueError("business terminal or fill set changed after build")
+    if degraded_report:
+        return {
+            "ok": True,
+            "required": True,
+            "mode": "degraded_report",
+            "decision": current["decision"],
+            "n_orders": current["n_orders"],
+            "trade_count": current["trade_count"],
+            "sha256": current["sha256"],
+            **inter_report,
+            "live_stage_terminal": stage_terminal,
+        }
     return {
         "ok": True,
         "required": True,
@@ -591,26 +807,67 @@ def run(
     db_root: str,
     no_send: bool,
     upstream_failure_report: bool = False,
+    degraded_report: bool = False,
+    *,
+    execution_context: str | None = None,
+    artifact_root: str | Path | None = None,
 ) -> dict:
-    # Validate before creating work/report/log directories.  The cycle is used
-    # in filenames and database identities, so traversal-shaped or impossible
-    # timestamps must fail without any filesystem side effect.
     cycle = validate_cycle_id(cycle)
-    WORK.mkdir(parents=True, exist_ok=True)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    RUNLOG.parent.mkdir(parents=True, exist_ok=True)
+    (
+        resolved_context,
+        no_send,
+        work_dir,
+        report_dir,
+        run_log,
+    ) = _runtime_outputs(
+        cycle,
+        no_send,
+        execution_context,
+        artifact_root,
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    run_log.parent.mkdir(parents=True, exist_ok=True)
     safe = cycle.replace(":", "").replace("T", "-")
-    payload_f = str(WORK / f"payload-{safe}.json")
-    content_f = str(WORK / f"content-{safe}.txt")
+    payload_f = str(work_dir / f"payload-{safe}.json")
+    content_f = str(work_dir / f"content-{safe}.txt")
+
+    def finish(report: dict) -> dict:
+        report.setdefault("execution_context", resolved_context)
+        report.setdefault(
+            "natural_production_evidence", resolved_context == "production")
+        report["_output_report_dir"] = str(report_dir)
+        report["_output_run_log"] = str(run_log)
+        return _finish(report)
+
+    # P0-5 5b：两种非常规形态互斥。upstream_failure 的前提是「无业务周期行」，
+    # degraded 的前提恰是「有终态但凭证未就绪」，同时成立即逻辑矛盾，直接拒。
+    if upstream_failure_report and degraded_report:
+        return finish({
+            "cycle": cycle, "ts": now_ts(), "report_mode": "invalid",
+            "steps": {}, "ok": False,
+            "fatal": "upstream_failure_and_degraded_are_mutually_exclusive",
+        })
+
+    degraded_state: dict | None = None
+    if degraded_report:
+        # 意图 → 事实。屏障若已就绪则升级回完整业务报告（走原终态硬闸）。
+        degraded_state = degraded_barrier_state(cycle)
+        degraded_report = bool(degraded_state.get("degraded"))
 
     rep: dict = {
         "cycle": cycle,
         "ts": now_ts(),
         "report_mode": (
-            "upstream_failure" if upstream_failure_report else "business_terminal"),
+            "upstream_failure" if upstream_failure_report
+            else "degraded_report" if degraded_report
+            else "business_terminal"),
         "steps": {},
         "ok": False,
     }
+    if degraded_state is not None:
+        rep["degraded_barrier_probe"] = degraded_state
+        if not degraded_report:
+            rep["degraded_upgraded_to_business_terminal"] = True
 
     # 1. build（进程内直调，确定性组装）
     try:
@@ -633,6 +890,19 @@ def run(
                 db_root, cycle, upstream_failure=failure_context)
         else:
             payload = bpp.build(db_root, cycle)
+        if degraded_report:
+            # 注入而非改 build() 签名：build 与 barrier 零耦合（它只读库），
+            # 降级是**发送侧**的凭证事实，塞进 payload 供 render/validate 消费
+            # 即可 —— 既不动确定性组装器契约，也不牵动它那一票既有测试替身。
+            payload["degraded_report"] = {
+                "schema_version": 1,
+                "reason": str((degraded_state or {}).get("reason")
+                              or "report_barrier_not_ready"),
+                "detail": str((degraded_state or {}).get("detail") or ""),
+                "declared_at_cst": now_ts(),
+                "note": ("live 终态凭证未就绪：成交与持仓按库内当前事实如实"
+                         "呈现，但不作「本轮已终局」的裁决"),
+            }
         with open(payload_f, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         rep["steps"]["build"] = {"ok": True, "action": payload.get("action_taken"),
@@ -642,42 +912,59 @@ def run(
     except Exception as e:
         rep["steps"]["build"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         rep["fatal"] = "build_failed"
-        return _finish(rep)
+        return finish(rep)
 
-    # 2. render：透传 db_root，确保库权威覆盖读取同一根目录。
-    rc, out, err = _run(r".\scripts\render_push_report.py",
-                        ["--json-file", payload_f, "--out-file", content_f,
-                         "--db-root", str(db_root)])
+    # 2-3. render + validate：仍在生产wrapper隔离进程内，顺序和canonical
+    # validator完全不变；只把原先两个连续Python子进程合并为一个，减少固定
+    # 启动开销。业务账实attestation仍在其后独立执行，绝不被合并或跳过。
+    render_args = [
+        "--json-file", payload_f,
+        "--out-file", content_f,
+        "--db-root", str(db_root),
+        "--validate-cycle-id", cycle,
+    ]
+    if no_send:
+        render_args.append("--validate-no-repair-queue")
+    if degraded_report:
+        render_args.append("--validate-expect-degraded")
+    prepare_started = time.monotonic()
+    rc, out, err = _run(
+        _public_project_path('scripts', 'render_push_report.py'), render_args)
+    prepare_elapsed = round(time.monotonic() - prepare_started, 3)
     receipt = {}
     try:
         receipt = json.loads(out) if out else {}
     except Exception:
         pass
-    rep["steps"]["render"] = {"rc": rc, "bytes": receipt.get("bytes"),
-                              "title": receipt.get("title"), "err": err[:200] if rc else None}
-    if rc != 0 or not Path(content_f).exists():
+    render_ok = (
+        receipt.get("render_ok") is True and Path(content_f).exists())
+    rep["steps"]["render"] = {
+        "rc": 0 if render_ok else rc,
+        "bytes": receipt.get("bytes"),
+        "title": receipt.get("title"),
+        "err": err[:200] if not render_ok else None,
+        "validation_fused": receipt.get("validation_fused") is True,
+        "combined_elapsed_seconds": prepare_elapsed,
+    }
+    if not render_ok:
         rep["fatal"] = "render_failed"
-        return _finish(rep)
+        return finish(rep)
 
-    # 3. validate（必须 rc=0 才外发）
-    validate_args = ["--file", content_f, "--cycle-id", cycle]
-    if no_send:
-        validate_args.append("--no-repair-queue")
-    rc, out, err = _run(
-        r".\scripts\validate_push_format.py",
-        validate_args,
-    )
-    vres = {}
-    try:
-        vres = json.loads(out) if out else {}
-    except Exception:
-        pass
-    rep["steps"]["validate"] = {"rc": rc, "errors": vres.get("errors"),
-                                "missing": vres.get("missing_fields"),
-                                "char_count": vres.get("char_count")}
-    if rc != 0:
+    # 组合子进程必须返回validator原始结构；缺失或非ok仍按原合同失败关闭。
+    vres = receipt.get("validation")
+    if not isinstance(vres, dict):
+        vres = {}
+    validate_ok = rc == 0 and vres.get("ok") is True
+    rep["steps"]["validate"] = {
+        "rc": 0 if validate_ok else (rc or 1),
+        "errors": vres.get("errors"),
+        "missing": vres.get("missing_fields"),
+        "char_count": vres.get("char_count"),
+        "fused_with_render": True,
+    }
+    if not validate_ok:
         rep["fatal"] = "validate_failed"       # 不外发残缺内容（阶段二在此写 repair_queue + 告警）
-        return _finish(rep)
+        return finish(rep)
 
     # 4. 业务终态/成交指纹前置硬闸：自激活槽起，先证明同槽 live
     # runner 已终止、租约已释放，且渲染所用终态/逐笔成交仍与权威库一致。
@@ -688,6 +975,7 @@ def run(
             db_root,
             cycle,
             upstream_failure_report=upstream_failure_report,
+            degraded_report=degraded_report,
             terminal_wait_seconds=5.0,
         )
         rep["steps"]["business_attestation_pre_archive"] = (
@@ -699,7 +987,7 @@ def run(
             "error": f"{type(exc).__name__}: {exc}",
         }
         rep["fatal"] = "business_attestation_failed"
-        return _finish(rep)
+        return finish(rep)
 
     # 5. 归档前置硬闸：归档返回成功且文件内容核验完成，才允许进入 send。
     # --no-send 下归到 dev 目录，不覆写生产 latest.md。
@@ -708,8 +996,8 @@ def run(
                          ensure_ascii=False)
     arch_args = ["--stdin"]
     if no_send:
-        arch_args = ["--reports-dir", str(WORK / "reports"), "--stdin"]
-    rc, out, err = _run(r".\scripts\push_archive.py", arch_args, stdin_text=arch_in)
+        arch_args = ["--reports-dir", str(work_dir / "reports"), "--stdin"]
+    rc, out, err = _run(_public_project_path('scripts', 'push_archive.py'), arch_args, stdin_text=arch_in)
     ares = {}
     try:
         ares = json.loads(out) if out else {}
@@ -724,7 +1012,7 @@ def run(
     if not archive_ok:
         rep["steps"]["send"] = {"skipped": True, "reason": "archive_hard_check_failed"}
         rep["fatal"] = "archive_hard_check_failed"
-        return _finish(rep)
+        return finish(rep)
 
     # 6. 外发（--no-send 跳过）。发送失败时，前置时间戳归档已经完整保留。
     if no_send:
@@ -744,6 +1032,7 @@ def run(
                     db_root,
                     cycle,
                     upstream_failure_report=upstream_failure_report,
+                    degraded_report=degraded_report,
                     terminal_wait_seconds=0.0,
                 )
             )
@@ -758,13 +1047,15 @@ def run(
                 "reason": "business_attestation_failed",
             }
             rep["fatal"] = "business_attestation_failed"
-            return _finish(rep)
+            return finish(rep)
         # 显式身份键 push:{cycle}：同 cycle 任何 content 同键，重跑幂等。
+        send_has_message_id = False
         try:
             rc, out, err = _run(
-                r".\scripts\qq_push.py",
+                _public_project_path('scripts', 'qq_push.py'),
                 ["--content-file", content_f, "--dedupe-key", f"push:{cycle}"],
             )
+            send_has_message_id = _has_nonempty_message_id(out)
             rep["steps"]["send"] = {
                 "rc": rc,
                 "out": out[:500],
@@ -787,8 +1078,17 @@ def run(
         _o = (_send.get("out") or "").lower()
         if _send.get("rc") == 0:
             status = "duplicate_skip" if ("duplicate" in _o or "skip" in _o) else "sent"
-        elif ("messageid" in _o) or ('"action": "send"' in _o):
-            # rc!=0 但回执带 messageId=已投递（qq_push 送达后置步骤偶发报错，非漏推）
+        elif (
+            _send.get("rc") == 3
+            or "uncertain_delivery" in _o
+            or "push uncertain" in _o
+        ):
+            # 外发命令超时发生在可能已经提交之后；没有messageId就不能宣称
+            # sent，也不能按failed自动重推。保留独立终态供告警/审计处理。
+            status = "uncertain_delivery"
+        elif send_has_message_id:
+            # 保留既有兼容：rc!=0 但确有非空 messageId，说明消息已提交后
+            # CLI 后置步骤才失败。action=send 只是请求动作，不能证明送达。
             status = "sent"
         else:
             status = "failed"
@@ -797,52 +1097,133 @@ def run(
                                         "would_write": {"push_last_cycle": cycle,
                                                         "push_last_status": status}}
     else:
-        state_json = str(WORK / f"state-{safe}.json")
+        state_json = str(work_dir / f"state-{safe}.json")
         with open(state_json, "w", encoding="utf-8") as f:
             json.dump({"updates": {"push_last_cycle": cycle, "push_last_status": status},
                        "ts": now_ts()}, f, ensure_ascii=False)
-        rc, out, err = _run(r".\scripts\system_state_writer.py", ["--json-file", state_json])
+        rc, out, err = _run(_public_project_path('scripts', 'system_state_writer.py'), ["--json-file", state_json])
         rep["steps"]["system_state"] = {"rc": rc}
 
     rep["send_status"] = status
     rep["ok"] = no_send or status in {"sent", "duplicate_skip"}
     if not rep["ok"]:
-        rep["fatal"] = "send_failed"
-    return _finish(rep)
+        rep["fatal"] = (
+            "send_uncertain_delivery"
+            if status == "uncertain_delivery" else "send_failed"
+        )
+    return finish(rep)
 
 
 def _finish(rep: dict) -> dict:
     """落环节报告 + 追加 run-log。"""
+    report_dir = Path(rep.pop("_output_report_dir", str(REPORT_DIR)))
+    run_log = Path(rep.pop("_output_run_log", str(RUNLOG)))
+    safe = rep["cycle"].replace(":", "").replace("T", "-")
+    filename = f"pipeline-{safe}.json"
     try:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        safe = rep["cycle"].replace(":", "").replace("T", "-")
-        with open(REPORT_DIR / f"pipeline-{safe}.json", "w", encoding="utf-8") as f:
-            json.dump(rep, f, ensure_ascii=False, indent=1)
-        RUNLOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(RUNLOG, "a", encoding="utf-8") as f:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        def _render(report_path: Path) -> str:
+            rep["artifact_storage"] = {
+                "schema_version": 1,
+                "family": "reports_push_pipeline",
+                "layout": layout_for_cycle(rep["cycle"]),
+                "activation_cycle_cst": REPORTS_PUSH_YMD_ACTIVATION_CYCLE,
+                "path": str(report_path),
+                "historical_files_moved": False,
+                "write_status": "written",
+            }
+            return json.dumps(rep, ensure_ascii=False, indent=1)
+
+        write_forward_text_artifact(
+            report_dir,
+            rep["cycle"],
+            filename,
+            _render,
+        )
+    except UnsafeArtifactPathError as exc:
+        rep["artifact_storage"] = {
+            "schema_version": 1,
+            "family": "reports_push_pipeline",
+            "layout": layout_for_cycle(rep["cycle"]),
+            "activation_cycle_cst": REPORTS_PUSH_YMD_ACTIVATION_CYCLE,
+            "path": str(exc.target_path),
+            "historical_files_moved": False,
+            "write_status": "rejected",
+            **exc.audit_fields(),
+        }
+        print(
+            "[push_pipeline] WARN unsafe artifact path rejected: "
+            + json.dumps(rep["artifact_storage"], ensure_ascii=False),
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        rep["artifact_storage"] = {
+            "schema_version": 1,
+            "family": "reports_push_pipeline",
+            "layout": layout_for_cycle(rep["cycle"]),
+            "activation_cycle_cst": REPORTS_PUSH_YMD_ACTIVATION_CYCLE,
+            "path": None,
+            "historical_files_moved": False,
+            "write_status": "failed",
+            "error_code": "artifact_write_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        print(f"[push_pipeline] WARN 报告落盘失败: {exc}", file=sys.stderr)
+
+    # Keep the existing append-only run-log as the audit sink even when the
+    # dated report itself is rejected.  This does not add a new write surface.
+    try:
+        run_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(run_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(rep, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[push_pipeline] WARN 报告落盘失败: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[push_pipeline] WARN run-log 落盘失败: {exc}", file=sys.stderr)
     return rep
 
+
+from collectors.cycle_contract import validate_cycle_id
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="纯脚本推送编排器")
     ap.add_argument("--cycle", required=True)
-    ap.add_argument("--db-root", default=r".\db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--no-send", action="store_true", help="跳过 QQ 外发（阶段一开发用）")
+    ap.add_argument(
+        "--execution-context",
+        choices=sorted(EXECUTION_CONTEXTS),
+        default=None,
+        help=("工件与副作用上下文；默认当前真实发送=production，"
+              "--no-send=test，旧cycle直跑自动降为probe并强制no-send"),
+    )
+    ap.add_argument(
+        "--artifact-root",
+        help="test/probe专用独立工件根；production忽略并使用既有权威路径",
+    )
     ap.add_argument(
         "--upstream-failure-report",
         action="store_true",
         help=("仅对未来已激活且已证明无执行副作用的 live/采集终局失败 "
               "生成 WAIT 报告"),
     )
+    ap.add_argument(
+        "--degraded-report",
+        action="store_true",
+        help=("有业务终态但 live 报告对账屏障未就绪时生成降级战报；"
+              "发送前独立复核，屏障已就绪则自动升级回完整业务报告"),
+    )
     args = ap.parse_args()
+    try:
+        args.cycle = validate_cycle_id(args.cycle)
+    except ValueError as exc:
+        ap.error(str(exc))
     rep = run(
         args.cycle,
         args.db_root,
         args.no_send,
         upstream_failure_report=args.upstream_failure_report,
+        degraded_report=args.degraded_report,
+        execution_context=args.execution_context,
+        artifact_root=args.artifact_root,
     )
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     return 0 if rep.get("ok") else 1

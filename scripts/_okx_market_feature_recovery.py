@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Bounded current-cycle recovery for order-book and recent-trade payloads.
+"""WS-first market-feature reads with bounded exact REST recovery.
 
 The frozen ``collect_market_features.py`` imports these call signatures.  A
 small production wrapper monkey-patches only those two transport references,
-keeping every frozen research dependency byte-identical while giving the
-runtime one fresh-client retry over the exact missing set.
+keeping every frozen research dependency byte-identical.  In ``ws_first`` the
+normal order-book/trade path reads the persistent WS cache; only an explicit
+missing or invalid set can reach the bounded fresh-client REST recovery.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import time
 from typing import Any, Callable, Sequence
 
 import _okx_http as okx
+import _okx_market_source as market_source
 
 
 INITIAL_TIMEOUT_SECONDS = 35.0
@@ -65,20 +67,49 @@ def _recover(
     params: Callable[[str], dict[str, str]],
     post: Callable[[list], Any],
     valid: Callable[[Any], bool],
+    primary_batch: Callable[[Sequence[str]], Any] | None = None,
 ) -> dict:
     syms = [str(symbol) for symbol in symbols if str(symbol or "").strip()]
     if not syms:
         return {}
     initial_outcomes: dict[str, dict] = {}
-    initial = _safe_batch(
-        syms,
-        path=path,
-        params=params,
-        post=post,
-        timeout_s=INITIAL_TIMEOUT_SECONDS,
-        request_retries=2,
-        outcomes=initial_outcomes,
-    )
+    mode = market_source.current_source_mode()
+    primary_receipt: dict[str, Any] = {}
+    if mode == "ws_first" and primary_batch is not None:
+        try:
+            market_batch = primary_batch(syms)
+            initial = dict(market_batch.data)
+            primary_receipt = market_batch.receipt()
+            for symbol in syms:
+                initial_outcomes[symbol] = {
+                    "ok": valid(initial.get(symbol)),
+                    "error_type": None,
+                    "root_error_type": None,
+                    "error_type_chain": [],
+                    "source": primary_receipt.get("source"),
+                }
+        except Exception as exc:  # noqa: BLE001 - bounded REST recovery below
+            initial = {}
+            primary_receipt = {
+                "source": "ws_adapter_error",
+                "fallback_reasons": [f"{type(exc).__name__}:{exc}"[:300]],
+            }
+            for symbol in syms:
+                initial_outcomes[symbol] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+    else:
+        initial = _safe_batch(
+            syms,
+            path=path,
+            params=params,
+            post=post,
+            timeout_s=INITIAL_TIMEOUT_SECONDS,
+            request_retries=2,
+            outcomes=initial_outcomes,
+        )
     selected = {
         symbol: initial.get(symbol)
         for symbol in syms
@@ -107,8 +138,16 @@ def _recover(
                 recovered += 1
     final = {symbol: selected.get(symbol, post([])) for symbol in syms}
     stats = {
-        "contract_version": 1,
+        "contract_version": 2,
         "source": source,
+        "market_source_mode": mode,
+        "routine_rest_primary_disabled": mode == "ws_first",
+        "primary_source": primary_receipt.get("source") or "rest",
+        "primary_ws_count": int(primary_receipt.get("ws_count") or 0),
+        "primary_rest_count": int(primary_receipt.get("rest_count") or 0),
+        "primary_fallback_reasons": list(
+            primary_receipt.get("fallback_reasons") or []
+        ),
         "attempts": 1 + int(retry_requested and bool(missing)),
         "maximum_fetch_phases": MAXIMUM_FETCH_PHASES,
         "historical_retry": False,
@@ -149,6 +188,11 @@ def fetch_orderbooks_batch_sync(
         valid=lambda value: bool(
             isinstance(value, dict) and value.get("bids") and value.get("asks")
         ),
+        primary_batch=lambda subset: market_source.get_orderbooks_batch(
+            subset,
+            depth,
+            INITIAL_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -163,6 +207,11 @@ def fetch_recent_trades_batch_sync(
         params=lambda symbol: {"instId": symbol, "limit": str(limit)},
         post=lambda data: data,
         valid=lambda value: bool(isinstance(value, list) and value),
+        primary_batch=lambda subset: market_source.get_recent_trades_batch(
+            subset,
+            limit,
+            INITIAL_TIMEOUT_SECONDS,
+        ),
     )
 
 

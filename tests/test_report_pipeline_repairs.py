@@ -8,18 +8,25 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-for _p in (SCRIPTS,):
+# migrate_weekly_win_rate_pct 于 2026-08-06 归档进 archive/migrations/；
+# 本用例跟着走（含幂等断言：二次 plan_migration 必须为空），理由同
+# tests/test_decision_data_semantics.py 顶部注释。
+MIGRATIONS = SCRIPTS / "archive" / "migrations"
+for _p in (SCRIPTS, MIGRATIONS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 import build_push_payload  # noqa: E402
 import daily_report_writer  # noqa: E402
+import trade_report_stats  # noqa: E402
+import _acceptance_thresholds as thresholds  # noqa: E402
 import missed_opps_writer  # noqa: E402
 import render_push_report  # noqa: E402
 import validate_daily_report  # noqa: E402
@@ -74,6 +81,166 @@ def _create_db(path: Path, schema: str) -> None:
 
 
 class MissedOpportunityMaturityTests(unittest.TestCase):
+    def test_forward_evidence_bridge_is_active_only_at_registered_period_end(self):
+        contract = {
+            "status": "COMPLETE",
+            "release_eligible": True,
+            "count": 0,
+            "candidate_window": {
+                "start_ts": "2026-08-31 04:00:00",
+                "end_ts": "2026-09-01 04:00:00",
+            },
+            "self_sha256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lessons = root / "lessons.db"
+            trades = root / "live_trades.db"
+            market = root / "market.db"
+            briefing = root / "briefing"
+            with (
+                mock.patch.object(daily_report_writer, "LESSONS_DB", lessons),
+                mock.patch.object(daily_report_writer, "LIVE_TRADES_DB", trades),
+                mock.patch.object(daily_report_writer, "MARKET_DB", market),
+                mock.patch.object(
+                    daily_report_writer, "BRIEFING_LOG_DIR", briefing),
+                mock.patch.object(
+                    trade_report_stats,
+                    "missed_opportunity_evidence_contract",
+                    return_value=contract,
+                ) as builder,
+            ):
+                self.assertIsNone(
+                    daily_report_writer._missed_opportunity_evidence_contract(
+                        "2026-08-30 08:00:00",
+                        "2026-08-31 08:00:00",
+                    ))
+                builder.assert_not_called()
+                observed = (
+                    daily_report_writer._missed_opportunity_evidence_contract(
+                        "2026-08-31 08:00:00",
+                        "2026-09-01 08:00:00",
+                    ))
+            self.assertEqual(contract, observed)
+            builder.assert_called_once_with(
+                report_start_ts="2026-08-31 08:00:00",
+                report_end_ts="2026-09-01 08:00:00",
+                lessons_db=lessons,
+                live_trades_db=trades,
+                market_db=market,
+                briefing_dir=briefing,
+                contract_activation_cst=(
+                    thresholds.MISSED_OPPORTUNITY_EVIDENCE_ACTIVATION_CST),
+            )
+
+    def test_noncomplete_evidence_is_machine_readable_draft(self):
+        contract = {
+            "status": "SOURCE_LAG",
+            "release_eligible": False,
+            "count": None,
+            "candidate_window": {
+                "start_ts": "2026-08-31 04:00:00",
+                "end_ts": "2026-09-01 04:00:00",
+            },
+            "self_sha256": "b" * 64,
+        }
+        payload = {
+            "live_reconcile_status": "clean",
+            "missed_opportunity_evidence_contract": contract,
+        }
+        state = daily_report_writer._report_state(payload)
+        self.assertEqual("evidence_draft", state["status"])
+        self.assertFalse(state["release_allowed"])
+        self.assertEqual("错失机会证据 SOURCE_LAG", state["reason"])
+        self.assertEqual(
+            "证据草稿｜错失机会证据 SOURCE_LAG｜禁止外发",
+            daily_report_writer._report_label(state),
+        )
+        line = daily_report_writer._missed_opportunity_machine_line(payload)
+        self.assertIn("status=SOURCE_LAG", line)
+        self.assertIn("release_eligible=false", line)
+        self.assertIn("count=N/A", line)
+        self.assertIn("self_sha256=" + "b" * 64, line)
+
+    def test_forward_contract_is_embedded_and_noncomplete_count_stays_null(self):
+        contract = {
+            "schema_version": 1,
+            "artifact_type": "missed_opportunity_evidence_contract",
+            "contract_active": True,
+            "status": "NO_DATA",
+            "release_eligible": False,
+            "count": None,
+            "candidate_window": {
+                "start_ts": "2026-08-31 04:00:00",
+                "end_ts": "2026-09-01 04:00:00",
+                "end_exclusive": True,
+            },
+            "self_sha256": "c" * 64,
+        }
+        stats = {
+            "source": "fixture",
+            "period_start_ts": "2026-08-31 08:00:00",
+            "period_end_ts": "2026-09-01 08:00:00",
+            "period_end_exclusive": True,
+            "open_count": 0,
+            "close_count": 0,
+            "realized_pnl": 0.0,
+            "close_realized_pnl": 0.0,
+            "reduce_count": 0,
+            "reduce_realized_pnl": 0.0,
+            "total_realized_pnl": 0.0,
+            "realizing_actions": ["close", "reduce"],
+            "excluded_non_fill_rows": 0,
+            "win_rate_pct": None,
+            "best_trade": None,
+            "worst_trade": None,
+            "best_realizing_trade": None,
+            "worst_realizing_trade": None,
+            "close_side_breakdown": {
+                "long": {"close_count": 0},
+                "short": {"close_count": 0},
+            },
+            "excluded_rejected_rows": 0,
+            "excluded_incomplete_rows": 0,
+            "risk_rejected_open_attempts": {
+                "count": 0, "reasons": {}, "items": [],
+            },
+        }
+        with (
+            mock.patch.object(
+                trade_report_stats, "profile_statistics", return_value=stats),
+            mock.patch.object(
+                trade_report_stats, "entry_quality_stats", return_value=None),
+            mock.patch.object(
+                daily_report_writer, "_account_bill_net_for_window",
+                return_value=None),
+            mock.patch.object(
+                daily_report_writer, "_missed_opportunity_evidence_contract",
+                return_value=contract),
+        ):
+            out = daily_report_writer._prepare_trade_payload(
+                {"live_reconcile_status": "clean"},
+                start_ts="2026-08-31 08:00:00",
+                end_ts="2026-09-01 08:00:00",
+                end_exclusive=True,
+                include_avg_hold=False,
+                period_kind="weekly",
+            )
+        audit = json.loads(out["raw"])["report_audit"]
+        missed = audit["missed_opportunity_metrics"]
+        self.assertIsNone(missed["count"])
+        self.assertEqual(contract, missed["evidence_contract"])
+        self.assertEqual("evidence_draft", audit["report_state"]["status"])
+        self.assertFalse(audit["report_state"]["release_allowed"])
+
+    def test_exact_2026_08_31_weekly_mutations_are_frozen(self):
+        for operation in ("--markdown-only", "--correct-existing"):
+            with self.assertRaisesRegex(ValueError, "is frozen"):
+                daily_report_writer._assert_weekly_report_mutation_allowed(
+                    "2026-08-31 00:00:00", operation)
+        daily_report_writer._assert_weekly_report_mutation_allowed(
+            "2026-09-07 00:00:00", "--markdown-only")
+
     def test_report_window_is_shifted_as_one_continuous_24h_window(self):
         self.assertEqual(
             ("2026-08-11 04:00:00", "2026-08-12 04:00:00"),
@@ -138,6 +305,7 @@ class MissedOpportunityMaturityTests(unittest.TestCase):
                         ("2026-08-12 04:00:00",),
                     ],
                 )
+                con.commit()
                 con.commit()
             finally:
                 con.close()
@@ -390,6 +558,40 @@ class WeeklyArtifactTests(unittest.TestCase):
             db = root / "account.db"
             out_dir = root / "weekly"
             _create_db(db, WEEKLY_SCHEMA)
+            raw = json.dumps({
+                "report_audit": {
+                    "period_kind": "weekly",
+                    "trade_metrics": {
+                        "live": {
+                            "period_start_ts": "2026-07-20 08:00:00",
+                            "period_end_ts": "2026-07-27 08:00:00",
+                            "close_side_breakdown": {
+                                "long": {
+                                    "close_count": 1,
+                                    "win_count": 1,
+                                    "win_rate_pct": 100.0,
+                                    "pnl_sum_usdt": 0.5,
+                                    "pnl_avg_usdt": 0.5,
+                                },
+                                "short": {
+                                    "close_count": 0,
+                                    "win_count": 0,
+                                    "win_rate_pct": None,
+                                    "pnl_sum_usdt": None,
+                                    "pnl_avg_usdt": None,
+                                },
+                            },
+                        }
+                    },
+                    "missed_opportunity_metrics": {
+                        "candidate_window_start_ts":
+                            "2026-07-20 04:00:00",
+                        "candidate_window_end_ts":
+                            "2026-07-27 04:00:00",
+                        "count": 3,
+                    },
+                }
+            })
             con = sqlite3.connect(db)
             try:
                 for profile in ("live", "demo"):
@@ -399,7 +601,7 @@ class WeeklyArtifactTests(unittest.TestCase):
                         "win_rate,summary,lessons,raw,trade_week_num)"
                         " VALUES(?,?,?,?,?,?,?,?,?,?)",
                         ("2026-07-27 00:00:00", profile, 1, 1, 0.5,
-                         0.5, "summary", "lessons", "{}", 7),
+                         0.5, "summary", "lessons", raw, 7),
                     )
                 con.commit()
             finally:
@@ -412,9 +614,13 @@ class WeeklyArtifactTests(unittest.TestCase):
                     ro, "2026-07-27 00:00:00")
             finally:
                 ro.close()
+            self.assertEqual(payload["live_close_long_count"], 1)
+            self.assertEqual(payload["live_close_short_count"], 0)
+            self.assertEqual(payload["missed_opps_window_count"], 3)
             with mock.patch.object(
                     daily_report_writer, "WEEKLY_REPORTS_DIR", out_dir):
-                daily_report_writer.write_weekly_markdown(payload, True)
+                path = Path(
+                    daily_report_writer.write_weekly_markdown(payload, True))
             after = hashlib.sha256(db.read_bytes()).hexdigest()
             self.assertEqual(before, after)
             ro = sqlite3.connect(
@@ -426,6 +632,67 @@ class WeeklyArtifactTests(unittest.TestCase):
                 ro.close()
             self.assertTrue(
                 (out_dir / "weekly-2026-07-27.md").exists())
+            content = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "已完整成熟4小时的错失机会记录 3 条", content)
+            self.assertIn("| 多 | 1 | 1 | 100.00% | 0.5000 | 0.5000 |", content)
+
+    def test_readonly_weekly_backfill_recovers_mature_null_missed_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "account.db"
+            lessons = root / "lessons.db"
+            _create_db(db, WEEKLY_SCHEMA)
+            with closing(sqlite3.connect(lessons)) as con:
+                con.execute("CREATE TABLE missed_opportunities(ts TEXT)")
+                con.executemany(
+                    "INSERT INTO missed_opportunities VALUES(?)",
+                    [
+                        ("2026-07-20 04:00:00",),
+                        ("2026-07-21 04:00:00",),
+                        ("2026-07-26 03:45:00",),
+                        # Right boundary proves the source has matured; it is
+                        # excluded by the half-open candidate window.
+                        ("2026-07-27 04:00:00",),
+                    ],
+                )
+                con.commit()
+            raw = json.dumps({
+                "report_audit": {
+                    "period_kind": "weekly",
+                    "trade_metrics": {"live": {
+                        "period_start_ts": "2026-07-20 08:00:00",
+                        "period_end_ts": "2026-07-27 08:00:00",
+                    }},
+                    "missed_opportunity_metrics": {
+                        "candidate_window_start_ts":
+                            "2026-07-20 04:00:00",
+                        "candidate_window_end_ts":
+                            "2026-07-27 04:00:00",
+                        "count": None,
+                    },
+                }
+            })
+            with closing(sqlite3.connect(db)) as con:
+                con.execute(
+                    "INSERT INTO weekly_reports("
+                    "week_start_ts,profile,raw,trade_week_num) "
+                    "VALUES(?,?,?,?)",
+                    ("2026-07-27 00:00:00", "live", raw, 7),
+                )
+                con.commit()
+            ro = sqlite3.connect(
+                f"file:{db.resolve().as_posix()}?mode=ro", uri=True)
+            try:
+                with mock.patch.object(
+                        daily_report_writer, "LESSONS_DB", lessons):
+                    payload = daily_report_writer.load_existing_weekly_payload(
+                        ro, "2026-07-27 00:00:00")
+            finally:
+                ro.close()
+            self.assertEqual(payload["missed_opps_window_count"], 3)
+
+
 
 
 class DailyValidatorTests(unittest.TestCase):
@@ -556,6 +823,39 @@ class PushMacroSummaryTests(unittest.TestCase):
         })
         self.assertEqual(value, "USD_BROAD 120.71 ELEVATED")
 
+    def test_explanatory_usd_broad_reuses_authoritative_market_value(self):
+        value = build_push_payload._usd_broad_summary(
+            {
+                "usd_broad": (
+                    "DTWEXBGS 119.0649 d1 -0.0037; dxy_zone=STALE "
+                    "because the weekly value is carried forward"
+                ),
+            },
+            fallback_value=119.0649,
+        )
+        self.assertEqual(value, "USD_BROAD 119.06 STALE")
+
+    def test_chinese_punctuation_zone_suffix_is_not_rendered(self):
+        value = build_push_payload._usd_broad_summary(
+            {
+                "usd_broad": (
+                    "DTWEXBGS 119.0649 d1 -0.0037；"
+                    "dxy_zone=STALE（周频 carry-forward 8天，不进 z-score）"
+                ),
+            },
+            fallback_value=119.0649,
+        )
+        self.assertEqual(value, "USD_BROAD 119.06 STALE")
+
+    def test_direct_zone_with_explanation_is_normalized(self):
+        value = build_push_payload._usd_broad_summary(
+            {
+                "dxy_broad_value": 120.71,
+                "dxy_zone": "ELEVATED（soft evidence only）",
+            },
+        )
+        self.assertEqual(value, "USD_BROAD 120.71 ELEVATED")
+
     def test_error_decision_is_never_rendered_as_hold(self):
         self.assertEqual(build_push_payload._map_decision("error"), "ERROR")
         self.assertEqual(
@@ -610,6 +910,62 @@ class PushSingleBookPayloadTests(unittest.TestCase):
         self.assertNotIn("demo", payload["assets"])
         self.assertEqual(payload["channel"], "live")
         self.assertNotIn("db_rows_demo", payload["execution"])
+
+    def test_hold_headline_uses_authoritative_position_symbol(self):
+        facts = {
+            "cycle_id": self.CYCLE,
+            "status": "ok",
+            "as_of": "2026-08-06 12:01:00",
+            "balance": {"totalEq": 1000.0},
+            "positions": [{
+                "instId": "HYPE-USDT-SWAP",
+                "posSide": "long",
+                "contracts": 23.0,
+                "avgPx": 58.9,
+                "markPx": 73.5,
+                "lever": 5.0,
+                "upl": 33.0,
+                "mark_notional_usdt": 169.0,
+                "position_imr": 33.8,
+                "position_age_hours": 80.0,
+                "sl": {"verified": True, "trigger_px": 68.0},
+            }],
+        }
+        raw = {
+            "action_taken": "HOLD",
+            "decision_card": {
+                "agent_judgement": "HYPE-USDT-SWAP reviewed; HOLD",
+            },
+            "live_facts": facts,
+            "requested_position_actions": [],
+            "position_action_results": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._db_root(tmp, live_row=True)
+            con = sqlite3.connect(root / "live_trades.db")
+            try:
+                con.execute(
+                    "UPDATE trade_cycles SET raw=? WHERE cycle_id=?",
+                    (json.dumps(raw), self.CYCLE),
+                )
+                con.commit()
+            finally:
+                con.close()
+            payload = build_push_payload.build(
+                root,
+                self.CYCLE,
+                now=datetime(
+                    2026, 8, 6, 12, 3,
+                    tzinfo=timezone(timedelta(hours=8)),
+                ),
+            )
+
+        self.assertEqual("HYPE", payload["symbol"])
+        self.assertEqual("【12:00】HOLD HYPE", payload["title"])
+        self.assertEqual(
+            ["HYPE-USDT-SWAP"],
+            [row["symbol"] for row in payload["positions"]],
+        )
 
     def test_build_reports_exchange_fill_from_prior_business_cycle(self):
         report_cycle = "2026-08-06T12:15"

@@ -8,6 +8,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -33,7 +42,7 @@ from collect_market_features import (
 
 
 CST = timezone(timedelta(hours=8))
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 INITIAL_TIMEOUT_SECONDS = 30.0
 INITIAL_WORKERS = 12
 RETRY_TIMEOUT_SECONDS = 12.0
@@ -42,6 +51,7 @@ MAX_RETRY_WAVES = 2
 INITIAL_REQUEST_RETRIES = 1
 RETRY_CONTRACT_VERSION = 2
 _VALIDATION_TIMESTAMP = "1970-01-01T00:00:00Z"
+EXPECTED_SNAPSHOT_SOURCE = "okx_public_instruments_live_usdt_linear_swap"
 
 
 def positioning_receipt_path(db_root: Path, cycle_id: str) -> Path:
@@ -116,6 +126,108 @@ def require_current_natural_cycle(
             f"{current_slot.strftime('%Y-%m-%dT%H:%M')}"
         )
     return parsed
+
+
+def select_current_official_symbols(
+    connection: sqlite3.Connection,
+    cycle_id: str,
+    max_symbols: int,
+) -> tuple[list[str], dict[str, object]]:
+    """Bind the producer denominator to this slot's frozen official universe.
+
+    A just-listed contract can appear in the official instrument response before
+    the aggregate ticker endpoint emits its first row.  Ranking only the latest
+    ticker snapshot therefore lets the producer claim 100% of a smaller set
+    while the independent same-slot audit correctly sees a universe mismatch.
+    The immutable official snapshot is the denominator authority; ticker
+    notional is used only to preserve the established ordering of symbols that
+    already have a ticker.
+    """
+    run = connection.execute(
+        "SELECT symbol_count,payload_sha256,complete,source "
+        "FROM official_instrument_snapshot_runs WHERE cycle_id=?",
+        (cycle_id,),
+    ).fetchone()
+    if run is None:
+        raise RuntimeError("same-slot official instrument snapshot missing")
+    expected_count = int(run[0])
+    payload_sha256 = str(run[1] or "")
+    complete = int(run[2])
+    source = str(run[3] or "")
+    rows = connection.execute(
+        "SELECT symbol,list_time_utc,state,settle_ccy,ct_type,"
+        "inst_category,ct_val,lot_sz "
+        "FROM official_instrument_snapshot_rows WHERE cycle_id=? "
+        "ORDER BY symbol",
+        (cycle_id,),
+    ).fetchall()
+    official_symbols = [str(row[0]) for row in rows]
+    observed_payload = [
+        {
+            "symbol": str(row[0] or "").strip().upper(),
+            "list_time_utc": row[1],
+            "state": row[2],
+            "settle_ccy": row[3],
+            "ct_type": row[4],
+            "inst_category": row[5],
+            "ct_val": row[6],
+            "lot_sz": row[7],
+        }
+        for row in rows
+    ]
+    observed_payload_sha256 = hashlib.sha256(json.dumps(
+        observed_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    if any((
+        complete != 1,
+        source != EXPECTED_SNAPSHOT_SOURCE,
+        expected_count <= 0,
+        len(rows) != expected_count,
+        len(official_symbols) != len(set(official_symbols)),
+        len(payload_sha256) != 64,
+        observed_payload_sha256 != payload_sha256,
+        any(
+            str(row[2]).lower() != "live"
+            or str(row[3]).upper() != "USDT"
+            or str(row[4]).lower() != "linear"
+            for row in rows
+        ),
+    )):
+        raise RuntimeError("same-slot official instrument snapshot invalid")
+    if expected_count > max_symbols:
+        raise RuntimeError(
+            "official instrument universe exceeds configured positioning limit: "
+            f"{expected_count}>{max_symbols}"
+        )
+
+    official_set = set(official_symbols)
+    ticker_ranked = select_positioning_symbols(connection, max_symbols)
+    selected = [symbol for symbol in ticker_ranked if symbol in official_set]
+    selected_set = set(selected)
+    selected.extend(
+        symbol for symbol in official_symbols if symbol not in selected_set
+    )
+    if len(selected) != expected_count or set(selected) != official_set:
+        raise RuntimeError("same-slot official universe binding failed")
+    return selected, {
+        "contract_version": 1,
+        "authority": "official_instrument_snapshot_rows.same_cycle",
+        "cycle_id": cycle_id,
+        "source": source,
+        "official_symbol_count": expected_count,
+        "official_payload_sha256": payload_sha256,
+        "observed_payload_sha256": observed_payload_sha256,
+        "ticker_ranked_symbols": len(ticker_ranked),
+        "official_without_ticker_symbols": [
+            symbol for symbol in official_symbols if symbol not in set(ticker_ranked)
+        ],
+        "exact_set_match": True,
+        "historical_fallback": False,
+    }
 
 
 def _payload_valid(payload, cycle_id: str, symbol: str) -> bool:
@@ -328,7 +440,7 @@ def fetch_positioning_rows_bounded(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="当前自然周期全宇宙官方1H账户多空比采集")
-    parser.add_argument("--db-root", default=r".\db")
+    parser.add_argument("--db-root", default=_public_project_path('db'))
     parser.add_argument("--cycle", required=True)
     parser.add_argument(
         "--positioning-max-symbols",
@@ -346,7 +458,9 @@ def main() -> int:
         limit = max(3, min(int(args.positioning_max_symbols), 1000))
         read_connection = connect_ro(db_path, timeout=20)
         try:
-            symbols = select_positioning_symbols(read_connection, limit)
+            symbols, universe_binding = select_current_official_symbols(
+                read_connection, args.cycle, limit,
+            )
         finally:
             read_connection.close()
         if not symbols:
@@ -383,6 +497,12 @@ def main() -> int:
             "selected_count": selected_count,
             "selected_symbols_sha256": hashlib.sha256(
                 selected_json.encode("utf-8")).hexdigest(),
+            "universe_binding": {
+                **universe_binding,
+                "selected_symbols_sha256": hashlib.sha256(
+                    selected_json.encode("utf-8")
+                ).hexdigest(),
+            },
             "wrote": {"positioning": wrote},
             "minimum_positioning_coverage": POSITIONING_MINIMUM_COVERAGE,
             "positioning_coverage_rate": coverage_rate,

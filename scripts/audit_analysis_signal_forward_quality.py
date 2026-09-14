@@ -15,8 +15,18 @@ threshold, dispatches a stage, or places an order.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -28,19 +38,58 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from core import policy_epochs
+
 
 CST = timezone(timedelta(hours=8))
 UTC = timezone.utc
 HORIZONS = {"15m": timedelta(minutes=15), "1H": timedelta(hours=1),
             "4H": timedelta(hours=4)}
-DEFAULT_ANALYSIS_DB = Path(r"./db/analysis.db")
-DEFAULT_MARKET_DB = Path(r"./db/market.db")
+DEFAULT_ANALYSIS_DB = Path(_public_project_path('db', 'analysis.db'))
+DEFAULT_MARKET_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_JSON = Path(
-    r"./reports/quality/analysis-signal-forward-evaluation.json")
+    _public_project_path('reports', 'quality', 'analysis-signal-forward-evaluation.json'))
 DEFAULT_LABELS = Path(
-    r"./reports/quality/analysis-signal-forward-labels.csv")
+    _public_project_path('reports', 'quality', 'analysis-signal-forward-labels.csv'))
 DEFAULT_EVALUATION_START = "2026-08-05T00:00:00+08:00"
 DEFAULT_CURRENT_PROTOCOL_START = "2026-08-10T00:00:00+08:00"
+LABEL_COLUMNS = [
+    "cycle_id", "symbol", "action", "side", "regime",
+    "analysis_completed_at_cst", "decision_ts_utc", "horizon",
+    "outcome_status", "label_evidence_source",
+    "entry_ts_utc", "entry_last", "entry_executable",
+    "entry_price_source", "exit_ts_utc", "exit_last", "exit_executable",
+    "exit_price_source", "last_directional_return",
+    "executable_directional_return", "signed_return_after_cost",
+    "after_cost_hit", "self_reported_confidence", "planned_rr",
+    "ev_p_win", "ev_p_n", "ev_ci_low", "ev_r",
+    "direction_evidence_count", "opposing_evidence_count",
+    "instrument_regime", "global_instrument_regime_match",
+]
+LEGACY_LABEL_COLUMNS = [
+    column for column in LABEL_COLUMNS if column != "label_evidence_source"
+]
+LABEL_KEY_FIELDS = (
+    "cycle_id", "symbol", "action", "side",
+    "analysis_completed_at_cst", "decision_ts_utc", "horizon",
+)
+FROZEN_OUTCOME_FIELDS = (
+    "outcome_status", "entry_ts_utc", "entry_last", "entry_executable",
+    "entry_price_source", "exit_ts_utc", "exit_last", "exit_executable",
+    "exit_price_source", "last_directional_return",
+    "executable_directional_return", "signed_return_after_cost",
+    "after_cost_hit",
+)
+CSV_FLOAT_FIELDS = {
+    "entry_last", "entry_executable", "exit_last", "exit_executable",
+    "last_directional_return", "executable_directional_return",
+    "signed_return_after_cost", "self_reported_confidence", "planned_rr",
+    "ev_p_win", "ev_ci_low", "ev_r",
+}
+CSV_INT_FIELDS = {
+    "ev_p_n", "direction_evidence_count", "opposing_evidence_count",
+}
+CSV_BOOL_FIELDS = {"after_cost_hit", "global_instrument_regime_match"}
 
 
 def _ro(path: Path) -> sqlite3.Connection:
@@ -68,6 +117,24 @@ def _iso_utc(value: datetime) -> str:
 
 def _iso_cst(value: datetime) -> str:
     return value.astimezone(CST).isoformat()
+
+
+def _rows_at_or_after_cycle_boundary(
+    rows: Iterable[dict[str, Any]], boundary: datetime,
+) -> tuple[list[dict[str, Any]], int]:
+    """Select a policy cohort by cycle identity; invalid cycles stay visible."""
+    selected: list[dict[str, Any]] = []
+    invalid = 0
+    boundary_utc = boundary.astimezone(UTC)
+    for row in rows:
+        try:
+            cycle_time = _parse_time(str(row.get("cycle_id") or ""))
+        except (TypeError, ValueError):
+            invalid += 1
+            continue
+        if cycle_time >= boundary_utc:
+            selected.append(row)
+    return selected, invalid
 
 
 def _wilson(successes: int, total: int,
@@ -106,18 +173,6 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _atomic_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    columns = [
-        "cycle_id", "symbol", "action", "side", "regime",
-        "analysis_completed_at_cst", "decision_ts_utc", "horizon",
-        "outcome_status", "entry_ts_utc", "entry_last", "entry_executable",
-        "entry_price_source", "exit_ts_utc", "exit_last", "exit_executable",
-        "exit_price_source", "last_directional_return",
-        "executable_directional_return", "signed_return_after_cost",
-        "after_cost_hit", "self_reported_confidence", "planned_rr",
-        "ev_p_win", "ev_p_n", "ev_ci_low", "ev_r",
-        "direction_evidence_count", "opposing_evidence_count",
-        "instrument_regime", "global_instrument_regime_match",
-    ]
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -125,7 +180,7 @@ def _atomic_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             prefix=f".{path.name}.", suffix=".tmp", delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            writer = csv.DictWriter(handle, fieldnames=columns,
+            writer = csv.DictWriter(handle, fieldnames=LABEL_COLUMNS,
                                     extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
@@ -136,6 +191,164 @@ def _atomic_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _label_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(row.get(field) or "") for field in LABEL_KEY_FIELDS)
+
+
+def _csv_bool(value: Any) -> bool | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"true", "1"}:
+        return True
+    if text in {"false", "0"}:
+        return False
+    raise ValueError(f"invalid boolean in prior label: {value!r}")
+
+
+def _read_prior_labels(path: Path) -> tuple[list[dict[str, Any]], str]:
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        header = set(reader.fieldnames or [])
+        missing = set(LEGACY_LABEL_COLUMNS) - header
+        if missing:
+            raise ValueError(
+                "prior labels missing required columns: "
+                + ",".join(sorted(missing))
+            )
+        for raw_row in reader:
+            row: dict[str, Any] = dict(raw_row)
+            for field in CSV_FLOAT_FIELDS:
+                text = str(row.get(field) or "").strip()
+                row[field] = float(text) if text else None
+            for field in CSV_INT_FIELDS:
+                text = str(row.get(field) or "").strip()
+                row[field] = int(float(text)) if text else None
+            for field in CSV_BOOL_FIELDS:
+                row[field] = _csv_bool(row.get(field))
+            row["label_evidence_source"] = str(
+                row.get("label_evidence_source") or "legacy_prior_artifact"
+            )
+            rows.append(row)
+    return rows, digest
+
+
+def _prior_matured_complete(row: dict[str, Any]) -> bool:
+    if row.get("outcome_status") != "matured":
+        return False
+    required = (
+        "entry_ts_utc", "entry_last", "entry_executable",
+        "entry_price_source", "exit_ts_utc", "exit_last",
+        "exit_executable", "exit_price_source",
+        "last_directional_return", "executable_directional_return",
+        "signed_return_after_cost", "after_cost_hit",
+    )
+    return all(row.get(field) not in (None, "") for field in required)
+
+
+def _frozen_value_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        if not isinstance(right, (int, float)) or isinstance(right, bool):
+            return False
+        return math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+    return left == right
+
+
+def _merge_prior_matured_labels(
+    current_rows: list[dict[str, Any]],
+    prior_rows: list[dict[str, Any]] | None,
+    *,
+    prior_sha256: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    current = [dict(row) for row in current_rows]
+    for row in current:
+        row["label_evidence_source"] = (
+            "matured_frozen_label"
+            if row.get("outcome_status") == "matured"
+            else "current_market_db"
+        )
+    if prior_rows is None:
+        return current, {
+            "status": "NO_PRIOR_ARTIFACT",
+            "prior_sha256": None,
+            "prior_rows": 0,
+            "prior_matured_rows": 0,
+            "reused_after_market_retention": 0,
+            "verified_against_current_market": 0,
+            "frozen_value_drift_rows": 0,
+        }
+
+    prior_matured: dict[tuple[str, ...], dict[str, Any]] = {}
+    invalid_matured = 0
+    for row in prior_rows:
+        if row.get("outcome_status") != "matured":
+            continue
+        if not _prior_matured_complete(row):
+            invalid_matured += 1
+            continue
+        key = _label_key(row)
+        if key in prior_matured:
+            raise ValueError(f"duplicate matured prior label identity: {key!r}")
+        prior_matured[key] = row
+    if invalid_matured:
+        raise ValueError(
+            f"prior labels contain {invalid_matured} incomplete matured rows"
+        )
+
+    current_keys = {_label_key(row) for row in current}
+    orphaned = sorted(set(prior_matured) - current_keys)
+    if orphaned:
+        raise ValueError(
+            "prior matured labels lost their analysis signal identities: "
+            f"count={len(orphaned)} sample={orphaned[0]!r}"
+        )
+
+    reused = 0
+    verified = 0
+    drifted = 0
+    for row in current:
+        prior = prior_matured.get(_label_key(row))
+        if prior is None:
+            continue
+        if str(prior.get("regime") or "") != str(row.get("regime") or ""):
+            raise ValueError(
+                f"prior matured label regime drift: {_label_key(row)!r}"
+            )
+        if row.get("outcome_status") == "matured":
+            verified += 1
+            row_drifted = any(
+                not _frozen_value_equal(prior.get(field), row.get(field))
+                for field in FROZEN_OUTCOME_FIELDS
+            )
+            if row_drifted:
+                drifted += 1
+            source = (
+                "prior_frozen_label_drift_preserved"
+                if row_drifted else "matured_frozen_label"
+            )
+        else:
+            reused += 1
+            source = "prior_frozen_label_retention_reuse"
+        for field in FROZEN_OUTCOME_FIELDS:
+            row[field] = prior.get(field)
+        row["outcome_status"] = "matured"
+        row["label_evidence_source"] = source
+
+    return current, {
+        "status": "PRIOR_MATURED_LABELS_FROZEN",
+        "prior_sha256": prior_sha256,
+        "prior_rows": len(prior_rows),
+        "prior_matured_rows": len(prior_matured),
+        "reused_after_market_retention": reused,
+        "verified_against_current_market": verified,
+        "frozen_value_drift_rows": drifted,
+        "orphaned_prior_matured_rows": 0,
+    }
 
 
 def _read_signal_rows(con: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -416,6 +629,8 @@ def audit(
     minimum_evaluation_n: int = 100,
     minimum_evaluation_days: int = 5,
     minimum_evaluation_cycles: int = 100,
+    prior_labels: list[dict[str, Any]] | None = None,
+    prior_labels_sha256: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if cost_bps < 0 or max_delay_minutes <= 0:
         raise ValueError("cost_bps and max_delay_minutes must be non-negative/positive")
@@ -441,6 +656,11 @@ def audit(
     finally:
         market.close()
         analysis.close()
+    labels, frozen_label_continuity = _merge_prior_matured_labels(
+        labels,
+        prior_labels,
+        prior_sha256=prior_labels_sha256,
+    )
 
     evaluation_start = evaluation_start.astimezone(UTC)
     current_protocol_start = current_protocol_start.astimezone(UTC)
@@ -457,6 +677,11 @@ def audit(
         if _parse_time(row["decision_ts_utc"], naive_zone=UTC)
         >= current_protocol_start
     ]
+    current_policy_start = _parse_time(
+        policy_epochs.PROBE_CLAUSE_END_CST)
+    current_policy, current_policy_invalid_cycles = (
+        _rows_at_or_after_cycle_boundary(labels, current_policy_start)
+    )
     horizon_selection = select_horizon_from_discovery(
         discovery,
         minimum_n=minimum_discovery_n,
@@ -502,6 +727,25 @@ def audit(
         )
         for side in ("long", "short") for horizon in HORIZONS
     }
+    current_policy_by_horizon = {
+        horizon: _metrics(
+            row for row in current_policy if row["horizon"] == horizon)
+        for horizon in HORIZONS
+    }
+    current_policy_selected = current_policy_by_horizon[selected_horizon]
+    current_policy_sample_ready = bool(
+        current_policy_selected["n"] >= minimum_evaluation_n
+        and current_policy_selected["distinct_days"] >= minimum_evaluation_days
+        and current_policy_selected["distinct_cycles"]
+        >= minimum_evaluation_cycles
+    )
+    if not current_policy_sample_ready:
+        current_policy_status = "NOT_MEASURABLE"
+    elif (current_policy_selected["precision_after_cost"] or 0.0) < 0.90:
+        current_policy_status = "NOT_MET"
+    else:
+        current_policy_status = (
+            "DIRECTIONAL_PRECISION_ONLY_NOT_CALIBRATED")
     payload = {
         "schema_version": 1,
         "artifact_type": "analysis_signal_forward_quality_audit",
@@ -534,10 +778,14 @@ def audit(
             "discovery_end_exclusive_utc": _iso_utc(evaluation_start),
             "evaluation_start_utc": _iso_utc(evaluation_start),
             "current_protocol_start_utc": _iso_utc(current_protocol_start),
+            "current_policy_start_cst": _iso_cst(current_policy_start),
+            "current_policy_boundary_source": (
+                "core.policy_epochs.PROBE_CLAUSE_END_CST"),
             "evaluation_evidence_class": "retrospective_not_independent_forward",
         },
         "data_quality": {
             "outcome_status_counts": dict(sorted(missing_counts.items())),
+            "frozen_label_continuity": frozen_label_continuity,
             "self_reported_confidence_semantics": (
                 "legacy optional uncalibrated field; never a production confidence claim"
             ),
@@ -545,6 +793,7 @@ def audit(
                 "signals span multiple historical decision protocols; current-protocol "
                 "window is reported separately and may be small"
             ),
+            "current_policy_invalid_cycle_rows": current_policy_invalid_cycles,
         },
         "all_history_by_horizon": by_horizon,
         "all_history_by_side_horizon": by_side_horizon,
@@ -557,6 +806,24 @@ def audit(
             horizon: _metrics(
                 row for row in current_protocol if row["horizon"] == horizon)
             for horizon in HORIZONS
+        },
+        "current_policy_by_horizon": current_policy_by_horizon,
+        "current_policy_diagnostic": {
+            "policy_epoch": policy_epochs.CURRENT_EPOCH,
+            "start_cst": _iso_cst(current_policy_start),
+            "boundary_source": "core.policy_epochs.PROBE_CLAUSE_END_CST",
+            "scope": (
+                "diagnostic-only cohort; all prior signals remain in protocol, "
+                "profitability, report, and acceptance denominators"
+            ),
+            "selected_horizon": selected_horizon,
+            "selected_horizon_metrics": current_policy_selected,
+            "minimum_evaluation_n": minimum_evaluation_n,
+            "minimum_evaluation_days": minimum_evaluation_days,
+            "minimum_evaluation_cycles": minimum_evaluation_cycles,
+            "status": current_policy_status,
+            "historical_rejudgement": False,
+            "acceptance_denominator_unchanged": True,
         },
         "legacy_self_reported_confidence_diagnostic_discovery_only": (
             _confidence_diagnostic(discovery)
@@ -573,9 +840,13 @@ def audit(
         "limitations": [
             "retrospective signal outcomes are not an untouched future window",
             "historical signals span multiple decision protocols",
+            "current-protocol is a schema cohort, not the current policy epoch; "
+            "the current-policy diagnostic is reported separately",
             "analysis_signals.confidence is optional, legacy, and not calibrated",
             "fixed-horizon directional quality is not realised portfolio PnL",
             "20bp is a standardised hurdle after observed spread, not fill-by-fill fees",
+            "previously matured label outcomes are frozen by signal identity so "
+            "45-day tick retention cannot reclassify them as missing",
         ],
         "production_mutation": False,
         "production_threshold_change_allowed": False,
@@ -591,6 +862,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--market-db", type=Path, default=DEFAULT_MARKET_DB)
     parser.add_argument("--json-out", type=Path, default=DEFAULT_JSON)
     parser.add_argument("--labels-out", type=Path, default=DEFAULT_LABELS)
+    parser.add_argument(
+        "--prior-labels", type=Path,
+        help=(
+            "previous immutable label artifact; default is the existing "
+            "--labels-out file when present"
+        ),
+    )
     parser.add_argument("--evaluation-start", default=DEFAULT_EVALUATION_START)
     parser.add_argument(
         "--current-protocol-start", default=DEFAULT_CURRENT_PROTOCOL_START)
@@ -608,6 +886,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        prior_path = args.prior_labels
+        if prior_path is None and args.labels_out.is_file():
+            prior_path = args.labels_out
+        prior_labels = None
+        prior_labels_sha256 = None
+        if prior_path is not None:
+            prior_labels, prior_labels_sha256 = _read_prior_labels(prior_path)
         payload, labels = audit(
             analysis_db=args.analysis_db,
             market_db=args.market_db,
@@ -621,9 +906,18 @@ def main(argv: list[str] | None = None) -> int:
             minimum_evaluation_n=args.minimum_evaluation_n,
             minimum_evaluation_days=args.minimum_evaluation_days,
             minimum_evaluation_cycles=args.minimum_evaluation_cycles,
+            prior_labels=prior_labels,
+            prior_labels_sha256=prior_labels_sha256,
         )
-        _atomic_json(args.json_out, payload)
         _atomic_csv(args.labels_out, labels)
+        labels_sha256 = hashlib.sha256(args.labels_out.read_bytes()).hexdigest()
+        payload["label_artifact"] = {
+            "path": str(args.labels_out),
+            "sha256": labels_sha256,
+            "rows": len(labels),
+            "write_order": "labels_then_hash_bound_json",
+        }
+        _atomic_json(args.json_out, payload)
     except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
         print(json.dumps({
             "ok": False,
@@ -637,6 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         "ok": True,
         "json_out": str(args.json_out),
         "labels_out": str(args.labels_out),
+        "labels_sha256": payload["label_artifact"]["sha256"],
         "signals": payload["signal_population"]["signals"],
         "selected_horizon": selected["selected_horizon"],
         "evaluation_n": selected["n"],

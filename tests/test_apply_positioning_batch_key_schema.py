@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -98,11 +98,11 @@ class PositioningBatchKeySchemaTests(unittest.TestCase):
             self.assertEqual(0, planned["target_key_duplicates"])
             self.assertFalse(planned["historical_backfill"])
 
-            stderr = io.StringIO()
-            with redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
-                migration.main(["--db", str(db_path), "--apply"])
-            self.assertEqual(2, caught.exception.code)
-            self.assertIn("backup-dir", stderr.getvalue())
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = migration.main(["--db", str(db_path), "--apply"])
+            self.assertEqual(2, rc)
+            self.assertIn("backup-dir", json.loads(output.getvalue())["error"])
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -157,7 +157,6 @@ class PositioningBatchKeySchemaTests(unittest.TestCase):
             with redirect_stdout(output):
                 rc = migration.main([
                     "--db", str(db_path), "--apply",
-                    "--backup-dir", str(root / "backups"),
                 ])
             repeated = json.loads(output.getvalue())
             self.assertEqual(0, rc)

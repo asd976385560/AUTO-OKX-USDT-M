@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""experience_features_v2.py — v2 相似特征派生与回填（Wave2 序9）。
+r"""experience_features_v2.py — 经验特征派生（v2 冻结、v3 前向启用）。
 
 派生（全部确定性，as-of 语义）：
   asset_class        core.asset_class 权威表
@@ -10,13 +10,20 @@ r"""experience_features_v2.py — v2 相似特征派生与回填（Wave2 序9）
   vol_24h_pct        15m K 线 as_of 前 24h (max(h)-min(l))/last(c)
   trend_1h/4h        1H/4H K 线 as_of 时 MA20 vs MA50（+1/-1；bars<50=None）
 
-CLI 回填：把 trade_experiences 全部行的 experience_vector 升级为
-  {"v":2, "features": {...}, "legacy_v1": [旧10维数组]}
-旧向量原位保留（终稿放行条件：旧向量可追溯）。幂等：已是 v2 的行跳过。
-默认 dry-run；--apply 真写。kline/derivatives 保留期 ≈3 个月，覆盖全部现存行；
-个别派生不出的特征 None 如实留空（覆盖惩罚在 similarity_v2 内）。
+现有 v2 向量按历史证据冻结，不回填、不重算。部署后 writer 仅新增带明确
+``experience_features_v3_strict_24h`` epoch 的 v3；finder 也只在完全相同的
+v3 epoch 内比较，禁止 v2/v3 静默混算。CLI 仅报告版本分布，--apply fail-closed。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -43,11 +50,17 @@ CST = timezone(timedelta(hours=8))
 
 
 def _cst_to_utcz(ts_cst: str) -> Optional[str]:
+    raw = str(ts_cst or "").strip()
+    if not raw:
+        return None
     try:
-        dt = datetime.strptime(str(ts_cst)[:19], "%Y-%m-%d %H:%M:%S")
+        dt = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw[-1:].upper() == "Z" else raw)
     except (TypeError, ValueError):
         return None
-    return dt.replace(tzinfo=CST).astimezone(timezone.utc).strftime(
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CST)
+    return dt.astimezone(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -57,31 +70,51 @@ def _ma(vals: list[float], n: int) -> Optional[float]:
     return sum(vals[-n:]) / n
 
 
+def _utc_window_bounds(as_of_z: str, hours: int) -> tuple[str, str]:
+    upper = datetime.strptime(as_of_z, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    lower = upper - timedelta(hours=hours)
+    return (
+        lower.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
 def derive_market_features(mcon: sqlite3.Connection, symbol: str,
                            as_of_cst: str) -> dict[str, Any]:
-    """funding / vol / trend as-of（只读 market.db；缺数据=None）。"""
+    """v3 funding / vol / trend as-of（严格 ``(lower, as_of]`` 窗）。"""
     out: dict[str, Any] = {"funding_rate": None, "vol_24h_pct": None,
                            "trend_1h": None, "trend_4h": None}
     as_of_z = _cst_to_utcz(as_of_cst)
     if not as_of_z:
         return out
+    funding_lower_z, _ = _utc_window_bounds(as_of_z, 4)
     row = mcon.execute(
         "SELECT funding_rate FROM derivatives WHERE symbol=? AND ts<=? "
-        "AND ts>=datetime(?, '-4 hours') ORDER BY ts DESC LIMIT 1",
-        (symbol, as_of_z, as_of_z)).fetchone()
+        "AND ts>? ORDER BY ts DESC LIMIT 1",
+        (symbol, as_of_z, funding_lower_z)).fetchone()
     if row and row[0] is not None:
         try:
             out["funding_rate"] = float(row[0])
         except (TypeError, ValueError):
             pass
+    vol_lower_z, _ = _utc_window_bounds(as_of_z, 24)
     bars = mcon.execute(
-        "SELECT h, l, c FROM kline_cache WHERE symbol=? AND tf='15m' "
-        "AND ts<=? AND ts>=datetime(?, '-24 hours') ORDER BY ts",
-        (symbol, as_of_z, as_of_z)).fetchall()
-    if len(bars) >= 24:
-        hi = max(b[0] for b in bars if b[0] is not None)
-        lo = min(b[1] for b in bars if b[1] is not None)
-        last_c = next((b[2] for b in reversed(bars) if b[2]), None)
+        "SELECT ts, h, l, c FROM kline_cache WHERE symbol=? AND tf='15m' "
+        "AND ts<=? AND ts>? ORDER BY ts",
+        (symbol, as_of_z, vol_lower_z)).fetchall()
+    upper_dt = datetime.strptime(as_of_z, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    expected_ts = {
+        (upper_dt - timedelta(minutes=15 * offset)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for offset in range(96)
+    }
+    observed_ts = {str(row[0]) for row in bars}
+    if len(bars) == 96 and observed_ts == expected_ts:
+        hi = max(b[1] for b in bars if b[1] is not None)
+        lo = min(b[2] for b in bars if b[2] is not None)
+        last_c = next((b[3] for b in reversed(bars) if b[3]), None)
         if hi and lo and last_c:
             out["vol_24h_pct"] = round((hi - lo) / last_c, 6)
     for tf, key in (("1H", "trend_1h"), ("4H", "trend_4h")):
@@ -118,7 +151,7 @@ def _planned_rr_from_card(card: Any) -> Optional[float]:
 
 def features_for_row(mcon: sqlite3.Connection, row: sqlite3.Row,
                      db_root: Path) -> dict[str, Any]:
-    """一条 trade_experiences 行 → v2 特征 dict。"""
+    """一条 trade_experiences 行 → 当前前向 v3 特征 dict（不写库）。"""
     raw: dict[str, Any] = {}
     try:
         parsed = json.loads(row["raw"] or "{}")
@@ -141,64 +174,57 @@ def features_for_row(mcon: sqlite3.Connection, row: sqlite3.Row,
         "planned_rr": _planned_rr_from_card(raw.get("decision_card")),
     }
     base.update(derive_market_features(mcon, row["symbol"], row["ts"]))
-    return _simutil.experience_features_v2(base)
+    return _simutil.experience_features_v3(base)
 
 
 def backfill(db_root: Path, apply: bool) -> dict[str, Any]:
-    acon = sqlite3.connect(str(db_root / "account.db"), timeout=15)
-    acon.execute("PRAGMA busy_timeout=10000")
+    acon = sqlite3.connect(
+        f"file:{db_root / 'account.db'}?mode=ro", uri=True, timeout=15)
     acon.row_factory = sqlite3.Row
-    mcon = sqlite3.connect(
-        f"file:{db_root / 'market.db'}?mode=ro", uri=True, timeout=15)
     try:
         rows = acon.execute(
-            "SELECT id, ts, symbol, side, action, regime, regime_stale, "
-            "score_total, experience_vector, raw FROM trade_experiences "
+            "SELECT id, experience_vector FROM trade_experiences "
             "ORDER BY id").fetchall()
-        upgraded = skipped_v2 = 0
-        coverage_counter: dict[str, int] = {}
-        updates = []
+        versions = {"v1_or_legacy": 0, "v2_frozen": 0, "v3_forward": 0,
+                    "invalid": 0}
         for row in rows:
-            legacy = None
             try:
                 stored = json.loads(row["experience_vector"] or "null")
             except json.JSONDecodeError:
-                stored = None
-            if isinstance(stored, dict) and stored.get("v") == 2:
-                skipped_v2 += 1
+                versions["invalid"] += 1
                 continue
-            if isinstance(stored, list):
-                legacy = stored
-            feats = features_for_row(mcon, row, db_root)
-            for k, v in feats.items():
-                if k in ("v",):
-                    continue
-                if v is not None:
-                    coverage_counter[k] = coverage_counter.get(k, 0) + 1
-            payload = {"v": 2, "features": feats, "legacy_v1": legacy}
-            updates.append((json.dumps(payload, ensure_ascii=False), row["id"]))
-            upgraded += 1
-        if apply and updates:
-            acon.executemany(
-                "UPDATE trade_experiences SET experience_vector=? WHERE id=?",
-                updates)
-            acon.commit()
-        return {"ok": True, "dry_run": not apply, "total_rows": len(rows),
-                "upgraded": upgraded, "already_v2": skipped_v2,
-                "feature_coverage": coverage_counter}
+            if isinstance(stored, dict) and stored.get("v") == 3:
+                versions["v3_forward"] += 1
+            elif isinstance(stored, dict) and stored.get("v") == 2:
+                versions["v2_frozen"] += 1
+            elif isinstance(stored, list) or stored is None:
+                versions["v1_or_legacy"] += 1
+            else:
+                versions["invalid"] += 1
+        out = {
+            "ok": not apply,
+            "dry_run": True,
+            "historical_mutation": False,
+            "total_rows": len(rows),
+            "versions": versions,
+            "feature_epoch": _simutil.FEATURE_EPOCH_V3,
+        }
+        if apply:
+            out["error"] = "historical_feature_backfill_frozen"
+        return out
     finally:
         acon.close()
-        mcon.close()
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="经验特征 v2 回填（默认 dry-run）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap = argparse.ArgumentParser(
+        description="经验特征版本分布（v2冻结；--apply 恒拒绝）")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
-    print(json.dumps(backfill(Path(args.db_root), args.apply),
-                     ensure_ascii=False, indent=1))
-    return 0
+    result = backfill(Path(args.db_root), args.apply)
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

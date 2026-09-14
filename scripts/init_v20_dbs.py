@@ -4,8 +4,9 @@
 | 库            | 唯一 writer   | 读者          | 本脚本动作                         |
 |:--------------|:--------------|:--------------|:-----------------------------------|
 | regime.db     | 慢采脚本      | 分析员        | 建 cross_market（schema 同现 market.db）|
-| analysis.db   | 分析员        | 实盘 trader   | 建 analysis_runs + analysis_signals |
+| analysis.db   | 分析员        | 双 trader     | 建 analysis_runs + analysis_signals |
 | live_trades.db| 实盘 trader   | 复盘          | 建 trades + trade_cycles            |
+| demo_trades.db| 模拟 trader   | 复盘          | 建 trades + trade_cycles（同构）    |
 | ledger.db     | 各采集器      | 全体          | 委托 ledger.init_ledger             |
 
 幂等（CREATE IF NOT EXISTS）。WAL/busy_timeout 复用 ledger.connect（单一来源）。
@@ -14,16 +15,25 @@
 确认的生产步（见 docs/团队架构 切换清单），不在本脚本内做，避免误碰生产。
 
 用法：
-    python init_v20_dbs.py --root .\\db          # 生产（建空库，不动现有库）
+    python init_v20_dbs.py --root <PROJECT_ROOT>\\db          # 生产（建空库，不动现有库）
     python init_v20_dbs.py --root <tmp> --verify       # tmp 验证 schema + journal_mode
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r".\collectors")
+sys.path.insert(0, _public_project_path('collectors'))
 import ledger  # noqa: E402  复用 connect()/init_ledger()（WAL 单一来源）
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -55,7 +65,15 @@ CREATE TABLE IF NOT EXISTS cross_market (
     dxy_calc_ecb REAL,
     dxy_calc_ecb_d1 REAL,
     fear_greed REAL,
-    fear_greed_label TEXT
+    fear_greed_label TEXT,
+    -- 2026-08-19 D4：宏观观测日类型化列（迁移脚本
+    -- apply_cross_market_staleness_schema.py 对既有库同步补齐）。
+    -- 陈旧度＝「读取时刻 − 观测日」，是函数不是状态，故刻意不落 *_stale 布尔列。
+    dxy_as_of TEXT,
+    vix_as_of TEXT,
+    spx_as_of TEXT,
+    gold_as_of TEXT,
+    btc_etf_as_of TEXT
 );
 
 CREATE TABLE IF NOT EXISTS macro_observations (
@@ -110,7 +128,7 @@ CREATE TABLE IF NOT EXISTS analysis_signals (
 CREATE INDEX IF NOT EXISTS idx_analysis_signals_cycle ON analysis_signals(cycle_id);
 """
 
-# live_trades.db：实盘 trader 是唯一 writer。
+# live_trades.db / demo_trades.db：同构。每个 trader 是自己库的唯一 writer。
 DDL_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +206,7 @@ def journal_mode(path: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 数据库初始化（只建表不搬数据）")
-    ap.add_argument("--root", default=r".\db")
+    ap.add_argument("--root", default=_public_project_path('db'))
     ap.add_argument("--verify", action="store_true", help="建完打印 schema + journal_mode")
     args = ap.parse_args()
     root = Path(args.root)

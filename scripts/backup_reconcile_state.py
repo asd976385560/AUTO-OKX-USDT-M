@@ -8,6 +8,15 @@ directory and writes a manifest after every source and backup passes
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -69,7 +78,7 @@ def _online_backup(source: Path, target: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--database", action="append",
                     help="db-root 下的文件名；可重复，默认备份 live/account/ledger")

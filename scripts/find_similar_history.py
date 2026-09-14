@@ -23,16 +23,25 @@
   }
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import sys, json, math, argparse
 from pathlib import Path
-sys.path.insert(0, r'./Lib/site-packages')
+sys.path.insert(0, _public_project_path('Lib', 'site-packages'))
 sys.stdout.reconfigure(encoding='utf-8')
 
 from _db_ro import connect_ro
 
 
 def market_db_path(db_root: str | None = None) -> str:
-    return str(Path(db_root or r'./db') / 'market.db')
+    return str(Path(db_root or _public_project_path('db')) / 'market.db')
 
 
 def vec_norm(v: list[float]) -> float:
@@ -175,7 +184,7 @@ def main() -> int:
     ap.add_argument("--tf", default="1D")
     ap.add_argument("--top-n", "--top", dest="top_n", type=int, default=10)
     ap.add_argument("--forward-bars", type=int, default=7)
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--pretty", action="store_true")
     args = ap.parse_args()
     result = find_similar(args.symbol, args.tf, args.top_n, args.forward_bars, db_root=args.db_root)

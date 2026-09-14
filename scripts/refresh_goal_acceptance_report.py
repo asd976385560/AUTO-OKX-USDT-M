@@ -2,6 +2,15 @@
 """Refresh live quality evidence in the goal acceptance report artifact."""
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -19,12 +28,63 @@ CST = timezone(timedelta(hours=8))
 
 def _coverage_target_pct(now: datetime | None = None) -> str:
     """当前生效的完善率/完整度闸门（预注册激活边界解析，四族同一数值）。"""
-    return f"{thresholds.coverage_target_rate(now or datetime.now(CST)):.0%}"
+    # Present-tense report copy is pinned to this deployed migration, never to
+    # wall clock.  Historical evidence paths must pass their own artifact time.
+    instant = now or thresholds.COVERAGE_TARGET_ACTIVATION_CST
+    return f"{thresholds.coverage_target_rate(instant):.0%}"
 
 
 def _credibility_target_pct(now: datetime | None = None) -> str:
     """当前生效的前向校准门（预注册激活边界解析；点精度与 Wilson 同值）。"""
-    return f"{thresholds.shadow_target_precision(now or datetime.now(CST)):.0%}"
+    instant = now or thresholds.SHADOW_CALIBRATION_ACTIVATION_CST
+    return f"{thresholds.shadow_target_precision(instant):.0%}"
+
+
+def _validated_historical_shadow_target(
+    evidence: dict, acceptance: dict, *, label: str,
+) -> float:
+    """Resolve a historical diagnostic's gate at that artifact's own as-of."""
+    as_of = evidence.get("as_of_utc") or evidence.get("generated_at_utc")
+    try:
+        declared_raw = acceptance.get(
+            "target_precision",
+            acceptance.get("target_wilson_95_lower_bound"),
+        )
+        declared = float(declared_raw)
+        expected = thresholds.shadow_target_precision(str(as_of))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} historical target is missing") from exc
+    if not math.isclose(declared, expected, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"{label} historical target disagrees with artifact as_of")
+    return declared
+
+
+def _validated_coverage_target(
+    audit: dict,
+    *,
+    as_of: object,
+    target_field: str,
+    migration_field: str,
+    label: str,
+) -> float:
+    """Fail closed unless an audit proves the threshold in force at its as-of."""
+    try:
+        expected_target = thresholds.coverage_target_rate(str(as_of))
+        declared_target = float(audit[target_field])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} effective target is missing or invalid") from exc
+    if not math.isfinite(declared_target) or not math.isclose(
+        declared_target, expected_target, rel_tol=0.0, abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            f"{label} effective target disagrees with activation boundary")
+    expected_facts = thresholds.coverage_migration_facts(str(as_of))
+    if audit.get(migration_field) != expected_facts:
+        raise ValueError(
+            f"{label} migration facts disagree with activation boundary")
+    return declared_target
+
+
 CONTRACT_DIRECT_METHODS = {
     "rubik_common_bucket",
     "official_public_oi_trades_candle_reconciled_fallback",
@@ -201,7 +261,7 @@ def _advance_report_generated_at(artifact: dict, candidate: object) -> str:
     manifest["generatedAt"] = generated_at
     snapshot["generatedAt"] = generated_at
     title = str(
-        manifest.get("title") or ". 四项目标实施与前向验收"
+        manifest.get("title") or '<PROJECT_ROOT> 四项目标实施与前向验收'.replace('<PROJECT_ROOT>', _public_project_path())
     )
     title_suffix = f"（{latest.astimezone(CST).strftime('%Y-%m-%d %H:%M')}）"
     if re.search(r"（[^（）]*）$", title):
@@ -231,7 +291,13 @@ def refresh_report_completeness(
     expected = int(audit["expected"])
     valid = int(audit["valid"])
     rate = float(audit["completeness_rate"])
-    target = float(audit["target_rate"])
+    target = _validated_coverage_target(
+        audit,
+        as_of=audit.get("evaluated_at_cst"),
+        target_field="target_rate",
+        migration_field="target_rate_migration",
+        label="daily report completeness audit",
+    )
     target_pct = f"{target:.0%}"
     invalid = int(audit.get("invalid", expected - valid))
     if (
@@ -253,6 +319,71 @@ def refresh_report_completeness(
     ):
         if audit.get(field) is not expected_value:
             raise ValueError(f"daily report audit unsafe field: {field}")
+
+    # The active daily gate is the pre-registered forward window.  Rebuild it
+    # from primitive counts instead of trusting producer status strings.
+    daily_forward = audit.get("forward_after_remediation")
+    if not isinstance(daily_forward, dict):
+        raise ValueError("daily report forward evidence missing")
+    daily_delivery_integrity = (
+        (audit.get("delivery_evidence") or {}).get("integrity_status") == "PASSED"
+    )
+    f_expected = int(daily_forward.get("expected", -1))
+    f_existing = int(daily_forward.get("existing", -1))
+    f_valid = int(daily_forward.get("valid", -1))
+    f_invalid = int(daily_forward.get("invalid", -1))
+    f_delivered = int(daily_forward.get("delivery_confirmed", 0))
+    f_delivered_complete = int(
+        daily_forward.get("delivered_report_complete", 0))
+    f_minimum = int(daily_forward.get("minimum_days", -1))
+    f_rate = float(daily_forward.get("completeness_rate", -1))
+    f_delivery_rate = float(
+        daily_forward.get("delivery_confirmation_rate", -1))
+    f_complete_delivery_rate = float(
+        daily_forward.get("delivered_report_completeness_rate", -1))
+    if (
+        f_expected < 0 or f_minimum != 30
+        or daily_forward.get("start_date") != "2026-08-13"
+        or not 0 <= f_valid <= f_existing <= f_expected
+        or f_invalid != f_expected - f_valid
+        or not 0 <= f_delivered_complete <= f_delivered <= f_expected
+        or int(daily_forward.get(
+            "delivery_unconfirmed", f_expected - f_delivered,
+        )) != f_expected - f_delivered
+        or not math.isclose(f_rate, f_valid / f_expected if f_expected else 0.0,
+                            abs_tol=1e-12)
+        or not math.isclose(
+            f_delivery_rate,
+            f_delivered / f_expected if f_expected else 0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            f_complete_delivery_rate,
+            f_delivered_complete / f_expected if f_expected else 0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("invalid daily report forward counts")
+    if f_expected < f_minimum:
+        expected_daily_forward_status = "INSUFFICIENT_EVIDENCE"
+    elif (
+        daily_delivery_integrity
+        and f_rate >= target and f_delivery_rate >= target
+        and f_complete_delivery_rate >= target
+    ):
+        expected_daily_forward_status = "PASSED"
+    else:
+        expected_daily_forward_status = "NOT_MET"
+    expected_daily_overall = (
+        "PENDING_FORWARD_EVIDENCE"
+        if expected_daily_forward_status == "INSUFFICIENT_EVIDENCE"
+        else expected_daily_forward_status
+    )
+    if (
+        str(daily_forward.get("status")) != expected_daily_forward_status
+        or str(audit.get("overall_status")) != expected_daily_overall
+    ):
+        raise ValueError("daily report forward/overall status disagrees with counts")
 
     push_window = push_audit.get("window") or {}
     push_counts = push_audit.get("counts") or {}
@@ -318,7 +449,13 @@ def refresh_report_completeness(
             observed, numerator / push_expected, abs_tol=1e-12,
         ):
             raise ValueError(f"Push {label} rate disagrees with counts")
-    push_target = float(push_audit.get("target_rate", -1))
+    push_target = _validated_coverage_target(
+        push_audit,
+        as_of=push_audit.get("as_of_cst"),
+        target_field="target_rate",
+        migration_field="target_rate_migration",
+        label="Push completeness audit",
+    )
     if not math.isclose(push_target, target, abs_tol=1e-12):
         raise ValueError("Push and daily report targets disagree")
     expected_push_report_status = (
@@ -586,7 +723,7 @@ def refresh_report_completeness(
     ):
         raise ValueError("Push forward failure rows disagree with counts")
 
-    daily_passed = expected_daily_status == "PASSED"
+    daily_passed = expected_daily_overall == "PASSED"
     push_report_passed = expected_push_report_status == "PASSED"
     push_delivery_passed = expected_push_delivery_status == "PASSED"
     forward_passed = expected_forward_status == "PASSED"
@@ -854,10 +991,25 @@ def refresh_source_health(
     forward_available = int(forward["available_slots"])
     forward_rate = float(forward["complete_rate"])
     forward_available_rate = float(forward["available_rate"])
-    target = float(audit["target_rate"])
+    target = _validated_coverage_target(
+        audit,
+        as_of=audit.get("as_of_cst"),
+        target_field="target_rate",
+        migration_field="target_rate_migration",
+        label="source-health audit",
+    )
     target_pct = f"{target:.0%}"
+    rolling_minimum = int(rolling.get("minimum_slots", -1))
+    forward_minimum = int(forward.get("minimum_slots", -1))
     if (
         expected <= 0
+        or expected != 14 * 24 * 4
+        or rolling_minimum != 14 * 24 * 4
+        or forward_minimum != 96
+        or not math.isclose(
+            float(rolling.get("target_rate", -1)), target, abs_tol=1e-12)
+        or not math.isclose(
+            float(forward.get("target_rate", -1)), target, abs_tol=1e-12)
         or not 0 <= observed <= expected
         or missing != expected - observed
         or not 0 <= complete <= available <= expected
@@ -885,6 +1037,30 @@ def refresh_source_health(
         )
     ):
         raise ValueError("invalid source-health audit counts")
+    rolling_expected_status = (
+        "INSUFFICIENT_EVIDENCE"
+        if expected < rolling_minimum
+        else "PASSED" if rolling_rate >= target else "NOT_MET"
+    )
+    forward_expected_slots = int(forward["expected_slots"])
+    forward_expected_status = (
+        "INSUFFICIENT_EVIDENCE"
+        if forward_expected_slots < forward_minimum
+        else "PASSED" if forward_rate >= target else "NOT_MET"
+    )
+    expected_overall_status = (
+        "PASSED"
+        if rolling_expected_status == forward_expected_status == "PASSED"
+        else "PENDING_FORWARD_EVIDENCE"
+        if forward_expected_status == "INSUFFICIENT_EVIDENCE"
+        else "NOT_MET"
+    )
+    if (
+        str(rolling.get("status")) != rolling_expected_status
+        or str(forward.get("status")) != forward_expected_status
+        or str(audit.get("overall_status")) != expected_overall_status
+    ):
+        raise ValueError("source-health statuses disagree with primitive counts")
 
     generated_at = _source_audit_utc(audit)
     as_of_cst = _parse_source_cst(audit["as_of_cst"])
@@ -984,7 +1160,7 @@ def refresh_source_health(
         "forward_minimum_slots": int(forward["minimum_slots"]),
         "forward_status": str(forward["status"]),
         "target_rate": target,
-        "status": "达标" if audit["overall_status"] == "PASSED" else "未达标",
+        "status": "达标" if expected_overall_status == "PASSED" else "未达标",
     })
     datasets["source_health"] = [
         row for row in datasets["source_health"] if row.get("source") != "fast"
@@ -1000,7 +1176,7 @@ def refresh_source_health(
             f"修复后前向 {forward_rate:.3%}（{forward['expected_slots']}/"
             f"{forward['minimum_slots']}槽）"
         ),
-        "status": "达标" if audit["overall_status"] == "PASSED" else "未达标",
+        "status": "达标" if expected_overall_status == "PASSED" else "未达标",
         "next_gate": (
             "08:00自然快照验证BRKB/SHOP闭合4H后逐币覆盖；fast修复后前向"
             f"至少{forward['minimum_slots']}槽且≥{target_pct}，"
@@ -1155,7 +1331,9 @@ def refresh_credibility_evidence(
     selected_holdout = selected["historical_holdout"]
     oracle = policy["oracle_ranking_diagnostic"]["historical_holdout"]
     production = signal_audit["retrospective_evaluation"]
-    target = float(policy["acceptance"]["target_precision"])
+    target = _validated_historical_shadow_target(
+        policy, policy["acceptance"], label="policy diagnostic")
+    target_pct = f"{target:.0%}"
 
     manifest = artifact["manifest"]
     sources = manifest["sources"]
@@ -1242,7 +1420,7 @@ def refresh_credibility_evidence(
             ],
             "metric_definitions": [
                 "long按ask入/bid出，short按bid入/ask出",
-                "可信度90%必须有独立未来窗、N>=100和>=100周期",
+                f"历史工件{target_pct}门必须有独立未来窗、N>=100和>=100周期",
             ],
         },
     })
@@ -1435,10 +1613,10 @@ def refresh_credibility_evidence(
     chart.update({
         "title": "扣20bp方向精确率：历史诊断、生产信号与上限",
         "subtitle": (
-            "实际生产信号仅N=11；固定候选族事后神谕也低于90%，"
+            f"实际生产信号仅N=11；固定候选族事后神谕也低于历史{target_pct}门，"
             "生产阈值保持不变。"
         ),
-        "question": "当前可执行选择是否有证据达到90%？",
+        "question": f"历史工件是否有证据达到当时的{target_pct}门？",
         "rationale": (
             "同一零基线尺度区分真实可执行结果、历史诊断、不可交易上限和目标。"
         ),
@@ -1447,14 +1625,14 @@ def refresh_credibility_evidence(
     credibility_block = _one(
         manifest["blocks"], "id", "credibility_section")
     credibility_block["body"] = (
-        "## 排序能力是主要短板，90%仍没有证据支持\n\n"
+        f"## 排序能力是主要短板，历史{target_pct}门仍没有证据支持\n\n"
         f"修正右截尾后，增强模型历史留出精度为{holdout['precision']:.3%}"
         f"（N={holdout['n']}，ECE={holdout['ece']:.3%}）；只在校准窗选择的"
         f"{selected['policy']}策略，在历史留出为"
         f"{selected_holdout['precision']:.3%}（N={selected_holdout['n']}，"
         f"Wilson {selected_holdout['wilson_95_low']:.3%}–"
         f"{selected_holdout['wilson_95_high']:.3%}，ECE="
-        f"{selected_holdout['ece']:.3%}）。两者都远低于90%。\n\n"
+        f"{selected_holdout['ece']:.3%}）。两者都远低于历史{target_pct}门。\n\n"
         f"实际生产LLM开多/开空信号按发现窗预选4H后，回顾评估为"
         f"{production['precision_after_cost']:.3%}（N={production['n']}，"
         f"Wilson {production['wilson_95_low']:.3%}–"
@@ -1496,9 +1674,14 @@ def refresh_selective_credibility(
         "internal_confirmation"
     ]
     independent_holdout = independent["evaluation"]["historical_holdout"]
-    target = float(shared["acceptance"]["target_precision"])
+    target = _validated_historical_shadow_target(
+        shared, shared["acceptance"], label="shared selective diagnostic")
     if target != float(independent["acceptance"]["target_precision"]):
         raise ValueError("selective target mismatch")
+    _validated_historical_shadow_target(
+        independent, independent["acceptance"],
+        label="independent selective diagnostic")
+    target_pct = f"{target:.0%}"
 
     manifest = artifact["manifest"]
     sources = manifest["sources"]
@@ -1633,7 +1816,7 @@ def refresh_selective_credibility(
         ),
         "description": (
             "同图比较线性历史诊断、实际生产信号、共享与分候选GBDT的"
-            "内部确认/历史留出，以及90%目标。"
+            f"内部确认/历史留出，以及历史工件{target_pct}目标。"
         ),
         "executed_at": independent["generated_at_utc"],
         "tables_used": list(dict.fromkeys(
@@ -1648,7 +1831,7 @@ def refresh_selective_credibility(
         ],
         "metric_definitions": [
             "精确率=冻结选择在相应时间窗中扣20bp后方向收益为正的比例",
-            "90%可信度还要求独立未来窗N>=100、>=5天、>=100周期且ECE<=5pp",
+            f"历史{target_pct}门还要求独立未来窗N>=100、>=5天、>=100周期且ECE<=5pp",
         ],
     })
 
@@ -1683,7 +1866,7 @@ def refresh_selective_credibility(
         "next_gate": (
             "保留生产阈值、风控和订单规模；积累新OI/主动买卖量的前向历史，"
             "预注册后仅用未来影子窗验收N>=100、>=5天、>=100周期、"
-            "精确率>=90%且ECE<=5pp"
+            f"历史工件精确率>={target_pct}且ECE<=5pp"
         ),
     })
     card = _one(manifest["cards"], "id", "credibility_card")
@@ -1696,7 +1879,7 @@ def refresh_selective_credibility(
         "metrics": [
             {"label": "生产信号4H精度", "field": "production_signal_precision",
              "format": "percent"},
-            {"label": "90%目标", "field": "credibility_target_rate",
+            {"label": f"历史{target_pct}目标", "field": "credibility_target_rate",
              "format": "percent"},
             {"label": "生产信号N", "field": "production_signal_n",
              "format": "number"},
@@ -1713,14 +1896,14 @@ def refresh_selective_credibility(
         "subtitle": (
             f"共享/分候选GBDT内部确认分别为"
             f"{shared_confirmation['precision']:.1%}/"
-            f"{independent_confirmation['precision']:.1%}；两者均未达90%。"
+            f"{independent_confirmation['precision']:.1%}；两者均未达历史{target_pct}门。"
         ),
         "dataset": "credibility_primary",
         "sourceId": "credibility_evidence",
     })
     section = _one(manifest["blocks"], "id", "credibility_section")
     section["body"] = (
-        "## 增加非线性复杂度没有修复候选排序，90%仍未获证明\n\n"
+        f"## 增加非线性复杂度没有修复候选排序，历史{target_pct}门仍未获证明\n\n"
         f"共享GBDT只在阈值选择窗达到{shared['threshold_selection']['precision']:.3%}"
         f"（N={shared['threshold_selection']['n']}），随后未参与阈值选择的内部"
         f"确认窗降至{shared_confirmation['precision']:.3%}"
@@ -1766,7 +1949,9 @@ def refresh_ranking_credibility(
 
     confirmation = ranking["evaluation"]["internal_confirmation"]
     holdout = ranking["evaluation"]["historical_holdout"]
-    target = float(acceptance["target_precision"])
+    target = _validated_historical_shadow_target(
+        ranking, acceptance, label="ranking diagnostic")
+    target_pct = f"{target:.0%}"
     manifest = artifact["manifest"]
     source = _upsert_id(manifest["sources"], "ranking_diagnostic")
     source.update({
@@ -1856,7 +2041,7 @@ def refresh_ranking_credibility(
             + "\n)\nSELECT * FROM evidence"
         ),
         "description": (
-            "同图比较生产信号、线性/GBDT/组内排序的确认或历史结果与90%目标。"
+            f"同图比较生产信号、线性/GBDT/组内排序结果与历史{target_pct}目标。"
         ),
         "executed_at": ranking["generated_at_utc"],
         "tables_used": list(dict.fromkeys(
@@ -1869,7 +2054,7 @@ def refresh_ranking_credibility(
         ],
         "metric_definitions": [
             "精确率=冻结选择在相应时间窗中扣20bp后方向收益为正的比例",
-            "90%还要求独立未来窗N>=100、>=5天、>=100周期且ECE<=5pp",
+            f"历史{target_pct}门还要求独立未来窗N>=100、>=5天、>=100周期且ECE<=5pp",
         ],
     })
 
@@ -1895,7 +2080,7 @@ def refresh_ranking_credibility(
         "status": "未达标",
         "next_gate": (
             "不再凭历史复杂度试验扩大交易；待新增官方OI/主动买卖量形成"
-            "前向历史后预注册模型，并仅在独立未来影子窗验收90%硬门槛"
+            f"前向历史后预注册模型；本历史工件按当时{target_pct}门留档"
         ),
     })
     card = _one(manifest["cards"], "id", "credibility_card")
@@ -1915,7 +2100,7 @@ def refresh_ranking_credibility(
             f"共享/分候选GBDT/组内排序内部确认为"
             f"{headline.get('shared_confirmation_precision', 0):.1%}/"
             f"{headline.get('independent_confirmation_precision', 0):.1%}/"
-            f"{confirmation['precision']:.1%}，均未达90%。"
+            f"{confirmation['precision']:.1%}，均未达历史{target_pct}门。"
         ),
     })
     selected_oracle = ranking["selected_subset_oracle_diagnostic"][
@@ -1924,7 +2109,7 @@ def refresh_ranking_credibility(
         "any_candidate_success_rate"]
     section = _one(manifest["blocks"], "id", "credibility_section")
     section["body"] = (
-        "## 六候选共同排序仍未识别出稳定方向，90%没有获证明\n\n"
+        f"## 六候选共同排序仍未识别出稳定方向，历史{target_pct}门没有获证明\n\n"
         f"最佳组内排序为 `{ranking['model_family']['selected_model']}`。阈值"
         f"选择窗最高仅{ranking['threshold_selection']['precision']:.3%}"
         f"（N={ranking['threshold_selection']['n']}），随后内部确认为"
@@ -1958,6 +2143,9 @@ def refresh_directional_separability(
         raise ValueError("directional diagnostic must forbid production change")
     if diagnostic.get("production_threshold_change_allowed") is not False:
         raise ValueError("directional diagnostic threshold gate must fail closed")
+    target = _validated_historical_shadow_target(
+        diagnostic, acceptance, label="directional diagnostic")
+    target_pct = f"{target:.0%}"
 
     confirmation = diagnostic["evaluation"]["internal_confirmation"]
     holdout = diagnostic["evaluation"]["historical_holdout"]
@@ -1987,7 +2175,7 @@ def refresh_directional_separability(
                 "任一候选成功率=六个相反方向/期限中事后至少一个扣成本成功",
                 "方向精确率=事前最高分候选扣成本后成功的比例",
                 "排名缺口=任一候选成功率-事前选择精确率",
-                "90%声明要求点精度和Wilson 95%下界都不低于90%",
+                f"历史{target_pct}声明要求点精度和Wilson 95%下界均达{target_pct}",
             ],
         },
     })
@@ -2063,7 +2251,7 @@ def refresh_directional_separability(
         ],
         "metric_definitions": [
             "精确率=冻结选择在相应时间窗中扣20bp后方向收益为正的比例",
-            "90%声明同时要求Wilson 95%下界>=90%和独立未来窗",
+            f"历史{target_pct}声明要求Wilson 95%下界同样达到{target_pct}且有独立未来窗",
         ],
     })
 
@@ -2090,7 +2278,7 @@ def refresh_directional_separability(
     gate["status"] = "未达标"
     gate["next_gate"] = (
         "用08:00起冻结影子记录的方向概率差与官方15m合约OI/主动买卖量"
-        "形成新未来样本；只在点精度和Wilson下界都达到90%后再谈风险审批"
+        f"形成新未来样本；本历史工件按当时{target_pct}门留档"
     )
     chart = _one(manifest["charts"], "id", "credibility_chart")
     chart["subtitle"] = (
@@ -2118,6 +2306,7 @@ def refresh_news_source_health(
     audit: dict,
     *,
     audit_relative_path: str,
+    registry: dict,
 ) -> dict:
     """Add strict scheduled-slot news-source evidence to the full report."""
     if artifact.get("surface") != "report":
@@ -2136,23 +2325,63 @@ def refresh_news_source_health(
     rows = list(forward["sources"])
     if not rows:
         raise ValueError("news-source audit has no source rows")
-    target = float(audit["target_rate"])
+    target = _validated_coverage_target(
+        audit,
+        as_of=audit.get("as_of_cst"),
+        target_field="target_rate",
+        migration_field="target_rate_migration",
+        label="news-source audit",
+    )
     target_pct = f"{target:.0%}"
     if not 0 < target <= 1:
         raise ValueError("news-source target invalid")
+    registry_sources = registry.get("sources") if isinstance(registry, dict) else None
+    if not isinstance(registry_sources, list):
+        raise ValueError("news registry sources must be a list")
+    global_start = _parse_source_cst(str(audit["forward_start_cst"]))
+    expected_specs: dict[str, tuple[str, int, str]] = {}
+    for item in registry_sources:
+        if (
+            not isinstance(item, dict) or item.get("type") != "news"
+            or not item.get("enabled")
+        ):
+            continue
+        adapter = str(item.get("adapter") or "")
+        if not adapter or adapter == "EXTERNAL_SCOUT":
+            continue
+        source_id = str(item.get("id") or "").strip()
+        interval = int(item.get("poll_interval_min") or 15)
+        role = (
+            "required" if bool(item.get("required"))
+            else "official_required" if source_id == "okx_news"
+            else "optional"
+        )
+        source_start = global_start
+        if item.get("audit_forward_start_cst"):
+            source_start = max(
+                source_start,
+                _parse_source_cst(str(item["audit_forward_start_cst"])),
+            )
+        expected_specs[source_id] = (role, interval, source_start.isoformat())
+    for source_id in (
+        "rss:bitcoinist", "rss:coindesk", "rss:cointelegraph",
+        "rss:cryptoslate", "rss:decrypt", "rss:theblock",
+    ):
+        expected_specs[source_id] = (
+            "required_subsource", 15, global_start.isoformat())
+    if "rss_en" not in expected_specs or "okx_news" not in expected_specs:
+        raise ValueError("news registry missing enabled rss_en/okx_news")
+
     source_ids = [str(item.get("source") or "") for item in rows]
     if any(not source for source in source_ids) or len(set(source_ids)) != len(
         source_ids
     ):
         raise ValueError("news-source ids invalid or duplicated")
-    required_sources = {
-        "okx_news", "rss_en", "rss:bitcoinist", "rss:coindesk",
-        "rss:cointelegraph", "rss:cryptoslate", "rss:decrypt",
-        "rss:theblock",
-    }
-    if not required_sources.issubset(source_ids):
-        raise ValueError("news-source critical source set incomplete")
+    if set(source_ids) != set(expected_specs):
+        raise ValueError("news-source set disagrees with enabled registry")
     for item in rows:
+        expected_role, expected_interval, expected_start = expected_specs[
+            str(item["source"])]
         expected = int(item["expected_slots"])
         observed = int(item["observed_rows"])
         missing = int(item["missing_slots"])
@@ -2184,12 +2413,15 @@ def refresh_news_source_health(
         if (
             min(expected, observed, missing, complete, degraded_or_failed) < 0
             or interval < 15 or interval % 15 != 0
+            or interval != expected_interval
+            or str(item.get("role")) != expected_role
             or minimum != expected_minimum
             or not math.isclose(
                 float(item["target_rate"]), target,
                 rel_tol=0.0, abs_tol=1.0e-12,
             )
-            or str(item.get("start_cst")) != str(audit["forward_start_cst"])
+            or _parse_source_cst(str(item.get("start_cst"))).isoformat()
+            != expected_start
             or observed + missing != expected
             or complete + degraded_or_failed != observed
             or complete != int(raw_counts.get("ok", 0))
@@ -2284,6 +2516,7 @@ def refresh_news_source_health(
     dataset_rows = [{
         "source": item["source"],
         "role": item["role"],
+        "start_cst": item["start_cst"],
         "schedule_minutes": int(item["schedule_minutes"]),
         "expected_slots": int(item["expected_slots"]),
         "observed_rows": int(item["observed_rows"]),
@@ -2425,12 +2658,19 @@ def _validate_positioning_forward_window(
 ) -> dict:
     if not isinstance(window, dict):
         raise ValueError(f"positioning {label} window missing")
+    window_target = _validated_coverage_target(
+        window,
+        as_of=window.get("as_of_cst"),
+        target_field="target_rate",
+        migration_field="target_rate_migration",
+        label=f"positioning {label} window",
+    )
     if (
         str(window.get("start_cst")) != expected_start
         or int(window.get("schedule_minutes", -1)) != expected_schedule_minutes
         or int(window.get("minimum_slots", -1)) != expected_minimum_slots
         or not math.isclose(
-            float(window.get("target_rate", -1)), target,
+            window_target, target,
             rel_tol=0.0, abs_tol=1.0e-12,
         )
     ):
@@ -2566,7 +2806,28 @@ def refresh_positioning_coverage(
             raise ValueError("unexpected positioning source")
     natural_rate = float(natural_audit["coverage_rate"])
     isolated_rate = float(isolated_audit["coverage_rate"])
-    target = float(natural_audit["minimum_rate"])
+    natural_as_of = (
+        natural_audit.get("generated_at_cst")
+        or natural_audit.get("generated_at_utc")
+    )
+    isolated_as_of = (
+        isolated_audit.get("generated_at_cst")
+        or isolated_audit.get("generated_at_utc")
+    )
+    target = _validated_coverage_target(
+        natural_audit,
+        as_of=natural_as_of,
+        target_field="minimum_rate",
+        migration_field="minimum_rate_migration",
+        label="natural positioning audit",
+    )
+    isolated_target = _validated_coverage_target(
+        isolated_audit,
+        as_of=isolated_as_of,
+        target_field="minimum_rate",
+        migration_field="minimum_rate_migration",
+        label="isolated positioning audit",
+    )
     target_pct = f"{target:.0%}"
     if not 0 <= natural_rate <= 1 or not 0 <= isolated_rate <= 1:
         raise ValueError("invalid positioning coverage rate")
@@ -2575,7 +2836,9 @@ def refresh_positioning_coverage(
     isolated_valid = int(isolated_audit["valid_symbols"])
     isolated_universe = int(isolated_audit["universe_symbols"])
     if (
-        natural_universe <= 0
+        not math.isclose(
+            isolated_target, target, rel_tol=0.0, abs_tol=1.0e-12)
+        or natural_universe <= 0
         or isolated_universe <= 0
         or not 0 <= natural_valid <= natural_universe
         or not 0 <= isolated_valid <= isolated_universe
@@ -3248,7 +3511,11 @@ def refresh_multitimeframe_coverage(
                 "market.db.market_contract_statistics",
                 audit_relative_path,
             ],
-            "filters": ["最新交易宇宙", "各数据族独立>=99%"],
+            "filters": [
+                "最新交易宇宙",
+                f"数据完善率四族按工件生效{_coverage_target_pct()}门；"
+                "多周期与合约统计影子链仍各自按99%门",
+            ],
             "metric_definitions": [
                 "15m/1H/4H覆盖率=精确已收盘bar全指标就绪symbol/最新ticker全宇宙"
             ],
@@ -3335,8 +3602,8 @@ def refresh_multitimeframe_coverage(
                 if four_hour["analysis_ready_rate"] >= target else
                 "等待新区4H指标自然成熟；"
             )
-            + "fast前向至少96槽且14日滚动窗>=99%；"
-            "持仓倾向至少24个整点与96个决策槽均>=99%；"
+            + f"fast前向至少96槽且14日滚动窗>={_coverage_target_pct()}；"
+            f"持仓倾向至少24个整点与96个决策槽均>={_coverage_target_pct()}；"
             "合约统计最新直采和至少96个前向槽均>=99%；"
             "新闻关键源完成24小时严格前向验收"),
     })
@@ -4379,7 +4646,11 @@ def refresh_contract_statistics_coverage(
                 natural_relative_path,
                 isolated_relative_path,
             ],
-            "filters": ["最新交易宇宙", "各数据族独立>=99%"],
+            "filters": [
+                "最新交易宇宙",
+                f"数据完善率四族按工件生效{_coverage_target_pct()}门；"
+                "多周期、资产分类与合约统计影子链仍各自按99%门",
+            ],
             "metric_definitions": [
                 "覆盖率=该数据族严格有效symbol/该周期最新交易宇宙"
             ],
@@ -4388,15 +4659,18 @@ def refresh_contract_statistics_coverage(
     coverage_chart = _one(manifest["charts"], "id", "coverage_chart")
     coverage_chart.update({
         "subtitle": (
-            "官方1H持仓倾向最新批次与最新15m合约OI/主动买卖量模型可用直采均已过"
-            f"99%；后者计划槽前向直采{forward_direct_rate:.3%}、"
+            f"官方1H持仓倾向最新批次已过{_coverage_target_pct()}，"
+            "最新15m合约OI/主动买卖量模型可用直采已过99%；后者计划槽"
+            f"前向直采{forward_direct_rate:.3%}、"
             f"{forward_expected}/{forward_minimum}槽，最新与长期门均已通过。"
             if contract_gate_passed else
-            "官方1H持仓倾向最新批次与最新15m合约OI/主动买卖量模型可用直采均已过"
-            f"99%；后者计划槽前向直采{forward_direct_rate:.3%}，仅"
+            f"官方1H持仓倾向最新批次已过{_coverage_target_pct()}，"
+            "最新15m合约OI/主动买卖量模型可用直采已过99%；后者计划槽"
+            f"前向直采{forward_direct_rate:.3%}，仅"
             f"{forward_expected}/{forward_minimum}槽，仍未通过长期门。"
             if latest_passed else
-            f"官方1H持仓倾向最新批次已过99%（双前向窗另验）；{latest_cycle_label}最新15m合约"
+            f"官方1H持仓倾向最新批次已过{_coverage_target_pct()}"
+            f"（双前向窗另验）；{latest_cycle_label}最新15m合约"
             f"OI/主动买卖量运行可用性{natural_rate:.3%}，但模型可用"
             f"直采仅{natural_direct_rate:.3%}，低于99%。"
         ),
@@ -4436,9 +4710,10 @@ def refresh_contract_statistics_coverage(
         ),
         "status": "未达标",
         "next_gate": (
-            "后续自然快照复核4H逐币覆盖；持仓倾向24整点与96决策槽均达99%；"
+            "后续自然快照复核4H逐币覆盖；持仓倾向24整点与96决策槽均达"
+            f"{_coverage_target_pct()}；"
             "合约统计直采与计划槽均至少96槽；"
-            "fast前向至少96槽且14日滚动窗均须>=99%"
+            f"fast前向至少96槽且14日滚动窗均须>={_coverage_target_pct()}"
         ),
     })
     first_failed = next(
@@ -4596,6 +4871,7 @@ def refresh_runtime_evidence(
         raise ValueError("model artifact is not ready for forward shadow")
 
     generated_at = str(evaluation.get("generated_at_utc") or "")
+    model_target_pct = _credibility_target_pct(model_shadow.get("generated_at_utc"))
     manifest = artifact["manifest"]
     _advance_report_generated_at(artifact, generated_at)
 
@@ -4778,7 +5054,7 @@ def refresh_runtime_evidence(
         + throughput_result + "。"
         f"按当日唯一交易对和{snapshots_target}个计划周期折算容量为"
         f"{observed_design_capacity:,}条/日；"
-        "判断量只表示可审计分析记录，不代表真实成交，也不代表90%可信度。"
+        f"判断量只表示可审计分析记录，不代表真实成交，也不代表{model_target_pct}可信度。"
     )
 
     model_section = _upsert_id(blocks, "model_forward_section")
@@ -4792,7 +5068,7 @@ def refresh_runtime_evidence(
             f"空{short_n}）。官方合约统计特征在{contract_rows}/{scored}个"
             "评分币上可用，但不参与旧冻结特征时钟；全部记录仍为"
             "confidence_claim_allowed=false、production_execution_authorized=false。"
-            "该周期标签尚未成熟，不能计算或声称90%精度。"
+            f"该周期标签尚未成熟，不能计算或声称{model_target_pct}精度。"
         ),
         "layout": "full",
     })
@@ -4830,6 +5106,461 @@ def refresh_runtime_evidence(
     blocks[credibility_index:credibility_index] = [model_section, model_block]
 
     _sync_title_block(manifest)
+    return artifact
+
+
+def _status_from_requirements(requirements: dict, *, minimum_key: str) -> str:
+    if requirements.get(minimum_key) is not True:
+        return "INSUFFICIENT_EVIDENCE"
+    return "PASSED" if all(value is True for value in requirements.values()) else "NOT_MET"
+
+
+def _record_migrated_audit(
+    artifact: dict, *, source_id: str, label: str, relative_path: str,
+    status_field: str, status: str, as_of: object,
+) -> None:
+    manifest = artifact["manifest"]
+    source = _upsert_id(manifest["sources"], source_id)
+    source.update({
+        "label": label,
+        "path": relative_path,
+        "query": {
+            "engine": "independent acceptance reconstruction",
+            "language": "python",
+            "description": "按工件as_of解析激活边界，并由原始计数重算比例、条件与状态。",
+            "executed_at": str(as_of),
+            "tables_used": [relative_path],
+        },
+    })
+    artifact["snapshot"]["datasets"]["headline"][0][status_field] = status
+
+
+def refresh_market_coverage_audit(
+    artifact: dict, audit: dict, *, family: str, audit_relative_path: str,
+) -> dict:
+    """Validate market-field/feature gates without trusting producer status."""
+    definitions = {
+        "field": (
+            "scheduled_market_field_coverage_audit", "market_field_coverage_status",
+            "市场字段计划槽覆盖审计",
+        ),
+        "feature": (
+            "scheduled_market_feature_coverage_audit", "market_feature_coverage_status",
+            "市场特征计划槽覆盖审计",
+        ),
+    }
+    if family not in definitions:
+        raise ValueError("unknown market coverage family")
+    artifact_type, status_field, label = definitions[family]
+    if audit.get("artifact_type") != artifact_type or audit.get("mode") != "read_only":
+        raise ValueError(f"invalid {family} market coverage audit")
+    target = _validated_coverage_target(
+        audit, as_of=audit.get("as_of_cst"), target_field="target_rate",
+        migration_field="target_rate_migration", label=label,
+    )
+    for key, expected_value in (
+        ("production_database_writes", 0),
+        ("production_threshold_change_allowed", False),
+        ("production_execution_authorized", False),
+        ("orders_placed", 0),
+    ):
+        if audit.get(key) != expected_value:
+            raise ValueError(f"{label} unsafe field: {key}")
+    counts = audit.get("counts") or {}
+    rates = audit.get("rates") or {}
+    expected_slots = int(counts.get("expected_slots", -1))
+    minimum_slots = int(audit.get("minimum_slots", -1))
+    passed_slots = int(counts.get("passed_slots", -1))
+    denominator = int(counts.get("expected_symbol_rows", -1))
+    if (
+        expected_slots < 0 or minimum_slots <= 0 or denominator < 0
+        or not 0 <= passed_slots <= expected_slots
+        or int(counts.get("failed_slots", -1)) != expected_slots - passed_slots
+    ):
+        raise ValueError(f"invalid {label} counts")
+    expected_requirements: dict[str, bool]
+    if family == "field":
+        official = audit.get("official_instrument_evidence") or {}
+        observed = int(counts.get("observed_slots", -1))
+        timely = int(counts.get("timely_slots", -1))
+        all_valid = int(counts.get("all_fields_valid_symbol_rows", -1))
+        official_passed = int(official.get("passed_snapshot_slots", -1))
+        metadata_rows = int(official.get("metadata_rows", -1))
+        metadata_valid = int(official.get("valid_metadata_rows", -1))
+        field_counts = counts.get("field_valid_symbol_rows") or {}
+        field_rates = rates.get("field_coverage_rates") or {}
+        if (
+            not 0 <= observed <= expected_slots
+            or int(counts.get("missing_slots", -1)) != expected_slots - observed
+            or not 0 <= timely <= expected_slots
+            or int(counts.get("late_or_missing_slots", -1)) != expected_slots - timely
+            or not 0 <= all_valid <= denominator
+            or not 0 <= official_passed <= expected_slots
+            or int(official.get("expected_slots", -1)) != expected_slots
+            or not 0 <= metadata_valid <= metadata_rows
+            or not field_counts or set(field_counts) != set(field_rates)
+            or any(not 0 <= int(value) <= denominator
+                   for value in field_counts.values())
+        ):
+            raise ValueError(f"invalid {label} primitive counts")
+        rebuilt_field_rates = {
+            key: int(value) / denominator if denominator else 0.0
+            for key, value in field_counts.items()
+        }
+        comparisons = [
+            (rates.get("all_fields_complete_rate"), all_valid / denominator if denominator else 0.0),
+            (rates.get("slot_pass_rate"), passed_slots / expected_slots if expected_slots else 0.0),
+            (rates.get("timely_snapshot_rate"), timely / expected_slots if expected_slots else 0.0),
+            (official.get("snapshot_slot_rate"), official_passed / expected_slots if expected_slots else 0.0),
+            (official.get("metadata_coverage_rate"), metadata_valid / metadata_rows if metadata_rows else 0.0),
+        ] + [(field_rates[key], value) for key, value in rebuilt_field_rates.items()]
+        if any(not math.isclose(float(got), want, abs_tol=1e-6) for got, want in comparisons):
+            raise ValueError(f"{label} rates disagree with counts")
+        expected_requirements = {
+            "minimum_slots_met": expected_slots >= minimum_slots,
+            "official_snapshot_slot_rate_at_least_target": official_passed / expected_slots >= target if expected_slots else False,
+            "official_metadata_rate_at_least_target": metadata_valid / metadata_rows >= target if metadata_rows else False,
+            "every_field_rate_at_least_target": all(value >= target for value in rebuilt_field_rates.values()),
+            "all_fields_row_rate_at_least_target": all_valid / denominator >= target if denominator else False,
+            "slot_pass_rate_at_least_target": passed_slots / expected_slots >= target if expected_slots else False,
+            "timely_snapshot_rate_at_least_target": timely / expected_slots >= target if expected_slots else False,
+        }
+    else:
+        expected_symbols = int(audit.get("expected_symbols_per_slot", -1))
+        selection = int(counts.get("passed_selection_slots", -1))
+        official_passed = int(counts.get("passed_official_snapshot_slots", -1))
+        metadata_rows = int(counts.get("official_metadata_rows", -1))
+        metadata_valid = int(counts.get("official_metadata_valid_rows", -1))
+        micro = int(counts.get("microstructure_valid_symbol_rows", -1))
+        flow = int(counts.get("trade_flow_valid_symbol_rows", -1))
+        combined = int(counts.get("combined_valid_symbol_rows", -1))
+        if (
+            expected_symbols <= 0 or denominator != expected_slots * expected_symbols
+            or not all(0 <= value <= expected_slots for value in (selection, official_passed))
+            or not 0 <= metadata_valid <= metadata_rows
+            or not all(0 <= value <= denominator for value in (micro, flow, combined))
+            or combined > min(micro, flow)
+        ):
+            raise ValueError(f"invalid {label} primitive counts")
+        rebuilt = {
+            "selection_snapshot_slot_rate": selection / expected_slots if expected_slots else 0.0,
+            "official_snapshot_slot_rate": official_passed / expected_slots if expected_slots else 0.0,
+            "official_metadata_coverage_rate": metadata_valid / metadata_rows if metadata_rows else 0.0,
+            "microstructure_coverage_rate": micro / denominator if denominator else 0.0,
+            "trade_flow_coverage_rate": flow / denominator if denominator else 0.0,
+            "combined_coverage_rate": combined / denominator if denominator else 0.0,
+            "slot_pass_rate": passed_slots / expected_slots if expected_slots else 0.0,
+        }
+        if any(not math.isclose(float(rates.get(key, -1)), value, abs_tol=1e-6)
+               for key, value in rebuilt.items()):
+            raise ValueError(f"{label} rates disagree with counts")
+        expected_requirements = {
+            "minimum_slots_met": expected_slots >= minimum_slots,
+            "selection_snapshot_slot_rate_at_least_target": rebuilt["selection_snapshot_slot_rate"] >= target,
+            "official_snapshot_slot_rate_at_least_target": rebuilt["official_snapshot_slot_rate"] >= target,
+            "official_metadata_coverage_rate_at_least_target": rebuilt["official_metadata_coverage_rate"] >= target,
+            "microstructure_coverage_rate_at_least_target": rebuilt["microstructure_coverage_rate"] >= target,
+            "trade_flow_coverage_rate_at_least_target": rebuilt["trade_flow_coverage_rate"] >= target,
+            "combined_coverage_rate_at_least_target": rebuilt["combined_coverage_rate"] >= target,
+            "slot_pass_rate_at_least_target": rebuilt["slot_pass_rate"] >= target,
+        }
+    if audit.get("requirements") != expected_requirements:
+        raise ValueError(f"{label} requirements disagree with counts")
+    expected_status = _status_from_requirements(
+        expected_requirements, minimum_key="minimum_slots_met")
+    if str(audit.get("status")) != expected_status:
+        raise ValueError(f"{label} status disagrees with counts")
+    _record_migrated_audit(
+        artifact, source_id=f"market_{family}_coverage", label=label,
+        relative_path=audit_relative_path, status_field=status_field,
+        status=expected_status, as_of=audit.get("as_of_cst"),
+    )
+    return artifact
+
+
+def _validate_periodic_surface(
+    surface: dict, target: float, *, minimum: int | None,
+    delivery_integrity: bool,
+) -> str:
+    expected = int(surface.get("expected", -1))
+    existing = int(surface.get("existing", -1))
+    valid = int(surface.get("valid", -1))
+    invalid = int(surface.get("invalid", -1))
+    delivered = int(surface.get("delivery_confirmed", -1))
+    complete = int(surface.get("delivered_report_complete", -1))
+    if (
+        expected < 0 or not 0 <= valid <= existing <= expected
+        or invalid != expected - valid
+        or not 0 <= complete <= delivered <= expected
+        or int(surface.get("delivery_unconfirmed", expected - delivered))
+        != expected - delivered
+    ):
+        raise ValueError("invalid periodic report counts")
+    rebuilt = {
+        "report_completeness_rate": valid / expected if expected else 0.0,
+        "delivery_confirmation_rate": delivered / expected if expected else 0.0,
+        "delivered_report_completeness_rate": complete / expected if expected else 0.0,
+    }
+    if any(not math.isclose(float(surface.get(key, -1)), value, abs_tol=1e-12)
+           for key, value in rebuilt.items()):
+        raise ValueError("periodic report rates disagree with counts")
+    if not math.isclose(float(surface.get("target_rate", -1)), target, abs_tol=1e-12):
+        raise ValueError("periodic surface target disagrees with parent")
+    declared_minimum = surface.get("minimum_expected")
+    if minimum is not None and int(declared_minimum) != minimum:
+        raise ValueError("periodic forward minimum changed")
+    if expected == 0 or (minimum is not None and expected < minimum):
+        status = "INSUFFICIENT_EVIDENCE"
+    elif delivery_integrity and all(value >= target for value in rebuilt.values()):
+        status = "PASSED"
+    else:
+        status = "NOT_MET"
+    if str(surface.get("status")) != status:
+        raise ValueError("periodic status disagrees with counts")
+    return status
+
+
+def refresh_periodic_report_completeness(
+    artifact: dict, audit: dict, *, audit_relative_path: str,
+) -> dict:
+    if (
+        audit.get("artifact_type") != "periodic_report_and_delivery_completeness_audit"
+        or audit.get("mode") != "read_only_business_data"
+    ):
+        raise ValueError("invalid periodic report completeness audit")
+    target = _validated_coverage_target(
+        audit, as_of=audit.get("as_of_cst"), target_field="target_rate",
+        migration_field="target_rate_migration", label="periodic report audit",
+    )
+    historical = audit.get("historical") or {}
+    forward = audit.get("forward_after_remediation") or {}
+    delivery_integrity = (
+        (audit.get("delivery_evidence") or {}).get("integrity_status") == "PASSED"
+    )
+    if forward.get("weekly_start") != "2026-08-17" or forward.get("monthly_start") != "2026-09-01":
+        raise ValueError("periodic forward activation layers changed")
+    historical_statuses = [
+        _validate_periodic_surface(
+            historical.get("weekly") or {}, target, minimum=None,
+            delivery_integrity=delivery_integrity),
+        _validate_periodic_surface(
+            historical.get("monthly") or {}, target, minimum=None,
+            delivery_integrity=delivery_integrity),
+    ]
+    forward_statuses = [
+        _validate_periodic_surface(
+            forward.get("weekly") or {}, target, minimum=12,
+            delivery_integrity=delivery_integrity),
+        _validate_periodic_surface(
+            forward.get("monthly") or {}, target, minimum=6,
+            delivery_integrity=delivery_integrity),
+    ]
+    expected_historical = (
+        "NOT_MET" if "NOT_MET" in historical_statuses
+        else "PASSED" if all(x == "PASSED" for x in historical_statuses)
+        else "INSUFFICIENT_EVIDENCE"
+    )
+    expected_forward = (
+        "NOT_MET" if "NOT_MET" in forward_statuses
+        else "PASSED" if all(x == "PASSED" for x in forward_statuses)
+        else "PENDING_FORWARD_EVIDENCE"
+    )
+    if (
+        historical.get("status") != expected_historical
+        or forward.get("status") != expected_forward
+        or audit.get("overall_status") != expected_forward
+    ):
+        raise ValueError("periodic aggregate status disagrees with surfaces")
+    safety = audit.get("safety") or {}
+    for key, expected in {
+        "auto_resend": False, "historical_backfill": False,
+        "production_database_writes": 0, "production_report_mutation": False,
+        "production_order_authorized": False, "orders_placed": 0,
+    }.items():
+        if safety.get(key) != expected:
+            raise ValueError(f"periodic report unsafe field: {key}")
+    _record_migrated_audit(
+        artifact, source_id="periodic_report_completeness",
+        label="周/月报完整与送达前向审计", relative_path=audit_relative_path,
+        status_field="periodic_report_gate_status", status=expected_forward,
+        as_of=audit.get("as_of_cst"),
+    )
+    headline = artifact["snapshot"]["datasets"]["headline"][0]
+    headline["report_and_push_gate_passed"] = bool(
+        headline.get("report_and_push_gate_passed", False)
+        and expected_forward == "PASSED")
+    return artifact
+
+
+def refresh_model_shadow_label_quality(
+    artifact: dict, audit: dict, *, audit_relative_path: str,
+) -> dict:
+    if (
+        audit.get("artifact_type") != "frozen_model_shadow_label_quality_audit"
+        or audit.get("mode") != "read_only_business_databases"
+    ):
+        raise ValueError("invalid model-shadow label-quality audit")
+    as_of = (audit.get("inputs") or {}).get("as_of_utc")
+    expected_facts = thresholds.shadow_migration_facts(str(as_of))
+    migration = audit.get("calibration_gate_migration") or {}
+    expected_migration = {
+        **expected_facts,
+        "declared_target_precision": expected_facts["effective_target_precision"],
+        "precision_floor_in_force": expected_facts["effective_target_precision"],
+        "rebuilt_with_target_precision": expected_facts["effective_target_precision"],
+    }
+    if migration != expected_migration:
+        raise ValueError("model-shadow audit migration facts disagree with as_of")
+    model_gates = audit.get("model_gate_results")
+    if not isinstance(model_gates, list) or not model_gates:
+        raise ValueError("model-shadow audit has no rebuilt model gate results")
+    model_keys: set[tuple[str, str]] = set()
+    rebuilt_statuses: list[str] = []
+    target = float(expected_facts["effective_target_precision"])
+    for item in model_gates:
+        model_key = (
+            str(item.get("model_id") or ""),
+            str(item.get("model_parameters_sha256") or ""),
+        )
+        if not all(model_key) or model_key in model_keys:
+            raise ValueError("model-shadow rebuilt model keys invalid")
+        model_keys.add(model_key)
+        n = int(item.get("n_labeled", -1))
+        successes = int(item.get("successes_after_cost", -1))
+        days = int(item.get("distinct_days", -1))
+        cycles = int(item.get("distinct_cycles", -1))
+        sides = item.get("side_counts") or {}
+        if (
+            n < 0 or not 0 <= successes <= n or days < 0 or cycles < 0
+            or int(sides.get("long", 0)) < 0
+            or int(sides.get("short", 0)) < 0
+            or sum(int(value) for value in sides.values()) != n
+        ):
+            raise ValueError("model-shadow rebuilt gate counts invalid")
+        precision = successes / n if n else None
+        if n:
+            z = 1.959963984540054
+            denominator = 1 + z * z / n
+            center = (precision + z * z / (2 * n)) / denominator
+            half = z * math.sqrt(
+                (precision * (1 - precision) + z * z / (4 * n)) / n
+            ) / denominator
+            wilson_low = max(0.0, center - half)
+        else:
+            wilson_low = None
+        observed_precision = item.get("precision_after_cost")
+        observed_wilson = item.get("wilson_95_low")
+        ece = item.get("ece")
+        if (
+            (precision is None) != (observed_precision is None)
+            or precision is not None and not math.isclose(
+                float(observed_precision), precision, abs_tol=1e-12)
+            or (wilson_low is None) != (observed_wilson is None)
+            or wilson_low is not None and not math.isclose(
+                float(observed_wilson), wilson_low, abs_tol=1e-12)
+            or (ece is not None and not 0 <= float(ece) <= 1)
+        ):
+            raise ValueError("model-shadow rebuilt gate rates disagree with counts")
+        requirements = item.get("requirements") or {}
+        expected_requirements = {
+            "minimum_sample_met": n >= 100,
+            "minimum_days_met": days >= 5,
+            "minimum_cycles_met": cycles >= 100,
+            "precision_at_least_target": precision is not None and precision >= target,
+            "wilson_95_low_at_least_target": wilson_low is not None and wilson_low >= target,
+            "ece_at_most_5pp": ece is not None and float(ece) <= 0.05,
+            "offline_gate_pass": requirements.get("offline_gate_pass") is True,
+            "minimum_long_labels_met": int(sides.get("long", 0)) >= 30,
+            "minimum_short_labels_met": int(sides.get("short", 0)) >= 30,
+        }
+        if requirements != expected_requirements:
+            raise ValueError("model-shadow rebuilt gate requirements disagree")
+        measurable = all(expected_requirements[key] for key in (
+            "minimum_sample_met", "minimum_days_met", "minimum_cycles_met",
+            "minimum_long_labels_met", "minimum_short_labels_met",
+        ))
+        forward_met = measurable and all(expected_requirements[key] for key in (
+            "precision_at_least_target", "wilson_95_low_at_least_target",
+            "ece_at_most_5pp",
+        ))
+        expected_status = (
+            "NOT_MEASURABLE" if not measurable
+            else "MET_FORWARD_SHADOW_REQUIRES_RISK_APPROVAL"
+            if forward_met and expected_requirements["offline_gate_pass"]
+            else "FORWARD_MET_BUT_OFFLINE_GATE_NOT_MET" if forward_met
+            else "NOT_MET"
+        )
+        if (
+            item.get("status") != expected_status
+            or item.get("production_threshold_change_allowed") is not False
+        ):
+            raise ValueError("model-shadow rebuilt gate status disagrees")
+        rebuilt_statuses.append(expected_status)
+    checks = audit.get("checks")
+    failed = audit.get("failed_checks")
+    required_checks = {
+        "evaluation_schema_v2", "label_schema_v3",
+        "evaluation_artifact_type_valid",
+        "acceptance_thresholds_not_weakened",
+        "acceptance_threshold_migration_exact",
+        "cost_hurdle_not_weakened", "execution_price_contract_exact",
+        "all_safety_flags_closed", "label_columns_exact",
+        "label_key_set_exact", "all_label_fields_match_raw_evidence",
+        "model_key_set_exact", "aggregate_metrics_match_labels",
+    }
+    safety_checks = audit.get("safety_checks")
+    if (
+        not isinstance(checks, dict) or not checks
+        or not required_checks.issubset(checks)
+        or any(value is not True for value in checks.values())
+        or not isinstance(safety_checks, dict) or not safety_checks
+        or any(value is not True for value in safety_checks.values())
+        or failed != [] or audit.get("status") != "PASSED"
+        or audit.get("safe_for_credibility_research") is not True
+        or audit.get("confidence_claim_allowed") is not False
+        or audit.get("production_threshold_change_allowed") is not False
+        or audit.get("production_execution_authorized") is not False
+        or audit.get("production_database_writes") != 0
+        or audit.get("production_mutation") is not False
+        or audit.get("orders_placed") != 0
+    ):
+        raise ValueError("model-shadow label-quality audit did not pass independently")
+    _record_migrated_audit(
+        artifact, source_id="model_shadow_label_quality",
+        label="冻结模型影子标签独立验真", relative_path=audit_relative_path,
+        status_field="model_shadow_label_quality_status", status="PASSED",
+        as_of=as_of,
+    )
+    headline = artifact["snapshot"]["datasets"]["headline"][0]
+    headline["active_credibility_target_rate"] = expected_facts[
+        "effective_target_precision"]
+    headline["confidence_claim_allowed"] = False
+    forward_gate_status = (
+        "MET_FORWARD_SHADOW_REQUIRES_RISK_APPROVAL"
+        if "MET_FORWARD_SHADOW_REQUIRES_RISK_APPROVAL" in rebuilt_statuses
+        else "FORWARD_MET_BUT_OFFLINE_GATE_NOT_MET"
+        if "FORWARD_MET_BUT_OFFLINE_GATE_NOT_MET" in rebuilt_statuses
+        else "NOT_MET" if "NOT_MET" in rebuilt_statuses
+        else "NOT_MEASURABLE"
+    )
+    headline["model_forward_gate_status"] = forward_gate_status
+    for gate in artifact["snapshot"]["datasets"].get("gates", []):
+        if gate.get("goal") == "分析可信度":
+            target_pct = f"{expected_facts['effective_target_precision']:.0%}"
+            gate["current"] = (
+                f"独立标签验真已通过；生效前向孪生门为{target_pct}，"
+                "但通过验真不等于校准门达标或获准切换执行策略"
+            )
+            gate["status"] = (
+                "待风险审批"
+                if forward_gate_status == "MET_FORWARD_SHADOW_REQUIRES_RISK_APPROVAL"
+                else "未达标"
+            )
+            gate["next_gate"] = (
+                f"点精度与Wilson 95%下界均达到{target_pct}，且N/天数/"
+                "周期/ECE/双侧样本/offline gate全通过后，仅进入风险审批"
+            )
+            break
     return artifact
 
 
@@ -4991,7 +5722,7 @@ def refresh_overall_narrative(artifact: dict) -> dict:
         f"{headline.get('independent_confirmation_precision', 0):.3%}"
         f"（N={headline.get('independent_confirmation_n', 0)}）{ranking_text}"
         f"{directional_text}，"
-        "均远低于90%。"
+        f"均远低于{_credibility_target_pct()}。"
         + (
             f"三周期精确已收盘原始OHLCV最低"
             f"{headline['multitimeframe_raw_minimum_rate']:.3%}，"
@@ -5204,6 +5935,15 @@ def main(argv=None) -> int:
     parser.add_argument("--push-audit-relative-path", required=True)
     parser.add_argument("--source-health-audit")
     parser.add_argument("--source-health-relative-path")
+    parser.add_argument("--market-field-audit", required=True)
+    parser.add_argument("--market-field-relative-path", required=True)
+    parser.add_argument("--market-feature-audit", required=True)
+    parser.add_argument("--market-feature-relative-path", required=True)
+    parser.add_argument("--periodic-report-audit", required=True)
+    parser.add_argument("--periodic-report-relative-path", required=True)
+    parser.add_argument("--model-shadow-label-quality-audit", required=True)
+    parser.add_argument(
+        "--model-shadow-label-quality-relative-path", required=True)
     parser.add_argument("--calibration-metrics")
     parser.add_argument("--calibration-relative-path")
     parser.add_argument("--policy-diagnostic")
@@ -5220,6 +5960,7 @@ def main(argv=None) -> int:
     parser.add_argument("--directional-relative-path")
     parser.add_argument("--news-source-health-audit")
     parser.add_argument("--news-source-health-relative-path")
+    parser.add_argument("--news-source-registry")
     parser.add_argument("--positioning-audit")
     parser.add_argument("--positioning-relative-path")
     parser.add_argument("--positioning-isolated-audit")
@@ -5267,6 +6008,53 @@ def main(argv=None) -> int:
             source_result,
             audit_relative_path=args.source_health_relative_path,
         )
+    migrated_audits = (
+        (
+            "market-field", args.market_field_audit,
+            args.market_field_relative_path,
+        ),
+        (
+            "market-feature", args.market_feature_audit,
+            args.market_feature_relative_path,
+        ),
+        (
+            "periodic-report", args.periodic_report_audit,
+            args.periodic_report_relative_path,
+        ),
+        (
+            "model-shadow-label-quality",
+            args.model_shadow_label_quality_audit,
+            args.model_shadow_label_quality_relative_path,
+        ),
+    )
+    any_migrated_arg = any(path or relative for _, path, relative in migrated_audits)
+    all_migrated_args = all(path and relative for _, path, relative in migrated_audits)
+    if any_migrated_arg and not all_migrated_args:
+        raise ValueError(
+            "market-field, market-feature, periodic-report, and model-shadow "
+            "migrated audits must be supplied as one complete chain")
+    migrated_results: dict[str, dict] = {}
+    for name, path_value, relative_path in migrated_audits:
+        if bool(path_value) != bool(relative_path):
+            raise ValueError(f"--{name}-audit and --{name}-relative-path are paired")
+        if not path_value:
+            continue
+        result = json.loads(Path(path_value).read_text(encoding="utf-8"))
+        migrated_results[name] = result
+        if name == "market-field":
+            updated = refresh_market_coverage_audit(
+                updated, result, family="field",
+                audit_relative_path=relative_path)
+        elif name == "market-feature":
+            updated = refresh_market_coverage_audit(
+                updated, result, family="feature",
+                audit_relative_path=relative_path)
+        elif name == "periodic-report":
+            updated = refresh_periodic_report_completeness(
+                updated, result, audit_relative_path=relative_path)
+        else:
+            updated = refresh_model_shadow_label_quality(
+                updated, result, audit_relative_path=relative_path)
     credibility_args = (
         args.calibration_metrics,
         args.calibration_relative_path,
@@ -5341,12 +6129,14 @@ def main(argv=None) -> int:
             directional_result,
             diagnostic_relative_path=args.directional_relative_path,
         )
-    if bool(args.news_source_health_audit) != bool(
-        args.news_source_health_relative_path
-    ):
+    news_args = (
+        args.news_source_health_audit,
+        args.news_source_health_relative_path,
+        args.news_source_registry,
+    )
+    if any(news_args) and not all(news_args):
         raise ValueError(
-            "--news-source-health-audit and --news-source-health-relative-path "
-            "are paired")
+            "news-source audit, relative path, and registry are supplied together")
     news_source_result = None
     if args.news_source_health_audit:
         news_source_result = json.loads(
@@ -5355,6 +6145,8 @@ def main(argv=None) -> int:
             updated,
             news_source_result,
             audit_relative_path=args.news_source_health_relative_path,
+            registry=json.loads(
+                Path(args.news_source_registry).read_text(encoding="utf-8")),
         )
     positioning_args = (
         args.positioning_audit,
@@ -5456,6 +6248,29 @@ def main(argv=None) -> int:
         and contract_result is not None
     ):
         updated = refresh_overall_narrative(updated)
+    if "model-shadow-label-quality" in migrated_results:
+        # Historical diagnostics above retain their artifact-time 90% labels;
+        # apply the current forward gate last so present-tense prose is 80%.
+        updated = refresh_model_shadow_label_quality(
+            updated,
+            migrated_results["model-shadow-label-quality"],
+            audit_relative_path=args.model_shadow_label_quality_relative_path,
+        )
+    migrated_status_fields = (
+        "market_field_coverage_status", "market_feature_coverage_status",
+        "periodic_report_gate_status", "model_shadow_label_quality_status",
+    )
+    headline = updated["snapshot"]["datasets"]["headline"][0]
+    if migrated_results:
+        # Supplying only part of the newly migrated chain must never create a
+        # green acceptance result.  A complete chain is required for the
+        # combined decision, while old CLI callers remain read-only compatible.
+        complete_chain = all(field in headline for field in migrated_status_fields)
+        headline["migrated_threshold_chain_status"] = (
+            "PASSED" if complete_chain and all(
+                headline[field] == "PASSED" for field in migrated_status_fields
+            ) else "NOT_MET"
+        )
     if not args.dry_run:
         _atomic_write_json(artifact_path, updated)
     print(json.dumps({
@@ -5488,6 +6303,14 @@ def main(argv=None) -> int:
         "push_overall_status": push_audit["overall_status"],
         "source_health_status": (
             source_result["overall_status"] if source_result else None),
+        "migrated_threshold_chain_status": headline.get(
+            "migrated_threshold_chain_status"),
+        "market_field_status": headline.get("market_field_coverage_status"),
+        "market_feature_status": headline.get("market_feature_coverage_status"),
+        "periodic_report_status": headline.get("periodic_report_gate_status"),
+        "model_shadow_label_quality_status": headline.get(
+            "model_shadow_label_quality_status"),
+        "model_forward_gate_status": headline.get("model_forward_gate_status"),
         "credibility_status": (
             policy_result["acceptance"]["status"]
             if credibility_result is not None else None

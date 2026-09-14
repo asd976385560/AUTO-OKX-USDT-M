@@ -1,13 +1,23 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-12
+last-updated: 2026-09-14
 updated-by: Codex
-change-summary: Sync the live-only runtime, consolidated collection, exact multitimeframe evidence, finite risk gates and read-only public recovery boundary.
+change-summary: Synchronize the current decision, execution, market-data and reporting contracts while retaining public release guards.
 -->
 
 # OKX 自主交易系统 V2.0 · 事实源
 
 本文定义公开代码中的 V2.0 架构、职责边界与安全不变量。`README.md` 是面向使用者的系统地图；发生冲突时，以本文和真实代码为准。
+
+## 当前前向决策协议（1.1.2）
+
+当前政策为 `minimal_contract_full_closure_v1`，继承 `all_market_lightweight_open_v1` 的轻量执行数据结构。manifest 对每个 symbol 只保留一行，不预先授权方向；review 是阅读预算，完整 manifest 内的标的均可由 Agent 判断。新周期不消费三周期、四态、mature/early 或 trend/timing 作为开仓门槛；这些字段仅解释历史回执。
+
+OPEN 的机器执行合同为扁平 `open_execution_package_v1={contract,entry,stop,target,exit_mode}`。确定性阶段在 analysis 落库后生成 facts/view，校验哈希交接；计划必须由 `write_position_plan.py` 从具名草稿校验并原子发布，runner 不接受身份不符的计划。HOLD/退出无需 OPEN 专用六项卡。账户、账仓、execution_intents、actor、SL、风险、成交确认、保护回读和唯一 writer 始终强制执行。
+
+独立无下单副作用的拒绝保留失败证据，可以继续其它独立动作；未知、已提交、同标的依赖、写入失败和缺保护继续停止。V4 分别核验 required 采集结果和业务终态；870 秒的业务边界不包含 Push，报告与送达使用独立截止时间。缺失证据、历史失败和未送达记录不能从分母删除。
+
+公共账本自动修复始终只读；生产部署中的自动补录与宿主事故处置不属于本发布的自动路径。`audit_weekly_trading_net_profit.py` 只读核算净收益，不将盈利目标表述为已达成结果。
 
 ## 1. 设计原则
 
@@ -49,8 +59,8 @@ fast/slow/news/account collectors
 2. fast collector 采集即时行情并同步账户，slow collector 采集合约规格和低频宏观数据；
 3. registry 新闻源经 `news_writer` 落库，news-scout 作为非必需旁路；
 4. dispatcher 在采集齐全且新鲜时抢 `stage_dispatch(live)`；
-5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，并绑定同 cycle 的 exact 已收盘 15m/1H/4H 证据；
-6. writer 和 executor 分别重验多周期证据、actor attestation、账仓一致、有限数值和硬风控后才允许订单 I/O；
+5. unified live 先写 analysis，再读取 OKX 权威账户与持仓，并绑定同 cycle 的完整候选 manifest 与事实交接证据；
+6. writer 和 executor 分别重验当前决策协议、actor attestation、账仓一致、有限数值和硬风控后才允许订单 I/O；
 7. `stage_runner.py` 以 profile lease 串行 live 任务，等待子进程终态并回读真实业务产物；`rc=0` 但缺业务行仍判失败；
 8. live trade cycle 就绪后，dispatcher 运行纯脚本 push pipeline；
 9. 日频维护完成对账、账单和质量文件后发布带 SHA-256 的 ready 清单，reviewer 校验后再生成报告。
@@ -109,7 +119,7 @@ Agent 不得直接写表，不得绕过 writer，不得手拼 OKX 下单命令�
 - 环境变量优先；
 - 允许采集器从本地 `config.md` 读取受控 fallback；
 - `config.md` 从 `config.example.md` 复制后填写，永远不得提交；
-- 业务推送与告警目标只由 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 提供，公开代码无默认目标且不接受 CLI 目标覆盖；
+- 业务推送与告警目标只由 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET`、`OKX_QQ_REPORT_TARGET` 提供，公开代码无默认目标且不接受 CLI 目标覆盖；
 - 公开账本 autoheal 永久只读；写参数或历史写开关只会返回非零结构化阻断，不修改交易库或 repair queue；
 - OKX API credential 由仓库外的 CLI profile 或部署环境管理；
 - 代理由 `OKX_PROXY_URL` 或当前启用的系统代理提供，代码不带私网地址或端口默认值。

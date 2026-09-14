@@ -154,13 +154,34 @@ class RenderDualMetricTests(unittest.TestCase):
         self.assertIn("值异常,核对slTriggerPx", line)
         self.assertIn("SL缓冲(现价)61%(值异常,核对markPx)", line)
 
-    def test_no_sl_still_renders_honest_missing(self) -> None:
+    def test_missing_sl_reads_as_unread_not_unattached(self) -> None:
+        """2026-08-20 契约变更：缺止损价不再一律断言「SL未挂」。
+
+        本用例原名 `test_no_sl_still_renders_honest_missing`，断言的却不诚实 ——
+        取不到值被写成了「未挂」。实测 8/40 轮有仓战报因此误报，而同轮
+        live_facts 里止损挂着且在被上移（60.75→64.864→67.0，verified=true）。
+        无 `sl_state` 的旧 payload 一律按 unread 处理：宁可说没读到，也不凭空
+        断言仓位在裸奔 —— 那会诱发不必要的手动干预。
+        """
         line = rpr.format_position(dict(self.BASE))
-        self.assertIn("SL未挂", line)
+        self.assertIn("未读取", line)
+        self.assertIn("非未挂", line)
+        self.assertNotIn("交易所已确认", line)
         # bool 不得冒充数值缓冲
         line2 = rpr.format_position({**self.BASE, "sl_pct": 2.6,
                                      "sl_buffer_pct": True})
         self.assertIn("计划SL距(开仓)2.6%", line2)
+
+    def test_exchange_confirmed_absence_still_says_unattached(self) -> None:
+        """「真没挂」是必须看见的风险事实，不能为了消灭假阴性而一并藏掉。"""
+        line = rpr.format_position({**self.BASE, "sl_state": "absent"})
+        self.assertIn("SL未挂", line)
+        self.assertIn("交易所已确认", line)
+
+    def test_unverified_algo_is_neither_attached_nor_absent(self) -> None:
+        line = rpr.format_position({**self.BASE, "sl_state": "unverified"})
+        self.assertIn("未确认", line)
+        self.assertIn("非未挂", line)
 
     def test_margin_return_and_locked_profit_are_explicit(self) -> None:
         line = rpr.format_position({

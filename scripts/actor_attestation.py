@@ -3,7 +3,7 @@ r"""actor_attestation.py — 接管重验凭证生成 CLI（Wave1 序6）。
 
 用法（live trader 在 executor 前检测到接管、或想主动自查时）：
   run_okx_python.ps1 scripts/actor_attestation.py --cycle-id 2026-08-10T11:15 \
-      --out-file ./tmp/attestation_2026-08-10T11-15.json
+      --out-file <PROJECT_ROOT>/tmp/attestation_2026-08-10T11-15.json
 
 输出 = core/actor_attestation.build_attestation 的确定性产物：会话 actor 时间线
 （只含不透明指纹，零模型名）+ 接管检测 + 重验包（analysis 状态/证据契约/EV 重算/
@@ -14,12 +14,21 @@ facts 年龄）+ 全文指纹。接管模型把整份 JSON 原样放入 receipt_
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r".")
+sys.path.insert(0, _public_project_path())
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30,7 +39,7 @@ from core.actor_attestation import build_attestation  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description="接管重验凭证生成（确定性）")
     ap.add_argument("--cycle-id", required=True)
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--stage", default="live")
     ap.add_argument("--out-file", default=None)
     args = ap.parse_args()

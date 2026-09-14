@@ -1,4 +1,14 @@
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import copy
+import inspect
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,6 +20,8 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import _acceptance_thresholds as thresholds  # noqa: E402
+import audit_push_completeness as push_auditor  # noqa: E402
 from refresh_goal_acceptance_report import (  # noqa: E402
     refresh_contract_statistics_coverage,
     refresh_credibility_evidence,
@@ -27,15 +39,42 @@ from refresh_goal_acceptance_report import (  # noqa: E402
 
 
 CST = timezone(timedelta(hours=8))
-# 与 refresh_goal_acceptance_report 中的预注册常量同源，改一处即两处同改。
-PUSH_FORWARD_START_CST = "2026-08-12T16:00:00+08:00"
-PUSH_FINALITY_GRACE_MINUTES = 45
+PUSH_FORWARD_START_CST = push_auditor.DEFAULT_FORWARD_START
+PUSH_FINALITY_GRACE_MINUTES = inspect.signature(
+    push_auditor.audit_push_completeness
+).parameters["finality_grace_minutes"].default
+
+
+def with_coverage_target(
+    payload: dict,
+    *,
+    as_of: str,
+    target_field: str = "target_rate",
+    migration_field: str = "target_rate_migration",
+) -> dict:
+    """Attach the shared boundary result without copying interlocked values."""
+    payload[target_field] = thresholds.coverage_target_rate(as_of)
+    payload[migration_field] = thresholds.coverage_migration_facts(as_of)
+    return payload
+
+
+def news_registry(*optional_sources: str) -> dict:
+    sources = [
+        {"id": "rss_en", "type": "news", "enabled": True,
+         "required": True, "adapter": "news_rss"},
+        {"id": "okx_news", "type": "news", "enabled": True,
+         "required": False, "adapter": "news_okx"},
+    ]
+    sources.extend({
+        "id": source, "type": "news", "enabled": True,
+        "required": False, "adapter": f"news_{source}",
+    } for source in optional_sources)
+    return {"sources": sources}
 
 
 def push_completeness_audit(
     *,
     days: int = 14,
-    target_rate: float = 0.99,
     evaluated_at_cst: str = "2026-08-13 17:00:00",
     as_of_cst: str = "2026-08-13T16:45:00+08:00",
 ) -> dict:
@@ -43,9 +82,10 @@ def push_completeness_audit(
 
     `refresh_report_completeness` 自 2026-08-12 起把 Push 审计作为**必填**第三位
     参数，并对窗口/计数/速率/状态/安全标志/逐日行/失败行/前向证据交叉复算。这里
-    按同一套恒等式生成，只留 days / target_rate / as_of 少量旋钮——避免测试里手抄
+    按同一套恒等式生成，只留 days / as_of 少量旋钮——避免测试里手抄
     几十个互相牵制的常量（手抄必然随生产口径演进而腐坏，本文件此前正是如此）。
     """
+    target_rate = thresholds.coverage_target_rate(as_of_cst)
     expected = days * 96
     start_date = datetime(2026, 7, 31, tzinfo=CST)
     daily_rows = [
@@ -101,7 +141,7 @@ def push_completeness_audit(
         "delivery_confirmation_rate": 1.0,
         "delivered_report_completeness_rate": 1.0,
     }
-    return {
+    payload = {
         "artifact_type": "push_report_and_delivery_completeness_audit",
         "mode": "read_only_business_data",
         "evaluated_at_cst": evaluated_at_cst,
@@ -170,6 +210,7 @@ def push_completeness_audit(
             "failure_rows": [],
         },
     }
+    return with_coverage_target(payload, as_of=as_of_cst)
 
 
 class RefreshGoalAcceptanceReportTests(unittest.TestCase):
@@ -177,7 +218,7 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（old）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "generatedAt": "old",
                 "sources": [{"id": "runtime", "query": {}}],
                 "charts": [{"id": "throughput_chart"}],
@@ -284,7 +325,7 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（old）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "generatedAt": "old",
                 "sources": [{"id": "coverage_evidence", "query": {}}],
                 "tables": [],
@@ -518,6 +559,8 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 "historical_holdout_ranking_gap": 0.4890,
             },
             "acceptance": {
+                "target_precision": thresholds.shadow_target_precision(
+                    "2026-08-12T07:20:00Z"),
                 "confidence_90_status": "NOT_PROVEN",
                 "production_status": "NO_CHANGE_ALLOWED",
             },
@@ -570,7 +613,8 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         # target_rate 与 start_cst 必须与审计头一致。这里按同一套恒等式生成，
         # 只留 complete 一个旋钮，避免手抄常量再次腐坏。
         forward_start = "2026-08-12T05:30:00+08:00"
-        target_rate = 0.99
+        as_of_cst = "2026-08-12T05:37:58+08:00"
+        target_rate = thresholds.coverage_target_rate(as_of_cst)
         minimum_window_hours = 24
 
         def source_row(source, role, complete, status):
@@ -610,12 +654,12 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
             for name in ("bitcoinist", "coindesk", "cointelegraph",
                          "cryptoslate", "decrypt", "theblock")
         ]
-        audit = {
+        audit = with_coverage_target({
             "artifact_type": "scheduled_news_source_health_audit",
             "generated_at_cst": "2026-08-12T05:37:59+08:00",
+            "as_of_cst": as_of_cst,
             "forward_start_cst": forward_start,
             "minimum_window_hours": minimum_window_hours,
-            "target_rate": target_rate,
             # 五个安全标志为必填（生产端拒绝会改库/触发重采/触发派发/授权执行的证据）。
             "production_mutation": False,
             "collector_retry_triggered": False,
@@ -631,11 +675,12 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                                "INSUFFICIENT_EVIDENCE"),
                 ],
             },
-        }
+        }, as_of=as_of_cst)
         result = refresh_news_source_health(
             artifact,
             audit,
             audit_relative_path="news-source-health-audit.json",
+            registry=news_registry("panews"),
         )
         headline = result["snapshot"]["datasets"]["headline"][0]
         # 关键源 8 行全 complete；可选 panews 未 complete 只进「全部源」分母。
@@ -769,15 +814,16 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 }],
             }},
         }
-        natural = {
+        natural = with_coverage_target({
             "artifact_type": "positioning_coverage_audit",
             "source": "okx_rest_contract_long_short_ratio",
             "generated_at_utc": "2026-08-11T19:01:46Z",
             "latest_batch_collected_ts": "2026-08-11T19:01:08Z",
-            "minimum_rate": 0.99, "coverage_rate": 426 / 427,
+            "coverage_rate": 426 / 427,
             "valid_symbols": 426, "universe_symbols": 427,
             "missing_symbols": ["APLD-USDT-SWAP"], "status": "PASSED",
-        }
+        }, as_of="2026-08-11T19:01:46Z", target_field="minimum_rate",
+           migration_field="minimum_rate_migration")
         isolated = dict(natural)
         isolated.update({
             "latest_batch_collected_ts": "2026-08-11T18:46:40Z",
@@ -1207,7 +1253,7 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（old）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "generatedAt": "old",
                 "sources": [{"id": "report_quality", "query": {}}],
                 "cards": [{
@@ -1248,18 +1294,35 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 },
             },
         }
-        audit = {
+        audit = with_coverage_target({
             "evaluated_at_cst": "2026-08-12 01:17:00",
             "window": {"start_date": "2026-07-28", "end_date": "2026-08-11"},
             "expected": 15,
             "valid": 15,
+            "invalid": 0,
             "completeness_rate": 1.0,
-            "target_rate": 0.99,
             # 日报审计的三个安全标志同为必填（生产端拒绝会写库/自动外发/授权下单的证据）。
             "auto_send": False,
             "database_write": False,
             "production_order_authorized": False,
-        }
+            "delivery_evidence": {"integrity_status": "PASSED"},
+            "forward_after_remediation": {
+                "start_date": "2026-08-13",
+                "minimum_days": 30,
+                "expected": 30,
+                "existing": 30,
+                "valid": 30,
+                "invalid": 0,
+                "completeness_rate": 1.0,
+                "delivery_confirmed": 30,
+                "delivery_unconfirmed": 0,
+                "delivered_report_complete": 30,
+                "delivery_confirmation_rate": 1.0,
+                "delivered_report_completeness_rate": 1.0,
+                "status": "PASSED",
+            },
+            "overall_status": "PASSED",
+        }, as_of="2026-08-12 01:17:00")
         before_other = copy.deepcopy(
             artifact["snapshot"]["datasets"]["gates"][0])
         result = refresh_report_completeness(
@@ -1298,7 +1361,7 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
         artifact = {
             "surface": "report",
             "manifest": {
-                "title": ". 四项目标实施与前向验收（old）",
+                "title": '<PROJECT_ROOT> 四项目标实施与前向验收（old）'.replace('<PROJECT_ROOT>', _public_project_path()),
                 "generatedAt": "old",
                 "sources": [],
                 "cards": [{
@@ -1336,16 +1399,18 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 },
             },
         }
-        audit = {
+        audit = with_coverage_target({
             "artifact_type": "scheduled_source_health_audit",
             "generated_at_cst": "2026-08-12T01:50:10+08:00",
             "as_of_cst": "2026-08-12T01:50:10+08:00",
-            "target_rate": 0.99,
             "overall_status": "PENDING_FORWARD_EVIDENCE",
             "rolling": {
                 "start_cst": "2026-07-29T02:00:00+08:00",
                 "end_exclusive_cst": "2026-08-12T02:00:00+08:00",
                 "expected_slots": 1344,
+                "minimum_slots": 1344,
+                "target_rate": thresholds.coverage_target_rate(
+                    "2026-08-12T01:50:10+08:00"),
                 "observed_rows": 1331,
                 "missing_slots": 13,
                 "complete_slots": 1296,
@@ -1353,19 +1418,22 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 "available_slots": 1305,
                 "available_rate": 0.970982,
                 "raw_status_counts": {"ok": 1296, "degraded": 9, "error": 26},
+                "status": "NOT_MET",
             },
             "forward_after_remediation": {
                 "start_cst": "2026-08-12T01:45:00+08:00",
                 "end_exclusive_cst": "2026-08-12T02:00:00+08:00",
                 "expected_slots": 1,
                 "minimum_slots": 96,
+                "target_rate": thresholds.coverage_target_rate(
+                    "2026-08-12T01:50:10+08:00"),
                 "complete_slots": 1,
                 "complete_rate": 1.0,
                 "available_slots": 1,
                 "available_rate": 1.0,
                 "status": "INSUFFICIENT_EVIDENCE",
             },
-        }
+        }, as_of="2026-08-12T01:50:10+08:00")
         result = refresh_source_health(
             artifact,
             audit,
@@ -1416,6 +1484,13 @@ class RefreshGoalAcceptanceReportTests(unittest.TestCase):
                 for table in rerun["manifest"]["tables"]
             ),
         )
+        tampered_status = copy.deepcopy(audit)
+        tampered_status["rolling"]["status"] = "PASSED"
+        with self.assertRaisesRegex(ValueError, "statuses disagree"):
+            refresh_source_health(
+                artifact, tampered_status,
+                audit_relative_path="reports/quality/source-health-audit.json",
+            )
 
 
 if __name__ == "__main__":

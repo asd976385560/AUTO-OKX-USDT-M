@@ -7,11 +7,20 @@ snapshot collection.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import subprocess
 from pathlib import Path
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 PWSH = "C:/Program Files/PowerShell/7/pwsh.exe"
 RUN_OKX = ROOT / "scripts" / "run_okx_python.ps1"
 

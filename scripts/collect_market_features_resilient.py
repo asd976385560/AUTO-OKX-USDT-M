@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Production wrapper for bounded market-feature transport recovery.
+"""Production wrapper for WS-first market features and bounded recovery.
 
 The underlying collector remains the byte-identical v7 frozen dependency.
-Only the production entrypoint substitutes current-cycle order-book/trade
-fetchers and appends their transport attestation to the collector JSON.
+Only the production entrypoint substitutes current-cycle WS-first
+order-book/trade fetchers and appends their WS/REST transport attestation to
+the collector JSON.
 """
 from __future__ import annotations
 

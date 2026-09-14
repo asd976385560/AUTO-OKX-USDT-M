@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import tempfile
 import unittest
@@ -99,6 +98,22 @@ def _market_evidence_contract(cycle_id: str, symbol: str) -> dict:
                     mtf_gate.expected_closed_bar_start(cycle, timeframe)),
                 "observed_bar_ts": (
                     mtf_gate.expected_closed_bar_start(cycle, timeframe)),
+                "closed_bar_proof": {
+                    "method": mtf_gate.CLOSED_BAR_PROOF_METHOD,
+                    "expected_successor_bar_ts": (
+                        mtf_gate.immediate_successor_bar_start(
+                            mtf_gate.expected_closed_bar_start(cycle, timeframe),
+                            timeframe,
+                        )
+                    ),
+                    "observed_successor_bar_ts": (
+                        mtf_gate.immediate_successor_bar_start(
+                            mtf_gate.expected_closed_bar_start(cycle, timeframe),
+                            timeframe,
+                        )
+                    ),
+                    "proven": True,
+                },
                 "bars_seen": mtf_gate.MINIMUM_BARS_FOR_FULL_INDICATORS,
                 "ready": True,
                 "values": dict(values),
@@ -310,6 +325,15 @@ def _create_market_db(path: Path, cycle_id: str,
                     100.0, 102.0, 99.0, 101.0, 1000.0,
                     100.0, 99.0, 2.0, 55.0, 0.5,
                 ))
+            # 当前生产闭合证明要求目标柱的紧邻后继柱存在。后继只证明前柱
+            # 已闭合，不进入 ts<=expected 的34根指标历史分母。
+            successor_ts = (expected + timedelta(seconds=seconds)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            rows.append((
+                successor_ts, symbol, timeframe,
+                101.0, 103.0, 100.0, 102.0, 1001.0,
+                100.0, 99.0, 2.0, 55.0, 0.5,
+            ))
             con.executemany(
                 "INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
@@ -366,6 +390,48 @@ def _write_trade_cycle(path: Path, cycle: str, decision: str,
 
 
 class AnalystWriterHardeningTests(unittest.TestCase):
+    def test_missing_cycle_reaches_validator_instead_of_rollout_parser_error(self):
+        payload = {"mode": "full", "status": "ok", "signals": [], "raw": {}}
+        normalized = analyst_writer.normalize_receipt(payload)
+        self.assertEqual([], normalized["signals"])
+        errors = analyst_writer.validate_receipt(payload)
+        self.assertTrue(any("cycle_id" in item for item in errors), errors)
+
+    def test_candidate_consume_normalization_can_filter_open_without_close(self):
+        payload = {
+            "cycle_id": "2026-08-29T10:00",
+            "signals": [
+                {"symbol": "AAA-USDT-SWAP", "action": "open_long"},
+                {"symbol": "HELD-USDT-SWAP", "action": "close", "side": "long"},
+            ],
+            "raw": {"reported": True},
+        }
+        retained_close = payload["signals"][1]
+        canonical_raw = {"candidate_quality": {"status": "NOT_MET"}}
+        quality = {
+            "status": "NOT_MET",
+            "rejected_open_signals": [{
+                "symbol": "AAA-USDT-SWAP",
+                "reason": "quality_valid_deep_dive_missing",
+            }],
+        }
+        with (
+            mock.patch.object(
+                analyst_writer.thresholds,
+                "candidate_bundle_phase",
+                return_value="consume"),
+            mock.patch.object(
+                analyst_writer,
+                "normalize_candidate_quality",
+                return_value=(canonical_raw, [retained_close], quality),
+            ) as normalize_quality,
+        ):
+            normalized = analyst_writer.normalize_receipt(payload)
+        normalize_quality.assert_called_once()
+        self.assertEqual([retained_close], normalized["signals"])
+        self.assertEqual(canonical_raw, normalized["raw"])
+        self.assertEqual(quality, normalized["candidate_quality"])
+
     def _open_payload(self, root: Path, *, side: object = "long") -> dict:
         cycle = "2026-07-29T14:00"
         symbol = "BTC-USDT-SWAP"
@@ -397,8 +463,7 @@ class AnalystWriterHardeningTests(unittest.TestCase):
             normalized = analyst_writer.normalize_receipt(payload)
             with mock.patch.object(
                     analyst_writer, "DB_PATH", root / "analysis.db"):
-                errors = analyst_writer.validate_receipt(
-                    payload, db_root=root)
+                errors = analyst_writer.validate_receipt(payload)
         self.assertEqual("long", normalized["signals"][0]["side"])
         self.assertEqual([], errors)
 
@@ -455,7 +520,6 @@ class AnalystWriterHardeningTests(unittest.TestCase):
 
             def notifying_connect(write=False, db_path=None):
                 self.assertTrue(write)
-                self.assertEqual(Path(db_path), db)
                 inner = sqlite3.connect(db, timeout=5)
                 inner.row_factory = sqlite3.Row
                 inner.execute("PRAGMA busy_timeout=5000")
@@ -482,13 +546,21 @@ class AnalystWriterHardeningTests(unittest.TestCase):
             self.assertEqual("analysis_deadline_exceeded", result["error"])
             self.assertEqual(0, result["production_database_writes"])
             self.assertEqual(3, checks)
+            # 2026-08-19 F1：越界不再「整轮静默蒸发」——业务结论仍然零提交，
+            # 但写一行 status='error' 占位，让复盘/经验/错失池看得见这一轮
+            # （实测 08-16~08-18 共 54/287 轮因此不可见）。signals 必须为空。
             with closing(sqlite3.connect(db)) as con:
-                self.assertEqual(
-                    0, con.execute(
-                        "SELECT COUNT(*) FROM analysis_runs").fetchone()[0])
+                run = con.execute(
+                    "SELECT status,raw,regime,market_summary FROM analysis_runs "
+                    "WHERE cycle_id=?", (cycle,)).fetchone()
                 self.assertEqual(
                     0, con.execute(
                         "SELECT COUNT(*) FROM analysis_signals").fetchone()[0])
+            self.assertIsNotNone(run)
+            self.assertEqual("error", run[0])
+            self.assertIn("analysis_deadline_exceeded", run[1])
+            self.assertIsNone(run[2])
+            self.assertIsNone(run[3])
 
     def test_deadline_crossed_before_commit_rolls_back_run_and_signals(
             self) -> None:
@@ -547,8 +619,74 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                     "WHERE cycle_id=?",
                     (cycle,),
                 ).fetchone()
-            self.assertEqual(("old-ts", '{"old":true}', "error"), run)
-            self.assertEqual(("OLD-USDT-SWAP", "wait"), signal)
+            # F1：整事务先回滚（业务 runs/signals 一律不提交），再以独立连接
+            # 写占位。故旧行被占位覆盖、旧 signal 被清空 —— 这不是「提交了业务
+            # 结论」，占位行的 regime/market_summary 恒为 NULL、raw 自证成因。
+            self.assertEqual("error", run[2])
+            self.assertNotEqual("old-ts", run[0])
+            self.assertIn("analysis_deadline_exceeded", run[1])
+            self.assertIn("placeholder", run[1])
+            self.assertIsNone(signal)
+
+    def test_deadline_placeholder_never_overwrites_ok_run(self) -> None:
+        """F1：占位行是可见性事实，绝不能顶掉已经落库的 status='ok' 终态。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "analysis.db"
+            _create_analysis_db(db)
+            cycle = "2026-08-15T23:00"
+            with closing(sqlite3.connect(db)) as con:
+                con.execute(
+                    "INSERT INTO analysis_runs"
+                    "(cycle_id,ts,mode,raw,status) VALUES(?,?,?,?,?)",
+                    (cycle, "good-ts", "full", '{"ok":true}', "ok"),
+                )
+                con.commit()
+            with mock.patch.object(analyst_writer, "DB_PATH", db):
+                analyst_writer._commit_deadline_placeholder(
+                    cycle, "full", {"error": "analysis_deadline_exceeded"})
+            with closing(sqlite3.connect(db)) as con:
+                run = con.execute(
+                    "SELECT ts,raw,status FROM analysis_runs WHERE cycle_id=?",
+                    (cycle,)).fetchone()
+            self.assertEqual(("good-ts", '{"ok":true}', "ok"), run)
+
+    def test_deadline_placeholder_ignores_malformed_cycle_id(self) -> None:
+        """F1：cycle_id 不是 UTC+8 槽位格式时静默 no-op，不建脏行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "analysis.db"
+            _create_analysis_db(db)
+            with mock.patch.object(analyst_writer, "DB_PATH", db):
+                analyst_writer._commit_deadline_placeholder(
+                    "not-a-cycle", "full", {"error": "x"})
+                analyst_writer._commit_deadline_placeholder(
+                    None, "full", {"error": "x"})
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(
+                    0, con.execute(
+                        "SELECT COUNT(*) FROM analysis_runs").fetchone()[0])
+
+    def test_non_ok_analysis_with_valid_trade_terminal_still_pushes(self) -> None:
+        """F2：有效 trade terminal 是最高权威，analysis 非 ok 不得永久无战报。"""
+        cycle = "2026-08-16T07:30"
+        now = datetime(2026, 8, 16, 7, 40, 0, tzinfo=CST)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+            fired: list = []
+            with mock.patch.object(
+                    dispatcher, "analysis_row",
+                    return_value={"mode": "full", "status": "error",
+                                  "ts": "2026-08-16 07:39:30"}), \
+                    mock.patch.object(
+                        dispatcher, "live_report_barrier_ready",
+                        return_value=True):
+                dispatcher.dispatch_cycle(
+                    root, ledger_path, cycle, now=now,
+                    fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual([("push", cycle, "full")], fired)
 
     def test_explicit_open_side_conflict_remains_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -557,8 +695,7 @@ class AnalystWriterHardeningTests(unittest.TestCase):
             normalized = analyst_writer.normalize_receipt(payload)
             with mock.patch.object(
                     analyst_writer, "DB_PATH", root / "analysis.db"):
-                errors = analyst_writer.validate_receipt(
-                    payload, db_root=root)
+                errors = analyst_writer.validate_receipt(payload)
         self.assertEqual("short", normalized["signals"][0]["side"])
         self.assertTrue(any("不一致" in item for item in errors), errors)
 
@@ -572,8 +709,7 @@ class AnalystWriterHardeningTests(unittest.TestCase):
             normalized = analyst_writer.normalize_receipt(payload)
             with mock.patch.object(
                     analyst_writer, "DB_PATH", root / "analysis.db"):
-                errors = analyst_writer.validate_receipt(
-                    payload, db_root=root)
+                errors = analyst_writer.validate_receipt(payload)
         evidence = normalized["signals"][0]["decision_card"][
             "multitimeframe_analysis"]["timeframes"]["15m"]["evidence"]
         self.assertEqual(["one exact reason"], evidence)
@@ -590,8 +726,7 @@ class AnalystWriterHardeningTests(unittest.TestCase):
                 normalized = analyst_writer.normalize_receipt(payload)
                 with mock.patch.object(
                         analyst_writer, "DB_PATH", root / "analysis.db"):
-                    errors = analyst_writer.validate_receipt(
-                        payload, db_root=root)
+                    errors = analyst_writer.validate_receipt(payload)
                 retained = normalized["signals"][0]["decision_card"][
                     "multitimeframe_analysis"]["timeframes"]["15m"][
                         "evidence"]
@@ -922,8 +1057,7 @@ class AnalystWriterHardeningTests(unittest.TestCase):
 
             with mock.patch.object(
                     analyst_writer, "DB_PATH", root / "analysis.db"):
-                errors = analyst_writer.validate_receipt(
-                    payload, db_root=root)
+                errors = analyst_writer.validate_receipt(payload)
 
             self.assertTrue(
                 any("与 market.db 本 cycle" in item for item in errors),
@@ -1572,7 +1706,126 @@ class TradesWriterHardeningTests(unittest.TestCase):
 
 
 class DispatcherHardeningTests(unittest.TestCase):
-    def test_future_push_waits_for_post_agent_report_barrier(self):
+    def setUp(self):
+        guard = __import__('unittest.mock', fromlist=['patch']).patch.dict(__import__('os').environ, {"OKX_TRIGGER_DRYRUN": "0"})
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_business_report_window_activates_forward_only_and_is_strict(self):
+        self.assertEqual(4, dispatcher.LOOKBACK_SLOTS)
+        activation = dispatcher.BUSINESS_REPORT_SAME_SLOT_FROM
+        cases = (
+            # Historical evaluation keeps the established late-report fixture.
+            ("2026-08-13T04:00", datetime(2026, 8, 13, 4, 20,
+                                          tzinfo=CST), True),
+            # At activation, a prior slot is already an old slot and must not
+            # become a new LOOKBACK-driven business-report dispatch.  This
+            # dispatcher test deliberately does not reclassify/revoke a runner
+            # that was already launched legally before activation.
+            ("2026-08-16T07:15", activation, False),
+            ("2026-08-16T07:30", activation + timedelta(minutes=13,
+                                                          seconds=59), True),
+            # The upper bound is deliberately strict: exact +14m is expired.
+            ("2026-08-16T07:30", activation + timedelta(minutes=14), False),
+            ("2026-08-16T07:30", activation + timedelta(minutes=30), False),
+            # V3 gives Push the registered 30-second post-record window without
+            # reclassifying the historical 14-minute boundary above.
+            ("2026-08-20T18:00", datetime(2026, 8, 20, 18, 14,
+                                           tzinfo=dispatcher.CST), True),
+            ("2026-08-20T18:00", datetime(2026, 8, 20, 18, 14, 30,
+                                           tzinfo=dispatcher.CST), False),
+            # A future slot cannot be sent early even though it appears in a
+            # caller-supplied cycle list.
+            ("2026-08-16T07:45", activation, False),
+            ("malformed-cycle", activation, False),
+        )
+        for cycle, now, expected in cases:
+            with self.subTest(cycle=cycle, now=now):
+                self.assertEqual(
+                    expected,
+                    dispatcher._business_report_in_window(cycle, now=now),
+                )
+
+    def test_full_report_obeys_same_window_without_taking_expired_latch(self):
+        cycle = "2026-08-16T07:30"
+        for now, expected in (
+            (datetime(2026, 8, 16, 7, 43, 59, tzinfo=CST), True),
+            (datetime(2026, 8, 16, 7, 44, 0, tzinfo=CST), False),
+        ):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ledger_path = root / "ledger.db"
+                dispatcher.ledger.init_ledger(ledger_path)
+                _create_trade_db(root / "live_trades.db")
+                _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+                fired: list = []
+                with mock.patch.object(
+                        dispatcher, "live_report_barrier_ready",
+                        return_value=True):
+                    out = dispatcher.dispatch_cycle(
+                        root, ledger_path, cycle, now=now,
+                        fire_fn=lambda *a, **k: fired.append(a) or "card")
+                self.assertEqual(
+                    [("push", cycle, "full")] if expected else [],
+                    fired,
+                    (fired, out),
+                )
+                self.assertEqual(
+                    expected,
+                    dispatcher.ledger.stage_dispatched(
+                        ledger_path, cycle, "push"),
+                )
+
+    def test_failure_report_obeys_same_window_without_taking_expired_latch(self):
+        cycle = "2026-08-16T07:30"
+        terminal = {
+            "stage": "live", "cycle_id": cycle, "status": "failed",
+            "failure_kind": "cycle_deadline_exceeded",
+        }
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-16 07:31:00"}
+        for now, expected in (
+            (datetime(2026, 8, 16, 7, 43, 59, tzinfo=CST), True),
+            (datetime(2026, 8, 16, 7, 44, 0, tzinfo=CST), False),
+        ):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ledger_path = root / "ledger.db"
+                dispatcher.ledger.init_ledger(ledger_path)
+                _create_trade_db(root / "live_trades.db")
+                self.assertTrue(dispatcher.ledger.try_stage(
+                    ledger_path, cycle, "live"))
+                fired: list = []
+                with (
+                    mock.patch.object(
+                        dispatcher, "analysis_row", return_value=analysis),
+                    mock.patch.object(
+                        dispatcher, "live_failure_terminal",
+                        return_value=terminal),
+                ):
+                    out = dispatcher.dispatch_cycle(
+                        root, ledger_path, cycle, now=now,
+                        fire_fn=lambda *a, **k: fired.append(a) or "card")
+                self.assertEqual(
+                    [("push", cycle, "failure_report")] if expected else [],
+                    fired,
+                    (fired, out),
+                )
+                self.assertEqual(
+                    expected,
+                    dispatcher.ledger.stage_dispatched(
+                        ledger_path, cycle, "push"),
+                )
+
+    def test_future_push_degrades_when_post_agent_report_barrier_missing(self):
+        """P0-5 5b：barrier 未就绪从「完全静默」改为「派降级战报」。
+
+        旧断言是 `fired` 为空 —— 那正是 08-05~08-18 缺 111 条战报里
+        「21 轮 analysis=ok 且终态齐却一个字没发」的成因：dispatcher 既不派
+        也不留痕。现在改派 mode='degraded_report'，push_pipeline 会在发送前
+        独立复核 barrier（仍未就绪才真降级，已就绪则升级回完整业务报告），
+        因此这里放行不等于绕开业务终态凭证。
+        """
         cycle = "2026-08-14T19:00"
         now = datetime(2026, 8, 14, 19, 12, tzinfo=CST)
         analysis = {
@@ -1596,10 +1849,29 @@ class DispatcherHardeningTests(unittest.TestCase):
                 out = dispatcher.dispatch_cycle(
                     root, ledger_path, cycle, now=now,
                     fire_fn=lambda *a, **k: fired.append(a) or "card")
-            self.assertFalse(fired, (fired, out))
-            self.assertFalse(dispatcher.ledger.stage_dispatched(
+            # 派了降级战报，且 out 里留下机器可读痕迹（原来两样都没有）。
+            self.assertEqual([("push", cycle, "degraded_report")], fired, out)
+            self.assertTrue(
+                any("degraded_push" in line and "report_barrier_not_ready" in line
+                    for line in out), out)
+            self.assertTrue(dispatcher.ledger.stage_dispatched(
                 ledger_path, cycle, "push"))
 
+    def test_ready_barrier_still_fires_full_business_report(self):
+        """屏障就绪的正常路径不受 5b 影响：仍是 mode='full'，零降级痕迹。"""
+        cycle = "2026-08-14T19:00"
+        now = datetime(2026, 8, 14, 19, 12, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-14 19:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+            self.assertTrue(dispatcher.ledger.try_stage(
+                ledger_path, cycle, "live"))
+            fired: list = []
             with (
                 mock.patch.object(
                     dispatcher, "analysis_row", return_value=analysis),
@@ -1611,6 +1883,35 @@ class DispatcherHardeningTests(unittest.TestCase):
                     root, ledger_path, cycle, now=now,
                     fire_fn=lambda *a, **k: fired.append(a) or "card")
             self.assertEqual([("push", cycle, "full")], fired, out)
+            self.assertFalse([ln for ln in out if "degraded_push" in ln], out)
+
+    def test_degraded_push_takes_the_slot_latch_exactly_once(self):
+        """降级战报只占本槽 push 闩锁一次 —— 不得每 tick 重派刷屏。"""
+        cycle = "2026-08-14T19:00"
+        now = datetime(2026, 8, 14, 19, 12, tzinfo=CST)
+        analysis = {
+            "mode": "full", "status": "ok", "ts": "2026-08-14 19:01:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger_path = root / "ledger.db"
+            dispatcher.ledger.init_ledger(ledger_path)
+            _create_trade_db(root / "live_trades.db")
+            _write_trade_cycle(root / "live_trades.db", cycle, "hold", 0)
+            self.assertTrue(dispatcher.ledger.try_stage(
+                ledger_path, cycle, "live"))
+            fired: list = []
+            for _ in range(3):
+                with (
+                    mock.patch.object(
+                        dispatcher, "analysis_row", return_value=analysis),
+                    mock.patch.object(
+                        dispatcher, "live_report_barrier_ready",
+                        return_value=False),
+                ):
+                    dispatcher.dispatch_cycle(
+                        root, ledger_path, cycle, now=now,
+                        fire_fn=lambda *a, **k: fired.append(a) or "card")
+            self.assertEqual([("push", cycle, "degraded_report")], fired)
 
     def test_profile_lease_serializes_cycles_and_owner_only_releases(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1828,12 +2129,7 @@ class DispatcherHardeningTests(unittest.TestCase):
         now = datetime(2026, 8, 14, 4, 10, tzinfo=CST)
         analysis = {
             "mode": "full", "status": "ok", "ts": "2026-08-14 04:08:00"}
-        # CI globally enables trigger dry-run, which intentionally never writes
-        # stage latches.  This case verifies the persistent lease/latch path
-        # with an injected fire function and isolated databases.
-        with mock.patch.dict(
-                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
-                tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ledger_path = root / "ledger.db"
             dispatcher.ledger.init_ledger(ledger_path)
@@ -1896,12 +2192,7 @@ class DispatcherHardeningTests(unittest.TestCase):
         # analysis 已过 max_age：trader 不会被追起，只剩 push 闸可评估
         now = datetime(2026, 7, 29, 12, 40, tzinfo=CST)
         analysis = {"mode": "full", "status": "ok", "ts": "2026-07-29 12:01:00"}
-        # CI keeps trigger dry-run enabled globally for safety.  This test
-        # specifically verifies the persistent stage latch, so exercise the
-        # non-dry-run dispatcher with an injected fire function and temp DBs.
-        with mock.patch.dict(
-                os.environ, {"OKX_TRIGGER_DRYRUN": "0"}, clear=False), \
-                tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ledger_path = root / "ledger.db"
             dispatcher.ledger.init_ledger(ledger_path)

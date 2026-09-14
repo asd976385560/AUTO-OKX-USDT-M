@@ -12,6 +12,15 @@ numeric fields remain auditable without contaminating current statistics.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import re
@@ -23,9 +32,9 @@ from typing import Any
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-DB = Path(r"./db/account.db")
+DB = Path(_public_project_path('db', 'account.db'))
 DEFAULT_SOURCE_MARKER = Path(
-    r"./reports/quality/playbook_current_source_v1.json")
+    _public_project_path('reports', 'quality', 'playbook_current_source_v1.json'))
 CST = timezone(timedelta(hours=8))
 PLAYBOOK_REF_RE = re.compile(r"playbook\s*#\s*(\d+)", re.IGNORECASE)
 

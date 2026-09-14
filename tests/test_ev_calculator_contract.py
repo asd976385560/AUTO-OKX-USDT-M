@@ -77,6 +77,18 @@ class EvCalculatorTests(unittest.TestCase):
         self.assertAlmostEqual(block["gross_rr"], 0.8947, places=3)
         self.assertGreater(block["breakeven_p"], 0.53)
 
+    def test_override_probability_need_not_exceed_historical_baseline(self):
+        """08-28 口径：claim 如实即可，低于历史基线也不构成 writer 门。"""
+        block, errors = build_ev_check(
+            _dot_card(rr_field=0.9, override={
+                "reason": "当前结构仍值得承担明确的负期望风险",
+                "p_win_claim": 0.35,
+            }), "short")
+        self.assertEqual([], errors)
+        self.assertEqual("ev_calculator_v3", block["version"])
+        self.assertEqual(0.35, block["override_p_win_claim"])
+        self.assertTrue(block["accepts_negative_ev"])
+
     def test_indeterminate_when_no_scope_has_enough_samples(self):
         """全 scope n<5 → indeterminate：无 EV 要求（n=1 也照给的原则不变）。"""
         block, errors = build_ev_check(

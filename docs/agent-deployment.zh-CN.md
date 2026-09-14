@@ -1,11 +1,14 @@
 <!--
 doc-version: V2.0-agent-deployment
-last-updated: 2026-08-12
+last-updated: 2026-09-14
 updated-by: Codex
 change-summary: Align public deployment with the live-only runtime and consolidated collection runner.
 -->
 
 # Agent 与 OpenClaw 部署指南
+
+当前公开版协议为 `minimal_contract_full_closure_v1`。请按最新 `agents/` 与 `templates/` 部署；历史三周期/六项卡只保留回执兼容。OPEN 使用 `open_execution_package_v1`，计划经 `write_position_plan.py` 原子发布。
+
 
 [简体中文](agent-deployment.zh-CN.md) · [English](agent-deployment.en.md)
 

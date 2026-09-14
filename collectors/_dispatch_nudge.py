@@ -7,9 +7,9 @@ trader 落库→push 派发 1.2min）。okx-dispatcher cron（*/2min）保持原
 四道守护闸（对抗核验 2026-07-16 钉死，缺一即转致命，禁删）：
   1. 暂停语义闸：okx-dispatcher cron enabled=1 才准 spawn（直读 openclaw.sqlite mode=ro，
      读失败/行缺失一律拒发 fail-closed）——保住「停 cron=停派发」不变量：P0 PAUSE 后已启动
-     agent 收尾落库不得绕过暂停派 trader 下真单；停用 cron 的测试窗自动静默。
-  2. DRYRUN 拒发：env 见 OKX_TRIGGER_DRYRUN（任何值，存在即拒）——dry-run
-     必须保持为显式人工验证上下文，writer 不把它扩散成额外 detached 派发。
+     agent 收尾落库不得绕过暂停派 trader 下真单；fulltest 停 cron 测试窗自动静默。
+  2. DRYRUN 拒发：env 见 OKX_TRIGGER_DRYRUN（任何值，存在即拒）——dryrun dispatcher 对真库
+     干跑仍写 stage_dispatch 闩锁，nudge 出去等于闩锁投毒。
   3. env 白名单：spawn 的 dispatcher 只继承系统基础键，OKX_* 全系 12 个消费键与 MX_APIKEY
      零透传——writer 跑在 LLM agent 会话内，agent shell 层可被注入任意 export，
      OKX_COLLECTORS_DIR（sys.path 劫持）/ OKX_OPENCLAW_BIN（起棒二进制替换）等不得
@@ -28,16 +28,13 @@ spawn 参数照抄 trigger_agent._fire_push_script 生产成熟模式（2026-07-
 """
 from __future__ import annotations
 
-import os as _project_os
-from pathlib import Path as _ProjectPath
 
-_PROJECT_ROOT = _ProjectPath(
-    _project_os.environ.get("OKX_ROOT")
-    or _ProjectPath(__file__).resolve().parents[1]
-).resolve()
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
 
 
 import os
@@ -47,12 +44,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-_DISPATCHER = _project_path('core', 'dispatcher.py')
-_DB_ROOT = _project_path('db')
-_LOG = Path(_project_path('logs', 'trigger', 'dispatch_nudge.log'))
+_DISPATCHER = _public_project_path('core', 'dispatcher.py')
+_DB_ROOT = _public_project_path('db')
+_LOG = Path(_public_project_path('logs', 'trigger', 'dispatch_nudge.log'))
 _STATE_DB = os.environ.get(
     "OKX_OPENCLAW_STATE_DB",
-    str(_ProjectPath.home().joinpath('.openclaw', 'state', 'openclaw.sqlite')))
+    '<USER_HOME>\\.openclaw\\state\\openclaw.sqlite'.replace('<USER_HOME>', str(__import__('pathlib').Path.home())))
 _DISPATCHER_CRON_NAME = "okx-dispatcher"  # job_id 会随重建漂移，name 稳定（runbook 附录 A 对照表）
 
 _DETACHED_PROCESS = 0x00000008
@@ -99,7 +96,7 @@ def _default_spawn(cmd: list, fh) -> None:
     subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
         creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
-        cwd=_project_path(), close_fds=True, env=_spawn_env())
+        cwd=_public_project_path(), close_fds=True, env=_spawn_env())
 
 
 def nudge(origin: str, db_root=None) -> dict:
@@ -143,7 +140,7 @@ def nudge_from_collector(origin: str, db_root, statuses, dry_collect: bool = Fal
 
     在 nudge() 四道守护闸之外加三道采集侧门（缺一即误拍）：
       a. dry_collect 假 ok 行不发（--dry-collect 只验 plumbing，账本行不代表真采集）；
-      b. 仅生产 db-root 发——nudge spawn 的 dispatcher 硬编码打 ./db，隔离/tmp
+      b. 仅生产 db-root 发——nudge spawn 的 dispatcher 硬编码打 <PROJECT_ROOT>\\db，隔离/tmp
          db-root 的采集落账若外拍会对生产库跑真 tick（幂等无害但破坏隔离语义）；
       c. 至少一个源 status ∈ ok|degraded 才发（error/timeout 轮 gate 必拒，白拍）。
     与 nudge() 同约：永不 raise、永不写 stdout、不改调用方退出码。
@@ -159,7 +156,7 @@ def nudge_from_collector(origin: str, db_root, statuses, dry_collect: bool = Fal
         sts = statuses if isinstance(statuses, (list, tuple, set)) else [statuses]
         if not any(str(s) in _COLLECTOR_DONE_STATUS for s in sts):
             return {"nudged": False, "reason": "no_done_status"}
-        return nudge(origin, db_root=db_root)
+        return nudge(origin)
     except Exception as e:  # noqa: BLE001 —— 与守护闸 4 同源：非致命
         try:
             sys.stderr.write(f"[dispatch_nudge][WARN] collector nudge skipped (non-fatal): {e}\n")

@@ -8,6 +8,15 @@ never modified.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -234,7 +243,7 @@ def _audit(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-db", default=r"./db/market.db")
+    parser.add_argument("--source-db", default=_public_project_path('db', 'market.db'))
     parser.add_argument("--target-db", required=True)
     parser.add_argument("--json-out", required=True)
     parser.add_argument("--max-symbols", type=int, default=500)

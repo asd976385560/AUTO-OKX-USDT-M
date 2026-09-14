@@ -9,7 +9,7 @@ rr=1.0、文字"≈0.9"、几何 0.895、用历史队列平均收益偷换本笔
 边界纪律（主人 2026-08-10 拍板）：
   - 硬拒写只针对**算术不一致**（rr 字段 vs 几何、方向几何非法、数字缺失）；
   - 负 EV **不拒单**：要求结构化 `risk_reward.ev_override`（reason + p_win_claim），
-    模型可以做不受欢迎的判断，但必须显式承认基线并给出修正后的胜率；
+    模型可以做不受欢迎的判断，但必须显式承认基线并如实给出自身胜率判断；
   - p_win 只取 evidence_contract 三个具名 scope 的 wins/n（首个 n≥5 的），
     **禁止**用 avg_pnl_pct 冒充概率；样本不足 → status=indeterminate，无 EV 闸。
 
@@ -33,7 +33,7 @@ except ImportError:  # executor 语境：core/ 目录裸导入风格
         RISK_SLIPPAGE_BUFFER_PCT,
     )
 
-EV_CHECK_VERSION = "ev_calculator_v2"
+EV_CHECK_VERSION = "ev_calculator_v3"
 RR_FIELD_TOLERANCE = 0.05      # 卡 rr 字段与几何 gross_rr 的绝对容差
 MIN_P_SAMPLE_N = 5             # p_win 可用的最小 scope 样本量
 FRICTION_PCT = RISK_FEE_BUFFER_PCT + RISK_SLIPPAGE_BUFFER_PCT
@@ -190,14 +190,7 @@ def build_ev_check(card: Any, side: str) -> tuple[dict[str, Any], list[str]]:
                 f"{p_info['p_win']:.2%} 计算 ev_r={ev_r:.3f} 为负"
                 f"（盈亏平衡需 {breakeven_p:.2%}）。负 EV 不禁开，但必须提供 "
                 "risk_reward.ev_override={reason, p_win_claim}：写明为何本笔"
-                "修正后胜率高于历史基线")
-        else:
-            if (p_claim is not None and p_info["p_win"] is not None
-                    and p_claim <= p_info["p_win"]):
-                errors.append(
-                    "ev_override.p_win_claim 必须高于确定性历史基线 "
-                    f"{p_info['p_win']:.2%}；否则不构成对负 EV 的修正"
-                )
+                "判断仍接受负 EV，并如实填写自身胜率")
 
     ev_check = {
         "version": EV_CHECK_VERSION,

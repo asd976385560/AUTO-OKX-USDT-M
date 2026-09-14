@@ -19,6 +19,15 @@ mfe_r≥1 → 1；路径完整且 <1 → 0；路径不完整 → 维持 NULL，�
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -54,7 +63,10 @@ NEW_COLUMNS = (
     ("path_coverage", "TEXT"),
     ("path_metric_version", "INTEGER"),
 )
-PATH_METRIC_VERSION = 2
+# 2026-08-19 G1/G2：v3 = 1R 统一为**净风险**（与 core/ev_calculator 同口径）
+# + path_coverage 的 'full' 改判「包络完整」。版本号跳变即触发全量回填
+# （回填 WHERE 就是 COALESCE(path_metric_version,0)<>PATH_METRIC_VERSION）。
+PATH_METRIC_VERSION = 3
 BAR_SECONDS = 15 * 60
 
 
@@ -76,6 +88,14 @@ def _ceil_bar(dt: datetime) -> datetime:
     return datetime.fromtimestamp(rounded, tz=dt.tzinfo)
 
 
+def _floor_bar(dt: datetime) -> datetime:
+    """向下取整到所属 15m bar 起点（构造包住开/平仓时刻的跨界 bar）。"""
+    epoch = int(dt.timestamp())
+    return datetime.fromtimestamp(
+        (epoch // BAR_SECONDS) * BAR_SECONDS, tz=dt.tzinfo)
+
+
+# v3 起不再参与 path_coverage 判定，仅供诊断保留。
 def _is_bar_boundary(dt: datetime) -> bool:
     return dt.second == 0 and dt.microsecond == 0 and dt.minute % 15 == 0
 
@@ -94,7 +114,14 @@ def compute_path_metrics(mcon: sqlite3.Connection, symbol: str, side: str,
     risk_dist = abs(entry_px - sl_px) / entry_px if entry_px > 0 else 0
     if risk_dist <= 0 or notional <= 0:
         return out
-    initial_risk = notional * risk_dist
+    # G1 v3 单一口径：1R = 净风险 = 毛止损距 + 摩擦，与 core/ev_calculator 的
+    # risk_net = risk + FRICTION_PCT 完全一致 → 「打到止损」恰好 -1R。
+    # v2 的分母是毛止损距、只在 realized 的分子扣摩擦，而 mfe_r/mae_r 分子分母
+    # 都不含摩擦，于是 exit_quality 的 giveback = mfe_r - realized_r_net 拿
+    # 「无摩擦 MFE」减「含摩擦 realized」，164 行实测中位虚增 0.065R、
+    # 紧止损单最高 0.70R。
+    risk_net_dist = risk_dist + FRICTION_PCT
+    initial_risk = notional * risk_net_dist
     out["initial_risk_usdt"] = round(initial_risk, 4)
     if realized_pnl is not None:
         fee_est = notional * FRICTION_PCT
@@ -120,15 +147,32 @@ def compute_path_metrics(mcon: sqlite3.Connection, symbol: str, side: str,
     ).fetchall()
     distinct = {str(b[0]) for b in bars}
     coverage = min(1.0, len(distinct) / expected)
-    exact_boundaries = _is_bar_boundary(opened) and _is_bar_boundary(closed)
+    # G2 v3：'full' 不再要求开/平仓时间戳精确落在 :00/:15/:30/:45（真实成交
+    # 命中概率约 1/900 → 实测 164 行 path_coverage **全部** partial_boundary、
+    # 0 行 full，使 ever_hit_1r=0 分支成为 100% 死代码，连带 exit_quality 的
+    # ever_hit_1r_flag_disagreements 自检结构性恒为 0）。改判「包络完整」：
+    # 内部 bar 一根不缺，且包住开/平仓时刻的两根跨界 bar 也在库里 ——
+    # 此时整段持仓被 K 线完全笼罩，可用包络极值给出真实 MFE 的上界。
+    env_first = _floor_bar(opened)
+    # 平仓恰好落在 bar 边界时，以 close 起点的那根 bar 不属于持仓窗；
+    # 退 1 微秒再向下取整，边界与非边界两种情形统一。
+    env_last = _floor_bar(closed - timedelta(microseconds=1))
+    env_expected = int(
+        (env_last - env_first).total_seconds() // BAR_SECONDS) + 1
+    env_bars = mcon.execute(
+        "SELECT ts, h, l FROM kline_cache WHERE symbol=? AND tf='15m' "
+        "AND ts>=? AND ts<=? ORDER BY ts",
+        (symbol, _utcz(env_first), _utcz(env_last)),
+    ).fetchall()
+    envelope_full = len({str(b[0]) for b in env_bars}) >= env_expected > 0
     if not bars:
         out["path_coverage"] = "none"
-    elif exact_boundaries and coverage >= 1.0:
+    elif coverage >= 1.0 and envelope_full:
         out["path_coverage"] = "full"
-    elif exact_boundaries:
-        out["path_coverage"] = f"partial:{coverage:.2f}"
     else:
-        out["path_coverage"] = f"partial_boundary:{coverage:.2f}"
+        # 前缀保持 'partial'：exit_quality / validate_daily_report 的解析器写的
+        # 是 startswith("partial")，历史 'partial_boundary:...' 行仍可解析。
+        out["path_coverage"] = f"partial:{coverage:.2f}"
     highs = [float(b[1]) for b in bars if b[1] is not None]
     lows = [float(b[2]) for b in bars if b[2] is not None]
     if not highs or not lows:
@@ -139,14 +183,25 @@ def compute_path_metrics(mcon: sqlite3.Connection, symbol: str, side: str,
     else:
         mfe = max(0.0, (entry_px - min(lows)) / entry_px)
         mae = max(0.0, (max(highs) - entry_px) / entry_px)
-    out["mfe_r"] = round(mfe / risk_dist, 4)
-    out["mae_r"] = round(mae / risk_dist, 4)
+    # G1 净口径：在峰值离场同样要付摩擦 → 分子扣 F；在最差点离场要多付 F →
+    # 分子加 F。分母同为净风险，故「打到止损」恒等于 mae_r=1.0，
+    # giveback = mfe_r - realized_r_net 两端同口径可减。
+    out["mfe_r"] = round(max(0.0, mfe - FRICTION_PCT) / risk_net_dist, 4)
+    out["mae_r"] = round((mae + FRICTION_PCT) / risk_net_dist, 4)
     if out["mfe_r"] >= 1.0:
         # 部分路径也能正向证明“曾触达”。
         out["ever_hit_1r"] = 1
     elif out["path_coverage"] == "full":
-        # 只有边界精确且内部全覆盖才允许把“未观察到”写成 0。
-        out["ever_hit_1r"] = 0
+        # G2：包络极值是真实 MFE 的**上界**（含仓外价格，只会高估）。上界仍
+        # <1R → 真值必然 <1R，「未触达」被证明，可以写 0；否则维持 NULL。
+        env_hi = [float(b[1]) for b in env_bars if b[1] is not None]
+        env_lo = [float(b[2]) for b in env_bars if b[2] is not None]
+        if env_hi and env_lo:
+            env_mfe = (max(0.0, (max(env_hi) - entry_px) / entry_px)
+                       if str(side).lower() == "long"
+                       else max(0.0, (entry_px - min(env_lo)) / entry_px))
+            if max(0.0, env_mfe - FRICTION_PCT) / risk_net_dist < 1.0:
+                out["ever_hit_1r"] = 0
     return out
 
 
@@ -195,20 +250,17 @@ def metrics_for_row(mcon: sqlite3.Connection, row: sqlite3.Row
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="trade_experiences 路径/退出埋点迁移+回填（默认 dry-run）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup-dir", default=None)
     args = ap.parse_args()
-    if args.apply and args.dry_run:
-        ap.error("--apply and --dry-run are mutually exclusive")
     root = Path(args.db_root)
     acc_path = root / "account.db"
     if not acc_path.exists():
         print(json.dumps({"ok": False, "error": f"库不存在: {acc_path}"}))
         return 2
 
-    acon = sqlite3.connect(str(acc_path), timeout=15)
+    acon = sqlite3.connect(acc_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
     acon.execute("PRAGMA busy_timeout=10000")
     acon.row_factory = sqlite3.Row
     mcon = sqlite3.connect(
@@ -255,6 +307,11 @@ def main() -> int:
                               "error": f"备份 quick_check={qc}"},
                              ensure_ascii=False, indent=1))
             return 2
+
+        acon.close()
+        acon = sqlite3.connect(acc_path, timeout=15)
+        acon.execute("PRAGMA busy_timeout=30000")
+        acon.row_factory = sqlite3.Row
 
         for col, typ in NEW_COLUMNS:
             if col not in have:

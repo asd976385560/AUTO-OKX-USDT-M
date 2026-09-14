@@ -14,6 +14,15 @@ future-only shadow window is always required.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -28,7 +37,7 @@ import pandas as pd
 import offline_multitimeframe_calibration as calibration
 
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 DEFAULT_INPUT = (
     ROOT / "reports" / "quality" / "goal-selective-multitimeframe-v1-20260812"
 )

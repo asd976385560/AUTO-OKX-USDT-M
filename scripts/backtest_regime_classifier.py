@@ -6,6 +6,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import bisect
 import itertools
@@ -124,7 +133,7 @@ def _objective(summary: dict) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="BTC 4H regime 历史回测（只读）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--json-out")
     args = ap.parse_args()
     rows = _rows(Path(args.db_root))
