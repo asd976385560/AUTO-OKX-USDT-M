@@ -1553,7 +1553,7 @@ class StageBusinessOutputTests(unittest.TestCase):
             stop_report = {}
             rc, _out, err, timed_out = stage_runner._proc.run_guarded(
                 prepared,
-                timeout=10,
+                timeout=20,
                 observer=lambda: "business_terminal_committed",
                 observer_poll_seconds=0.1,
                 graceful_stop=lambda _proc, reason: (
@@ -1564,7 +1564,8 @@ class StageBusinessOutputTests(unittest.TestCase):
                         reason,
                     )
                 ),
-                graceful_stop_timeout=3,
+                # Includes Node cold start on shared Windows CI runners.
+                graceful_stop_timeout=10,
                 stop_report=stop_report,
             )
             loaded = stage_runner._load_same_connection_receipt(control)

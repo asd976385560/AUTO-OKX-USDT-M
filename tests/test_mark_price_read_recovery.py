@@ -84,11 +84,13 @@ class MarkPriceReadRecoveryTests(unittest.TestCase):
         http.assert_not_called()
 
     def test_diagnostic_cannot_be_borrowed_by_another_symbol_profile_or_call(self):
-        with mock.patch.object(ox, "okx_json", return_value=quote()):
+        with mock.patch.object(ox, "okx_json", return_value=quote()), \
+                mock.patch.object(ox.time, "monotonic", return_value=100.0):
             self.assertEqual(0.1654, ox.get_mark_price(SYMBOL, "live"))
         self.assertIsNone(ox.get_mark_price_evidence("BTC-USDT-SWAP", "live"))
         self.assertIsNone(ox.get_mark_price_evidence(SYMBOL, "demo"))
-        self.assertIsNone(ox.get_mark_price_evidence(SYMBOL, "live", since_monotonic=time.monotonic()))
+        self.assertIsNotNone(ox.get_mark_price_evidence(SYMBOL, "live", since_monotonic=100.0))
+        self.assertIsNone(ox.get_mark_price_evidence(SYMBOL, "live", since_monotonic=100.1))
 
 
 if __name__ == "__main__":

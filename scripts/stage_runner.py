@@ -2332,7 +2332,7 @@ def _run_stage_child(
                 "refusal": observed_reason,
                 "source": "stage_runner.live_observer",
                 "child_returncode": int(child_rc),
-            })
+            }, db_path=(Path(db_root).resolve() if db_root is not None else DB_ROOT) / "analysis.db")
             result["analysis_placeholder_written"] = True
         except Exception:  # noqa: BLE001
             result["analysis_placeholder_written"] = False
@@ -4421,7 +4421,7 @@ def main() -> int:
                         "source": "stage_runner.agent_protocol_terminal",
                         "child_returncode": child_rc,
                         "agent_protocol_evidence": protocol_evidence,
-                    })
+                    }, db_path=DB_ROOT / "analysis.db")
                     child_result["analysis_placeholder_written"] = True
                 except Exception:  # noqa: BLE001 - diagnostic must not mask root
                     child_result["analysis_placeholder_written"] = False

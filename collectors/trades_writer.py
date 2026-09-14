@@ -2753,7 +2753,7 @@ def write_experiences(
                 # NULL，不用"当前 regime"顶替（那是后见之明，会污染历史样本）。
                 cycle_regime = data.get("regime")
                 if cycle_regime in (None, ""):
-                    cycle_regime = _regime_for_ts(experience_ts)
+                    cycle_regime = _regime_for_ts(experience_ts, db_root=db_root)
                 payload = {
                     "cycle_id": data.get("cycle_id"),
                     "profile": profile,

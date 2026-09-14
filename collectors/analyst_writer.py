@@ -1147,7 +1147,7 @@ def validate_receipt(
                         )
                         expected_context = _regime_scope_block(
                             str(sig.get("symbol") or ""), data.get("regime"),
-                            str(data.get("cycle_id") or ""))
+                            str(data.get("cycle_id") or ""), db_root=validation_root)
                         actual_context = (
                             (contract.get("query") or {}).get("instrument_context")
                             if isinstance(contract, dict) else None
@@ -1209,14 +1209,14 @@ def validate_receipt(
             errors.extend(
                 "candidate_policy: " + str(item)
                 for item in blockers if str(item).strip())
-    errors.extend(_validate_lightweight_open_prices(data))
+    errors.extend(_validate_lightweight_open_prices(data, db_root=validation_root))
     return errors
 
 
 # ---------------------------------------------------------------------------
 # 写入
 # ---------------------------------------------------------------------------
-def _commit_deadline_placeholder(cycle_id, mode, refusal) -> None:
+def _commit_deadline_placeholder(cycle_id, mode, refusal, db_path: Path | None = None) -> None:
     """分析硬闸越界时写一行 status='error' 占位，替代「整轮静默蒸发」。
 
     2026-08-19 F1：越界此前一律 rollback / 直接 return，持久层零行 —— 实测
@@ -1234,7 +1234,7 @@ def _commit_deadline_placeholder(cycle_id, mode, refusal) -> None:
         return
     con = None
     try:
-        con = connect(write=True)
+        con = connect(write=True, db_path=db_path) if db_path is not None else connect(write=True)
         con.execute("BEGIN IMMEDIATE")
         existing = con.execute(
             "SELECT status FROM analysis_runs WHERE cycle_id=?",
@@ -1275,7 +1275,7 @@ def _commit_deadline_placeholder(cycle_id, mode, refusal) -> None:
                 pass
 
 
-def commit_deadline_placeholder(cycle_id, mode, refusal) -> None:
+def commit_deadline_placeholder(cycle_id, mode, refusal, db_path: Path | None = None) -> None:
     """占位行的跨模块公开入口（2026-08-19 F1 补齐）。
 
     F1 首版只在 analyst_writer 自己拒绝越界写入时落占位行，覆盖面比预期窄：
@@ -1286,7 +1286,7 @@ def commit_deadline_placeholder(cycle_id, mode, refusal) -> None:
     `query_state` 的 lost_cycles 因此长期 FAIL）。此入口让外部补写同一行，
     语义与内部路径完全一致——不复制第二份占位逻辑。
     """
-    _commit_deadline_placeholder(cycle_id, mode, refusal)
+    _commit_deadline_placeholder(cycle_id, mode, refusal, db_path=db_path)
 
 
 def write_analysis(data: dict, db_path: Path | None = None) -> dict:
@@ -1304,7 +1304,7 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     if deadline_refusal:
         # F1：越界仍拒绝授权本轮 facts/order 阶段，但不再静默蒸发。
         _commit_deadline_placeholder(
-            data.get("cycle_id"), data.get("mode"), deadline_refusal)
+            data.get("cycle_id"), data.get("mode"), deadline_refusal, db_path=db_path)
         return deadline_refusal
     data = normalize_receipt(data)
     errors = validate_receipt(data, db_root=db_path.parent)
@@ -1328,7 +1328,7 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
     # clock boundary.  Recheck immediately before the first write transaction.
     deadline_refusal = analysis_deadline_refusal(cycle_id)
     if deadline_refusal:
-        _commit_deadline_placeholder(cycle_id, mode, deadline_refusal)
+        _commit_deadline_placeholder(cycle_id, mode, deadline_refusal, db_path=db_path)
         return deadline_refusal
     con = connect(write=True, db_path=db_path)
     try:
@@ -1359,7 +1359,7 @@ def write_analysis(data: dict, db_path: Path | None = None) -> dict:
         if deadline_refusal:
             # 先释放写锁再写占位（占位走独立连接与独立事务）。
             con.rollback()
-            _commit_deadline_placeholder(cycle_id, mode, deadline_refusal)
+            _commit_deadline_placeholder(cycle_id, mode, deadline_refusal, db_path=db_path)
             return deadline_refusal
         ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
         # analysis_runs.raw 的 schema 注释承诺“完整结构化报告 JSON”。保存

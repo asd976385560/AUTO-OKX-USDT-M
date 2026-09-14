@@ -93,7 +93,7 @@ class LiveObserverPlaceholderTests(unittest.TestCase):
                 mock.patch.object(stage_runner, "_abort_gateway_session",
                                   return_value={"ok": True}):
             return stage_runner._run_stage_child(
-                "live", self.CYCLE, ["noop"], now=self.now)
+                "live", self.CYCLE, ["noop"], now=self.now, db_root=self.db.parent)
 
     def _row(self):
         with closing(sqlite3.connect(self.db)) as con:
