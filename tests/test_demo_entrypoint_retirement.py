@@ -2,12 +2,9 @@
 from __future__ import annotations
 
 import io
-import json
-import sqlite3
 import sys
-import tempfile
 import unittest
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +15,7 @@ for path in (ROOT / "scripts", ROOT / "collectors"):
         sys.path.insert(0, str(path))
 
 import collect_data  # noqa: E402
+from core import order_executor  # noqa: E402
 
 
 class DemoEntrypointRetirementTests(unittest.TestCase):
@@ -30,9 +28,14 @@ class DemoEntrypointRetirementTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("--demo 已于 2026-08-06 下线", stderr.getvalue())
 
-    pass
+    def test_demo_role_and_persona_are_not_published(self) -> None:
+        self.assertFalse((ROOT / "agents" / "demo_trader.md").exists())
+        self.assertFalse((ROOT / "agents" / "personas" / "demo_trader").exists())
 
-    pass
+    def test_executor_rejects_retired_demo_profile(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            order_executor._require_live_profile("demo", "test")
+        self.assertIn("demo", str(caught.exception).lower())
 
 
 if __name__ == "__main__":

@@ -2656,7 +2656,6 @@ class StageBusinessOutputTests(unittest.TestCase):
             status["agent_terminal_evidence"]["agent_protocol_evidence"],
         )
 
-    pass
 
     def test_length_terminal_is_classified_without_model_chain_metadata(self):
         cycle = "2026-07-28T16:45"

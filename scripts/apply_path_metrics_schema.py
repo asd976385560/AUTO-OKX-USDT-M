@@ -260,7 +260,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"库不存在: {acc_path}"}))
         return 2
 
-    acon = sqlite3.connect(str(acc_path), timeout=15)
+    acon = sqlite3.connect(acc_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
     acon.execute("PRAGMA busy_timeout=10000")
     acon.row_factory = sqlite3.Row
     mcon = sqlite3.connect(
@@ -307,6 +307,11 @@ def main() -> int:
                               "error": f"备份 quick_check={qc}"},
                              ensure_ascii=False, indent=1))
             return 2
+
+        acon.close()
+        acon = sqlite3.connect(acc_path, timeout=15)
+        acon.execute("PRAGMA busy_timeout=30000")
+        acon.row_factory = sqlite3.Row
 
         for col, typ in NEW_COLUMNS:
             if col not in have:

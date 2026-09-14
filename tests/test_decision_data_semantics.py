@@ -426,7 +426,6 @@ class ExperienceRegimePointInTimeTests(unittest.TestCase):
             self.assertEqual(stored_vec["features"]["regime"], "range")
             self.assertEqual(stored_vec["features"]["side"], "long")
 
-    pass
 
 
 if __name__ == "__main__":

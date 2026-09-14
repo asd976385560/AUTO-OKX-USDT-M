@@ -627,14 +627,6 @@ class CollectCycleRunGuardTests(unittest.TestCase):
         self.assertNotIn("unrelated_large_payload", slim["steps"][2])
 
 
-class CollectionSlotGuardScriptContractTests(unittest.TestCase):
-    pass
-
-    pass
-
-    pass
-
-    pass
 
 
 if __name__ == "__main__":

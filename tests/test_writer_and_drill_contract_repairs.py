@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for writer ownership and controlled drill maintenance."""
+"""Regression tests for published writer ownership and collection contracts."""
 from __future__ import annotations
 
-import hashlib
 import io
 import sqlite3
 import sys
@@ -15,61 +14,15 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 COLLECTORS = ROOT / "collectors"
-# drill_reconcile 于 2026-08-06 归档进 archive/drill/（它只接受 profile=demo，
-# 而 demo 已全量下线）。用例跟着走：drill.db 仍是需要时可授权维护的只读归档，
-# 这层回归是那次授权敢批的依据。理由同 tests/test_decision_data_semantics.py。
-DRILL_ARCHIVE = SCRIPTS / "archive" / "drill"
-for _p in (SCRIPTS, COLLECTORS, DRILL_ARCHIVE):
+for _p in (SCRIPTS, COLLECTORS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 import fast_collect  # noqa: E402
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _create_drill_db(path: Path, *, with_profile: bool = True) -> None:
-    profile = ", profile TEXT DEFAULT 'demo'" if with_profile else ""
-    con = sqlite3.connect(str(path))
-    try:
-        con.executescript(
-            f"""
-            CREATE TABLE drill_trades (
-                id INTEGER PRIMARY KEY,
-                ts TEXT,
-                symbol TEXT,
-                side TEXT,
-                sz REAL,
-                lever INTEGER,
-                mark_px REAL,
-                ct_val REAL,
-                margin REAL,
-                notional REAL,
-                entry_reason TEXT,
-                status TEXT,
-                close_ts TEXT,
-                close_reason TEXT
-                {profile}
-            );
-            CREATE TABLE drill_cycle_runs (
-                id INTEGER PRIMARY KEY
-                {profile}
-            );
-            CREATE TABLE drill_account_snapshots (
-                ts TEXT PRIMARY KEY,
-                total_eq REAL,
-                avail_bal REAL,
-                margin_used REAL,
-                position_count INTEGER
-                {profile}
-            );
-            """
-        )
-        con.commit()
-    finally:
-        con.close()
 
 
 class WriterOwnershipTests(unittest.TestCase):
@@ -272,16 +225,6 @@ class FastCollectionStatusTests(unittest.TestCase):
             )
 
 
-class DrillMaintenanceTests(unittest.TestCase):
-    pass
-
-    pass
-
-    pass
-
-    pass
-
-    pass
 
 
 if __name__ == "__main__":

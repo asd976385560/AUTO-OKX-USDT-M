@@ -693,8 +693,6 @@ class WeeklyArtifactTests(unittest.TestCase):
             self.assertEqual(payload["missed_opps_window_count"], 3)
 
 
-class WeeklyMigrationTests(unittest.TestCase):
-    pass
 
 
 class DailyValidatorTests(unittest.TestCase):

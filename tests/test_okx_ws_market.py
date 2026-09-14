@@ -1151,11 +1151,8 @@ class AuditWindowTests(unittest.TestCase):
 
 
 class RestRotationAuditTests(unittest.TestCase):
-    pass
 
-    pass
 
-    pass
 
     def test_recovery_metric_ignores_planned_rebuild(self) -> None:
         events = [
@@ -1167,8 +1164,6 @@ class RestRotationAuditTests(unittest.TestCase):
         self.assertEqual([6.0], ws_health_audit._actual_recovery_seconds(events))
 
 
-class LauncherContractTests(unittest.TestCase):
-    pass
 
 
 if __name__ == "__main__":

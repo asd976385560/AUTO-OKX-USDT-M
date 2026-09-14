@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": f"db missing: {db_path}"}))
         return 2
 
-    connection = sqlite3.connect(str(db_path), timeout=30)
+    connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
     connection.execute("PRAGMA busy_timeout=20000")
     try:
         state = _schema_state(connection)
@@ -263,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         backup_path = _backup(connection, db_path, Path(args.backup_dir))
+        connection.close()
+        connection = sqlite3.connect(db_path, timeout=30)
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.row_factory = sqlite3.Row
+
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(TARGET_DDL)
         columns = ",".join(REQUIRED_COLUMNS)

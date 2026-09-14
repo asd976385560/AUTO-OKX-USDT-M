@@ -25,6 +25,7 @@ MIGRATION_GUARD = SCRIPTS / "migration_guard.py"
 # Keep each script's historical target argument while standardising the safety
 # flags.  This is also a concise inventory of the reviewed public migrations.
 MIGRATIONS = {
+    "apply_kline_indicator_schema.py": lambda root: ["--db", os.fspath(root / "market.db")],
     "apply_basis_schema.py": lambda root: ["--db", os.fspath(root / "market.db")],
     "apply_cross_market_staleness_schema.py": lambda root: ["--db", os.fspath(root / "regime.db")],
     "apply_analysis_status_col.py": lambda root: ["--root", os.fspath(root)],
@@ -83,6 +84,7 @@ def _fixture(root: Path) -> None:
     _executescript(
         root / "market.db",
         """
+        CREATE TABLE kline_cache(ts TEXT, symbol TEXT, bar TEXT);
         CREATE TABLE derivatives (ts TEXT PRIMARY KEY, symbol TEXT);
         CREATE TABLE cross_market (
             ts TEXT PRIMARY KEY,
@@ -195,7 +197,7 @@ class MigrationCliSafetyTests(unittest.TestCase):
     maxDiff = None
 
     def test_all_reviewed_migrations_expose_uniform_safety_flags(self):
-        self.assertEqual(len(MIGRATIONS), 11)
+        self.assertEqual(len(MIGRATIONS), 12)
         for script in MIGRATIONS:
             with self.subTest(script=script):
                 result = _run(script, "--help")

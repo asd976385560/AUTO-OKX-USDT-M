@@ -17,15 +17,6 @@ r"""apply_kline_indicator_schema.py — kline_cache 扩展指标列迁移（2026
 """
 from __future__ import annotations
 
-
-def _public_project_path(*parts):
-    """Resolve this public checkout without a host-specific fallback."""
-    import os
-    from pathlib import Path
-    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
-    return str(root.joinpath(*parts))
-
-
 import argparse
 import json
 import sqlite3
@@ -37,6 +28,11 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from _kline_indicators import EXTENDED_COLUMNS  # noqa: E402
+from migration_guard import (  # noqa: E402
+    add_migration_arguments,
+    backup_databases,
+    resolve_apply,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -63,40 +59,55 @@ def plan_migration(con: sqlite3.Connection) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="kline_cache BOLL/OBV 扩展列迁移（默认 dry-run）")
-    ap.add_argument("--db", default=_public_project_path('db', 'market.db'))
-    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--db", default=r".\db\market.db")
+    add_migration_arguments(ap)
     args = ap.parse_args()
+    apply = resolve_apply(ap, args)
     db_path = Path(args.db)
     if not db_path.exists():
         print(json.dumps({"ok": False, "error": f"库不存在: {db_path}"},
                          ensure_ascii=False))
         return 2
 
+    read_con = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=15)
+    read_con.execute("PRAGMA busy_timeout=10000")
+    try:
+        plan = plan_migration(read_con)
+    finally:
+        read_con.close()
+    if not plan.get("ok"):
+        print(json.dumps({**plan, "db": str(db_path)}, ensure_ascii=False))
+        return 2
+    report = {
+        "db": str(db_path),
+        "dry_run": not apply,
+        **plan,
+    }
+    if not apply or plan["already_complete"]:
+        report["action"] = (
+            "noop-already-complete" if plan["already_complete"]
+            else "plan-only")
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+        return 0
+
+    backups = backup_databases(
+        [db_path], Path(args.backup_dir), "kline-indicator-schema")
     con = sqlite3.connect(str(db_path), timeout=15)
     con.execute("PRAGMA busy_timeout=10000")
     try:
-        plan = plan_migration(con)
-        if not plan.get("ok"):
-            print(json.dumps({**plan, "db": str(db_path)}, ensure_ascii=False))
+        current = plan_migration(con)
+        if not current.get("ok"):
+            print(json.dumps({**current, "db": str(db_path)}, ensure_ascii=False))
             return 2
-        report = {
-            "db": str(db_path),
-            "dry_run": not args.apply,
-            **plan,
-        }
-        if not args.apply or plan["already_complete"]:
-            report["action"] = (
-                "noop-already-complete" if plan["already_complete"]
-                else "plan-only")
-            print(json.dumps(report, ensure_ascii=False, indent=1))
-            return 0
-        for col in plan["missing"]:
+        for col in current["missing"]:
             con.execute(f"ALTER TABLE kline_cache ADD COLUMN {col} REAL")
         con.commit()
         after = plan_migration(con)
         report.update({
             "action": "applied",
-            "added": plan["missing"],
+            "backup": str(backups[db_path.resolve()]),
+            "added": current["missing"],
             "post_missing": after.get("missing"),
         })
         ok = not after.get("missing")

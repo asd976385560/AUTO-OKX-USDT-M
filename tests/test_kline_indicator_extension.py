@@ -137,7 +137,7 @@ class MigrationAwareWriteTests(unittest.TestCase):
                 self.assertFalse(ki.kline_insert_plan(con)["extended"])
                 con.close()
                 # apply 两次幂等
-                sys.argv = ["x", "--db", str(db), "--apply"]
+                sys.argv = ["x", "--db", str(db), "--apply", "--backup-dir", str(Path(tmp) / "backups")]
                 self.assertEqual(mig.main(), 0)
                 self.assertEqual(mig.main(), 0)
             finally:

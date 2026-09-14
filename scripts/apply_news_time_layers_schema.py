@@ -86,7 +86,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"库不存在: {db_path}"}))
         return 2
 
-    con = sqlite3.connect(str(db_path), timeout=20)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=20)
     con.execute("PRAGMA busy_timeout=15000")
     con.row_factory = sqlite3.Row
     try:
@@ -144,6 +144,11 @@ def main() -> int:
                               "error": f"备份 quick_check={qc}，中止"},
                              ensure_ascii=False, indent=1))
             return 2
+
+        con.close()
+        con = sqlite3.connect(db_path, timeout=20)
+        con.execute("PRAGMA busy_timeout=30000")
+        con.row_factory = sqlite3.Row
 
         for col, typ in NEW_COLUMNS:
             if col not in have:
