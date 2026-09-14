@@ -4,10 +4,20 @@
 This is a read-only monitoring surface.  A report counts as complete only when
 its expected file exists and ``validate_daily_report`` accepts its structure,
 fixed 24-hour window, database facts, reconciliation state, revision metadata,
-and risk-reject facts.  A failed 99% gate is data, not a process failure: the
+and risk-reject facts.  A failed effective gate (95% from the registered
+activation boundary; 99% before it) is data, not a process failure: the
 script exits 0 after a successful audit and records ``NOT_MET`` in the JSON.
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import hashlib
@@ -113,6 +123,8 @@ def audit_daily_reports(
     account_db: Path,
     live_trades_db: Path,
     ledger_db: Path,
+    market_db: Path | None = None,
+    lessons_db: Path | None = None,
     delivery_hashes: dict[str, set[str]] | None = None,
     marked_identities: set[str] | None = None,
     delivery_integrity: bool = True,
@@ -144,11 +156,18 @@ def audit_daily_reports(
             }
         else:
             try:
+                validator_args = {
+                    "report_path": path,
+                    "account_db": account_db,
+                    "live_trades_db": live_trades_db,
+                    "ledger_db": ledger_db,
+                }
+                if market_db is not None:
+                    validator_args["market_db"] = market_db
+                if lessons_db is not None:
+                    validator_args["lessons_db"] = lessons_db
                 result = validator(
-                    report_path=path,
-                    account_db=account_db,
-                    live_trades_db=live_trades_db,
-                    ledger_db=ledger_db,
+                    **validator_args,
                 )
                 row = {
                     "date": day.isoformat(),
@@ -157,6 +176,7 @@ def audit_daily_reports(
                     "valid": bool(result.get("ok")),
                     "report_ts": result.get("report_ts"),
                     "errors": list(result.get("errors") or []),
+                    "warnings": list(result.get("warnings") or []),
                     "checks": list(result.get("checks") or []),
                     "auto_send": False,
                 }
@@ -167,6 +187,7 @@ def audit_daily_reports(
                     "exists": True,
                     "valid": False,
                     "errors": [f"validator: {type(exc).__name__}: {exc}"],
+                    "warnings": [],
                     "checks": [],
                     "auto_send": False,
                 }
@@ -268,6 +289,8 @@ def audit_forward_daily_reports(
     account_db: Path,
     live_trades_db: Path,
     ledger_db: Path,
+    market_db: Path | None = None,
+    lessons_db: Path | None = None,
     delivery_hashes: dict[str, set[str]] | None = None,
     marked_identities: set[str] | None = None,
     delivery_integrity: bool = True,
@@ -300,6 +323,8 @@ def audit_forward_daily_reports(
         account_db=account_db,
         live_trades_db=live_trades_db,
         ledger_db=ledger_db,
+        market_db=market_db,
+        lessons_db=lessons_db,
         delivery_hashes=delivery_hashes,
         marked_identities=marked_identities,
         delivery_integrity=delivery_integrity,
@@ -384,16 +409,18 @@ def parse_args(argv=None):
         default=DEFAULT_FORWARD_MINIMUM_DAYS,
     )
     parser.add_argument(
-        "--reports-dir", default=r".\reports\daily-reports")
-    parser.add_argument("--account-db", default=r".\db\account.db")
+        "--reports-dir", default=_public_project_path('reports', 'daily-reports'))
+    parser.add_argument("--account-db", default=_public_project_path('db', 'account.db'))
     parser.add_argument(
-        "--live-trades-db", default=r".\db\live_trades.db")
-    parser.add_argument("--ledger-db", default=r".\db\ledger.db")
+        "--live-trades-db", default=_public_project_path('db', 'live_trades.db'))
+    parser.add_argument("--ledger-db", default=_public_project_path('db', 'ledger.db'))
+    parser.add_argument("--market-db", default=_public_project_path('db', 'market.db'))
+    parser.add_argument("--lessons-db", default=_public_project_path('db', 'lessons.db'))
     parser.add_argument(
-        "--event-log", default=r".\logs\push\qq_push_dedupe.jsonl")
+        "--event-log", default=_public_project_path('logs', 'push', 'qq_push_dedupe.jsonl'))
     parser.add_argument(
         "--json-out",
-        default=r".\reports\quality\daily-report-completeness.json",
+        default=_public_project_path('reports', 'quality', 'daily-report-completeness.json'),
     )
     args = parser.parse_args(argv)
     if args.start is None and args.end is not None:
@@ -419,9 +446,16 @@ def main(argv=None) -> int:
         "account_db": Path(args.account_db),
         "live_trades_db": Path(args.live_trades_db),
         "ledger_db": Path(args.ledger_db),
+        "market_db": Path(args.market_db),
+        "lessons_db": Path(args.lessons_db),
     }
     event_log = Path(args.event_log)
-    missing = [str(path) for path in (*required.values(), event_log)
+    # A missing lessons DB is a per-report validation failure when the report
+    # claims missed-opportunity facts, not a process-level audit crash.
+    unconditional = [
+        path for name, path in required.items() if name != "lessons_db"
+    ]
+    missing = [str(path) for path in (*unconditional, event_log)
                if not path.exists()]
     if missing:
         print(json.dumps({

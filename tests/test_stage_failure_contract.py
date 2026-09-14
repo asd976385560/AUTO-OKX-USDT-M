@@ -6,7 +6,9 @@ import os
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -29,6 +31,24 @@ CST = timezone(timedelta(hours=8))
 
 
 class StageFailureContractTests(unittest.TestCase):
+    def test_ledger_import_ignores_shadow_modules_and_uses_absolute_owner(self):
+        contract._ledger.cache_clear()
+        shadows = {
+            "collectors": types.ModuleType("collectors"),
+            "ledger": types.ModuleType("ledger"),
+        }
+        try:
+            with mock.patch.dict(sys.modules, shadows):
+                module = contract._ledger()
+            self.assertEqual(
+                (ROOT / "collectors" / "ledger.py").resolve(),
+                Path(module.__file__).resolve(),
+            )
+            self.assertEqual(("ok", "degraded"), module.DONE_STATUS)
+            self.assertTrue(module.is_failure_status("error"))
+        finally:
+            contract._ledger.cache_clear()
+
     def _write(self, root: Path, cycle: str, **updates) -> None:
         payload = {
             "stage": "live",
@@ -60,8 +80,9 @@ class StageFailureContractTests(unittest.TestCase):
                 now=datetime(2026, 8, 13, 4, 13, tzinfo=CST),
             )
         self.assertEqual(result["failure_kind"], "agent_idle_timeout")
-        self.assertEqual(result["production_database_writes"], 0)
-        self.assertEqual(result["orders_placed"], 0)
+        self.assertEqual(result["side_effect_proof"], "not_proven")
+        self.assertIsNone(result["production_database_writes"])
+        self.assertIsNone(result["orders_placed"])
         serialized = json.dumps(result).lower()
         for forbidden in ("provider", "model", "prompt", "must-not-be-emitted"):
             self.assertNotIn(forbidden, serialized)
@@ -206,6 +227,55 @@ class StageFailureContractTests(unittest.TestCase):
             self.assertTrue(
                 result["report_reconcile_barrier"]["report_safe"])
 
+    def test_db_root_path_proves_execution_absence_before_zero_claim(self):
+        cycle = "2026-08-14T19:00"
+        now = datetime(2026, 8, 14, 19, 12, tzinfo=CST)
+        barrier = {
+            "schema_version": 1, "required": True,
+            "profile": "live", "cycle_id": cycle,
+            "contract_version": 1, "request_id": "c" * 32,
+            "status": "ok", "rc": 0, "applied": False,
+            "blocking": False, "p0": False,
+            "contract_valid": True, "report_safe": True,
+            "started_at": "2026-08-14 19:08:01",
+            "finished_at": "2026-08-14 19:08:02",
+            "findings_count": 0, "healed_count": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = root / "status"
+            db_root = root / "db"
+            status.mkdir()
+            db_root.mkdir()
+            self._write(
+                status, cycle,
+                started_at="2026-08-14 19:01:00",
+                finished_at="2026-08-14 19:08:00",
+                report_reconcile_barrier=barrier,
+            )
+            with closing(sqlite3.connect(db_root / "live_trades.db")) as con:
+                con.executescript(
+                    "CREATE TABLE trade_cycles(cycle_id TEXT);"
+                    "CREATE TABLE trades(cycle_id TEXT);")
+                con.commit()
+            with closing(sqlite3.connect(db_root / "ledger.db")) as con:
+                con.execute(
+                    "CREATE TABLE execution_intents(cycle_id TEXT,state TEXT)")
+                con.commit()
+            result = contract.load_upstream_failure(
+                cycle, db_root=db_root, status_dir=status, now=now)
+            self.assertEqual("proved_absent", result["side_effect_proof"])
+            self.assertEqual(0, result["production_database_writes"])
+            self.assertEqual(0, result["orders_placed"])
+
+            with closing(sqlite3.connect(db_root / "ledger.db")) as con:
+                con.execute(
+                    "INSERT INTO execution_intents VALUES(?,?)",
+                    (cycle, "submitting"))
+                con.commit()
+            self.assertIsNone(contract.load_upstream_failure(
+                cycle, db_root=db_root, status_dir=status, now=now))
+
     def _collection_fixture(
         self,
         root: Path,
@@ -328,6 +398,21 @@ class StageFailureContractTests(unittest.TestCase):
 class FailureReportPlumbingTests(unittest.TestCase):
     CYCLE = "2026-08-13T04:00"
 
+    def test_trigger_passes_full_report_identity_to_supervisor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            with (
+                mock.patch.object(trigger_agent, "LOG_DIR", log_dir),
+                mock.patch.dict(os.environ, {"OKX_TRIGGER_DRYRUN": "1"}),
+            ):
+                trigger_agent._fire_push_script(self.CYCLE)
+            text = (log_dir / "push-20260813-0400.log").read_text(
+                encoding="utf-8")
+        self.assertIn("mode=full execution=script", text)
+        self.assertIn("--stage push", text)
+        self.assertIn("--mode full --", text)
+        self.assertNotIn("--upstream-failure-report", text)
+
     def test_trigger_passes_only_failure_report_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp)
@@ -340,6 +425,9 @@ class FailureReportPlumbingTests(unittest.TestCase):
             text = (log_dir / "push-20260813-0400.log").read_text(
                 encoding="utf-8")
         self.assertIn("--upstream-failure-report", text)
+        self.assertIn("mode=failure_report execution=script", text)
+        self.assertIn("--stage push", text)
+        self.assertIn("--mode failure_report --", text)
         self.assertNotIn("failure_kind", text)
 
     def test_pipeline_revalidates_failure_before_builder(self):

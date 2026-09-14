@@ -44,6 +44,26 @@ class ContractStatisticsCoverageAuditTests(unittest.TestCase):
             audited.call_args.kwargs["forward_start"],
         )
 
+    def test_cli_returns_one_for_valid_not_met_audit(self) -> None:
+        payload = {
+            "overall_status": "NOT_MET",
+            "status": "PASSED",
+            "latest_cycle_id": "2026-08-22T08:15",
+            "valid_symbols": 438,
+            "universe_symbols": 438,
+            "coverage_rate": 1.0,
+            "forward_after_remediation": {"expected_slots": 222},
+        }
+        with (
+            mock.patch.object(
+                audit, "audit_contract_statistics", return_value=payload,
+            ),
+            mock.patch.object(audit, "_atomic_json"),
+        ):
+            status = audit.main(["--json-out", "unused-quality.json"])
+
+        self.assertEqual(1, status)
+
     def test_separate_read_only_universe_database_audits_isolated_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -79,14 +99,93 @@ class ContractStatisticsCoverageAuditTests(unittest.TestCase):
             con.close()
 
             result = audit.audit_contract_statistics(
-                statistics_db, universe_db_path=universe_db)
+                statistics_db,
+                universe_db_path=universe_db,
+                as_of=audit._parse_cst("2026-08-15T20:00:00+08:00"),
+            )
 
             self.assertEqual(result["availability_status"], "PASSED")
             self.assertEqual(result["analysis_ready_status"], "PASSED")
             self.assertEqual(result["status"], "PASSED")
             self.assertEqual(result["coverage_rate"], 1.0)
+            self.assertEqual(result["minimum_coverage"], 0.99)
+            self.assertEqual(result["forward_target_rate"], 0.95)
+            self.assertEqual(
+                result["forward_target_rate_migration"][
+                    "effective_target_rate"
+                ],
+                0.95,
+            )
             self.assertEqual(result["statistics_db"], str(statistics_db))
             self.assertEqual(result["universe_db"], str(universe_db))
+
+            legacy = audit.audit_contract_statistics(
+                statistics_db,
+                universe_db_path=universe_db,
+                as_of=audit._parse_cst("2026-08-15T19:59:59+08:00"),
+            )
+            self.assertEqual(legacy["minimum_coverage"], 0.99)
+            self.assertEqual(legacy["forward_target_rate"], 0.99)
+            self.assertFalse(
+                legacy["forward_target_rate_migration"]["activated"]
+            )
+
+    def test_forward_gate_separates_99pct_slot_quality_from_95pct_rate(self) -> None:
+        start = audit._parse_cst("2026-08-15T20:00:00+08:00")
+        end = start + audit.timedelta(minutes=20 * audit.SLOT_MINUTES)
+        complete = {
+            "latest_ticker_ts": "2026-08-15T12:00:02Z",
+            "universe_symbols": 1,
+            "batch_rows": 1,
+            "valid_symbols": 1,
+            "direct_valid_symbols": 1,
+            "carried_forward_valid_symbols": 0,
+            "availability_status": "PASSED",
+            "analysis_ready_status": "PASSED",
+            "coverage_rate": 1.0,
+            "direct_coverage_rate": 1.0,
+            "carry_forward_rate": 0.0,
+            "missing_symbols": [],
+            "invalid_symbols": {},
+            "duplicate_symbols": [],
+            "extra_symbols": [],
+            "analysis_ready_checks": {"single_collected_timestamp": True},
+        }
+        calls = 0
+
+        def per_slot(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 20:
+                raise ValueError("missing batch")
+            return complete
+
+        with (
+            mock.patch.object(
+                audit, "audit_contract_statistics", side_effect=per_slot,
+            ),
+            mock.patch.object(
+                audit, "_latest_ticker_universe",
+                return_value=("2026-08-15T12:00:02Z", {"BTC-USDT-SWAP"}),
+            ),
+        ):
+            forward = audit._summarize_forward_window(
+                statistics_db=Path("statistics.db"),
+                universe_db=Path("universe.db"),
+                start=start,
+                end_exclusive=end,
+                minimum_coverage=0.99,
+                target_rate=0.95,
+                maximum_source_lag_seconds=5_400,
+                minimum_slots=20,
+            )
+
+        self.assertEqual(forward["slot_minimum_coverage"], 0.99)
+        self.assertEqual(forward["target_rate"], 0.95)
+        self.assertEqual(forward["passed_slots"], 19)
+        self.assertEqual(forward["slot_pass_rate"], 0.95)
+        self.assertEqual(forward["status"], "PASSED")
+        self.assertEqual(forward["analysis_ready_status"], "PASSED")
 
     def test_latest_exact_batch_passes_and_stale_row_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -368,6 +467,17 @@ class ContractStatisticsCoverageAuditTests(unittest.TestCase):
             self.assertEqual(2 / 3, forward["analysis_ready_slot_pass_rate"])
             self.assertEqual("INSUFFICIENT_EVIDENCE", forward["status"])
             self.assertEqual("PENDING_FORWARD_EVIDENCE", result["overall_status"])
+            self.assertEqual(forward["target_rate"], 0.99)
+            self.assertEqual(
+                forward["target_rate_migration"]["effective_target_rate"],
+                0.99,
+            )
+            self.assertEqual(
+                forward["legacy_target_diagnostics"][
+                    "target_dependent_rates_excluded"
+                ],
+                [],
+            )
             missing = next(
                 row for row in forward["slots"]
                 if row["cycle_id"] == "2026-08-12T08:30"

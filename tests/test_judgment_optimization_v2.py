@@ -113,10 +113,17 @@ class PathMetricV2Tests(unittest.TestCase):
             self.con, "BTC-USDT-SWAP", "long", 100.0, 95.0, 1000.0,
             "2026-08-10 10:15:00", "2026-08-10 11:00:00", 60.0,
         )
-        self.assertEqual(result["path_metric_version"], 2)
+        # 2026-08-19 G1/G2 v3：1R = **净风险**（毛止损距 + 摩擦 0.2%），与
+        # core/ev_calculator 同口径 → 打到止损恰好 -1R；mfe 分子扣摩擦、mae
+        # 分子加摩擦。'full' 改判「包络完整」（内部 bar 齐 + 跨界 bar 也在库），
+        # 不再要求成交时间戳精确落在 :00/:15/:30/:45（那让 ever_hit_1r=0
+        # 成为 100% 死代码：实测 164 行全是 partial_boundary、0 行 full）。
+        # 本例：risk_net=0.05+0.002=0.052；mfe=(0.06-0.002)/0.052=1.1154；
+        #       mae=(0.06+0.002)/0.052=1.1923。
+        self.assertEqual(result["path_metric_version"], 3)
         self.assertEqual(result["path_coverage"], "full")
-        self.assertAlmostEqual(result["mfe_r"], 1.2)
-        self.assertAlmostEqual(result["mae_r"], 1.2)
+        self.assertAlmostEqual(result["mfe_r"], 1.1154)
+        self.assertAlmostEqual(result["mae_r"], 1.1923)
         self.assertEqual(result["ever_hit_1r"], 1)
 
     def test_boundary_partial_never_turns_unknown_into_false(self) -> None:
@@ -127,7 +134,10 @@ class PathMetricV2Tests(unittest.TestCase):
             self.con, "BTC-USDT-SWAP", "long", 100.0, 95.0, 1000.0,
             "2026-08-10 10:07:00", "2026-08-10 11:02:00", -10.0,
         )
-        self.assertEqual(result["path_coverage"], "partial_boundary:1.00")
+        # v3：内部 bar 齐（coverage=1.00）但包络缺跨界 bar → 仍是 partial，
+        # 'partial_boundary' 前缀取消（下游解析器写的是 startswith("partial")，
+        # 历史行仍可解析）。未观察到 ≠ 已证明未触达，ever_hit_1r 保持 None。
+        self.assertEqual(result["path_coverage"], "partial:1.00")
         self.assertLess(result["mfe_r"], 1.0)
         self.assertIsNone(result["ever_hit_1r"])
 
@@ -139,8 +149,10 @@ class PathMetricV2Tests(unittest.TestCase):
         )
         self.assertGreaterEqual(result["mfe_r"], 0.0)
         self.assertGreaterEqual(result["mae_r"], 0.0)
-        self.assertAlmostEqual(result["mfe_r"], 1.2)
-        self.assertAlmostEqual(result["mae_r"], 0.8)
+        # v3 净口径：risk_net=0.05+0.002=0.052；
+        # mfe=(0.06-0.002)/0.052=1.1154；mae=(0.04+0.002)/0.052=0.8077。
+        self.assertAlmostEqual(result["mfe_r"], 1.1154)
+        self.assertAlmostEqual(result["mae_r"], 0.8077)
 
 
 class NewsTimeSemanticsV2Tests(unittest.TestCase):
@@ -282,6 +294,53 @@ class ExperienceCalibrationV2Tests(unittest.TestCase):
         self.assertEqual(result["asset_class"]["crypto"]["n"], 2)
         self.assertEqual(result["asset_class"]["tokenized_stock"]["n"], 1)
         self.assertEqual(result["asset_class_current_map_fallback_n"], 2)
+        # rows without ts / trend flags stay explicitly unknown (no guessing)
+        self.assertEqual(result["open_hour_bucket"]["unknown"]["n"], 4)
+        self.assertEqual(result["regime_alignment"]["trend_up/未知"]["n"], 2)
+        self.assertEqual(result["regime_alignment"]["range/未知"]["n"], 2)
+
+    def test_open_hour_and_regime_alignment_groups(self) -> None:
+        # 2026-08-17: descriptive-only buckets — open hour (UTC+8, 4h) and
+        # side vs. frozen 1H/4H trend flags (顺势/逆势/混合/未知).
+        def row(ts, side, regime, pnl, t1, t4):
+            return {
+                "symbol": "X-USDT-SWAP", "side": side, "cycle_id": ts[:13],
+                "ts": ts, "regime": regime, "pnl_pct": pnl,
+                "realized_pnl": pnl, "hold_hours": 5.0,
+                "raw": json.dumps({"decision_card": {
+                    "historical_experience": {"usage": "partial"}}}),
+                "experience_vector": json.dumps({"v": 2, "features": {
+                    "asset_class": "crypto", "trend_1h": t1, "trend_4h": t4}}),
+            }
+        rows = [
+            row("2026-08-14 01:45:00", "long", "range", -1.0, 1, 1),    # 00-03h 顺势
+            row("2026-08-14 04:12:00", "short", "range", -1.5, -1, -1),  # 04-07h 顺势
+            row("2026-08-14 12:17:00", "short", "range", 1.2, 1, -1),    # 12-15h 混合
+            row("2026-08-15 12:26:00", "long", "trend_up", 2.6, 1, 1),   # 12-15h 顺势
+            row("2026-08-16 22:41:00", "long", "range", -3.3, -1, -1),   # 20-23h 逆势
+            row("bad-timestamp", "long", "range", 0.5, None, 1),         # unknown/未知
+        ]
+        result = decision_briefing.experience_calibration(rows, {}, {})
+        hours = result["open_hour_bucket"]
+        self.assertEqual(list(hours), ["00-03h", "04-07h", "12-15h", "20-23h", "unknown"])
+        self.assertEqual(hours["12-15h"]["n"], 2)
+        self.assertEqual(hours["12-15h"]["wins"], 2)
+        self.assertEqual(hours["00-03h"]["win_rate_pct"], 0.0)
+        alignment = result["regime_alignment"]
+        self.assertEqual(alignment["range/顺势"]["n"], 2)
+        self.assertEqual(alignment["range/顺势"]["wins"], 0)
+        self.assertEqual(alignment["range/逆势"]["n"], 1)
+        self.assertEqual(alignment["range/混合"]["n"], 1)
+        self.assertEqual(alignment["range/未知"]["n"], 1)
+        self.assertEqual(alignment["trend_up/顺势"]["n"], 1)
+        # regimes are grouped together and ordered 顺势→逆势→混合→未知
+        self.assertEqual(
+            list(alignment),
+            ["range/顺势", "range/逆势", "range/混合", "range/未知", "trend_up/顺势"])
+        self.assertEqual(decision_briefing._open_hour_bucket("2026-08-17 23:59:59"), "20-23h")
+        self.assertEqual(decision_briefing._open_hour_bucket(None), "unknown")
+        self.assertEqual(decision_briefing._trend_alignment("short", -1, 0), "混合")
+        self.assertEqual(decision_briefing._trend_alignment("flat", 1, 1), "未知")
 
 
 class EvOverrideV2Tests(unittest.TestCase):
@@ -307,10 +366,13 @@ class EvOverrideV2Tests(unittest.TestCase):
             }},
         }
 
-    def test_override_probability_must_improve_on_baseline(self) -> None:
-        _block, errors = ev_calculator.build_ev_check(
+    def test_override_probability_is_recorded_without_historical_gate(self) -> None:
+        block, errors = ev_calculator.build_ev_check(
             self._card(0.40), "short")
-        self.assertTrue(any("必须高于" in item for item in errors), errors)
+        self.assertEqual([], errors)
+        self.assertEqual(0.40, block["override_p_win_claim"])
+        self.assertLess(block["claim_ev_r"], 0)
+        self.assertTrue(block["accepts_negative_ev"])
 
     def test_still_negative_claim_is_explicitly_recorded(self) -> None:
         # 45% 高于历史 40%，但仍低于约 53% 盈亏平衡线；允许判断自由，必须留痕。
@@ -322,6 +384,19 @@ class EvOverrideV2Tests(unittest.TestCase):
 
 
 class OptionalTakeProfitV2Tests(unittest.TestCase):
+    def test_okx_call_preserves_exception_type_and_timeout_budget(self) -> None:
+        with mock.patch.object(
+            _okxorder, "okx_json",
+            side_effect=TimeoutError("transport timed out"),
+        ):
+            result = _okxorder._call(
+                "swap", "place", profile="live", timeout_sec=12.5)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("TimeoutError", result["error_type"])
+        self.assertEqual(12.5, result["timeout_seconds"])
+        self.assertIn("transport timed out", result["error"])
+
     def test_market_open_rejects_combined_tp_sl_before_cli(self) -> None:
         with mock.patch.object(_okxorder, "is_dryrun", return_value=False), \
              mock.patch.object(_okxorder, "_call") as call:

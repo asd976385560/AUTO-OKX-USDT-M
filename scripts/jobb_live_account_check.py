@@ -15,6 +15,15 @@ Read-only against OKX; writes the fresh snapshot to account.db for audit.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -509,6 +518,9 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
             )
         # 数量化经验账必须与本轮 OKX 实仓一致。命中只开/续
         # repair_queue 元数据，不改经验或订单；恢复一致后自动闭单。
+        # 例外（2026-09-11）：UNRECORDED 方向（经验 < 实仓）的行若是因交易所
+        # 仓位消失才"恢复一致"、而经验库里没有对应开仓，保持 pending 并注明
+        # 未回填（hold_unrecorded_vanished），不再把整笔漏记当自愈关掉。
         actual_positions = {
             (str(item.get("instId")), position_side(item)):
                 abs(signed_size(item))
@@ -524,7 +536,8 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
                 findings=experience_findings,
                 ts=ts,
                 closed_by="jobb_live_account_check",
-                resolution="jobb live account check invariant healed")
+                resolution="jobb live account check invariant healed",
+                hold=li.hold_unrecorded_vanished)
             experience_audit = {
                 "findings": experience_findings,
                 "repair_queue": experience_queue,
@@ -566,7 +579,7 @@ def collect_live_account(profile: str, db_root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobB mandatory live account/position check")
     parser.add_argument("--profile", default="live")
-    parser.add_argument("--db-root", default=r"./db")
+    parser.add_argument("--db-root", default=_public_project_path('db'))
     parser.add_argument("--repair-auto-vanished", action="store_true",
                         help="dry-run 查找已被 V2 主账本平仓取代的伪 auto-vanished 事件")
     parser.add_argument("--since", default=None,

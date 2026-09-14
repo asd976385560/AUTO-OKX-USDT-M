@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-16
+last-updated: 2026-09-14
 updated-by: Codex
-change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidence, action contracts and public safety gates.
+change-summary: Synchronize the current decision, execution, market-data and reporting contracts while retaining public release guards.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidenc
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。当前运行链仅保留 live：统一实盘 Agent 先完成分析，再经确定性多周期证据、账户事实、硬风控、订单执行和 writer 同进程提交交易结果。
+V2.0 将市场采集、风控、下单、记账、推送和阶段派发放在确定性代码中，将分析、交易判断、复盘和无 API 新闻取数交给隔离 Agent。当前运行链仅保留 live：统一实盘 Agent 先完成分析，再经确定性决策证据、账户事实、硬风控、订单执行和 writer 同进程提交交易结果。
 
 > [!WARNING]
 > 本项目包含真实交易执行能力。首次部署必须保持 `OKX_EXECUTOR_DRYRUN=1` 和 `OKX_TRIGGER_DRYRUN=1`，并在隔离数据库中完成验证。本项目不构成投资建议，也不保证盈利。
@@ -69,16 +69,14 @@ GitHub Release 名称统一为 `v<VERSION>`。每次发布的非空说明及版�
 
 ## 本次同步
 
-本分支同步截至 2026-08-15 的实际运行代码，并在进入公开项目时重新应用可移植与安全边界：
+本次公开版本 **1.1.2** 同步 2026-09-14 的源码快照，并保留公开版的隔离与写入约束。
 
-- Demo 运行能力、角色和数据库初始化目标已经下线，主链收敛为 unified live → push；
-- `collect_cycle.py` 将整点 fast → news → slow 与每刻钟 fast → news 聚合运行，逐步记录结果、绝对截止时间和副作用失败；
-- 新增 OKX 公告、官方合约历史、BOLL/OBV、仓位批次与有界市场特征恢复，并用完整轮 SLA、字段覆盖和周期报告审计核验采集结果；
-- OPEN/ADD 必须绑定同一 cycle 的 exact 已收盘 15m/1H/4H 证据，REDUCE/ADJUST_PROTECTION 也进入明确动作契约，writer 与 executor 独立重验；
-- Live 风控同时执行组合 IMR 66.6%、单笔增量 IMR 15%、单笔止损风险 5%、可用保证金、有限数值、账仓一致和 actor attestation 闸；
-- Push 使用 16 项静态必含段，三周期、执行审计和业务证明由独立版本化硬闸校验，并对计划槽、归档和精确送达分别审计；
-- 所有公开路径使用项目根或占位符，迁移默认 dry-run 且写入必须显式授权和验证备份；公开 `ledger_autoheal.py` 永久只读；
-- 业务推送与告警目标分离，只从 `OKX_QQ_TARGET`、`OKX_QQ_ALERT_TARGET` 读取；真实凭证、目标、主机状态、数据库、日志和修复工具均不进入仓库。
+- 当前前向协议为 `minimal_contract_full_closure_v1`：全市场候选每个 symbol 一行、方向中立；Agent 选择方向，确定性阶段发布并核验 facts/view 与交接哈希。历史 `all_market_lightweight_open_v1` 和三周期卡只保留读取兼容。
+- OPEN 使用扁平 `open_execution_package_v1`。`write_position_plan.py` 校验具名草稿后原子发布计划，runner 验证计划、事实、actor 和回执身份。
+- 执行层增加官方 tickSz 对齐、旧保护单身份核对、无仓侧清理、标记价有界恢复和保护回读。组合 IMR 66.6%、单笔增量 IMR 15%、止损风险 5% 及其余硬闸保持。
+- 明确没有下单副作用的独立拒绝保留失败，可继续其它独立标的；未知副作用、账本冲突、缺保护仍阻断。业务失败不会被告警送达改写为成功。
+- 新增可选公共行情 WebSocket 缓存、采集诊断、按年月日归档、错失机会证据合同和 Gateway 推送；结果不明仍记 `uncertain_delivery`，不自动重发。
+- 公共 autoheal 永久只读。迁移必须显式 `--apply --backup-dir` 并完成在线备份；数据库、日志、真实路由及宿主运维文件不进入仓库。
 
 ## 架构
 

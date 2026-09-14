@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""V2.0 §8.5 —— 交易经验写入（由 live trades_writer 挂钩并写 account.db）。
+"""V2.0 §8.5 —— 交易经验写入（由 trades_writer 挂钩，live+demo 同写 account.db）。
 
 每笔交易完成写结构化经验入 account.db.trade_experiences（LLM 长期记忆）。开仓写 open 行
 （含决策背景 + experience_vector），平仓 UPDATE 该行为 closed（补 pnl_pct/hold_hours/is_gross_profit_close）。
 caller 提供 account.db 连接并负责 commit；交易账与经验跨库，经验失败不阻塞交易记账。
 
-`experience_vector` 由 `_simutil.experience_vector` 编码（与 find_similar_experience 同空间）。
+新行 `experience_vector` 由 `_simutil.experience_features_v3` 编码并携带固定 epoch；
+历史 v2 blob 原样冻结（与 find_similar_experience 的前向 v3 空间严格隔离）。
 本模块用 caller 传入的 conn.execute（**不** 自己 commit、**不** 开新连接）——保证同事务。
 
     决策卡随 trade raw 一并保存；L2 教训摘要由 reviewer 流程
@@ -15,6 +16,15 @@ caller 提供 account.db 连接并负责 commit；交易账与经验跨库，经
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import json
 import re
 import sqlite3
@@ -22,20 +32,20 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-sys.path.insert(0, r"./scripts")
+sys.path.insert(0, _public_project_path('scripts'))
 import _simutil  # noqa: E402
 
 import os
 from pathlib import Path
 
-_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", r"./db"))
+_DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _public_project_path('db')))
 
 
-def _v2_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
-    """v2 特征载荷（Wave2 序9；与 experience_features_v2 回填同构）。
+def _v3_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
+    """前向 v3 特征载荷（严格24h；历史 v2 不重算）。
 
-    市场态派生失败 → 字段 None 如实留空（覆盖惩罚在 similarity_v2 内），
-    绝不因特征派生失败阻断记账。legacy_v1=None：v2 起新行无旧向量。
+    市场态派生失败 → 字段 None 如实留空，绝不因特征派生失败阻断记账。
+    外层和内层均携带固定 epoch，finder 只比较完全相同的 v3 epoch。
     """
     stop_distance = None
     try:
@@ -56,8 +66,8 @@ def _v2_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
         try:
             from core.asset_class import asset_class_of
         except ImportError:
-            if r"." not in sys.path:
-                sys.path.insert(0, r".")
+            if _public_project_path() not in sys.path:
+                sys.path.insert(0, _public_project_path())
             from core.asset_class import asset_class_of
         base["asset_class"] = asset_class_of(symbol, _DB_ROOT)
         card = trade.get("decision_card")
@@ -72,10 +82,13 @@ def _v2_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
             finally:
                 mcon.close()
     except Exception as exc:  # noqa: BLE001  特征派生永不阻断记账
-        print(f"[trade_experience_writer][WARN] v2 特征派生失败 "
+        print(f"[trade_experience_writer][WARN] v3 特征派生失败 "
               f"{symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
-    return {"v": 2, "features": _simutil.experience_features_v2(base),
-            "legacy_v1": None}
+    return {
+        "v": 3,
+        "feature_epoch": _simutil.FEATURE_EPOCH_V3,
+        "features": _simutil.experience_features_v3(base),
+    }
 
 
 def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
@@ -256,11 +269,46 @@ def _hold_hours(open_ts: Optional[str], now_ts: str) -> Optional[float]:
         return None
 
 
-def _trade_ordid(t: dict) -> Optional[str]:
+def _nested_ordids(value: object) -> set[str]:
+    """Collect explicit order identities without guessing from prices/times."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"ordId", "ord_id"} and child not in (None, "", 0):
+                found.add(str(child))
+            elif key == "ord_ids" and isinstance(child, list):
+                found.update(
+                    str(item) for item in child if item not in (None, "", 0))
+            elif isinstance(child, (dict, list)):
+                found.update(_nested_ordids(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_nested_ordids(child))
+    return found
+
+
+def _trade_ord_identity(t: dict) -> set[str]:
+    """交易行的权威身份集合：顶层单键优先，否则取 raw 里的全部嵌套身份。"""
     for k in ("ordId", "ord_id", "open_id"):
         v = t.get(k)
         if v not in (None, "", 0):
-            return str(v)
+            return {str(v)}
+    raw: object = t.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw = None
+    # Exchange reconciliation rows store the authority under raw.ord_ids/fills
+    # rather than at the trade-row top level.  Recover only one unique identity;
+    # multiple IDs remain ambiguous and therefore keep the close event blocked.
+    return _nested_ordids(raw)
+
+
+def _trade_ordid(t: dict) -> Optional[str]:
+    identities = _trade_ord_identity(t)
+    if len(identities) == 1:
+        return next(iter(identities))
     return None
 
 
@@ -326,7 +374,7 @@ def _close_event(
     trade: dict, cycle_id: str, now_ts: str, consumed_sz: float,
     allocated_pnl: Optional[float],
 ) -> dict:
-    return {
+    event = {
         "ordId": _trade_ordid(trade),
         "cycle_id": cycle_id,
         "ts": now_ts,
@@ -334,6 +382,15 @@ def _close_event(
         "pnl": allocated_pnl,
         "fill_px": trade.get("fill_px") or trade.get("px"),
     }
+    if event["ordId"] is None:
+        # 2026-09-12：身份不唯一时 _trade_ordid 按设计返回 None（交易所用多张
+        # 单平掉同一仓位、由对账回填出的聚合行）。此处额外留痕完整身份集合，
+        # 下游按集合核验；仍不挑选、不伪造单一 id。无任何身份时不加该键，
+        # 保持 fail-closed。
+        identities = _trade_ord_identity(trade)
+        if identities:
+            event["ord_ids"] = sorted(identities)
+    return event
 
 
 def _dup_exists(conn: sqlite3.Connection, profile: str, symbol: str, side: str,
@@ -396,7 +453,7 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                            _trade_ordid(t)):
                 deduped += 1
                 continue
-            vec = _v2_vector_payload(
+            vec = _v3_vector_payload(
                 symbol, side, "open", regime, now_ts, t)
             open_sz = _positive(t.get("sz"))
             conn.execute(
@@ -522,7 +579,7 @@ def insert_or_update_experiences(conn: sqlite3.Connection, data: dict,
                 unmatched_pnl = None
                 if pnl_value is not None and close_sz and unmatched_sz is not None:
                     unmatched_pnl = pnl_value * unmatched_sz / close_sz
-                vec = _v2_vector_payload(
+                vec = _v3_vector_payload(
                     symbol, side, "close", regime, now_ts, t)
                 fallback_raw = dict(t)
                 fallback_raw["unmatched_sz"] = unmatched_sz

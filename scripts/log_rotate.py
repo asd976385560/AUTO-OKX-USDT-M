@@ -11,9 +11,18 @@
   log_rotate.py                      # dry-run，列将删文件与释放空间
   log_rotate.py --apply              # 真删（超 7 天）
   log_rotate.py --days 14 --apply    # 保留窗 14 天
-  log_rotate.py --dirs trigger,push,stage-status --days 7 --apply
+  log_rotate.py --dirs trigger,push,stage-status,stage-control --days 7 --apply
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import sys
@@ -23,10 +32,11 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-LOG_ROOT = Path(r"./logs")
+LOG_ROOT = Path(_public_project_path('logs'))
 # 轮转目标：per-cycle 高频落盘的调试日志目录。审计类 jsonl（qq_push_dedupe/pipeline_runs/
 # monitor audit）不在此删——它们是排障权威、体量小、单独按需管。
-# standalone 默认保持 trigger/push；daily_maintenance 显式追加 stage-status。
+# standalone 默认保持 trigger/push；daily_maintenance 显式追加
+# stage-status/stage-control。
 DEFAULT_DIRS = ["trigger", "push"]
 # 保护：这些结构化审计/状态文件不删（即便在目标目录内）
 PROTECT_SUFFIX = (".jsonl",)
@@ -35,9 +45,10 @@ PROTECT_NAMES = ("alert_state.json",)
 
 def rotate(dirs: list[str], days: float, apply: bool) -> dict:
     cutoff = time.time() - days * 86400
-    deleted = kept_protected = 0
-    freed = 0
+    candidates = deleted = delete_failed = kept_protected = 0
+    candidate_bytes = freed = 0
     samples: list[str] = []
+    failures: list[dict[str, str]] = []
     for sub in dirs:
         d = LOG_ROOT / sub
         if not d.is_dir():
@@ -56,16 +67,34 @@ def rotate(dirs: list[str], days: float, apply: bool) -> dict:
                 continue
             if len(samples) < 5:
                 samples.append(f"{sub}/{f.name}")
-            deleted += 1
-            freed += sz
+            candidates += 1
+            candidate_bytes += sz
             if apply:
                 try:
                     f.unlink()
                 except OSError as e:
+                    delete_failed += 1
+                    failures.append({
+                        "path": str(f),
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    })
                     print(f"[log_rotate] WARN 删除失败 {f}: {e}", file=sys.stderr)
-    return {"deleted": deleted, "freed_mb": round(freed / 1e6, 1),
-            "kept_protected": kept_protected, "apply": apply, "days": days,
-            "samples": samples}
+                    continue
+                deleted += 1
+                freed += sz
+    return {
+        "candidates": candidates,
+        "candidate_mb": round(candidate_bytes / 1e6, 1),
+        "deleted": deleted,
+        "freed_mb": round(freed / 1e6, 1),
+        "delete_failed": delete_failed,
+        "kept_protected": kept_protected,
+        "apply": apply,
+        "days": days,
+        "samples": samples,
+        "failures": failures,
+    }
 
 
 def main() -> int:
@@ -79,10 +108,10 @@ def main() -> int:
     r = rotate(dirs, args.days, args.apply)
     import json
     print(json.dumps(r, ensure_ascii=False, indent=1))
-    if not args.apply and r["deleted"]:
-        print(f"[dry-run] 将删 {r['deleted']} 文件、释放 {r['freed_mb']}MB（--apply 才真删）",
+    if not args.apply and r["candidates"]:
+        print(f"[dry-run] 将删 {r['candidates']} 文件、预计释放 {r['candidate_mb']}MB（--apply 才真删）",
               file=sys.stderr)
-    return 0
+    return 2 if args.apply and r["delete_failed"] else 0
 
 
 if __name__ == "__main__":

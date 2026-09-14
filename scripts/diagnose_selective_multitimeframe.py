@@ -15,6 +15,15 @@ production database.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -35,7 +44,7 @@ TIMEFRAMES = ("15m", "1H", "4H")
 SIDES = ("long", "short")
 COST_HURDLE = 0.002
 DEFAULT_INPUT = Path(
-    r"./reports/quality/goal-selective-multitimeframe-v1-20260812"
+    _public_project_path('reports', 'quality', 'goal-selective-multitimeframe-v1-20260812')
 )
 DEFAULT_OUTPUT = DEFAULT_INPUT / "selective_diagnostic.json"
 DEFAULT_MODEL = DEFAULT_INPUT / "selective_model.json"
@@ -184,6 +193,16 @@ def _complete_outcome_mask(panel: pd.DataFrame) -> pd.Series:
     return panel[labels].notna().all(axis=1)
 
 
+def _long_short_success_overlap(panel: pd.DataFrame) -> int:
+    return sum(
+        int((
+            panel[f"{timeframe}_long_success"].eq(1)
+            & panel[f"{timeframe}_short_success"].eq(1)
+        ).sum())
+        for timeframe in TIMEFRAMES
+    )
+
+
 def _calibration_subsplits(
     panel: pd.DataFrame,
     *,
@@ -260,12 +279,14 @@ def _quality_audit(
             (~panel["split"].isin(["train", "calibration", "test", "purged"])).sum()),
         "label_columns_in_features": sorted(
             set(feature_columns) & set(_outcome_columns())),
+        "long_short_success_overlap": _long_short_success_overlap(panel),
     }
     passed = (
         critical["duplicate_obs_id"] == 0
         and critical["clock_violations"] == 0
         and critical["unknown_split_rows"] == 0
         and not critical["label_columns_in_features"]
+        and critical["long_short_success_overlap"] == 0
     )
     return {
         "status": "PASSED" if passed else "NOT_MET",
@@ -295,6 +316,7 @@ def _expand_candidates(
     assets = tuple(asset_classes)
     for timeframe in TIMEFRAMES:
         for side in SIDES:
+            direction = 1.0 if side == "long" else -1.0
             piece = panel[[
                 "obs_id", "obs_ts", "decision_ts", "entry_ts", "symbol",
                 "asset_class", "rule_direction", "split", *feature_columns,

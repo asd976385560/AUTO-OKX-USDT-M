@@ -25,6 +25,10 @@ GEO_QUERIES = (
     "俄乌战争最新进展",
 )
 
+
+class MXQuotaExceeded(RuntimeError):
+    """Non-retryable daily free-quota exhaustion from the MX API."""
+
 _HIGH = (
     "暴涨", "暴跌", "崩盘", "重大", "破纪录", "历史新高", "急跌", "ETF",
     "降息", "加息", "战争", "军事", "冲突", "制裁", "核", "导弹",
@@ -62,7 +66,10 @@ def search(query: str, *, key: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC) ->
             or (payload or {}).get("msg")
             or "unknown business error"
         ).strip()
-        raise RuntimeError(f"MX business code={code}: {message[:110]}")
+        error = f"MX business code={code}: {message[:110]}"
+        if str(code) == "113":
+            raise MXQuotaExceeded(error)
+        raise RuntimeError(error)
     rows = (
         ((payload or {}).get("data") or {})
         .get("data", {})

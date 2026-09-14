@@ -23,6 +23,15 @@ open → ①15 组精确重复（同 profile+symbol+side+action+cycle_id）36 �
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import os
@@ -35,8 +44,8 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ACCOUNT_DB = Path(os.environ.get("OKX_ACCOUNT_DB", r"./db/account.db"))
-ARCHIVE_ROOT = Path(r"./tmp/archive")
+ACCOUNT_DB = Path(os.environ.get("OKX_ACCOUNT_DB", _public_project_path('db', 'account.db')))
+ARCHIVE_ROOT = Path(_public_project_path('tmp', 'archive'))
 
 
 def connect(path: Path) -> sqlite3.Connection:

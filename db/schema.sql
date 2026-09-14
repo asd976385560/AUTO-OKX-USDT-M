@@ -1,7 +1,7 @@
 -- OKX 永续合约自主交易系统 - 数据库 Schema
--- 导出时间: 2026-08-13 12:16:04 CST
+-- 导出时间: 2026-09-14 12:33:20 CST
 -- 版本: V2.0
--- 数据库目录: .\db\
+-- 数据库目录: <PROJECT_ROOT>/db/
 -- 本文件供 AI 读取表结构使用，不要手动编辑（改 schema 后跑 export_schema.py 重生成）
 -- 核心拆分库由 init_v20_dbs.py 初始化；增量变更走 apply_* 幂等迁移脚本
 
@@ -30,7 +30,7 @@ CREATE TABLE derivatives (
     premium           REAL,
     oi                REAL,
     oi_ccy            REAL,
-    oi_usd            REAL,
+    oi_usd            REAL, mark_px REAL, index_px REAL, basis_bp REAL,
     PRIMARY KEY (ts, symbol)
 );
 
@@ -413,7 +413,7 @@ CREATE TABLE playbook (
     updated_utc     TEXT NOT NULL
 , evidence_count INTEGER DEFAULT 0, win_count INTEGER DEFAULT 0, loss_count INTEGER DEFAULT 0, win_rate REAL, avg_pnl_pct REAL, last_validated_cycle INTEGER);
 
-CREATE TABLE position_snapshots (
+CREATE TABLE "position_snapshots" (
     ts            TEXT NOT NULL,
     profile       TEXT NOT NULL DEFAULT 'live',
     symbol        TEXT NOT NULL,
@@ -424,7 +424,7 @@ CREATE TABLE position_snapshots (
     liqPx         REAL,
     upl           REAL,
     marginRatio   REAL,
-    PRIMARY KEY (ts, profile, symbol)
+    PRIMARY KEY (ts, profile, symbol, side)
 );
 
 CREATE TABLE "repair_queue" (
@@ -583,6 +583,8 @@ CREATE INDEX idx_trade_exp_prs ON trade_experiences(profile, regime, side);
 
 CREATE INDEX idx_trade_exp_sym_ts ON trade_experiences(symbol, ts);
 
+CREATE UNIQUE INDEX uq_position_snapshot_side_identity ON position_snapshots(ts,profile,symbol,COALESCE(side,''));
+
 -- ============================================================
 -- 数据库: lessons.db
 -- ============================================================
@@ -608,7 +610,7 @@ CREATE TABLE "missed_opportunities" (
     notes           TEXT,
     reviewed_utc    TEXT NOT NULL,
     decision_card   TEXT
-);
+, sim_stop_pct REAL, sim_tp_pct REAL, sim_outcome_24h TEXT, sim_first_touch_cst TEXT);
 
 CREATE TABLE param_suggestions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -748,7 +750,7 @@ CREATE TABLE cross_market (
     gold_d1       REAL,
     spx_d1        REAL,
     btc_mcap_chg_24h_usd REAL GENERATED ALWAYS AS (btc_etf_flow) VIRTUAL
-, btc_etf_net_flow_usd REAL, source_meta TEXT, carried_forward TEXT, dxy_calc_ecb REAL, dxy_calc_ecb_d1 REAL, fear_greed REAL, fear_greed_label TEXT);
+, btc_etf_net_flow_usd REAL, source_meta TEXT, carried_forward TEXT, dxy_calc_ecb REAL, dxy_calc_ecb_d1 REAL, fear_greed REAL, fear_greed_label TEXT, dxy_as_of TEXT, vix_as_of TEXT, spx_as_of TEXT, gold_as_of TEXT, btc_etf_as_of TEXT);
 
 CREATE TABLE macro_events (
     calendar_id TEXT PRIMARY KEY,

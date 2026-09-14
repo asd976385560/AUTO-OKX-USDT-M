@@ -4,12 +4,14 @@
 covers V2.1 §1/§3（完善率与完整度 99%→95%）与 §2（前向校准门 90%→80%）。
 黑名单三审计（多周期/资产分类/合约统计）与消费端引用必须原地不动。
 """
+import ast
 import inspect
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,14 +33,112 @@ import audit_report_completeness  # noqa: E402
 import audit_model_shadow_label_quality as auditor  # noqa: E402
 import audit_source_health  # noqa: E402
 import evaluate_multitimeframe_model_shadow as evaluator  # noqa: E402
+from refresh_goal_acceptance_report import (  # noqa: E402
+    _validated_coverage_target,
+)
+
+
+def _literal_assignment(path: Path, name: str):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == name
+                   for target in targets):
+                matches.append(ast.literal_eval(node.value))
+    if len(matches) != 1:
+        raise AssertionError(f"expected one assignment for {name}, got {matches}")
+    return matches[0]
+
+
+def _cli_default(module, option: str):
+    path = Path(module.__file__)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            and any(
+                isinstance(arg, ast.Constant) and arg.value == option
+                for arg in node.args
+            )
+        ):
+            continue
+        defaults = [kw.value for kw in node.keywords if kw.arg == "default"]
+        if len(defaults) == 1:
+            matches.append(ast.literal_eval(defaults[0]))
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one CLI default for {option}, got {matches}")
+    return matches[0]
 
 
 BEFORE = "2026-08-15T19:59:59+08:00"
 AT = "2026-08-15T20:00:00+08:00"
 AFTER = "2026-08-16T00:00:00+08:00"
+V3_BEFORE = "2026-08-20T17:59:59+08:00"
+V3_AT = "2026-08-20T18:00:00+08:00"
+V4_BEFORE = "2026-08-21T17:59:59+08:00"
+V4_AT = "2026-08-21T18:00:00+08:00"
+LIVENESS_BEFORE = "2026-08-21T18:59:59+08:00"
+LIVENESS_AT = "2026-08-21T19:00:00+08:00"
+WEEKLY_PROFIT_DECISION = "2026-08-26T14:26:06+08:00"
+WEEKLY_PROFIT_ACTIVATION = "2026-08-31T08:00:00+08:00"
+MISSED_EVIDENCE_DECISION = "2026-08-31T19:32:24+08:00"
+MISSED_EVIDENCE_ACTIVATION = "2026-09-01T08:00:00+08:00"
+SLA_TIER2_BEFORE_DECISION = "2026-08-27T01:09:05+08:00"
+SLA_TIER2_DECISION = "2026-08-27T01:09:06+08:00"
+SLA_TIER2_BEFORE_ACTIVATION = "2026-08-27T01:59:59+08:00"
+SLA_TIER2_ACTIVATION = "2026-08-27T02:00:00+08:00"
+SLA_TIER2_EXCEPTION_BEFORE = "2026-08-27T08:04:12+08:00"
+SLA_TIER2_EXCEPTION_DECISION = "2026-08-27T08:04:13+08:00"
 
 
 class ActivationBoundaryTests(unittest.TestCase):
+    def test_missed_opportunity_evidence_contract_is_forward_only(self):
+        self.assertEqual(
+            MISSED_EVIDENCE_DECISION,
+            thresholds.MISSED_OPPORTUNITY_EVIDENCE_DECISION_RECORDED_CST,
+        )
+        self.assertEqual(
+            MISSED_EVIDENCE_ACTIVATION,
+            thresholds.MISSED_OPPORTUNITY_EVIDENCE_ACTIVATION_CST,
+        )
+        self.assertFalse(
+            thresholds.missed_opportunity_evidence_contract_active(
+                "2026-09-01 07:59:59"))
+        self.assertTrue(
+            thresholds.missed_opportunity_evidence_contract_active(
+                "2026-09-01 08:00:00"))
+        facts = thresholds.missed_opportunity_evidence_registration_facts(
+            "2026-09-01 08:00:00")
+        self.assertEqual(MISSED_EVIDENCE_DECISION, facts["decision_recorded"])
+        self.assertEqual(MISSED_EVIDENCE_ACTIVATION, facts["activation_cst"])
+        self.assertEqual(">=", facts["comparison"])
+        self.assertTrue(facts["active"])
+        self.assertFalse(facts["legacy_reports_rejudged"])
+
+    def test_weekly_profit_gate_starts_at_first_complete_future_week(self):
+        decision = thresholds.parse_cst(WEEKLY_PROFIT_DECISION)
+        activation = thresholds.parse_cst(WEEKLY_PROFIT_ACTIVATION)
+        self.assertEqual(
+            WEEKLY_PROFIT_DECISION,
+            thresholds.WEEKLY_TRADING_NET_PROFIT_DECISION_CST,
+        )
+        self.assertEqual(
+            WEEKLY_PROFIT_ACTIVATION,
+            thresholds.WEEKLY_TRADING_NET_PROFIT_ACTIVATION_CST,
+        )
+        self.assertGreater(activation, decision)
+        self.assertEqual(0, activation.weekday())
+        self.assertEqual((8, 0, 0), (
+            activation.hour, activation.minute, activation.second))
+        self.assertEqual(0.0, thresholds.WEEKLY_TRADING_NET_PROFIT_TARGET_USDT)
+        self.assertEqual(">", thresholds.WEEKLY_TRADING_NET_PROFIT_COMPARISON)
+
     def test_coverage_gate_is_forward_only(self):
         self.assertEqual(0.99, thresholds.coverage_target_rate(BEFORE))
         self.assertEqual(0.95, thresholds.coverage_target_rate(AT))
@@ -79,6 +179,338 @@ class ActivationBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(diagnostics["diagnostic_only"])
 
+    def test_v3_sla_gates_are_forward_only(self):
+        self.assertEqual(
+            570, thresholds.sla_analysis_deadline_seconds(V3_BEFORE))
+        self.assertEqual(600, thresholds.sla_analysis_deadline_seconds(V3_AT))
+        self.assertEqual(
+            780, thresholds.sla_business_terminal_deadline_seconds(V3_BEFORE))
+        self.assertEqual(
+            780, thresholds.sla_business_terminal_deadline_seconds(V3_AT))
+        self.assertEqual(
+            840, thresholds.sla_record_reconcile_deadline_seconds(V3_BEFORE))
+        self.assertEqual(
+            840, thresholds.sla_record_reconcile_deadline_seconds(V3_AT))
+        self.assertEqual(
+            840, thresholds.push_same_slot_max_age_seconds(V3_BEFORE))
+        self.assertEqual(
+            870, thresholds.push_same_slot_max_age_seconds(V3_AT))
+        self.assertEqual(
+            840, thresholds.post_push_monitor_deadline_seconds(V3_BEFORE))
+        self.assertEqual(
+            900, thresholds.post_push_monitor_deadline_seconds(V3_AT))
+
+    def test_v3_pass_tier_push_latency_and_review_semantics_share_boundary(self):
+        self.assertIsNone(thresholds.sla_pass_rate_target(V3_BEFORE))
+        self.assertEqual(0.80, thresholds.sla_pass_rate_target(V3_AT))
+        self.assertIsNone(
+            thresholds.push_delivery_latency_target_seconds(V3_BEFORE))
+        self.assertEqual(
+            30, thresholds.push_delivery_latency_target_seconds(V3_AT))
+        self.assertFalse(
+            thresholds.structured_position_actions_count_as_review(V3_BEFORE))
+        self.assertTrue(
+            thresholds.structured_position_actions_count_as_review(V3_AT))
+        self.assertEqual(
+            thresholds.SLA_V3_REGISTRATION_ACTIVATION_CST,
+            thresholds.SLA_PASS_RATE_TIER_ACTIVATION_CST,
+        )
+        self.assertEqual(
+            thresholds.SLA_V3_REGISTRATION_ACTIVATION_CST,
+            thresholds.PUSH_DELIVERY_LATENCY_ACTIVATION_CST,
+        )
+        self.assertEqual(
+            thresholds.SLA_V3_REGISTRATION_ACTIVATION_CST,
+            thresholds.STRUCTURED_POSITION_REVIEW_ACTIVATION_CST,
+        )
+
+    def test_v3_registration_facts_do_not_preregister_next_tier(self):
+        facts = thresholds.sla_v3_registration_facts(V3_AT)
+        self.assertTrue(facts["activated"])
+        self.assertEqual(
+            "successful_live_report_reconcile_barrier_finished_at",
+            facts["clock_stop"],
+        )
+        self.assertEqual(0.80, facts["pass_rate_tier"]["target_rate"])
+        self.assertFalse(facts["pass_rate_tier"]["next_tier_registered"])
+        push = thresholds.push_latency_registration_facts(V3_AT)
+        self.assertEqual("<=", push["comparison"])
+        self.assertFalse(push["historical_rejudgement"])
+
+    def test_sla_tier2_registration_is_forward_only(self):
+        self.assertEqual(
+            SLA_TIER2_DECISION,
+            thresholds.SLA_PASS_RATE_TIER_2_DECISION_CST,
+        )
+        self.assertEqual(
+            SLA_TIER2_ACTIVATION,
+            thresholds.SLA_PASS_RATE_TIER_2_ACTIVATION_CST,
+        )
+        self.assertGreater(
+            thresholds.parse_cst(SLA_TIER2_ACTIVATION),
+            thresholds.parse_cst(SLA_TIER2_DECISION),
+        )
+        self.assertEqual(0.80, thresholds.sla_pass_rate_target(
+            SLA_TIER2_BEFORE_ACTIVATION))
+        self.assertEqual(1, thresholds.sla_pass_rate_tier_index(
+            SLA_TIER2_BEFORE_ACTIVATION))
+        self.assertEqual(96, thresholds.sla_pass_rate_minimum_slots(
+            SLA_TIER2_BEFORE_ACTIVATION))
+        self.assertEqual(
+            thresholds.SLA_V4_PASS_RATE_TIER_ACTIVATION_CST,
+            thresholds.sla_pass_rate_window_activation_cst(
+                SLA_TIER2_BEFORE_ACTIVATION),
+        )
+
+        self.assertIsNone(thresholds.sla_pass_rate_next_tier_registration(
+            SLA_TIER2_BEFORE_DECISION))
+        pending = thresholds.sla_pass_rate_next_tier_registration(
+            SLA_TIER2_DECISION)
+        self.assertIsNotNone(pending)
+        self.assertEqual(2, pending["tier"])
+        self.assertEqual(0.90, pending["target_rate"])
+        self.assertEqual(192, pending["minimum_slots"])
+        before_facts = thresholds.sla_v3_registration_facts(
+            SLA_TIER2_DECISION)
+        self.assertTrue(
+            before_facts["pass_rate_tier"]["next_tier_registered"])
+        self.assertEqual(
+            "REGISTERED_PENDING_ACTIVATION",
+            before_facts["pass_rate_tier"]["next_tier"]["status"],
+        )
+
+        self.assertEqual(0.90, thresholds.sla_pass_rate_target(
+            SLA_TIER2_ACTIVATION))
+        self.assertEqual(2, thresholds.sla_pass_rate_tier_index(
+            SLA_TIER2_ACTIVATION))
+        self.assertEqual(192, thresholds.sla_pass_rate_minimum_slots(
+            SLA_TIER2_ACTIVATION))
+        self.assertEqual(
+            SLA_TIER2_ACTIVATION,
+            thresholds.sla_pass_rate_window_activation_cst(
+                SLA_TIER2_ACTIVATION),
+        )
+        active_facts = thresholds.sla_v3_registration_facts(
+            SLA_TIER2_ACTIVATION)
+        active_tier = active_facts["pass_rate_tier"]
+        self.assertEqual(2, active_tier["tier"])
+        self.assertEqual(0.90, active_tier["target_rate"])
+        self.assertEqual(192, active_tier["minimum_slots"])
+        self.assertFalse(active_tier["next_tier_registered"])
+        self.assertIsNone(active_tier["next_tier"])
+        self.assertEqual(1, len(active_tier["prior_tier_registrations"]))
+        self.assertEqual(
+            thresholds.SLA_PASS_RATE_TIER_2_ACTIVATION_CST,
+            active_tier["prior_tier_registrations"][0][
+                "end_exclusive_cst"],
+        )
+        self.assertFalse(active_tier["historical_rejudgement"])
+        self.assertEqual(
+            870, thresholds.sla_business_terminal_deadline_seconds(
+                SLA_TIER2_ACTIVATION))
+
+    def test_tier2_exact_0300_user_exception_is_one_off_and_auditable(self):
+        self.assertEqual([], thresholds.sla_pass_rate_acceptance_exceptions(
+            SLA_TIER2_EXCEPTION_BEFORE))
+        exceptions = thresholds.sla_pass_rate_acceptance_exceptions(
+            SLA_TIER2_EXCEPTION_DECISION)
+        self.assertEqual(1, len(exceptions))
+        exception = exceptions[0]
+        self.assertEqual("2026-08-27T03:00", exception["cycle_id"])
+        self.assertEqual(2, exception["tier"])
+        self.assertTrue(exception["user_approved"])
+        self.assertTrue(exception["post_observation"])
+        self.assertTrue(exception["raw_cycle_fact_preserved"])
+        self.assertFalse(exception["recurring"])
+        self.assertEqual(
+            exception,
+            thresholds.sla_pass_rate_acceptance_exception_for_cycle(
+                "2026-08-27T03:00", SLA_TIER2_EXCEPTION_DECISION),
+        )
+        self.assertIsNone(
+            thresholds.sla_pass_rate_acceptance_exception_for_cycle(
+                "2026-08-28T03:00", SLA_TIER2_EXCEPTION_DECISION))
+
+        registration = thresholds.sla_v3_registration_facts(
+            SLA_TIER2_EXCEPTION_DECISION)
+        facts = registration["pass_rate_tier"]
+        self.assertEqual(exceptions, facts["acceptance_exceptions"])
+        self.assertTrue(facts["historical_rejudgement"])
+        self.assertEqual(
+            ["2026-08-27T03:00"], facts["historical_rejudgement_scope"])
+        self.assertTrue(facts["raw_cycle_facts_preserved"])
+        self.assertIn("raw cycle facts stay preserved", registration["semantics"])
+
+    def test_v4_two_gate_scope_stops_before_persistence(self):
+        self.assertFalse(
+            thresholds.complete_cycle_uses_business_terminal_stop(V4_BEFORE))
+        self.assertTrue(
+            thresholds.complete_cycle_uses_business_terminal_stop(V4_AT))
+        self.assertFalse(
+            thresholds.complete_cycle_uses_record_reconcile_stop(V4_AT))
+        self.assertEqual(
+            870, thresholds.sla_analysis_deadline_seconds(V4_AT))
+        self.assertEqual(
+            870, thresholds.sla_business_terminal_deadline_seconds(V4_AT))
+        self.assertEqual(
+            900, thresholds.sla_record_reconcile_deadline_seconds(V4_AT))
+        self.assertEqual(
+            930, thresholds.push_same_slot_max_age_seconds(V4_AT))
+        self.assertEqual(
+            960, thresholds.post_push_monitor_deadline_seconds(V4_AT))
+        facts = thresholds.sla_v3_registration_facts(V4_AT)
+        self.assertEqual(
+            "successful_analysis_judgment_trade_terminal_at",
+            facts["clock_stop"],
+        )
+        self.assertEqual([
+            "required_collection_sources_completed",
+            "analysis_judgment_trade_completed",
+        ], facts["stage_gates"])
+        self.assertIn("business_database_commit", facts["excluded_from_870_seconds"])
+        self.assertIn("push_delivery", facts["excluded_from_870_seconds"])
+        self.assertEqual(
+            thresholds.SLA_V4_PROCESS_SCOPE_ACTIVATION_CST,
+            thresholds.sla_pass_rate_window_activation_cst(V4_AT),
+        )
+        self.assertEqual(
+            thresholds.SLA_PASS_RATE_TIER_ACTIVATION_CST,
+            thresholds.sla_pass_rate_window_activation_cst(V4_BEFORE),
+        )
+
+    def test_critical_output_zero_streak_registration_is_forward_only(self):
+        self.assertIsNone(
+            thresholds.critical_output_zero_streak_threshold_slots(
+                LIVENESS_BEFORE))
+        self.assertEqual(
+            2,
+            thresholds.critical_output_zero_streak_threshold_slots(
+                LIVENESS_AT),
+        )
+        before = thresholds.critical_output_zero_streak_registration_facts(
+            LIVENESS_BEFORE)
+        active = thresholds.critical_output_zero_streak_registration_facts(
+            LIVENESS_AT)
+        self.assertEqual("REGISTERED_FORWARD_ONLY", before["status"])
+        self.assertEqual(2, before["alert_threshold_slots"])
+        self.assertIsNone(before["effective_alert_threshold_slots"])
+        self.assertFalse(before["activated"])
+        self.assertEqual(2, active["effective_alert_threshold_slots"])
+        self.assertTrue(active["activated"])
+        self.assertFalse(active["historical_rejudgement"])
+        self.assertFalse(active["external_alert_wiring"])
+        self.assertFalse(active["scheduler_authority"])
+        self.assertFalse(active["trading_authority"])
+
+    def test_candidate_bundle_has_separate_forward_shadow_and_consume_edges(self):
+        registered = thresholds.candidate_bundle_registration_facts(
+            "2026-08-29T09:45")
+        self.assertEqual("REGISTERED_FORWARD_ONLY", registered["status"])
+        self.assertEqual("off", registered["phase"])
+        self.assertEqual(
+            "2026-08-29T10:00:00+08:00",
+            registered["shadow_activation_cst"],
+        )
+        self.assertIsNone(registered["consume_activation_cst"])
+        self.assertEqual(24, registered["shadow_minimum_natural_slots"])
+        self.assertEqual(96, registered["consume_minimum_natural_slots"])
+        self.assertFalse(registered["scheduler_changed"])
+        self.assertFalse(registered["model_or_provider_changed"])
+        self.assertEqual(
+            "shadow", thresholds.candidate_bundle_phase(
+                "2026-08-29T10:00"))
+        with (
+            mock.patch.object(
+                thresholds, "CANDIDATE_BUNDLE_SHADOW_ACTIVATION_CST",
+                "2026-08-29T10:00:00+08:00"),
+            mock.patch.object(
+                thresholds, "CANDIDATE_BUNDLE_CONSUME_ACTIVATION_CST",
+                "2026-08-29T16:00:00+08:00"),
+            mock.patch.object(
+                thresholds, "CANDIDATE_BUNDLE_CONSUME_END_CST",
+                "2026-08-30T16:00:00+08:00"),
+        ):
+            self.assertEqual(
+                "off", thresholds.candidate_bundle_phase(
+                    "2026-08-29T09:45"))
+            self.assertEqual(
+                "shadow", thresholds.candidate_bundle_phase(
+                    "2026-08-29T10:00"))
+            self.assertEqual(
+                "consume", thresholds.candidate_bundle_phase(
+                    "2026-08-29T16:00"))
+            self.assertEqual(
+                "rollback", thresholds.candidate_bundle_phase(
+                    "2026-08-30T16:00"))
+
+    def test_zero_open_funnel_repairs_are_forward_only(self):
+        self.assertEqual(
+            "2026-09-01T01:30:00+08:00",
+            thresholds.CANDIDATE_OPPORTUNITY_STATE_ACTIVATION_CST)
+        self.assertEqual(
+            "2026-09-01T02:45:00+08:00",
+            thresholds.CANDIDATE_OPPORTUNITY_STATE_V2_ACTIVATION_CST)
+        self.assertFalse(thresholds.candidate_exact_identity_enforced(
+            "2026-09-01T03:45"))
+        self.assertTrue(thresholds.candidate_exact_identity_enforced(
+            "2026-09-01T04:00"))
+        self.assertFalse(thresholds.side_regime_soft_veto_shadow_active(
+            "2026-09-01T03:45"))
+        self.assertTrue(thresholds.side_regime_soft_veto_shadow_active(
+            "2026-09-01T04:00"))
+        self.assertFalse(thresholds.zero_open_watchdog_active(
+            "2026-09-01T03:45"))
+        self.assertTrue(thresholds.zero_open_watchdog_active(
+            "2026-09-01T04:00"))
+        self.assertEqual(96, thresholds.ZERO_OPEN_WATCHDOG_THRESHOLD_SLOTS)
+
+    def test_goal_refresh_validates_target_and_full_migration_facts(self):
+        for moment in (BEFORE, AT):
+            expected = thresholds.coverage_target_rate(moment)
+            payload = {
+                "target_rate": expected,
+                "target_rate_migration": thresholds.coverage_migration_facts(
+                    moment),
+            }
+            with self.subTest(moment=moment):
+                self.assertEqual(
+                    expected,
+                    _validated_coverage_target(
+                        payload,
+                        as_of=moment,
+                        target_field="target_rate",
+                        migration_field="target_rate_migration",
+                        label="fixture",
+                    ),
+                )
+
+        lowered = {
+            "target_rate": thresholds.coverage_target_rate(AT) - 0.01,
+            "target_rate_migration": thresholds.coverage_migration_facts(AT),
+        }
+        with self.assertRaisesRegex(ValueError, "effective target"):
+            _validated_coverage_target(
+                lowered,
+                as_of=AT,
+                target_field="target_rate",
+                migration_field="target_rate_migration",
+                label="fixture",
+            )
+
+        tampered_facts = {
+            "target_rate": thresholds.coverage_target_rate(AT),
+            "target_rate_migration": thresholds.coverage_migration_facts(AT),
+        }
+        tampered_facts["target_rate_migration"]["activated"] = False
+        with self.assertRaisesRegex(ValueError, "migration facts"):
+            _validated_coverage_target(
+                tampered_facts,
+                as_of=AT,
+                target_field="target_rate",
+                migration_field="target_rate_migration",
+                label="fixture",
+            )
+
 
 class MigratedAuditDefaultsTests(unittest.TestCase):
     """闸门默认值必须是「按边界解析」而不是任何硬编码数字。"""
@@ -98,6 +530,8 @@ class MigratedAuditDefaultsTests(unittest.TestCase):
          "target_rate"),
         (audit_positioning_coverage.audit_positioning_collection_receipts,
          "target_rate"),
+        (audit_contract_statistics_coverage.audit_contract_statistics,
+         "forward_target_rate"),
     )
 
     def test_every_migrated_audit_resolves_its_default(self):
@@ -117,27 +551,54 @@ class MigratedAuditDefaultsTests(unittest.TestCase):
                 self.assertEqual(0.95, module.TARGET_RATE)
                 self.assertEqual(0.99, module.LEGACY_TARGET_RATE)
 
+    def test_contract_statistics_forward_cli_resolves_migrated_target(self):
+        self.assertIsNone(_cli_default(
+            audit_contract_statistics_coverage, "--forward-target-rate"))
+
 
 class BlacklistUntouchedTests(unittest.TestCase):
     """黑名单三审计挂在影子标签/信号验收链，本批不迁移。"""
 
     def test_blacklisted_audits_keep_99_percent(self):
         cases = (
-            (audit_multitimeframe_coverage, "audit_multitimeframe_coverage"),
-            (audit_asset_class_coverage, "audit_asset_class_coverage"),
-            (audit_contract_statistics_coverage,
-             "audit_contract_statistics_coverage"),
+            (audit_multitimeframe_coverage.audit_multitimeframe_coverage,
+             "minimum_rate"),
+            (audit_asset_class_coverage.audit_asset_class_coverage,
+             "minimum_rate"),
+            (audit_contract_statistics_coverage.audit_contract_statistics,
+             "minimum_coverage"),
         )
-        for module, name in cases:
-            function = getattr(module, name, None)
-            if function is None:
-                continue
-            with self.subTest(module=name):
+        for function, parameter in cases:
+            with self.subTest(function=function.__name__, parameter=parameter):
                 signature = inspect.signature(function)
-                for parameter in ("target_rate", "minimum_rate"):
-                    if parameter in signature.parameters:
-                        self.assertEqual(
-                            0.99, signature.parameters[parameter].default)
+                self.assertIn(parameter, signature.parameters)
+                self.assertEqual(0.99, signature.parameters[parameter].default)
+
+    def test_blacklisted_cli_defaults_keep_99_percent(self):
+        for module, option in (
+            (audit_multitimeframe_coverage, "--minimum-rate"),
+            (audit_asset_class_coverage, "--minimum-rate"),
+            (audit_contract_statistics_coverage, "--minimum-coverage"),
+        ):
+            with self.subTest(module=module.__name__, option=option):
+                self.assertEqual(0.99, _cli_default(module, option))
+
+    def test_consumer_side_99_percent_references_do_not_drift(self):
+        cases = (
+            (SCRIPTS / "decision_briefing.py",
+             "POSITIONING_MINIMUM_COVERAGE"),
+            (SCRIPTS / "collect_market_features.py",
+             "CONTRACT_STATS_MINIMUM_COVERAGE"),
+            (SCRIPTS / "collect_market_features.py",
+             "MARKET_FEATURE_MINIMUM_COVERAGE"),
+            (SCRIPTS / "collect_market_features.py",
+             "POSITIONING_MINIMUM_COVERAGE"),
+            (SCRIPTS / "recover_contract_statistics_current.py",
+             "MINIMUM_DIRECT_RATE"),
+        )
+        for path, name in cases:
+            with self.subTest(path=path.name, name=name):
+                self.assertEqual(0.99, _literal_assignment(path, name))
 
 
 class SourceHealthGateMigrationTests(unittest.TestCase):
@@ -267,6 +728,17 @@ class CalibrationTwinThresholdTests(unittest.TestCase):
             with self.subTest(module=module.__name__):
                 self.assertNotIn('"precision_at_least_90pct"', source)
                 self.assertNotIn('"wilson_95_low_at_least_90pct"', source)
+
+    def test_active_trade_contract_does_not_restate_obsolete_90pct_gate(self):
+        trader = (ROOT / "agents" / "live_trader.md").read_text(
+            encoding="utf-8")
+        decision_card = (ROOT / "core" / "decision_card.py").read_text(
+            encoding="utf-8")
+        self.assertNotIn("独立前瞻验证通过 90%", trader)
+        self.assertNotIn("独立90%门", decision_card)
+        self.assertIn("all_market_lightweight_open_v1", trader)
+        self.assertIn("OPEN不再要求六/九项展示卡", trader)
+        self.assertIn("当前独立前向门通过且主人", decision_card)
 
     def test_evaluator_and_audit_share_one_resolved_threshold(self):
         # 评估器自报的 target_precision 与审计的地板同源；边界前 0.90、

@@ -10,13 +10,22 @@ launch-but-failed 归因（P13）依赖它——不导出即永久丢失。本�
   audit_snapshot.py            # 增量导出（无新行=exit 0 空跑）
   audit_snapshot.py --status   # 只打统计（行数/速率/滚动窗估算），不导出
 
-产物: ./reports//audit_snapshots//audit_<UTC+8时间戳>_seq<起>-<止>.jsonl.gz
+产物: <PROJECT_ROOT>\\reports\\audit_snapshots\\audit_<UTC+8时间戳>_seq<起>-<止>.jsonl.gz
 游标: 同目录 _cursor.json（导出成功后才推进；文件先写 .tmp 再改名，断电安全）。
 告警: 若表内最小 sequence > 游标+1，说明两次导出间隔超过滚动窗、有行已滚丢——
       打 [GAP] 并照常导出剩余行（exit 0，丢失量记录在案）。
 只读保证: 源库一律 file:...?mode=ro 打开，本脚本绝不写 openclaw.sqlite。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import gzip
@@ -30,8 +39,8 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-STATE_DB = "C:/Users/Administrator/.openclaw/state/openclaw.sqlite"
-OUT_DIR = Path(r"./reports/audit_snapshots")
+STATE_DB = '<USER_HOME>/.openclaw/state/openclaw.sqlite'.replace('<USER_HOME>', str(__import__('pathlib').Path.home()))
+OUT_DIR = Path(_public_project_path('reports', 'audit_snapshots'))
 CURSOR_FILE = OUT_DIR / "_cursor.json"
 LOCK_FILE = OUT_DIR / "_lock"
 LOCK_STALE_SEC = 3600

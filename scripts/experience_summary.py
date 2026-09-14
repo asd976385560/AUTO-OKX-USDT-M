@@ -12,10 +12,19 @@ reviewer 每日复盘收尾段调用本脚本，不阻塞交易。
 绝不把历史 decision_card 的自由文本重新喂回检索。dry-run 默认，--apply 才写。
 
 用法：
-  run_okx_python.ps1 scripts/experience_summary.py --db-root ./db            # dry-run 列待填
-  run_okx_python.ps1 scripts/experience_summary.py --db-root ./db --apply    # 回填
+  run_okx_python.ps1 scripts/experience_summary.py --db-root <PROJECT_ROOT>/db            # dry-run 列待填
+  run_okx_python.ps1 scripts/experience_summary.py --db-root <PROJECT_ROOT>/db --apply    # 回填
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -139,7 +148,7 @@ def fill(db_root, apply: bool = False, limit: int = 500,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="L2 经验摘要确定性回填")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int, default=500)
     ap.add_argument("--refresh-labels", action="store_true",

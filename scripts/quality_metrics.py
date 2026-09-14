@@ -16,6 +16,15 @@ reviewer 08:05 开场读这个文件做数据驱动复盘。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import json
 import os
 import sqlite3
@@ -25,8 +34,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-if r"." not in sys.path:
-    sys.path.insert(0, r".")
+if _public_project_path() not in sys.path:
+    sys.path.insert(0, _public_project_path())
 from core.decision_card import validate_card  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
@@ -34,9 +43,9 @@ CST = timezone(timedelta(hours=8))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", r"./db"))
+DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _public_project_path('db')))
 REPORT_DIR = Path(os.environ.get(
-    "OKX_QUALITY_REPORT_DIR", r"./reports/quality"))
+    "OKX_QUALITY_REPORT_DIR", _public_project_path('reports', 'quality')))
 WINDOW_DAYS = 14
 FAILURE_STATUSES = frozenset({
     "error",
@@ -188,7 +197,12 @@ def metric_analysis() -> dict:
         ).fetchall()
         total_runs = len(runs)
         status_counts = Counter(r["status"] or "unknown" for r in runs)
-        skip_stale = status_counts.get("skipped", 0) + status_counts.get("stale", 0)
+        # 2026-08-19 F1：'error' = 9:30 硬闸占位行，与 skipped/stale 同属
+        # 「本轮没有可用分析」，必须进退化率分子，否则占位行只抬分母、
+        # 把质量指标稀释成「更健康」。
+        skip_stale = (status_counts.get("skipped", 0)
+                      + status_counts.get("stale", 0)
+                      + status_counts.get("error", 0))
         skip_stale_pct = round(skip_stale / total_runs * 100, 1) if total_runs else 0
 
         # signals

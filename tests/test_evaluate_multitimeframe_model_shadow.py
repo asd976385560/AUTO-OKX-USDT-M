@@ -122,6 +122,45 @@ class FrozenModelEvaluationTests(unittest.TestCase):
             {"fixture-model", "fixture-second-model"},
         )
 
+    def test_preexisting_post_snapshot_artifact_is_not_counted_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shadow = root / "shadow"
+            shadow.mkdir()
+            before = _artifact(generated="2026-08-12T00:00:45Z")
+            after = _artifact(generated="2026-08-12T01:00:00Z")
+            after["cycle_id"] = "2026-08-12T09:00"
+            (shadow / "before.json").write_text(
+                json.dumps(before), encoding="utf-8")
+            (shadow / "after.json").write_text(
+                json.dumps(after), encoding="utf-8")
+            market = root / "market.db"
+            con = sqlite3.connect(market)
+            con.execute(
+                "CREATE TABLE tick_snapshots("
+                "ts TEXT,symbol TEXT,last REAL,bid REAL,ask REAL)"
+            )
+            con.executemany(
+                "INSERT INTO tick_snapshots VALUES(?,?,?,?,?)",
+                [
+                    ("2026-08-12T00:15:00Z", "BTC-USDT-SWAP", 100.0, 99.9, 100.1),
+                    ("2026-08-12T00:30:00Z", "BTC-USDT-SWAP", 101.0, 100.9, 101.1),
+                ],
+            )
+            con.commit()
+            con.close()
+
+            payload, labels = evaluator.evaluate(
+                shadow_root=shadow,
+                market_db=market,
+                as_of_utc=datetime(2026, 8, 12, 0, 31, tzinfo=UTC),
+            )
+
+        self.assertEqual(payload["artifacts_discovered_in_root"], 2)
+        self.assertEqual(payload["artifacts_loaded"], 1)
+        self.assertEqual(payload["post_snapshot_artifacts_ignored"], 1)
+        self.assertEqual(len(labels), 1)
+
     def test_loader_excludes_pre_freeze_and_keeps_latest_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

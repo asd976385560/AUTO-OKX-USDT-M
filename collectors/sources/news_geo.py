@@ -13,7 +13,13 @@ if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 
 import news_writer  # noqa: E402
-from _mx_news_common import GEO_QUERIES, api_key, normalize, search  # noqa: E402
+from _mx_news_common import (  # noqa: E402
+    GEO_QUERIES,
+    MXQuotaExceeded,
+    api_key,
+    normalize,
+    search,
+)
 
 
 def fetch_items(errors: list[str] | None = None,
@@ -26,23 +32,37 @@ def fetch_items(errors: list[str] | None = None,
     rows: list[dict] = []
     recovered = 0
     final_failed = 0
+    quota_exhausted = False
+    queries_attempted = 0
+    queries_skipped_after_quota = 0
     for index, query in enumerate(GEO_QUERIES):
+        queries_attempted += 1
         last_error: Exception | None = None
+        query_succeeded = False
         for attempt, timeout_sec in ((1, 6.0), (2, 4.0)):
             if attempt == 2:
                 time.sleep(0.5)
             try:
                 rows.extend(search(query, key=key, timeout_sec=timeout_sec))
+                query_succeeded = True
                 if attempt == 2:
                     recovered += 1
                 break
+            except MXQuotaExceeded as exc:
+                last_error = exc
+                quota_exhausted = True
+                break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-        else:
+        if not query_succeeded:
             final_failed += 1
             if errors is not None:
                 errors.append(
                     f"{query}: {type(last_error).__name__}: {last_error}"[:150])
+        if quota_exhausted:
+            queries_skipped_after_quota = len(GEO_QUERIES) - index - 1
+            final_failed += queries_skipped_after_quota
+            break
         if index + 1 < len(GEO_QUERIES):
             time.sleep(0.5)
 
@@ -51,6 +71,10 @@ def fetch_items(errors: list[str] | None = None,
             "queries": len(GEO_QUERIES),
             "recovered_after_retry": recovered,
             "final_failed": final_failed,
+            "quota_exhausted": quota_exhausted,
+            "queries_attempted": queries_attempted,
+            "queries_skipped_after_quota": queries_skipped_after_quota,
+            "retry_skipped_non_retryable": quota_exhausted,
         })
 
     items = []

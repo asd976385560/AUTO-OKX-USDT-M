@@ -21,6 +21,15 @@ exit：0=全清 1=有告警已推 2=编排自身错误。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import os
@@ -37,10 +46,10 @@ if hasattr(sys.stderr, "reconfigure"):
 
 CST = timezone(timedelta(hours=8))
 PWSH = os.environ.get("OKX_PWSH_BIN", r"C:\Program Files\PowerShell\7\pwsh.exe")
-WRAP = r"./scripts/run_okx_python.ps1"
-RECON = r"./scripts/reconcile_exchange_closes.py"
-QQ_PUSH = r"./scripts/qq_push.py"
-LOG_DIR = Path(r"./logs/reconcile")
+WRAP = _public_project_path('scripts', 'run_okx_python.ps1')
+RECON = _public_project_path('scripts', 'reconcile_exchange_closes.py')
+QQ_PUSH = _public_project_path('scripts', 'qq_push.py')
+LOG_DIR = Path(_public_project_path('logs', 'reconcile'))
 _CREATE_NO_WINDOW = 0x08000000
 _MARK_WORDS = ("[GHOST", "[OVER_CLOSED", "[UNRECORDED", "[LEFTOVER")
 # LEDGER_DB / _APPLIED_CYCLE_RE 随 demo 自动 --apply 自愈路径一并移除（2026-08-06）。

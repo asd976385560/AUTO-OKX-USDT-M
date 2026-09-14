@@ -11,10 +11,19 @@
 发现漂移只报告，修复一律经人工确认后重新导出；本脚本零写入。
 
 用法：
-  run_okx_python.ps1 scripts/schema_drift_check.py [--db-root ./db] [--schema ./db/schema.sql]
+  run_okx_python.ps1 scripts/schema_drift_check.py [--db-root <PROJECT_ROOT>/db] [--schema <PROJECT_ROOT>/db/schema.sql]
 退出码：0=一致；1=有漂移；2=输入或 schema 解析错误。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import re
@@ -235,8 +244,8 @@ def collect_drifts(declared: SchemaMap, live: SchemaMap) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="schema drift check (read-only)")
-    ap.add_argument("--db-root", default=r"./db")
-    ap.add_argument("--schema", default=r"./db/schema.sql")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
+    ap.add_argument("--schema", default=_public_project_path('db', 'schema.sql'))
     args = ap.parse_args(argv)
     schema_path = Path(args.schema)
     db_root = Path(args.db_root)

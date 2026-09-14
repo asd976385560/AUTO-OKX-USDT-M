@@ -2,7 +2,7 @@
 doc: daily_template
 doc-version: V2.1-template
 last-updated: 2026-08-13
-updated-by: Codex
+updated-by: Claude
 change-summary: 规格书四段：writer 自动渲染市场总览/全市场扫描/数据完善率，新增 reviewer 必填 focus_next_day 次日关注（2026-08-14 激活边界起 validator 硬性要求，历史归档不反向加责）。
 role: 日/周/月复盘模板（reviewer / okx-reviewer -> account.db + reports/daily-reports/ + reports/weekly/）
 权威: skill.md（复盘/推送相关节）+ scripts/daily_report_writer.py + scripts/validate_daily_report.py
@@ -145,7 +145,7 @@ pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\s
 # dry-run（默认，只 print 不写）
 pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\scripts\daily_report_writer.py --json-file <PROJECT_ROOT>\tmp\review.json
 # 校验事实回执无误后才 apply
-pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\scripts\daily_report_writer.py --json-file <PROJECT_ROOT>\tmp\review.json --apply --profiles both
+pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\scripts\daily_report_writer.py --json-file <PROJECT_ROOT>\tmp\review.json --apply --profiles live
 
 # 仅修复/重渲染 Markdown（不重复 INSERT daily_reports；仍需显式 --apply）
 pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\scripts\daily_report_writer.py --json-file <PROJECT_ROOT>\tmp\review.json --markdown-only --apply

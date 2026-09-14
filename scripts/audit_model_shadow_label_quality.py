@@ -890,7 +890,21 @@ def audit(
     as_of = _parse_utc(evaluation["as_of_utc"])
     cost_bps = float(evaluation["round_trip_cost_bps"])
     contract = evaluation.get("acceptance_contract") or {}
-    artifacts, unreadable = _load_artifacts(shadow_root)
+    discovered_artifacts, unreadable = _load_artifacts(shadow_root)
+    artifacts: list[tuple[Path, dict[str, Any]]] = []
+    post_snapshot_artifacts: list[Path] = []
+    for artifact_path, artifact_payload in discovered_artifacts:
+        try:
+            generated_at = _parse_utc(
+                str(artifact_payload["generated_at_utc"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            unreadable.append(
+                f"{artifact_path}:invalid_generated_at_utc:{type(exc).__name__}")
+            continue
+        if generated_at > as_of:
+            post_snapshot_artifacts.append(artifact_path)
+            continue
+        artifacts.append((artifact_path, artifact_payload))
     expected, counters, model_gates = _expected_labels(
         artifacts, market_db, as_of=as_of, cost_bps=cost_bps,
     )
@@ -932,6 +946,7 @@ def audit(
         for item in evaluation.get("models") or []
     }
     model_metric_mismatches: list[dict[str, Any]] = []
+    rebuilt_model_gate_results: list[dict[str, Any]] = []
     gate_consistent = all(len(values) == 1 for values in model_gates.values())
     for model_key, gates in sorted(model_gates.items()):
         gate = next(iter(gates)) if len(gates) == 1 else False
@@ -952,6 +967,11 @@ def audit(
             min_long_labels=min_long_labels,
             min_short_labels=min_short_labels,
         )
+        rebuilt_model_gate_results.append({
+            "model_id": model_key[0],
+            "model_parameters_sha256": model_key[1],
+            **expected_overall,
+        })
         if not _metrics_match(expected_overall, result.get("overall") or {}):
             model_metric_mismatches.append({
                 "model": list(model_key), "scope": "overall",
@@ -1042,6 +1062,10 @@ def audit(
     # 地板=预注册激活边界解析出的值（边界前 0.90、边界起 0.80）。点精度与
     # Wilson 下界是孪生阈值，同一个地板同时管住两者。
     precision_floor = thresholds.shadow_target_precision(as_of)
+    expected_migration = thresholds.shadow_migration_facts(as_of)
+    migration_facts_exact = (
+        contract.get("target_precision_migration") == expected_migration
+    )
     thresholds_not_weakened = (
         declared_precision is not None and declared_precision >= precision_floor
         and minimum_wilson is not None and minimum_wilson >= precision_floor
@@ -1066,6 +1090,7 @@ def audit(
         "offline_gate_consistent_per_frozen_model": gate_consistent,
         "evaluation_generated_not_before_as_of": generated_at >= as_of,
         "acceptance_thresholds_not_weakened": thresholds_not_weakened,
+        "acceptance_threshold_migration_exact": migration_facts_exact,
         "cost_hurdle_not_weakened": (
             math.isfinite(cost_bps)
             and cost_bps >= 20.0
@@ -1129,9 +1154,13 @@ def audit(
             "shadow_root": str(shadow_root.resolve()),
             "market_db": str(market_db.resolve()),
             "as_of_utc": _iso(as_of),
+            "artifact_snapshot_rule": (
+                "generated_at_utc <= evaluation.as_of_utc"),
         },
         "row_profile": {
+            "artifacts_discovered_in_root": len(discovered_artifacts),
             "artifacts_loaded": len(artifacts),
+            "post_snapshot_artifacts_ignored": len(post_snapshot_artifacts),
             "selected_records": counters.get("selected_records", 0),
             "expected_mature_labels": len(expected),
             "observed_labels": len(actual),
@@ -1146,6 +1175,7 @@ def audit(
             "crossed_executable_price_records": counters.get(
                 "crossed_executable_price_records", 0),
         },
+        "model_gate_results": rebuilt_model_gate_results,
         "quality_rates": {
             "mature_label_completeness_rate": (
                 len(set(actual_keys) & set(expected_keys)) / len(expected_keys)
@@ -1164,6 +1194,10 @@ def audit(
         "failed_checks": failed,
         "evidence": {
             "unreadable_artifacts": unreadable[:20],
+            "post_snapshot_artifact_samples": [
+                str(path.relative_to(shadow_root))
+                for path in post_snapshot_artifacts[:20]
+            ],
             "duplicate_expected_keys": [list(key) for key in duplicate_expected[:20]],
             "duplicate_actual_keys": [list(key) for key in duplicate_actual[:20]],
             "missing_label_keys": [

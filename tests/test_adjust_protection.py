@@ -219,6 +219,36 @@ def _live_tp(algo_id="TP1", px=9.50, sz=100.0):
             "side": "sell", "reduceOnly": "true", "instId": "LINK-USDT-SWAP"}
 
 
+class ProtectionReadbackTruthTests(unittest.TestCase):
+    def test_query_failure_is_unreadable_not_naked(self) -> None:
+        with (
+            mock.patch.object(
+                oe.ox, "get_algo_orders", side_effect=OSError("api down")),
+            mock.patch.object(oe.time, "sleep"),
+        ):
+            result = oe.assert_protection_state(
+                "LINK-USDT-SWAP", "long", "live",
+                expected_sl_px=8.25, expected_sz=100.0, retries=1)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["unreadable"])
+        self.assertFalse(result["naked"])
+
+    def test_missing_size_requires_explicit_whole_position_proof(self) -> None:
+        base = _live_sl(sz=None)
+        with mock.patch.object(oe.ox, "get_algo_orders", return_value=[base]):
+            missing = oe.assert_protection_state(
+                "LINK-USDT-SWAP", "long", "live",
+                expected_sl_px=8.25, expected_sz=100.0, retries=1)
+        self.assertFalse(missing["ok"])
+
+        whole = {**base, "closeFraction": "1"}
+        with mock.patch.object(oe.ox, "get_algo_orders", return_value=[whole]):
+            proven = oe.assert_protection_state(
+                "LINK-USDT-SWAP", "long", "live",
+                expected_sl_px=8.25, expected_sz=100.0, retries=1)
+        self.assertTrue(proven["ok"])
+
+
 class AdjustProtectionFlowTests(unittest.TestCase):
     def _run(self, harness, **kw):
         import contextlib

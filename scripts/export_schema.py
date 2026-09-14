@@ -2,6 +2,15 @@
 """导出 V2.0 业务数据库 schema 到 db/schema.sql。"""
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import re
 from datetime import datetime, timedelta, timezone
@@ -11,7 +20,7 @@ from typing import Iterable
 from _db_ro import connect_ro
 
 SCHEMA_VERSION = "V2.0"
-DEFAULT_DB_ROOT = Path(r"./db")
+DEFAULT_DB_ROOT = Path(_public_project_path('db'))
 # V2.0 规范库；drill.db 永久保留为业务只读历史归档，唯一授权维护写入口
 # 为 scripts/archive/drill/drill_reconcile.py --apply（2026-08-06 归档）。
 # schema 导出不得暗示删除该库或维护入口。

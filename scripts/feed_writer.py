@@ -10,13 +10,22 @@ parses to ensure validity, then writes to trades_writer.py --stdin subprocess.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
 
-WRITER = Path(r"./collectors/trades_writer.py")
+WRITER = Path(_public_project_path('collectors', 'trades_writer.py'))
 
 
 def main() -> int:

@@ -121,7 +121,24 @@ class WriterBlocksTests(unittest.TestCase):
             block = drw._data_completeness_block(root, WINDOW_START, WINDOW_END)
         self.assertIn("2/3=66.7%", block)
         self.assertIn("⚠️ fast: 失败/超时 1/2 次", block)
-        self.assertIn("99%", block)
+        self.assertIn("四族仍按 ≥99% 判定", block)
+        self.assertIn("不提前套用 ≥95%", block)
+
+    def test_completeness_policy_activates_forward_only_at_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_ledger(root / "ledger.db", [
+                ("2026-08-15T19:45", "fast", "ok", "2026-08-15 19:46:00"),
+            ])
+            block = drw._data_completeness_block(
+                root, "2026-08-15 19:45:00", "2026-08-15 20:00:00")
+        self.assertIn("2026-08-15T20:00:00+08:00", block)
+        self.assertIn("只对新样本按 ≥95% 判定", block)
+        self.assertIn("边界前历史仍按 ≥99% 判定，不重算、不重判", block)
+        self.assertIn("按 ≥99% 的达成率保留为诊断列", block)
+        self.assertIn("audit_multitimeframe_coverage", block)
+        self.assertIn("audit_asset_class_coverage", block)
+        self.assertIn("audit_contract_statistics_coverage", block)
 
     def test_completeness_block_degrades_without_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,7 +157,8 @@ class WriterBlocksTests(unittest.TestCase):
         self.assertIn("总市值 $3.61T", block)
         self.assertIn("BTC.D 58.30%", block)
         self.assertIn("恐贪指数 64/Greed", block)
-        self.assertIn("regime=trend_up", block)
+        self.assertIn("24h回归预报=trend_up", block)
+        self.assertIn("非当前趋势", block)
 
     def test_market_overview_degrades_without_dbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

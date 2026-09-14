@@ -12,6 +12,15 @@ No production database, threshold, stage, or exchange path is accessed.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import csv
 import json
@@ -29,7 +38,7 @@ import offline_multitimeframe_calibration as calibration
 
 
 DEFAULT_INPUT = Path(
-    r"./reports/quality/goal-multitimeframe-policy-diagnostic-v2-20260812")
+    _public_project_path('reports', 'quality', 'goal-multitimeframe-policy-diagnostic-v2-20260812'))
 DEFAULT_OUTPUT = DEFAULT_INPUT / "policy_diagnostic.json"
 DEFAULT_TABLE = DEFAULT_INPUT / "calibration_policy_candidates.csv"
 

@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -17,9 +26,10 @@ from _kline_indicators import (
     kline_insert_plan,
 )
 from _okxcli import okx_json
-from _okx_http import fetch_candles_batch_sync, fetch_instruments_sync
+from _okx_market_source import fetch_candles_batch_sync, fetch_instruments_sync
 from public_macro import (
     fed_funds_rows,
+    fetch_ecb_dxy,
     import_xsearch_etf,
     latest_snapshot,
     reconcile_etf_consensus,
@@ -27,7 +37,7 @@ from public_macro import (
 )
 from regime_classifier import classify_regime
 
-DEFAULT_DB_ROOT = Path(r".\db")
+DEFAULT_DB_ROOT = Path(_public_project_path('db'))
 FRED_SERIES = {
     # 兼容字段名仍为 dxy，但实际序列是 FRED Nominal Broad U.S. Dollar Index，
     # 不是 ICE DXY。展示层必须标 USD_BROAD(DTWEXBGS)，禁混称。
@@ -61,6 +71,37 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _upsert_hourly_official_macro(
+    con: sqlite3.Connection,
+    *,
+    fed_rate,
+    fed_obs_date,
+    fed_d1,
+    ecb_rows: list[dict],
+) -> dict[str, object]:
+    """Persist only successfully parsed official FRED/ECB observations.
+
+    The function is deterministic and network-free so the hourly integration can
+    be regression-tested without touching production databases or public services.
+    """
+    fed_written = upsert_observations(
+        con, fed_funds_rows(fed_rate, fed_obs_date, d1=fed_d1)
+    )
+    ecb_written = upsert_observations(con, ecb_rows)
+    if fed_written or ecb_written:
+        con.commit()
+    ecb_dates = [
+        str(row.get("observation_date") or "")[:10]
+        for row in ecb_rows
+        if row.get("observation_date")
+    ]
+    return {
+        "fed_written": fed_written,
+        "ecb_written": ecb_written,
+        "ecb_latest_date": max(ecb_dates) if ecb_dates else None,
+    }
+
+
 def ms_to_iso(value: str | int | None) -> str | None:
     if value in (None, ""):
         return None
@@ -80,53 +121,45 @@ def to_float(value) -> float | None:
         return None
 
 
-def _fetch_gold_etf_d1() -> float | None:
-    """Fetch 518880 gold ETF daily return via mx-data. Returns e.g. -0.007475 for -0.7475%."""
+def gold_d1_from_history(con, gold_now: float | None) -> float | None:
+    """XAUT(USD) 自身 24h 收益（2026-08-19 D3，替代 mx_data_518880）。
+
+    弃用理由：旧口径查妙想「518880 黄金 ETF」——人民币计价、A 股时段、且是
+    **盘中至今涨幅**，与 gold 列的 CoinGecko tether-gold(XAUT/USD, 7×24)
+    根本不是同一个标的。实证 2026-08-13 当日 gold_d1 从 +0.0104 摆到
+    -0.0075（同日变号），A 股收盘后又冻结 17 小时。解析逻辑还是「遍历 dict
+    取第一个含 % 的值」，取到哪一列都不确定。
+
+    新口径：取 cross_market 自身序列中最接近 now-24h 的行（容差 ±90min），
+    d1=(now-prev)/prev。与 dxy_d1/spx_d1 的「上一观测→最新观测」同族
+    （FRED 是前一交易日收盘；XAUT 无收盘，24/7 资产的等价物是同时刻 24h）。
+    锚点必须是真实观测：carried_forward 含 'gold' 的行会让 d1 恒 0（假平静），
+    一律跳过；找不到合格锚点返回 None（宁缺勿假，绝不伪造 0）。
+    """
+    if gold_now is None or gold_now <= 0:
+        return None
     try:
-        import sys
-        from pathlib import Path
-        candidates = [
-            Path(__file__).resolve().parents[2] / "mx-data" / "mx_data.py",
-            Path.home() / ".openclaw" / "workspace" / "skills" / "mx-data" / "mx_data.py",
-        ]
-        mx_data_path = next((p for p in candidates if p.exists()), None)
-        if mx_data_path is None:
-            print("[WARN] mx_data.py not found, gold ETF skipped", flush=True)
-            return None
-        if not os.environ.get("MX_APIKEY"):
-            try:
-                cfg = (Path(__file__).resolve().parents[1] / "config.md").read_text(encoding="utf-8")
-                import re
-                m = re.search(r"###\s+4\.4 妙想资讯.*?\|\s*API Key\s*\|\s*([^|`\s][^|`]*)\s*\|", cfg, re.S)
-                if m:
-                    os.environ["MX_APIKEY"] = m.group(1).strip()
-            except Exception:
-                pass
-        sys.path.insert(0, str(mx_data_path.parent))
-        from mx_data import MXData
-        mx = MXData()
-        result = mx.query("518880黄金ETF近2个交易日最新价涨跌幅")
-        tables, _, _, err = mx.parse_result(result)
-        if err or not tables:
-            print(f"[WARN] mx-data gold query failed: {err}", flush=True)
-            return None
-        # Find the change % row (most recent = first row)
-        for table in tables:
-            for row in table.get("rows", []):
-                # Second field is usually change%, first is date, second is price, third is change%
-                for k, v in row.items():
-                    if isinstance(v, str) and "%" in v:
-                        try:
-                            pct = float(v.rstrip("%").rstrip("％")) / 100.0
-                            print(f"[INFO] Gold ETF (518880) daily return: {pct:.4f}", flush=True)
-                            return pct
-                        except ValueError:
-                            continue
-        print("[WARN] No gold ETF change% found in mx-data result", flush=True)
+        rows = con.execute(
+            "SELECT ts, gold, carried_forward FROM cross_market "
+            "WHERE gold IS NOT NULL "
+            "AND ts <= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours','+90 minutes') "
+            "AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours','-90 minutes') "
+            "ORDER BY ABS(strftime('%s',ts) - (strftime('%s','now') - 86400)) "
+            "LIMIT 5"
+        ).fetchall()
+    except sqlite3.Error:
         return None
-    except Exception as e:
-        print(f"[WARN] gold ETF fetch failed: {e}", flush=True)
-        return None
+    for row in rows:
+        try:
+            carried = str(row[2] or "")
+            prev = row[1]
+        except (IndexError, TypeError):
+            continue
+        if "gold" in carried:
+            continue
+        if prev:
+            return (float(gold_now) - float(prev)) / float(prev)
+    return None
 
 
 def _fetch_gold_price_usd() -> float | None:
@@ -233,8 +266,9 @@ def compute_indicators(candles: list[dict]) -> list[dict]:
     avg_loss = sum(loss) / 14 if loss else 0.0
     # Compute per-bar RSI, then update averages for next bar
     for i in range(14, len(deltas) + 1):
-        rs = avg_gain / avg_loss if avg_loss != 0 else 100.0
-        rsi_series.append(100.0 - (100.0 / (1.0 + rs)))
+        rsi = (100.0 if avg_gain > 0 else 50.0) if avg_loss == 0 else (
+            100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+        rsi_series.append(rsi)
         if i < len(deltas):
             avg_gain = (avg_gain * 13 + (deltas[i] if deltas[i] > 0 else 0.0)) / 14
             avg_loss = (avg_loss * 13 + (-deltas[i] if deltas[i] < 0 else 0.0)) / 14
@@ -282,6 +316,65 @@ def _fetch_all_swap_symbols() -> list[str]:
         and inst.get("state") == "live"
     ]
     return symbols, all_instruments
+
+
+def _latest_live_position_symbols(db_root: Path) -> list[str]:
+    """Read the latest account snapshot's active live symbols without writing.
+
+    Slow K-line batches are deadline-bounded.  Submitting current positions
+    first keeps position/exit evidence available when a later tail of the
+    all-market batch times out, while preserving every symbol in the request
+    and leaving the total budget unchanged.
+    """
+    path = Path(db_root) / "account.db"
+    if not path.is_file():
+        return []
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        latest = connection.execute(
+            "SELECT MAX(ts) FROM account_snapshots WHERE profile='live'"
+        ).fetchone()[0]
+        if latest is None:
+            return []
+        rows = connection.execute(
+            "SELECT symbol,sz FROM position_snapshots "
+            "WHERE profile='live' AND ts=? ORDER BY symbol",
+            (str(latest),),
+        ).fetchall()
+        output: list[str] = []
+        for symbol, size in rows:
+            try:
+                active = abs(float(size or 0)) > 0
+            except (TypeError, ValueError):
+                active = False
+            normalized = str(symbol or "").strip()
+            if active and normalized and normalized not in output:
+                output.append(normalized)
+        return output
+    except sqlite3.Error:
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _prioritize_symbols(
+    symbols: list[str], priority_symbols: list[str],
+) -> list[str]:
+    """Stable position-first ordering without changing the universe."""
+    available = set(symbols)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for symbol in [*priority_symbols, *symbols]:
+        if symbol in available and symbol not in seen:
+            ordered.append(symbol)
+            seen.add(symbol)
+    return ordered
 
 
 def _ensure_instruments_cache_table(con: sqlite3.Connection) -> None:
@@ -382,6 +475,8 @@ def _collect_instruments_cache(
 def collect_slow_klines(
     market_con: sqlite3.Connection,
     symbols: list[str],
+    *,
+    timing_out: dict[str, float] | None = None,
 ) -> tuple[int, list[str]]:
     """Fetch 1H/4H/1D/1W/1M K-lines + indicators for ALL symbols.
 
@@ -402,9 +497,12 @@ def collect_slow_klines(
         )
     deadline = time.monotonic() + SLOW_KLINE_BUDGET_S
     for tf, bar in SLOW_TIMEFRAMES.items():
+        timeframe_started = time.monotonic()
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             incomplete.append(f"{tf}:skipped_budget")
+            if timing_out is not None:
+                timing_out[tf] = 0.0
             continue
         batch = fetch_candles_batch_sync(
             symbols,
@@ -448,6 +546,9 @@ def collect_slow_klines(
                 if insert_plan["extended"]:
                     base_row += extended_row_tail(item)
                 rows_to_write.append(base_row)
+        if timing_out is not None:
+            timing_out[tf] = round(
+                time.monotonic() - timeframe_started, 3)
 
     market_con.executemany(insert_plan["sql"], rows_to_write)
     market_con.commit()
@@ -600,8 +701,8 @@ def _deterministic_sentiment(news_con: sqlite3.Connection) -> int:
     （脱 OKX 硬依赖，OKX 死也不归零）。写库仍走慢采（news.db 单写者），不破单写不变量。"""
     try:
         import sys as _sys
-        if r".\scripts" not in _sys.path:
-            _sys.path.insert(0, r".\scripts")
+        if _public_project_path('scripts') not in _sys.path:
+            _sys.path.insert(0, _public_project_path('scripts'))
         import sentiment_compute as _sc
         main_db = next((r[2] for r in news_con.execute("PRAGMA database_list").fetchall()
                         if r[1] == "main"), None)
@@ -626,6 +727,54 @@ def _deterministic_sentiment(news_con: sqlite3.Connection) -> int:
         return 0
 
 
+_COIN_SENTIMENT_INSERT_SQL = (
+    "INSERT OR REPLACE INTO coin_sentiment "
+    "(ts, symbol, period, label, bullish_ratio, bearish_ratio, bullish_cnt, "
+    "bearish_cnt, neutral_cnt, mention_cnt, news_mention_cnt, x_mention_cnt, raw) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _write_coin_sentiment_rows(
+    news_con: sqlite3.Connection,
+    rows: list[tuple],
+    *,
+    lock_retry_seconds: float = 1.0,
+) -> int:
+    """Atomically write one fetched payload, retrying one transient DB lock.
+
+    The hourly aggregator intentionally runs deterministic news and slow data in
+    parallel.  Both own disjoint tables in ``news.db``, but SQLite still has a
+    database-wide writer lock.  Reusing the already fetched payload after one
+    bounded wait preserves the primary source without issuing another network
+    request or changing scheduler timing.
+    """
+    if not rows:
+        return 0
+    for attempt in range(2):
+        try:
+            news_con.executemany(_COIN_SENTIMENT_INSERT_SQL, rows)
+            news_con.commit()
+            if attempt:
+                print(
+                    "[collect_slow][WARN] coin_sentiment primary write "
+                    "recovered after one database-lock retry",
+                    flush=True,
+                )
+            return len(rows)
+        except sqlite3.OperationalError as exc:
+            news_con.rollback()
+            locked = "locked" in str(exc).casefold()
+            if attempt == 0 and locked:
+                time.sleep(max(0.0, float(lock_retry_seconds)))
+                continue
+            raise
+        except Exception:
+            news_con.rollback()
+            raise
+    return 0
+
+
 def collect_coin_sentiment(news_con: sqlite3.Connection) -> int:
     """主源 OKX sentiment-rank（可用时全币覆盖最广）；失败/空 → 确定性自有数据兜底
     （脱 OKX 依赖，§6/P5 resilience）。"""
@@ -633,6 +782,7 @@ def collect_coin_sentiment(news_con: sqlite3.Connection) -> int:
     try:
         payload = okx_json("news", "sentiment-rank", "--period", "24h", "--limit", "50")
         ts_local = utc_now_iso()
+        primary_rows: list[tuple] = []
         for batch in payload:
             # OKX sentiment-rank returns 24h aggregated data with a daily timestamp (UTC 00:00).
             # Using the server timestamp makes the data appear stale (>24h) within hours.
@@ -644,29 +794,24 @@ def collect_coin_sentiment(news_con: sqlite3.Connection) -> int:
                 if SYMBOLS is not None and ccy not in SYMBOLS:
                     continue
                 sentiment = detail.get("sentiment") or {}
-                news_con.execute(
-                    "INSERT OR REPLACE INTO coin_sentiment "
-                    "(ts, symbol, period, label, bullish_ratio, bearish_ratio, bullish_cnt, bearish_cnt, neutral_cnt, mention_cnt, news_mention_cnt, x_mention_cnt, raw) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        ts,
-                        f"{ccy}-USDT-SWAP",
-                        period,
-                        sentiment.get("label"),
-                        to_float(sentiment.get("bullishRatio")),
-                        to_float(sentiment.get("bearishRatio")),
-                        int(detail.get("bullishCnt", "0")),
-                        int(detail.get("bearishCnt", "0")),
-                        int(detail.get("neutralCnt", "0")),
-                        int(detail.get("mentionCnt", "0")),
-                        int(detail.get("newsMentionCnt", "0")),
-                        int(detail.get("xMentionCnt", "0")),
-                        json.dumps(detail, ensure_ascii=False),
-                    ),
-                )
-                inserted += 1
-        news_con.commit()
+                primary_rows.append((
+                    ts,
+                    f"{ccy}-USDT-SWAP",
+                    period,
+                    sentiment.get("label"),
+                    to_float(sentiment.get("bullishRatio")),
+                    to_float(sentiment.get("bearishRatio")),
+                    int(detail.get("bullishCnt", "0")),
+                    int(detail.get("bearishCnt", "0")),
+                    int(detail.get("neutralCnt", "0")),
+                    int(detail.get("mentionCnt", "0")),
+                    int(detail.get("newsMentionCnt", "0")),
+                    int(detail.get("xMentionCnt", "0")),
+                    json.dumps(detail, ensure_ascii=False),
+                ))
+        inserted = _write_coin_sentiment_rows(news_con, primary_rows)
     except Exception as e:  # noqa: BLE001 —— OKX 不可用转兜底，不让整轮采集失败
+        news_con.rollback()
         print(f"[collect_slow][WARN] OKX sentiment-rank 不可用，转确定性兜底: {e}", flush=True)
         inserted = 0
     if inserted == 0:
@@ -683,6 +828,9 @@ def main() -> int:
     args = parser.parse_args()
     db_root = Path(args.db_root)
     ts = utc_now_iso()
+    total_started = time.monotonic()
+    phase_started = total_started
+    timing_s: dict[str, object] = {}
 
     market_con = open_db(db_root, "market.db")
     news_con = open_db(db_root, "news.db")
@@ -702,10 +850,23 @@ def main() -> int:
     # 让 slow_collect wrapper 如实记 ledger slow='degraded'（仍算完成不阻断，但 analyst 拿到信号），
     # 不再"K线/宏观全挂也 return 0 记 ok"。
     degraded: list[str] = []
+    prioritized: list[str] = []
     # Dynamically discover all live USDT-M SWAP symbols
     try:
         all_symbols, all_instruments = _fetch_all_swap_symbols()
+        position_priority = _latest_live_position_symbols(db_root)
+        all_symbols = _prioritize_symbols(all_symbols, position_priority)
         print(f"[collect_slow] Discovered {len(all_symbols)} USDT-M SWAP contracts", flush=True)
+        slow_universe = set(all_symbols)
+        prioritized = [
+            symbol for symbol in position_priority if symbol in slow_universe
+        ]
+        if prioritized:
+            print(
+                "[collect_slow] position-first slow K-line priority: "
+                + ",".join(prioritized),
+                flush=True,
+            )
     except Exception as e:
         print(f"[collect_slow] WARNING: Could not fetch symbols ({e}); using empty list", flush=True)
         all_symbols, all_instruments = [], []
@@ -719,14 +880,21 @@ def main() -> int:
     except Exception as e:
         print(f"[collect_slow] instruments_cache skip ({e})", flush=True)
 
+    timing_s["symbols_and_instruments"] = round(
+        time.monotonic() - phase_started, 3)
+    phase_started = time.monotonic()
+
     bucket = TokenBucket(rate_per_sec=0.5, capacity=2)
 
     # ── K-lines (1H/4H/1D/1W/1M) ───────────────────────────────────────────
     # ALL symbols get slow K-lines (full coverage for accuracy)
+    kline_incomplete: list[str] = []
     try:
+        kline_timeframes: dict[str, float] = {}
         kline_rows, kline_incomplete = collect_slow_klines(
-            market_con, all_symbols
+            market_con, all_symbols, timing_out=kline_timeframes
         )
+        timing_s["slow_kline_timeframes"] = kline_timeframes
         print(f"[collect_slow] Wrote {kline_rows} slow kline rows for {len(all_symbols)} symbols", flush=True)
         if kline_incomplete:
             degraded.append("klines")
@@ -742,21 +910,44 @@ def main() -> int:
     if all_symbols and kline_rows == 0 and "klines" not in degraded:
         degraded.append("klines")  # 有币种却一根没写 = 静默全失败
 
+    timing_s["slow_klines"] = round(time.monotonic() - phase_started, 3)
+    phase_started = time.monotonic()
+
     # ── Macro data ────────────────────────────────────────────────────────────
-    # Gold ETF (518880) daily return via mx-data + gold spot price via FRED
-    gold_d1 = _fetch_gold_etf_d1()
+    # gold = CoinGecko tether-gold(XAUT/USD)；D3 起 gold_d1 由该序列自身算出，
+    # 需要 regime.db 连接，故实际计算移到 cm_con 可用之后（carry-forward 判定后）。
+    gold_d1 = None
     gold_price = _fetch_gold_price_usd()
+    ecb_rows: list[dict] = []
+    # D4：观测日预初始化 —— FRED 整块失败时下游（:928 的滞后判定、source_meta
+    # 与类型化列）不得 NameError。原代码只是恰好没踩到。
+    dxy_obs_date = vix_obs_date = spx_obs_date = None
 
     try:
         with make_client(timeout=15.0) as client:
             fred_key = load_fred_key()
             dxy, dxy_d1, dxy_obs_date = fred_latest(client, bucket, FRED_SERIES["dxy"], fred_key)
-            vix, vix_d1, _vix_date = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
-            spx, spx_d1, _spx_date = fred_latest(client, bucket, FRED_SERIES["spx"], fred_key)
+            # 2026-08-19 D4：vix/spx 的观测日此前被丢弃（source_meta 只有
+            # {"source":"fred"}），消费方无从判断陈旧。现落 source_meta +
+            # 类型化列双写。
+            vix, vix_d1, vix_obs_date = fred_latest(client, bucket, FRED_SERIES["vix"], fred_key)
+            spx, spx_d1, spx_obs_date = fred_latest(client, bucket, FRED_SERIES["spx"], fred_key)
             # 联邦基金利率同 client/bucket 顺路采；失败只 WARN（fred_latest 内已兜），
             # 不影响 cross_market 行——落库在下方 public_macro 同步块（宁缺勿假）。
             fed_rate, fed_d1, fed_obs_date = fred_latest(
                 client, bucket, FRED_SERIES["fed_funds"], fred_key)
+            # ECB publishes its weekday reference rates after the 07:55 CST daily
+            # maintenance window.  Refresh in the existing hourly slow cycle so a
+            # newly published official row does not wait until the next morning.
+            # Failure is source-local and preserves the prior audited observation.
+            try:
+                ecb_rows = fetch_ecb_dxy(client, timeout=12.0)
+            except Exception as _e:  # noqa: BLE001
+                print(
+                    "[collect_slow][WARN] ECB reference-rate refresh skipped: "
+                    f"{type(_e).__name__}: {_e}",
+                    flush=True,
+                )
             # DefiLlama /v2/chains 是本块唯一无内层保护的取数——超时/坏响应会抛异常冒泡到
             # 下方 except、跳过整行 cross_market（连带丢弃新鲜的 dxy/regime），使整个 :00 槽
             # regime stale 丢轮。与 CoinGecko/FRED 一致包内层 try：失败→None→走 697 行
@@ -785,13 +976,24 @@ def main() -> int:
         try:
             imported = import_xsearch_etf(news_con, cm_con)
             consensus = reconcile_etf_consensus(cm_con)
-            fed_written = upsert_observations(
-                cm_con, fed_funds_rows(fed_rate, fed_obs_date, d1=fed_d1))
-            if fed_written:
-                cm_con.commit()
+            official_written = _upsert_hourly_official_macro(
+                cm_con,
+                fed_rate=fed_rate,
+                fed_obs_date=fed_obs_date,
+                fed_d1=fed_d1,
+                ecb_rows=ecb_rows,
+            )
+            if official_written["fed_written"]:
                 print(
                     "[collect_slow] fed_funds(DFF) "
                     f"{fed_rate}% as_of={fed_obs_date} -> macro_observations",
+                    flush=True,
+                )
+            if official_written["ecb_written"]:
+                print(
+                    "[collect_slow] ECB reference-rate refresh "
+                    f"rows={official_written['ecb_written']} "
+                    f"latest={official_written['ecb_latest_date']}",
                     flush=True,
                 )
             public_macro_snapshot = latest_snapshot(cm_con)
@@ -810,10 +1012,13 @@ def main() -> int:
         # 决策面对空值，且 P1 复制链把 NULL 传播到之后每一轮（DTWEXBGS 官方发布
         # 延迟约 1 周属正常节奏，值"陈旧"仍可用；d1 不伪造，沿用时置 None）。
         prev_vals = cm_con.execute(
-            "SELECT dxy, vix, spx, gold, defillama_tvl_total, btc_etf_flow "
+            "SELECT dxy, vix, spx, gold, defillama_tvl_total, btc_etf_flow, "
+            "dxy_as_of, vix_as_of, spx_as_of, gold_as_of "
             "FROM cross_market WHERE dxy IS NOT NULL OR vix IS NOT NULL OR spx IS NOT NULL "
             "ORDER BY ts DESC LIMIT 1"
-        ).fetchone() or (None,) * 6
+        ).fetchone() or (None,) * 10
+        # 上一行的观测日（与 prev_vals 同一行取出，保证值与观测日同源）。
+        prev_as_of = tuple(prev_vals[6:10]) + (None,) * 4
         carried_forward = []
         if dxy is None and prev_vals[0] is not None:
             dxy, dxy_d1 = prev_vals[0], None
@@ -850,6 +1055,10 @@ def main() -> int:
             gold_price = prev_vals[3]
             carried_forward.append("gold")
             print(f"[collect_slow][WARN] gold 拉取失败，沿用上一行值 {gold_price}", flush=True)
+        # D3：d1 必须在 carry-forward 判定之后算 —— 本轮 gold 若是沿用值，
+        # 与 24h 前锚点相减得到的是失真读数，此时直接留 None（不伪造 0）。
+        if "gold" not in carried_forward:
+            gold_d1 = gold_d1_from_history(cm_con, gold_price)
         if tvl_total is None and prev_vals[4] is not None:
             tvl_total = prev_vals[4]
             carried_forward.append("defillama_tvl_total")
@@ -932,8 +1141,11 @@ def main() -> int:
             "(ts, dxy, gold, gold_d1, vix, spx, spx_d1, btc_etf_flow, dxy_d1, vix_d1, "
             "defillama_tvl_total, regime, btc_dominance, total_mcap_usd, total_volume_24h_usd, "
             "btc_etf_net_flow_usd, dxy_calc_ecb, dxy_calc_ecb_d1, fear_greed, "
-            "fear_greed_label, source_meta, carried_forward) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "fear_greed_label, source_meta, carried_forward, "
+            # D4：观测日类型化列 —— 消费方不必解析 source_meta JSON 就能判陈旧。
+            "dxy_as_of, vix_as_of, spx_as_of, gold_as_of, btc_etf_as_of) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?)",
             (ts, dxy, gold_price, gold_d1, vix, spx, spx_d1, btc_mcap_chg_24h_usd,
              dxy_d1, vix_d1, tvl_total, regime, cg["btc_d"], cg["total_mcap_usd"],
              cg["total_volume_24h_usd"], btc_etf_net_flow_usd,
@@ -945,12 +1157,21 @@ def main() -> int:
                       "metric": "nominal_broad_usd_index",
                       "legacy_field": "dxy",
                       "is_ice_dxy": False,
-                      "source_as_of": dxy_obs_date,
+                      "source_as_of": (
+                          prev_as_of[0] if "dxy" in carried_forward
+                          else dxy_obs_date),
                   },
-                 "vix": {"source": "fred"},
-                 "spx": {"source": "fred"},
+                 "vix": {"source": "fred", "series": "VIXCLS",
+                         "source_as_of": vix_obs_date},
+                 "spx": {"source": "fred", "series": "SP500",
+                         "source_as_of": spx_obs_date},
                  "gold": {"source": "coingecko_tether_gold_proxy"},
-                 "gold_d1": {"source": "mx_data_518880"},
+                 "gold_d1": {
+                     "source": "coingecko_tether_gold_proxy_24h",
+                     "method": "self_series_rolling_24h",
+                     "note": ("XAUT/USD 自身 24h；2026-08-19 起弃用 "
+                              "mx_data_518880（A股518880·人民币·盘中至今涨幅）"),
+                 },
                  "defillama_tvl_total": {"source": "defillama"},
                  "btc_mcap_chg_24h_usd": {"source": "coingecko"},
                  "btc_etf_net_flow_usd": etf_meta,
@@ -966,13 +1187,26 @@ def main() -> int:
                      "source_as_of": fear_row.get("observation_date"),
                  },
              }, ensure_ascii=False),
-             json.dumps(carried_forward, ensure_ascii=False)),
+             json.dumps(carried_forward, ensure_ascii=False),
+             # D4 + 2026-08-20 修正：沿用值不冒充新观测，但**观测日要一起
+             # 沿用**。写今天的日期才叫冒充；写原观测日是实话——那个值就是
+             # 那次观测被再次端出来。原实现写 None，把已知的陈旧度丢在了
+             # 源头失效那一轮（carry-forward 只在拉取失败时发生），最该看见
+             # 陈旧度的时候反而看不见。取不到上一行观测日才退回 None。
+             (prev_as_of[0] if "dxy" in carried_forward else dxy_obs_date),
+             (prev_as_of[1] if "vix" in carried_forward else vix_obs_date),
+             (prev_as_of[2] if "spx" in carried_forward else spx_obs_date),
+             (prev_as_of[3] if "gold" in carried_forward else ts),
+             (etf_meta or {}).get("source_as_of")),
         )
         cm_con.commit()
         print(f"[collect_slow] cross_market 单写 regime.db OK (regime={regime})", flush=True)
     except Exception as e:
         print(f"[collect_slow] Macro/cross_market collection failed: {e}", flush=True)
         degraded.append("cross_market")
+
+    timing_s["macro_regime"] = round(time.monotonic() - phase_started, 3)
+    phase_started = time.monotonic()
 
     # ── Coin sentiment ────────────────────────────────────────────────────────
     try:
@@ -981,6 +1215,8 @@ def main() -> int:
         print(f"[WARN] coin_sentiment 跳过（API 不可达）: {e}", flush=True)
         sentiment_rows = 0
         degraded.append("coin_sentiment")
+
+    timing_s["coin_sentiment"] = round(time.monotonic() - phase_started, 3)
 
     market_con.close()
     news_con.close()
@@ -1004,6 +1240,7 @@ def main() -> int:
     except Exception as e:
         print(f"[collect_slow] cycle_runs write failed: {e}", flush=True)
 
+    timing_s["total"] = round(time.monotonic() - total_started, 3)
     print(
         json.dumps(
             {
@@ -1014,7 +1251,12 @@ def main() -> int:
                     "coin_sentiment": sentiment_rows,
                 },
                 "symbols_count": len(all_symbols),
+                "position_priority_symbols": prioritized,
                 "degraded": degraded,
+                "degradation_details": {
+                    "slow_kline_incomplete": kline_incomplete,
+                },
+                "timing_s": timing_s,
                 "proxy": os.environ.get("OKX_PROXY_URL", "none"),
             },
             ensure_ascii=False,

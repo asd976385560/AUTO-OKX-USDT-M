@@ -74,6 +74,7 @@ def _run_open(pre_sz: float, *, adjust_result: dict | None = None,
               expected_pre_position_pos_id: str | None = None,
               expected_pre_position_c_time: str | None = None,
               position_reads: list[list[dict]] | None = None,
+              receipt_context: dict | None = None,
               io_mocks: dict | None = None):
     """跑一次 open_position，返回 (回执, adjust_protection 的 mock, repair 的 mock)。"""
     adjust_mock = mock.Mock(return_value=adjust_result or {
@@ -106,7 +107,8 @@ def _run_open(pre_sz: float, *, adjust_result: dict | None = None,
                             side_effect=_ready_multitimeframe))
         p(mock.patch.object(oe.ei, "reserve",
                             return_value={"status": "reserved", "fingerprint": "FP"}))
-        for name in ("mark_submitting", "mark_submitted", "mark_completed"):
+        for name in ("mark_submitting", "mark_submitted", "mark_completed",
+                     "mark_failed_clean", "mark_uncertain"):
             p(mock.patch.object(oe.ei, name))
         p(mock.patch.object(oe.ox, "get_balance", return_value={"ok": True}))
         p(mock.patch.object(oe.ac, "extract_settlement_capacity",
@@ -147,7 +149,11 @@ def _run_open(pre_sz: float, *, adjust_result: dict | None = None,
 
         result = oe.open_position(
             SYMBOL, "long", 1.0, 5.0, sl, "live", cycle_id=CYCLE,
-            receipt_context=_valid_receipt_context(CYCLE, "long", SYMBOL),
+            receipt_context=(
+                receipt_context
+                if receipt_context is not None
+                else _valid_receipt_context(CYCLE, "long", SYMBOL)
+            ),
             expected_pre_position_exists=expected_pre_position_exists,
             expected_pre_position_sz=expected_pre_position_sz,
             expected_pre_position_pos_id=expected_pre_position_pos_id,
@@ -236,6 +242,28 @@ class AddTriggersProtectionSyncTests(unittest.TestCase):
         self.assertEqual(kwargs["reason_code"], "post_add_resize")
         self.assertEqual(kwargs["cycle_id"], CYCLE)
         self.assertEqual(result["protection_sync"]["path"], "amend_consolidate")
+
+    def test_add_strips_open_package_only_for_nested_protection(self) -> None:
+        context = _valid_receipt_context(CYCLE, "long", SYMBOL)
+        package = {
+            "contract": "open_execution_package_v1",
+            "entry": 0.0702,
+            "stop": 0.0677,
+            "target": 0.075,
+            "exit_mode": "fixed_tp",
+        }
+        attestation = {"contract": "actor_attestation_v1", "ok": True}
+        context[oe.OPEN_EXECUTION_PACKAGE_KEY] = package
+        context["actor_attestation"] = attestation
+
+        result, adjust, _repair, _journal = _run_open(
+            pre_sz=1.0, receipt_context=context)
+
+        self.assertTrue(result["ok"], result)
+        nested_context = adjust.call_args.kwargs["receipt_context"]
+        self.assertNotIn(oe.OPEN_EXECUTION_PACKAGE_KEY, nested_context)
+        self.assertEqual(nested_context["actor_attestation"], attestation)
+        self.assertEqual(context[oe.OPEN_EXECUTION_PACKAGE_KEY], package)
 
     def test_fresh_open_never_touches_protection(self) -> None:
         """全新开仓只有一张 SL，收敛无意义；多跑一次改单纯属加风险。"""

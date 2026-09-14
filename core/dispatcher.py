@@ -12,7 +12,9 @@ unified-live/push 的幂等统一使用（demo stage 已于 2026-08-06 下线，
   - stage demo：**2026-08-06 全量下线**，stage 已从 trigger_agent 的路由表移除，
         手动也起不了。人工回滚 analyst 写入 analysis 后，仍补派 full live。
   - stage push：**live** 的有效业务终态已写、且同 cycle live profile 租约已释放、
-        push 未派 → 抢锁 → fire。业务终态
+        push 未派 → 抢锁 → fire。2026-08-16 07:30 CST 起业务战报只允许
+        `slot <= now < slot+14m`；LOOKBACK 仅作终态核验，不新起旧槽。
+        激活前已合法起棒的历史 runner 不在 dispatcher 内追溯终止/改判。业务终态
         包括成交/HOLD，也包括可证明零交易所副作用的显式 REJECT/ERROR；后者按
         原始错误事实出报告，绝不伪造成 WAIT。
         从 2026-08-13T04:00 起，若监督器已证明 live 失败、租约已释放且仍无有效
@@ -26,10 +28,19 @@ unified-live/push 的幂等统一使用（demo stage 已于 2026-08-06 下线，
 零模型名（红线 #1）：起棒经 trigger_agent（agent-id 集中在那）。
 
 用法（OpenClaw 命令型 cron */2min）：
-    pwsh -NoProfile -File ./scripts/run_okx_python.ps1 ./core/dispatcher.py --db-root ./db
+    pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 <PROJECT_ROOT>\core\dispatcher.py --db-root <PROJECT_ROOT>\db
     OKX_TRIGGER_DRYRUN=1 + 上述 wrapper 命令   # 只验逻辑不真起棒
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import hashlib
@@ -41,19 +52,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-_PROJECT_ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
-
-
-def _project_path(*parts: str) -> str:
-    return str(_PROJECT_ROOT.joinpath(*parts))
-
-
-_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _project_path("collectors"))
+_COLLECTORS = os.environ.get("OKX_COLLECTORS_DIR", _public_project_path('collectors'))
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
-_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", _project_path("scripts"))
+_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", _public_project_path('scripts'))
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
@@ -63,7 +65,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import ledger          # noqa: E402  connect/cycle_id_for/try_stage/stage_dispatched
 import trigger_agent   # noqa: E402  fire 适配层
-from cycle_contract import validate_cycle_id  # noqa: E402
+import _acceptance_thresholds as thresholds  # noqa: E402
 from stage_failure_contract import (  # noqa: E402
     load_live_failure,
     load_live_report_barrier,
@@ -73,18 +75,27 @@ from stage_failure_contract import (  # noqa: E402
 CST = timezone(timedelta(hours=8))
 MAX_AGE_SEC = 900  # analysis 写出 ≤15min 内仍可起 trader；超过视陈旧不追
 COLLECT_MAX_AGE = 900  # 采集齐活后 ≤15min 内仍可起 unified live；gate 继续 registry-aware
-LOOKBACK_SLOTS = 4  # P4b：dispatch_once 回扫最近 N+1 个 15min 槽，给 push 等晚到 stage 多轮补派机会（stage_dispatch 闩锁保幂等）
+LOOKBACK_SLOTS = 4  # 保留最近 N+1 槽终态/送达核验视野；激活后业务 push 不得从旧槽补派
 PUSH_VERIFY_MIN_SEC = 900   # push 派发后给足 15min 送达，再核验
 PUSH_VERIFY_MAX_SEC = 2400  # 只核验最近 40min 内派发的 push；窗口自然滚动即幂等，无需去重状态
-PUSH_EVENT_LOG = Path(_project_path("logs", "push", "qq_push_dedupe.jsonl"))
+PUSH_EVENT_LOG = Path(_public_project_path('logs', 'push', 'qq_push_dedupe.jsonl'))
 STAGE_STATUS_DIR = Path(os.environ.get(
-    "OKX_STAGE_STATUS_DIR", _project_path("logs", "stage-status")))
-CANONICAL_DB_ROOT = Path(_project_path("db")).resolve()
+    "OKX_STAGE_STATUS_DIR", _public_project_path('logs', 'stage-status')))
 BUSINESS_ERROR_REPORTABLE_FROM = "2026-08-14T02:15"
 # Same-slot reconciled closes before this boundary keep their historical
 # dispatch/report treatment.  This prevents deployment from chasing a slot
 # whose legacy close report may already have been delivered.
 RECONCILE_ANALYSIS_TERMINAL_FROM = "2026-08-14T04:00"
+# Forward-only business-report freshness boundary.  LOOKBACK_SLOTS remains 4
+# for read-only verification and late-terminal observation, but must never turn
+# into an old business-report retry after this instant.  stage_runner's C2C
+# failure alert is a separate alert path and is intentionally unaffected.
+BUSINESS_REPORT_SAME_SLOT_FROM = thresholds.parse_cst(
+    thresholds.PUSH_SAME_SLOT_ACTIVATION_CST)
+BUSINESS_REPORT_MAX_AGE_SEC = thresholds.PUSH_SAME_SLOT_MAX_AGE_SECONDS
+
+
+from collectors.cycle_contract import validate_cycle_id
 
 
 def _root_namespace(db_root: Path | str) -> str:
@@ -97,6 +108,25 @@ def _root_namespace(db_root: Path | str) -> str:
         os.path.normcase(os.fspath(resolved)).encode("utf-8")
     ).hexdigest()[:10]
 
+
+def _live_lease_blocks_push(
+    ledger_path: Path,
+    cycle: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Apply the live-lease push barrier only to its forward activation set.
+
+    Older cycles retain their historical dispatch treatment.  For activated
+    cycles, ``live_cycle_in_progress`` remains fail-closed on probe errors so a
+    partial same-cycle terminal can never consume the push latch early.
+    """
+    if str(cycle) < RECONCILE_ANALYSIS_TERMINAL_FROM:
+        return False
+    return live_cycle_in_progress(ledger_path, cycle, now=now)
+
+
+CANONICAL_DB_ROOT = Path(_public_project_path('db')).resolve()
 
 def now_cst() -> str:
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
@@ -248,23 +278,6 @@ def live_cycle_in_progress(ledger_path: Path, cycle: str,
             connection.close()
 
 
-def _live_lease_blocks_push(
-    ledger_path: Path,
-    cycle: str,
-    *,
-    now: Optional[datetime] = None,
-) -> bool:
-    """Apply the live-lease push barrier only to its forward activation set.
-
-    Older cycles retain their historical dispatch treatment.  For activated
-    cycles, ``live_cycle_in_progress`` remains fail-closed on probe errors so a
-    partial same-cycle terminal can never consume the push latch early.
-    """
-    if str(cycle) < RECONCILE_ANALYSIS_TERMINAL_FROM:
-        return False
-    return live_cycle_in_progress(ledger_path, cycle, now=now)
-
-
 def trade_error_reportable(db_root: Path, profile: str, cycle: str) -> bool:
     """Prove an explicit business error is safe to report as itself.
 
@@ -373,10 +386,6 @@ def live_failure_terminal(
     callers.  The dispatcher supplies the root so an explicit collection
     terminal can be considered only after execution-path absence is proved.
     """
-    if db_root is not None and _root_namespace(db_root):
-        # The shared failure-contract helper uses canonical status filenames.
-        # Never let an isolated tree consume a production Agent terminal.
-        return None
     if db_root is not None:
         return load_upstream_failure(
             cycle,
@@ -485,6 +494,49 @@ def _fire_stage(ledger_path, cycle: str, stage: str, mode: str,
         log(f"{cycle}: fire {stage} FAILED, latch released: {e}")
 
 
+def _business_report_in_window(cycle: str,
+                               now: Optional[datetime] = None) -> bool:
+    """Return whether a group business report may take the push latch.
+
+    Before the preregistered activation instant, preserve the historical
+    dispatcher semantics.  From activation onward, prevent any *new* old-slot
+    dispatch; a runner legally started before activation is not retrospectively
+    stopped or reclassified here.  ``full`` and
+    ``failure_report`` are current-slot products only: ``slot <= now`` and age
+    must remain below the cycle-resolved single-source threshold.  Parsing
+    errors fail closed once the rule is active.
+    """
+    now = now or datetime.now(CST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CST)
+    else:
+        now = now.astimezone(CST)
+    if now < BUSINESS_REPORT_SAME_SLOT_FROM:
+        return True
+    try:
+        slot = datetime.strptime(cycle, "%Y-%m-%dT%H:%M").replace(tzinfo=CST)
+    except (TypeError, ValueError):
+        return False
+    age_sec = (now - slot).total_seconds()
+    return 0 <= age_sec < thresholds.push_same_slot_max_age_seconds(cycle)
+
+
+def _fire_business_report(ledger_path: Path, cycle: str, mode: str,
+                          now: Optional[datetime], fire_fn: Callable,
+                          out: list) -> bool:
+    """Freshness-gated business push; expiry never consumes ``stage=push``."""
+    if not _business_report_in_window(cycle, now=now):
+        log(f"{cycle}: {mode} business report outside registered same-slot window "
+            "(alert-only; push latch kept free, no late report)")
+        # 2026-08-19 P0-5：过窗此前只进 log，out 里毫无痕迹 —— 08-05~08-18
+        # 缺 111 条战报全程无人可查（其中 108 轮连 push 闩锁都没拿到）。
+        # 此处只做**可观测**：不重试、不补派、不拉起（README 红线禁 watchdog）。
+        out.append(f"skipped_push {cycle}: outside_same_slot_window mode={mode}")
+        return False
+    _fire_stage(ledger_path, cycle, "push", mode, fire_fn, out)
+    return True
+
+
 def _slot_expired(cycle: str, now: datetime) -> bool:
     """槽位过窗判定：槽起点已过去 一个槽长 + COLLECT_MAX_AGE → 本槽采集不会再来。
 
@@ -563,8 +615,8 @@ def _fire_failure_report_if_terminal(
         return False
     if terminal is None:
         return False
-    _fire_stage(
-        ledger_path, cycle, "push", "failure_report", fire_fn, out)
+    _fire_business_report(
+        ledger_path, cycle, "failure_report", now, fire_fn, out)
     return True
 
 
@@ -601,8 +653,8 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
                 or trade_error_reportable(db_root, "live", cycle))):
             if not _live_lease_blocks_push(ledger_path, cycle, now=now):
                 if live_report_barrier_ready(cycle, db_root):
-                    _fire_stage(
-                        ledger_path, cycle, "push", "full", effective_fire, out)
+                    _fire_business_report(
+                        ledger_path, cycle, "full", now, effective_fire, out)
             return out
         if trade_cycle_present(db_root, "live", cycle) and not maintenance_only:
             # 行已出现但不是合法终态：保留 push 闩锁，既不伪造失败报告，
@@ -615,18 +667,7 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
         # 人工回滚 analyst 槽由 candidate 跳过，待其写 analysis 后走 full live。
         try:
             if allow_unified_live and _collection_ready(ledger_path, cycle):
-                if allow_agent_stages:
-                    _fire_stage(
-                        ledger_path, cycle, "live", "unified",
-                        effective_fire, out)
-                else:
-                    out.append(
-                        f"blocked live/demo {cycle}: non-default db_root requires dry-run"
-                    )
-                    log(
-                        f"{cycle}: live Agent blocked before lease/latch; "
-                        "non-default db_root requires OKX_TRIGGER_DRYRUN=1"
-                    )
+                _fire_stage(ledger_path, cycle, "live", "unified", effective_fire, out) if allow_agent_stages else out.append(f"blocked live/demo {cycle}: non-default db_root requires dry-run")
         except Exception as e:
             log(f"{cycle}: unified live dispatch error (ignored): {e}")
         return out
@@ -640,6 +681,28 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # mode 固定为 full；是否允许下游仅由 analysis status 决定。
     # WARN 防刷屏：stage_dispatch 哨兵行 (cycle,'skip_warn') 唯一约束保每 cycle 只打一次。
     if status != "ok" or mode != "full":
+        # 2026-08-19 F2：与 ``a is None`` 分支对齐 —— 有效 trade terminal 是最高
+        # 权威，analysis 非 ok 不得让一笔真成交永久无战报。此前本分支在失败报告
+        # 之后**无条件 return**，下面的 push 逻辑完全够不到；而「没有 analysis 行」
+        # 反而正常派 full 业务报告，同一件事两条相反结论。
+        # maintenance_only 守卫照搬上游语义：同槽自动对账 close 是权威成交事实，
+        # 但不能取代本槽 scheduled unified Agent 的完整分析终态。
+        maintenance_only = trade_terminal_requires_analysis(
+            db_root, "live", cycle)
+        if (not maintenance_only and (
+                trade_written(db_root, "live", cycle)
+                or trade_error_reportable(db_root, "live", cycle))):
+            if not _live_lease_blocks_push(ledger_path, cycle, now=now):
+                if live_report_barrier_ready(cycle, db_root):
+                    _fire_business_report(
+                        ledger_path, cycle, "full", now, effective_fire, out)
+                else:
+                    out.append(
+                        f"skipped_push {cycle}: report_barrier_not_ready "
+                        f"(analysis {status})")
+            return out
+        # 行已出现但不是合法终态：保留 push 闩锁，既不伪造失败报告也不重启
+        # Agent（原语义原样保留，由下面 not trade_cycle_present 守卫兜住）。
         if (not trade_cycle_present(db_root, "live", cycle)
                 and _fire_failure_report_if_terminal(
                 ledger_path, cycle, now, effective_fire, out)):
@@ -647,16 +710,16 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
         reason = f"status={status or '<missing>'},mode={mode or '<missing>'}"
         if os.environ.get("OKX_TRIGGER_DRYRUN") == "1":
             out.append(f"dry_run skip {cycle} analysis {reason}, no latch written")
-            log(
-                f"{cycle}: dry-run WARN analysis {reason} -> skip live/push; "
-                "no skip_warn latch written"
-            )
             return out
         if (not ledger.stage_dispatched(ledger_path, cycle, "skip_warn")
                 and ledger.try_stage(ledger_path, cycle, "skip_warn")):
             out.append(f"skip {cycle} analysis {reason}, no trader/push")
+            # 2026-08-19：删除已失效的「recovers if analyst rewrites status=ok」
+            # 承诺 —— analysis 硬闸（analyst_writer.analysis_deadline_refusal）无
+            # override 旁路，LOOKBACK_SLOTS=4（75min）必然超期，该自愈路径恒不存在。
             log(f"{cycle}: WARN analysis {reason} -> skip live/push "
-                f"(re-check every tick; recovers if analyst rewrites status=ok)")
+                f"(re-check every tick; no analyst self-heal path after the "
+                f"registered analysis deadline gate — owner action required)")
         return out
 
     # 人工回滚 analyst 轮若 live 尚未派，在此补派 full live；unified 轮的 live 闩锁
@@ -667,13 +730,7 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
     # 资金比 live 还少）。当日先停自动派发，随后决定连运行能力与历史数据一并清除；
     # order_executor 现以 _require_live_profile() 硬拒任何非 live profile。
     if age <= max_age:
-        if allow_agent_stages:
-            _fire_stage(
-                ledger_path, cycle, "live", mode, effective_fire, out)
-        else:
-            out.append(
-                f"blocked live/demo {cycle}: non-default db_root requires dry-run"
-            )
+        _fire_stage(ledger_path, cycle, "live", mode, effective_fire, out) if allow_agent_stages else out.append(f"blocked live/demo {cycle}: non-default db_root requires dry-run")
     else:
         if not ledger.stage_dispatched(ledger_path, cycle, "live"):
             out.append(f"stale {cycle} age={age}s>{max_age}s skip trader")
@@ -689,8 +746,26 @@ def dispatch_cycle(db_root: Path, ledger_path, cycle: str,
             or trade_error_reportable(db_root, "live", cycle)):
         if not _live_lease_blocks_push(ledger_path, cycle, now=now):
             if live_report_barrier_ready(cycle, db_root):
-                _fire_stage(
-                    ledger_path, cycle, "push", mode, effective_fire, out)
+                _fire_business_report(
+                    ledger_path, cycle, mode, now, effective_fire, out)
+            else:
+                # P0-5 5b：barrier fail-closed 此前是**完全静默** —— 21 轮
+                # analysis=ok 且 trade_cycles 终态齐的 cycle 一个字没发。
+                # 现改派**降级战报**：内容仍是完整业务事实，但强制打「live
+                # 终态凭证未就绪」横幅，且不主张本轮成交已是终局。
+                # 红线未破：只占本槽 push 闩锁一次、过窗不补发、不重试 live、
+                # 不拉起任何进程。
+                # 关键防伪：mode 只是意图，push_pipeline 在发送前会**独立复核**
+                # barrier；届时若已就绪，它自动升级回完整业务报告并走完整终态
+                # 硬闸 —— 因此这条路径无法用来绕开业务终态凭证。
+                out.append(
+                    f"degraded_push {cycle}: report_barrier_not_ready mode={mode}")
+                log(f"{cycle}: report barrier not ready -> degraded business "
+                    f"report (alert-only, no retry, no relaunch)")
+                _fire_business_report(
+                    ledger_path, cycle, "degraded_report", now, effective_fire, out)
+        else:
+            out.append(f"deferred_push {cycle}: live_runner_in_progress")
     elif not trade_cycle_present(db_root, "live", cycle):
         _fire_failure_report_if_terminal(
             ledger_path, cycle, now, effective_fire, out)
@@ -715,8 +790,7 @@ def _delivered_dedupe_keys(event_log: Path, floor_ts: str) -> set:
             continue
         if (ev.get("ts") or "") < floor_ts or not ev.get("dedupe_key"):
             continue
-        if (ev.get("event") == "duplicate_skip"
-                and ev.get("existing_status") == "sent") or (
+        if ev.get("event") == "duplicate_skip" or (
                 ev.get("event") == "mark" and ev.get("status") == "sent"):
             out.add(ev["dedupe_key"])
     return out
@@ -840,7 +914,7 @@ def main() -> int:
     ap.add_argument("--db-root", required=True)
     ap.add_argument("--max-age", type=int, default=MAX_AGE_SEC)
     args = ap.parse_args()
-    db_root = Path(args.db_root).resolve()
+    db_root = Path(args.db_root)
     ledger.init_ledger(db_root / "ledger.db")  # 幂等保 stage_dispatch 存在
     actions = dispatch_once(db_root, max_age=args.max_age)
     if not actions:

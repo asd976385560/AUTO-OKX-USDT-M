@@ -15,6 +15,15 @@ CHECK 时直接报告 already-applied。任何未知 status 值存在时 fail-cl
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -81,14 +90,11 @@ def check_expression_selftest() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="repair_queue.status CHECK 约束迁移（默认 dry-run）")
-    ap.add_argument("--db", default=r"./db/account.db")
+    ap.add_argument("--db", default=_public_project_path('db', 'account.db'))
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup-dir", default=None,
                     help="--apply 必填：备份 account.db 的目录")
     args = ap.parse_args()
-    if args.apply and args.dry_run:
-        ap.error("--apply and --dry-run are mutually exclusive")
     db_path = Path(args.db)
     if not db_path.exists():
         print(json.dumps({"ok": False, "error": f"库不存在: {db_path}"}))

@@ -38,6 +38,47 @@ class CollectCycleRunGuardTests(unittest.TestCase):
             "stderr_tail": "",
         }
 
+    def test_child_output_is_forced_to_utf8(self):
+        with mock.patch.dict(
+                collect_cycle.os.environ,
+                {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"}):
+            child_env = collect_cycle._python_child_env()
+        self.assertEqual("utf-8", child_env["PYTHONIOENCODING"])
+        self.assertEqual("1", child_env["PYTHONUTF8"])
+
+    def test_news_mixed_zero_row_degraded_and_failed_is_full_outage(self):
+        step = {
+            "ok": True,
+            "payload": {"sources": [
+                {"id": "rss_en", "status": "degraded", "fetched": 0,
+                 "err": "transport down"},
+                {"id": "mx_search", "status": "failed", "fetched": 0,
+                 "err": "quota down"},
+                {"id": "hourly_only", "status": "skipped",
+                 "why": "poll_interval_min=60"},
+            ]},
+        }
+        ok, warnings = collect_cycle._news_verdict(step)
+        self.assertFalse(ok)
+        self.assertFalse(step["ok"])
+        self.assertTrue(step["all_sources_failed"])
+        self.assertEqual(1, step["outage_equivalent_degraded"])
+        self.assertEqual(2, len(warnings))
+
+    def test_news_natural_zero_events_and_cadence_skips_remain_ok(self):
+        step = {
+            "ok": True,
+            "payload": {"sources": [
+                {"id": "quiet", "status": "ok", "fetched": 0},
+                {"id": "not_due", "status": "skipped",
+                 "why": "poll_interval_min=60"},
+            ]},
+        }
+        ok, warnings = collect_cycle._news_verdict(step)
+        self.assertTrue(ok)
+        self.assertEqual([], warnings)
+        self.assertTrue(step["ok"])
+
     def test_exact_cycle_lock_allows_only_one_live_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -155,6 +196,34 @@ class CollectCycleRunGuardTests(unittest.TestCase):
                 self.assertEqual(collect_cycle.main(), 0)
             self.assertFalse(guard_dir.exists())
 
+    def test_dry_collect_rejects_production_root_without_touching_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "OKX"
+            db_root = root / "db"
+            db_root.mkdir(parents=True)
+            ledger_path = db_root / "ledger.db"
+            ledger_path.write_bytes(b"sentinel-ledger")
+            argv = [
+                "collect_cycle.py", "--tier", "quarter", "--dry-collect",
+                "--db-root", str(db_root),
+                "--guard-dir", str(root / "guards"),
+                "--log-dir", str(root / "logs"),
+            ]
+            runner = mock.Mock(side_effect=self._success_step)
+            with (
+                mock.patch.object(collect_cycle, "ROOT", root),
+                mock.patch.object(
+                    collect_cycle.ledger, "cycle_id_for",
+                    return_value=self.CYCLE),
+                mock.patch.object(collect_cycle, "run_step", runner),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(64, collect_cycle.main())
+            runner.assert_not_called()
+            self.assertEqual(b"sentinel-ledger", ledger_path.read_bytes())
+            self.assertFalse((root / "logs").exists())
+
     def test_explicit_current_cycle_is_pinned_into_fast_step(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -245,6 +314,89 @@ class CollectCycleRunGuardTests(unittest.TestCase):
             runner.assert_not_called()
             self.assertFalse((root / "guards").exists())
             self.assertFalse((root / "logs").exists())
+
+    def test_auto_tier_resolves_quarter_slot(self):
+        """--tier auto（2026-08-26 兜底 cron 二合一）在 :15/:30/:45 槽自推 quarter。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = mock.Mock(side_effect=self._success_step)
+            argv = [
+                "collect_cycle.py", "--tier", "auto",
+                "--db-root", str(root / "db"),
+                "--guard-dir", str(root / "guards"),
+                "--log-dir", str(root / "logs"),
+            ]
+            with (
+                mock.patch.object(
+                    collect_cycle.ledger, "cycle_id_for",
+                    return_value=self.CYCLE),
+                mock.patch.object(collect_cycle, "run_step", runner),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                return_code = collect_cycle.main()
+            result = json.loads(output.getvalue())
+
+        self.assertEqual(0, return_code)
+        self.assertEqual("quarter", result["tier"])
+        self.assertEqual(self.CYCLE, result["cycle"])
+        step_names = [call.args[0] for call in runner.call_args_list]
+        self.assertNotIn("slow", step_names)
+
+    def test_auto_tier_resolves_hourly_slot(self):
+        """--tier auto 在 :00 槽自推 hourly（cycle_id_for 向下归槽，延迟触发不错档）。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = mock.Mock(side_effect=self._success_step)
+            argv = [
+                "collect_cycle.py", "--tier", "auto",
+                "--db-root", str(root / "db"),
+                "--guard-dir", str(root / "guards"),
+                "--log-dir", str(root / "logs"),
+            ]
+            with (
+                mock.patch.object(
+                    collect_cycle.ledger, "cycle_id_for",
+                    return_value=self.HOUR_CYCLE),
+                mock.patch.object(collect_cycle, "run_step", runner),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                return_code = collect_cycle.main()
+            result = json.loads(output.getvalue())
+
+        self.assertEqual(0, return_code)
+        self.assertEqual("hourly", result["tier"])
+        self.assertEqual(self.HOUR_CYCLE, result["cycle"])
+        step_names = [call.args[0] for call in runner.call_args_list]
+        self.assertIn("slow", step_names)
+
+    def test_auto_tier_with_stale_explicit_cycle_still_rejects(self):
+        """auto 只放宽层级推导；过期 --cycle 仍在联网/写盘前拒绝。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = mock.Mock()
+            argv = [
+                "collect_cycle.py", "--tier", "auto",
+                "--cycle", "2026-08-13T02:45",
+                "--guard-dir", str(root / "guards"),
+                "--log-dir", str(root / "logs"),
+            ]
+            with (
+                mock.patch.object(
+                    collect_cycle.ledger, "cycle_id_for",
+                    return_value=self.CYCLE),
+                mock.patch.object(collect_cycle, "run_step", runner),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                return_code = collect_cycle.main()
+            result = json.loads(output.getvalue())
+
+        self.assertEqual(2, return_code)
+        self.assertIn("not the current natural slot", result["error"])
+        runner.assert_not_called()
+        self.assertFalse((root / "guards").exists())
 
     def test_fast_degraded_is_warning_without_changing_success_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -338,6 +490,8 @@ class CollectCycleRunGuardTests(unittest.TestCase):
             ["fast", "news", "slow"],
             [step["name"] for step in result["steps"]],
         )
+        self.assertIn(
+            "--defer-multitimeframe-coverage", observed_args["fast"])
         self.assertIn("--defer-dispatch-nudge", observed_args["slow"])
         self.assertIn(self.HOUR_CYCLE, observed_args["slow"])
         nudge.assert_called_once_with(
@@ -350,6 +504,55 @@ class CollectCycleRunGuardTests(unittest.TestCase):
             {"nudged": True, "reason": "ok"},
             result["deferred_dispatch_nudge"],
         )
+
+    def test_post_slow_mtf_audit_publishes_only_after_ready_slow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db_root = str(Path(temporary) / "db")
+            ready_slow = self._success_step("slow")
+            ready_slow["payload"] = {
+                "status_slow": "ok", "status_regime": "ok"}
+            audit_result = {
+                "name": "multitimeframe_coverage_audit",
+                "ok": True,
+                "rc": 0,
+                "dur_s": 0.1,
+                "payload": {
+                    "status": "NOT_MET",
+                    "data_completeness_status": "PASSED",
+                    "analysis_readiness_status": "NOT_MET",
+                },
+                "stderr_tail": "",
+            }
+            with mock.patch.object(
+                collect_cycle, "run_step", return_value=audit_result
+            ) as runner:
+                step = collect_cycle._post_slow_multitimeframe_coverage(
+                    db_root, "2026-08-13T08:00", ready_slow)
+
+            self.assertIsNotNone(step)
+            self.assertTrue(step["diagnostic_only"])
+            self.assertTrue(step["after_same_cycle_slow"])
+            args = runner.call_args.args
+            self.assertEqual("multitimeframe_coverage_audit", args[0])
+            self.assertIn("--execution-context", args[2])
+            self.assertIn("test", args[2])
+            self.assertIn(
+                str(Path(temporary) / "reports" / "quality" /
+                    "multitimeframe-coverage-audit.json"),
+                args[2],
+            )
+
+    def test_post_slow_mtf_audit_retains_canonical_when_slow_not_ready(self):
+        slow = self._success_step("slow")
+        slow["payload"] = {
+            "status_slow": "degraded", "status_regime": "ok"}
+        with mock.patch.object(collect_cycle, "run_step") as runner:
+            step = collect_cycle._post_slow_multitimeframe_coverage(
+                r"E:\isolated\db", "2026-08-13T16:00", slow)
+        runner.assert_not_called()
+        self.assertEqual("same_cycle_slow_not_complete", step["skipped"])
+        self.assertTrue(step["canonical_receipt_retained"])
+        self.assertTrue(step["diagnostic_only"])
 
     def test_success_log_retains_only_compact_fast_data_quality(self):
         receipt = {
@@ -374,6 +577,27 @@ class CollectCycleRunGuardTests(unittest.TestCase):
             }, {
                 "name": "news", "ok": True, "rc": 0, "dur_s": 1.0,
                 "payload": {"sources": ["trimmed"]},
+            }, {
+                "name": "slow", "ok": True, "rc": 0, "dur_s": 4.0,
+                "payload": {
+                    "status_slow": "degraded",
+                    "status_regime": "ok",
+                    "error": "collect_slow degraded: blocks=klines",
+                    "collector_timing_s": {
+                        "slow_klines": 3.0,
+                        "macro_regime": 1.0,
+                        "total": 4.0,
+                    },
+                    "collector_degraded": ["klines"],
+                    "collector_degradation_details": {
+                        "slow_kline_incomplete": ["1M:420/436"],
+                    },
+                    "collector_wrote": {"klines": 123},
+                    "collector_symbols_count": 436,
+                    "collector_position_priority_symbols": ["UNI-USDT-SWAP"],
+                    "collector_warnings": ["1M:420/436"],
+                    "unrelated_large_payload": {"must": "be trimmed"},
+                },
             }],
         }
         slim = collect_cycle._slim_for_log(output)
@@ -381,5 +605,37 @@ class CollectCycleRunGuardTests(unittest.TestCase):
         self.assertEqual(slim["steps"][0]["data_quality"], receipt)
         self.assertNotIn("payload", slim["steps"][1])
         self.assertNotIn("data_quality", slim["steps"][1])
+        self.assertNotIn("payload", slim["steps"][2])
+        self.assertEqual(
+            slim["steps"][2]["collector_timing_s"]["slow_klines"],
+            3.0,
+        )
+        self.assertEqual("degraded", slim["steps"][2]["status_slow"])
+        self.assertEqual(["klines"], slim["steps"][2]["collector_degraded"])
+        self.assertEqual(
+            ["1M:420/436"],
+            slim["steps"][2]["collector_degradation_details"]
+            ["slow_kline_incomplete"],
+        )
+        self.assertEqual(123, slim["steps"][2]["collector_wrote"]["klines"])
+        self.assertEqual(436, slim["steps"][2]["collector_symbols_count"])
+        self.assertEqual(
+            ["UNI-USDT-SWAP"],
+            slim["steps"][2]["collector_position_priority_symbols"],
+        )
+        self.assertEqual(["1M:420/436"], slim["steps"][2]["collector_warnings"])
+        self.assertNotIn("unrelated_large_payload", slim["steps"][2])
+
+
+class CollectionSlotGuardScriptContractTests(unittest.TestCase):
+    pass
+
+    pass
+
+    pass
+
+    pass
+
+
 if __name__ == "__main__":
     unittest.main()

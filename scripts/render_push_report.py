@@ -17,6 +17,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -35,6 +44,9 @@ from core.risk_validator import (
     MAX_SINGLE_ORDER_IMR_RATIO,
 )
 from core.decision_card import validate_multitimeframe_analysis
+from scripts import _acceptance_thresholds as thresholds
+from scripts import _zh_labels
+from scripts import _push_duration
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -163,6 +175,22 @@ def first_nonempty(*values: Any, default: str = "-") -> str:
     return default
 
 
+def etf_macro_line(macro: dict[str, Any]) -> str:
+    status = first_nonempty(
+        macro.get("btc_etf_flow_status"), default="missing")
+    as_of = first_nonempty(macro.get("btc_etf_flow_as_of"), default="-")
+    if status == "STALE/N/A":
+        diagnostic = first_nonempty(
+            macro.get("btc_etf_diagnostic_hard_value_usd"), default="-")
+        return (
+            f"BTC ETF净流 STALE/N/A | as_of {as_of} | "
+            f"历史诊断值 {diagnostic}"
+        )
+    value = first_nonempty(
+        macro.get("btc_etf_net_flow_usd"), default="-")
+    return f"BTC ETF净流 {value} | 状态 {status} | as_of {as_of}"
+
+
 def card_text(value: Any) -> str:
     """Flatten one decision-card field without exposing raw JSON blobs.
 
@@ -219,6 +247,13 @@ def format_multitimeframe_analysis(
     decision = decision if isinstance(decision, dict) else {}
     raw_entries = decision.get("multitimeframe_analyses")
     entries = list(raw_entries) if isinstance(raw_entries, list) else []
+    if cycle_id and thresholds.decision_restriction_removal_active(cycle_id):
+        leg_count = len(entries) if entries else 1
+        return (
+            f"OPEN/ADD覆盖={leg_count}/{leg_count}\n"
+            "三周期合同=已按主人批准的all_market_lightweight_open_v1策略移除 | "
+            "执行仍受账户、账仓、SL与risk_validator硬闸约束"
+        )
     if not entries:
         expected_side = str(
             decision.get("multitimeframe_expected_side") or "").strip().lower()
@@ -477,7 +512,19 @@ def format_position(position: dict[str, Any]) -> str:
         else:
             sl_txt = f"计划SL距(开仓){planned_core}"
     else:
-        sl_txt = "SL未挂"
+        # 2026-08-20：区分「读过交易所且确实没有」与「本轮没读到」。
+        # 旧实现一律写「SL未挂」，把缺值断言成缺保护 —— 实测 8/40 轮有仓
+        # 战报误报，而同轮 live_facts 里止损挂着且在被上移。这与 F5 杀掉的
+        # 「无错失机会」是同一类伪断言的镜像，只是落在风控最要害的字段上：
+        # 它会让人以为仓位在裸奔，可能触发不必要的手动干预。
+        # 无 sl_state 的旧 payload 按 unread 处理 —— 「真没挂」必须有正证据。
+        _sl_state = str(position.get("sl_state") or "unread").lower()
+        if _sl_state == "absent":
+            sl_txt = "SL未挂(交易所已确认无止损单)"
+        elif _sl_state == "unverified":
+            sl_txt = "SL未确认(有algo单但未验成，非未挂)"
+        else:
+            sl_txt = "SL本轮未读取(非未挂；上游未取到交易所止损)"
     # 2026-07-15 主人要求：补保证金 USD + 占净值%（payload margin_usd/margin_pct，
     # build_push_payload 按 sz×ctVal×avgPx÷lev 算）；缺失静默省略该字段。
     _mu, _mp = position.get("margin_usd"), position.get("margin_pct")
@@ -485,21 +532,60 @@ def format_position(position: dict[str, Any]) -> str:
         margin_txt = f"保证金≈${_mu}" + (f"/{_mp}%净值" if isinstance(_mp, (int, float)) else "") + " | "
     else:
         margin_txt = ""
+    # 2026-08-19 G8②：同一行里分子分母此前不同源 —— margin_usd 是 mark 口径
+    # position_imr，而 upl_pct_initial_margin 是 entry 口径 sz×ctVal×avgPx÷lev
+    # （实测 2026-08-18 10:00 LINK：24.1/23.59=102% 却印 113.8%）。统一按
+    # margin_usd 重算；拿不到才回退 payload 值，并显式标注口径。
     upl_pct = position.get("upl_pct_initial_margin")
-    if isinstance(upl_pct, (int, float)) and not isinstance(upl_pct, bool):
-        upl_txt = f"浮盈{upl}（保证金收益率{float(upl_pct):+.1f}%）"
+    _upl_val = position.get("upl")
+    if (isinstance(_mu, (int, float)) and float(_mu) > 0
+            and isinstance(_upl_val, (int, float))
+            and not isinstance(_upl_val, bool)):
+        upl_txt = (f"浮盈{upl}（保证金收益率"
+                   f"{float(_upl_val) / float(_mu) * 100:+.1f}%，IMR口径）")
+    elif isinstance(upl_pct, (int, float)) and not isinstance(upl_pct, bool):
+        upl_txt = f"浮盈{upl}（保证金收益率{float(upl_pct):+.1f}%，开仓保证金口径）"
     else:
         upl_txt = f"浮盈{upl}"
-    secured = position.get("secured_profit_at_stop_usdt")
-    giveback = position.get("giveback_to_stop_pct_of_current_upl")
-    if (
-        isinstance(secured, (int, float)) and not isinstance(secured, bool)
-        and float(secured) > 0
-    ):
-        lock_txt = f" | SL锁盈≈${float(secured):.2f}"
-        if isinstance(giveback, (int, float)) and not isinstance(giveback, bool):
-            lock_txt += f"（到SL将回吐当前浮盈{float(giveback):.1f}%）"
+    # 2026-08-20：锁盈三态化。旧实现只在 secured>0 时输出，`else` 一律空串，
+    # 于是三种完全不同的状态渲染成同一个「什么都没有」：
+    #   ① 止损仍在成本之下 —— 上游 `secured = max(0, pnl_at_stop)` 把负值压成 0.0；
+    #   ② 上游没算出到 SL 盈亏（缺 markPx/base_qty 等）—— None；
+    #   ③ 恰好为 0。
+    # ① 是确定事实而且是风控要害：实测有仓位浮盈为正、却「到 SL 较现价再亏
+    # 的钱＝当前浮盈的 266.7%」（吐光还倒亏），这条信息此前完全不可见，与
+    # 同屏另一个已锁盈仓位长得一模一样。缺值必须说缺值，未保本必须说未保本。
+    # 全部取 payload 既有字段，不新增上游计算。
+    def _fnum(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return None
+
+    secured = _fnum(position.get("secured_profit_at_stop_usdt"))
+    giveback = _fnum(position.get("giveback_to_stop_pct_of_current_upl"))
+    pnl_at_stop = _fnum(position.get("pnl_at_stop_from_entry_usdt"))
+    extra_loss = _fnum(position.get("additional_loss_to_stop_from_mark_usdt"))
+    sl_present = str(stop_distance) not in ("", "-")
+    if secured is not None and secured > 0:
+        lock_txt = f" | SL锁盈≈${secured:.2f}"
+        if giveback is not None:
+            lock_txt += f"（到SL将回吐当前浮盈{giveback:.1f}%）"
+    elif pnl_at_stop is not None and pnl_at_stop <= 0:
+        # 恰好保本单独措辞——四舍五入到分后写「亏≈$0.00」是自相矛盾的。
+        if abs(pnl_at_stop) < 0.005:
+            lock_txt = " | SL恰好保本(到SL不赚不亏"
+        else:
+            lock_txt = f" | SL未锁盈(到SL从开仓价亏≈${abs(pnl_at_stop):.2f}"
+        if extra_loss is not None:
+            lock_txt += f"；较现价再亏≈${extra_loss:.2f}"
+            if giveback is not None:
+                lock_txt += f"，为当前浮盈的{giveback:.1f}%"
+        lock_txt += ")"
+    elif sl_present:
+        # 有止损但上游没给到 SL 盈亏：如实报未知，不冒充「无锁盈」。
+        lock_txt = " | SL锁盈未知(上游未提供到SL盈亏)"
     else:
+        # 无止损时 sl_txt 已说明状态，此处不再重复噪音。
         lock_txt = ""
     return f"{profile} {symbol} {side} {size}张 @{avg_price} {leverage}x | {margin_txt}{hold_disp} | {upl_txt} | {sl_txt}{lock_txt}"
 
@@ -580,6 +666,9 @@ def format_exceptions(exceptions: list[Any]) -> str:
         if isinstance(item, dict):
             name = first_nonempty(item.get("name"), item.get("type"), item.get("check"), default="异常")
             status = first_nonempty(item.get("status"), item.get("level"), default="-")
+            # 展示层 status 中文映射（2026-08-21）。只能放这里：_is_runtime_fault
+            # 靠英文关键词在 payload 层分流异常段，改 payload 会被误移出。
+            status = _zh_labels.collection_status_zh(status)
             detail = first_nonempty(item.get("detail"), item.get("message"), item.get("fix"), default="-")
             lines.append(f"{name} [{status}] {detail}")
         else:
@@ -593,9 +682,9 @@ def qq_markdown_hardbreak(content: str) -> str:
     return "\n".join(f"{line}  " if line.strip() else "" for line in lines).rstrip() + "\n"
 
 
-LEDGER_DB = "./db/ledger.db"
-ACCOUNT_DB = "./db/account.db"
-DB_ROOT = "./db"
+LEDGER_DB = _public_project_path('db', 'ledger.db')
+ACCOUNT_DB = _public_project_path('db', 'account.db')
+DB_ROOT = _public_project_path('db')
 SNAPSHOT_FRESH_MIN = 30
 
 
@@ -756,13 +845,8 @@ def authoritative_cycle_duration(cycle_id: Any) -> int | None:
             con.close()
         if not row or not row[0]:
             return None
-        s = str(row[0]).strip()
-        if s.endswith("Z"):
-            dt = (datetime.fromisoformat(s.replace("Z", "+00:00"))
-                  .astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None))
-        else:
-            dt = datetime.fromisoformat(s.replace("T", " ", 1)[:19])
-        secs = (datetime.now() - dt).total_seconds()
+        dt = thresholds.parse_cst(str(row[0]).strip())
+        secs = (datetime.now(thresholds.CST) - dt).total_seconds()
         if secs < 0 or secs > 6 * 3600:
             return None
         return int(round(secs))
@@ -842,6 +926,9 @@ def validate_input(payload: dict[str, Any]) -> None:
 def render(payload: dict[str, Any]) -> dict[str, Any]:
     _cycle_pre = section(payload, "cycle")
     _cycle_id = payload.get("cycle_id") or _cycle_pre.get("cycle_id") or _cycle_pre.get("id")
+    minimal_policy = bool(
+        _cycle_id and thresholds.minimal_decision_contract_active(
+            str(_cycle_id)))
     _auth_cc = authoritative_cycle_count(_cycle_id)
     if _auth_cc is not None:
         payload["cycle_count"] = _auth_cc
@@ -867,6 +954,14 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
     hhmm = first_nonempty(payload.get("hhmm"), cycle.get("hhmm"), default=datetime.now().strftime("%H:%M"))
+    duration_evidence = None
+    duration_label = f"{cycle_duration}s"
+    if _push_duration.duration_contract_active(_cycle_id):
+        duration_evidence = _push_duration.read_business_duration(
+            DB_ROOT, _cycle_id)
+        duration_label = (
+            f"{duration_evidence['elapsed_seconds']}s"
+            if duration_evidence["status"] == "known" else "未知")
     # channel 使用固定语义 live，不接收 agent 自报值。
     channel = "live"
     action = first_nonempty(payload.get("action_taken"), decision.get("action_taken"), execution.get("action_taken"), default="OPEN_LONG").upper()
@@ -985,7 +1080,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     # 至少带市场实质；skill 仍要求 agent 显式传摘要。
     if not str(action_summary).strip() or str(action_summary).strip() == "-":
         # 兜底摘要复用已做过 dict 防御的 btc，防 JSON 字面量直出。
-        action_summary = f"{action} @ regime={regime} BTC ${btc if btc != '-' else '?'}（摘要缺失补位）"
+        action_summary = f"{action} @ 24h回归预报={regime} BTC ${btc if btc != '-' else '?'}（摘要缺失补位）"
     action_summary = text(action_summary)
 
     decision_reason = first_nonempty(
@@ -1000,9 +1095,18 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         else "Agent裁决后交易所成交"
         if decision_origin == "exchange_reconcile_after_business_terminal"
         else "Agent自主裁决"
-        if decision_card
+        if decision_card or minimal_policy
         else f"兼容格式置信度 {confidence}"
     )
+    # P0-5 5b：降级战报横幅。写在第 2 行（紧贴头行）而不是塞进异常段——
+    # 读者第一眼就要看见「这份报告没有 live 终态凭证背书」，不能藏在末尾。
+    # 内容本身仍是完整业务事实（成交/持仓/风控照旧），降的是**裁决效力**：
+    # 不主张本轮已终局。validate_push_format 按 --expect-degraded 反查此横幅。
+    _degraded_block = payload.get("degraded_report")
+    is_degraded_report = isinstance(_degraded_block, dict)
+    if is_degraded_report:
+        decision_banner = (
+            "⚠️降级战报(live终态凭证未就绪) | " + decision_banner)
     historical = decision_card.get("historical_experience")
     if not isinstance(historical, dict):
         historical = {}
@@ -1058,6 +1162,16 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
                 (" | " if business_attestation_meta else "")
                 + f"业务指纹={_att_hash}"
             )
+    if is_degraded_report:
+        # 与账实成交/业务指纹同段并列：这三者一起构成「本轮成交事实的凭证
+        # 状态」。not_ready 明示屏障缺位，reason 保留机器可读的原始成因。
+        _dg_reason = str(
+            (_degraded_block or {}).get("reason") or "report_barrier_not_ready")
+        business_attestation_meta += (
+            (" | " if business_attestation_meta else "")
+            + f"report_barrier=not_ready(reason={_dg_reason})"
+            + " | 本轮不作终局裁决：成交与持仓为读取时刻事实，可能被迟到回执改写"
+        )
     inter_report_exchange_meta = ""
     _interval_attestation = payload.get(
         "inter_report_exchange_attestation")
@@ -1066,7 +1180,13 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         _interval_hash = str(_interval_attestation.get("sha256") or "")
         if _interval_count is not None:
             inter_report_exchange_meta = (
-                f"报告间交易所成交={_interval_count}笔")
+                f"报告间交易所成交={_interval_count}笔"
+                # G8③：静默漏笔改为显式外显。窗口内账本行数 = 计入 + 未计入，
+                # 三者闭合可被独立验真（旧 v1 attestation 无该字段则不打印）。
+                + (f"｜另{int(_interval_attestation.get('excluded_count') or 0)}"
+                   "笔证据不足未计入"
+                   if _interval_attestation.get("excluded_count") is not None
+                   else ""))
         _interval_details = []
         for _fill in (_interval_attestation.get("fills") or [])[:3]:
             if not isinstance(_fill, dict):
@@ -1140,7 +1260,7 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
     single_order_txt = _single_order_risk_segment(payload)
 
     content_parts = [
-        f"【{hhmm}】第{cycle_count}轮 / ⏱{cycle_duration}s / {channel} / {action} {symbol}",
+        f"【{hhmm}】第{cycle_count}轮 / ⏱{duration_label} / {channel} / {action} {symbol}",
         f"{decision_banner} | {action_summary}",
         "",
         "📊 资产",
@@ -1153,37 +1273,39 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         f"Live组合保证金 {margin_display} | 杠杆 {leverage}x / {MAX_LEVERAGE:g}x | 同侧 {with_pct(side_pct)}(观察) | 持仓 {position_count}(数量仅观察) | {risk_status}{single_order_txt}",
         "",
         "🌍 行情",
-        f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | regime={regime} | USD_BROAD {dxy}",
+        f"BTC ${btc} ({with_pct(btc_chg)}) | ETH ${eth} ({with_pct(eth_chg)}) | 24h回归预报={regime} | USD_BROAD {dxy}",
         "",
         "🎯 Agent裁决",
         decision_reason,
-        "",
-        "🧩 三周期判断",
-        multitimeframe_report,
-        "",
-        "🧭 六项决策卡",
-        (
-            f"方向：{card_text(decision_card.get('direction_evidence'))}\n"
-            f"反对：{card_text(decision_card.get('opposing_evidence'))}\n"
-            f"执行：{card_text(decision_card.get('execution_conditions'))}\n"
-            f"失效：{card_text(decision_card.get('invalidation_point'))}\n"
-            f"风险收益：{card_text(decision_card.get('risk_reward'))}\n"
-            f"组合：{card_text(decision_card.get('portfolio_impact'))}"
-            if decision_card else "旧轮次无 decision_card_v1"
-        ),
-        "",
-        "📚 历史经验",
-        (
-            f"盈利样本 {len(historical.get('matched_wins') or [])} | "
-            f"亏损样本 {len(historical.get('matched_losses') or [])} | "
-            f"错失机会 {len(historical.get('missed_opportunities') or [])} | "
-            f"取舍={historical.get('usage') or 'none'}："
-            f"{card_text(historical.get('reason'))}"
-            if historical else
-            f"兼容格式 play_id={play_id} \"{play_title}\" | "
-            f"hit_rate={with_pct(hit_rate)} / avg_return={with_pct(avg_return)} "
-            f"| 不确定性={uncertainty}"
-        ),
+        *([] if minimal_policy else [
+            "",
+            "🧩 三周期判断",
+            multitimeframe_report,
+            "",
+            "🧭 六项决策卡",
+            (
+                f"方向：{card_text(decision_card.get('direction_evidence'))}\n"
+                f"反对：{card_text(decision_card.get('opposing_evidence'))}\n"
+                f"执行：{card_text(decision_card.get('execution_conditions'))}\n"
+                f"失效：{card_text(decision_card.get('invalidation_point'))}\n"
+                f"风险收益：{card_text(decision_card.get('risk_reward'))}\n"
+                f"组合：{card_text(decision_card.get('portfolio_impact'))}"
+                if decision_card else "旧轮次无 decision_card_v1"
+            ),
+            "",
+            "📚 历史经验",
+            (
+                f"盈利样本 {len(historical.get('matched_wins') or [])} | "
+                f"亏损样本 {len(historical.get('matched_losses') or [])} | "
+                f"错失机会 {len(historical.get('missed_opportunities') or [])} | "
+                f"取舍={historical.get('usage') or 'none'}："
+                f"{card_text(historical.get('reason'))}"
+                if historical else
+                f"兼容格式 play_id={play_id} \"{play_title}\" | "
+                f"hit_rate={with_pct(hit_rate)} / avg_return={with_pct(avg_return)} "
+                f"| 不确定性={uncertainty}"
+            ),
+        ]),
         "",
         "⚙️ 执行",
         f"{execution_result}\n{exec_meta}"
@@ -1193,10 +1315,14 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
            if inter_report_exchange_meta else ""),
         "",
         "⏰ 时间线",
-        f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}",
+        f"下次HH:00: {next_hh01}min | 下次复盘: {next_review}"
+        + (f"\n{_push_duration.DISPLAY_SEMANTICS}" if duration_evidence else ""),
         "",
         "⚠️ 异常",
-        format_exceptions(exceptions),
+        format_exceptions(exceptions + (
+            [_push_duration.unknown_message(duration_evidence["reason"])]
+            if duration_evidence and duration_evidence["status"] == "unknown"
+            else [])),
     ]
 
     include_macro = bool(payload.get("is_hh01")) or bool(macro.get("enabled"))
@@ -1205,13 +1331,14 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         top_gainers = first_nonempty(market.get("top_gainers"), default="-")
         top_losers = first_nonempty(market.get("top_losers"), default="-")
         funding_anomalies = first_nonempty(market.get("funding_anomalies"), default="无")
+        etf_line = etf_macro_line(macro)
         content_parts.extend([
             "",
             "🌐 宏观 HH:00",
             f"USD_BROAD(DTWEXBGS) {first_nonempty(macro.get('dxy'), dxy)} ({with_pct(macro.get('dxy_d1'))}) | VIX {first_nonempty(macro.get('vix'), default='-')} | SPX {first_nonempty(macro.get('spx'), default='-')} ({with_pct(macro.get('spx_d1'))})",
             f"DXY_CALC_ECB {first_nonempty(macro.get('dxy_calc_ecb'), default='-')} ({with_pct(macro.get('dxy_calc_ecb_d1'))}, 非ICE官方报价) | Fear&Greed {first_nonempty(macro.get('fear_greed'), default='-')}/{first_nonempty(macro.get('fear_greed_label'), default='-')}",
             f"BTC市值Δ24h(≠ETF净流) {first_nonempty(macro.get('btc_mcap_chg_24h_usd'), macro.get('btc_etf_proxy'), default='-')} | TVL {first_nonempty(macro.get('tvl'), default='-')} | BTC.D {with_pct(macro.get('btc_dominance'))}",
-            f"BTC ETF净流 {first_nonempty(macro.get('btc_etf_net_flow_usd'), default='-')} | 状态 {first_nonempty(macro.get('btc_etf_flow_status'), default='missing')} | as_of {first_nonempty(macro.get('btc_etf_flow_as_of'), default='-')}",
+            etf_line,
             f"降级源: {degraded_sources}",
             "",
             "📊 全市场 HH:00",
@@ -1229,10 +1356,15 @@ def render(payload: dict[str, Any]) -> dict[str, Any]:
         "ok": True,
         "title": title,
         "content": content,
+        "cycle_duration_evidence": duration_evidence,
         "char_count": len(content),
-        "sections": ["header", "assets", "positions", "risk", "market", "decision",
-                     "multitimeframe_analysis", "decision_card", "experience",
-                     "execution", "timeline", "exceptions"],
+        "sections": (
+            ["header", "assets", "positions", "risk", "market", "decision",
+             "execution", "timeline", "exceptions"]
+            if minimal_policy else
+            ["header", "assets", "positions", "risk", "market", "decision",
+             "multitimeframe_analysis", "decision_card", "experience",
+             "execution", "timeline", "exceptions"]),
     }
 
 
@@ -1246,8 +1378,24 @@ def main() -> int:
                         help="渲染产物写入 UTF-8 文件（2026-06-13：绕开控制台 GBK 管道污染——"
                              "agent 捕获 stdout 中文会乱码；后续 validate --file / 归档 content_file 直读此文件）")
     parser.add_argument("--db-root", default=None,
-                        help="库权威覆盖（轮次/资金/持仓数/累计收益/耗时）的读取根目录；"
-                             "默认 ./db")
+                        help='库权威覆盖（轮次/资金/持仓数/累计收益/耗时）的读取根目录；默认 <PROJECT_ROOT>/db'.replace('<PROJECT_ROOT>', _public_project_path()))
+    parser.add_argument(
+        "--validate-cycle-id",
+        help=(
+            "渲染后在同一wrapper进程内调用canonical Push validator；"
+            "用于生产管道减少一次进程启动，不改变校验合同"
+        ),
+    )
+    parser.add_argument(
+        "--validate-no-repair-queue",
+        action="store_true",
+        help="组合渲染/校验时跳过repair_queue写入（隔离/开发用）",
+    )
+    parser.add_argument(
+        "--validate-expect-degraded",
+        action="store_true",
+        help="组合渲染/校验时要求降级战报横幅",
+    )
     args = parser.parse_args()
 
     if args.db_root:
@@ -1263,12 +1411,47 @@ def main() -> int:
         content = result.get("content", "") if isinstance(result, dict) else str(result)
         with open(args.out_file, "w", encoding="utf-8") as fh:
             fh.write(content)
-        receipt = {"ok": True, "out_file": args.out_file,
-                   "bytes": len(content.encode("utf-8"))}
+        receipt = {
+            "ok": True,
+            "render_ok": True,
+            "out_file": args.out_file,
+            "bytes": len(content.encode("utf-8")),
+        }
         if isinstance(result, dict) and result.get("title"):
             receipt["title"] = result["title"]
+        validation = None
+        if args.validate_cycle_id:
+            import validate_push_format as validator
+
+            validation = validator.validate(
+                content,
+                cycle_id=args.validate_cycle_id,
+                expect_degraded=args.validate_expect_degraded,
+                db_root=DB_ROOT,
+            )
+            receipt["validation"] = validation
+            receipt["validation_fused"] = True
+            if not validation["ok"]:
+                if not args.validate_no_repair_queue:
+                    validator.write_repair_queue(
+                        "push_format",
+                        "推送格式错误: "
+                        + ", ".join(validation["errors"][:3]),
+                        "使用 render_push_report.py 重新渲染，并按 "
+                        "templates/push_template.md §2 核对必填段",
+                    )
+                receipt["ok"] = False
+            else:
+                if validation["warnings"]:
+                    print(
+                        "[validate_push][WARN] "
+                        f"{len(validation['warnings'])} 个过时格式",
+                        file=sys.stderr,
+                    )
+                if not args.validate_no_repair_queue:
+                    validator.close_healed_push_format()
         print(json.dumps(receipt, ensure_ascii=False))
-        return 0
+        return 0 if validation is None or validation["ok"] else 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

@@ -12,6 +12,15 @@ Only fully closed candles available at the evaluation time are used.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -33,7 +42,7 @@ TIMEFRAME_SECONDS = {"15m": 15 * 60, "1H": 60 * 60, "4H": 4 * 60 * 60}
 TIMEFRAME_WEIGHTS = {"15m": 0.25, "1H": 0.35, "4H": 0.40}
 REQUIRED_KLINE_FIELDS = ("o", "h", "l", "c", "v")
 REQUIRED_INDICATOR_FIELDS = ("ma5", "ma20", "atr14", "rsi14", "macd_hist")
-DEFAULT_DB_ROOT = Path(r"./db")
+DEFAULT_DB_ROOT = Path(_public_project_path('db'))
 DEFAULT_MIN_QUOTE_VOLUME_USD = 5_000_000.0
 DEFAULT_MIN_OI_USD = 5_000_000.0
 DEFAULT_MIN_COMPLETENESS_PCT = 99.0

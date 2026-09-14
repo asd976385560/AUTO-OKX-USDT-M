@@ -23,10 +23,19 @@ live_facts 的交易前快照作基线，只投影 facts.as_of 后至构建时�
 带同 cycle positions_projected_cycle 时，render 不再用较旧 position_snapshots 覆盖持仓数。
 
 用法:
-  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root .\\db] [--out-file x.json]
+  build_push_payload.py [--cycle 2026-07-07T12:00] [--db-root <PROJECT_ROOT>\\db] [--out-file x.json]
   缺 --cycle 时取 analysis_runs 最新 cycle。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import hashlib
@@ -40,7 +49,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.decision_card import (
+    MINIMAL_DECISION_PROTOCOL,
+    OPEN_EXECUTION_PACKAGE_KEY,
+    is_open_execution_package,
+)
 from core.risk_validator import MAX_PORTFOLIO_IMR_RATIO
+from scripts import _acceptance_thresholds as thresholds
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -48,7 +63,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_DB = r".\db"
+DEFAULT_DB = _public_project_path('db')
 BUSINESS_ERROR_REPORTABLE_FROM = "2026-08-14T02:15"
 INTER_REPORT_EXCHANGE_ATTESTATION_REQUIRED_FROM = "2026-08-15T08:00"
 INTER_REPORT_WINDOW_MINUTES = 15
@@ -58,6 +73,7 @@ INTER_REPORT_RECONCILE_SOURCES = {
 }
 INTER_REPORT_DIRECT_FILL_SOURCE = "fills"
 INTER_REPORT_DIRECT_TS_SOURCE = "fills.fillTime"
+ETF_CONFIRMED_MAX_AGE_DAYS = 3
 
 # trades.action(+side) → 标准枚举（render/validate 只认单枚举，禁复合标签）
 _OPEN = {"open", "add"}
@@ -246,7 +262,7 @@ def _loads(s):
         return {}
 
 
-def _open_trade_decisions(trades):
+def _open_trade_decisions(trades, *, closure_policy=False):
     """Return one frozen decision entry per actual OPEN/ADD symbol+side leg.
 
     Multiple fills of the same leg share one market decision.  If their frozen
@@ -262,35 +278,47 @@ def _open_trade_decisions(trades):
         side = str(trade.get("side") or "").strip().lower()
         key = (symbol, side)
         raw = _loads(trade.get("raw"))
-        card = _loads(raw.get("decision_card")) if isinstance(raw, dict) else {}
+        business_key = (
+            OPEN_EXECUTION_PACKAGE_KEY if closure_policy else "decision_card")
+        card = _loads(raw.get(business_key)) if isinstance(raw, dict) else {}
         card = card if isinstance(card, dict) else {}
         if key not in by_leg:
             entry = {
                 "symbol": symbol,
                 "side": side,
-                "decision_card": card,
+                business_key: card,
                 "conflicting_cards": False,
             }
             by_leg[key] = entry
             entries.append(entry)
             continue
         existing = by_leg[key]
-        previous = existing.get("decision_card") or {}
+        previous = existing.get(business_key) or {}
         if not previous and card:
-            existing["decision_card"] = card
+            existing[business_key] = card
         elif previous and card and previous != card:
-            existing["decision_card"] = {}
+            existing[business_key] = {}
             existing["conflicting_cards"] = True
     return entries
 
 
-def _first_open_trade_card(trades):
+def _first_open_trade_card(trades, *, closure_policy=False):
     """Return the first non-conflicting card frozen on an OPEN/ADD ledger leg."""
-    for entry in _open_trade_decisions(trades):
-        card = entry.get("decision_card")
+    business_key = (
+        OPEN_EXECUTION_PACKAGE_KEY if closure_policy else "decision_card")
+    for entry in _open_trade_decisions(
+            trades, closure_policy=closure_policy):
+        card = entry.get(business_key)
         if isinstance(card, dict) and card:
             return card
     return {}
+
+
+def _closure_execution_package_payload(package: object) -> dict:
+    """Expose exactly one validated five-field package in closure Push."""
+    if not is_open_execution_package(package):
+        return {}
+    return {OPEN_EXECUTION_PACKAGE_KEY: dict(package)}
 
 
 def _summary_section(value):
@@ -351,6 +379,68 @@ def _as_cst_datetime(value):
     return dt.astimezone(CST)
 
 
+def _etf_observation_age_days(observation_date, cycle) -> int | None:
+    cycle_dt = _as_cst_datetime(cycle)
+    try:
+        observed = datetime.strptime(
+            str(observation_date or "")[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    if cycle_dt is None:
+        return None
+    age = (cycle_dt.date() - observed).days
+    return age if age >= 0 else None
+
+
+def _etf_push_state(public_macro_snapshot, stored_meta, stored_hard, cycle):
+    """Resolve ETF display without promoting stale confirmed data to current."""
+    meta = stored_meta if isinstance(stored_meta, dict) else {}
+    hard = stored_hard
+    provisional = meta.get("provisional_value_usd")
+    confirmed = public_macro_snapshot.get("etf_confirmed") or {}
+    provisional_row = public_macro_snapshot.get("etf_provisional") or {}
+    conflict = public_macro_snapshot.get("etf_conflict") or {}
+    diagnostic_hard = None
+    age_days = None
+    if confirmed:
+        hard = confirmed.get("value")
+        provisional = None
+        meta = {
+            "status": "cross_checked",
+            "source_as_of": confirmed.get("observation_date"),
+        }
+    elif conflict:
+        hard = None
+        provisional = None
+        meta = {
+            "status": "conflict",
+            "source_as_of": conflict.get("observation_date"),
+        }
+    elif provisional_row:
+        hard = None
+        provisional = provisional_row.get("value")
+        meta = {
+            "status": "provisional_single_source",
+            "source_as_of": provisional_row.get("observation_date"),
+            "source": provisional_row.get("source"),
+        }
+    if isinstance(hard, (int, float)):
+        age_days = _etf_observation_age_days(meta.get("source_as_of"), cycle)
+        if age_days is None or age_days > ETF_CONFIRMED_MAX_AGE_DAYS:
+            diagnostic_hard = hard
+            hard = None
+            provisional = None
+            meta = {**meta, "status": "STALE/N/A"}
+    return {
+        "hard": hard,
+        "provisional": provisional,
+        "status": meta.get("status") or "missing",
+        "as_of": meta.get("source_as_of") or "-",
+        "age_days": age_days,
+        "diagnostic_hard": diagnostic_hard,
+    }
+
+
 def _ledger_order(value, fallback):
     try:
         return int(value)
@@ -358,7 +448,14 @@ def _ledger_order(value, fallback):
         return int(fallback)
 
 
-def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts, as_of=None):
+# 2026-08-19 G8①：投影是否真的应用过（按 profile 记）。旧代码无条件把
+# positions_projected_cycle 置为本 cycle → render 的 _positions_projected 恒 True
+# → #588 事故后加的 authoritative_position_count 交叉校验**永久失效**。
+_PROJECTION_APPLIED: dict = {}
+
+
+def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts,
+                                      as_of=None, applied_out=None):
     """把快照后至 payload 构建时点的全部已落库成交投影到持仓。
 
     trader 可能跨 cycle 交错完成：例如当前 push 对应 16:15，但较慢的 16:00
@@ -452,6 +549,9 @@ def _project_positions_through_trades(snapshot_rows, trades, snapshot_ts, as_of=
                 if old_upl is not None and old_qty > 0:
                     current["upl"] = old_upl * new_qty / old_qty
                 current["_projected_after_baseline"] = True
+        if applied_out is not None:
+            # 只要有一笔窗口内成交被真正重放，就记一次（含被完全平掉的仓）。
+            applied_out.append(True)
 
     return [positions[key] for key in order if key in positions]
 
@@ -530,8 +630,29 @@ def _short_dxy(dxy_trend: str) -> str:
     return f"USD_BROAD {head} {tail}".strip()
 
 
-def _usd_broad_summary(macro: dict) -> str:
-    """Render old and current USD_BROAD macro schemas without false missing."""
+def _normalize_usd_broad_zone(value) -> str:
+    """Keep only the stable zone enum, never an explanatory suffix."""
+    text = str(value or "").strip().lstrip("*_` ").upper()
+    for token in ("EXTREME", "ELEVATED", "STALE", "NORMAL", "NEUTRAL"):
+        if text.startswith(token):
+            return token
+    return ""
+
+
+def _usd_broad_summary(
+    macro: dict,
+    *,
+    fallback_value=None,
+) -> str:
+    """Render USD_BROAD without treating explanatory prose as missing data.
+
+    The analyst contract requires a ``macro`` object but historical and current
+    agents have represented ``usd_broad`` as either a number or an explanatory
+    sentence.  The deterministic payload already reads the authoritative
+    ``cross_market.dxy`` value for the market section, so reuse that same value
+    when the analyst field is non-numeric.  A zone explicitly embedded as
+    ``dxy_zone=...`` remains evidence and is preserved.
+    """
     legacy = str(macro.get("dxy_trend") or "").strip()
     if legacy:
         return _short_dxy(legacy)
@@ -544,12 +665,26 @@ def _usd_broad_summary(macro: dict) -> str:
             ),
         )
     )
-    zone = str(
+    if value is None:
+        value = _float_or_none(fallback_value)
+    zone = _normalize_usd_broad_zone(
         macro.get("dxy_broad_zone")
         or macro.get("dxy_zone")
         or macro.get("usd_broad_zone")
-        or ""
-    ).strip()
+    )
+    if not zone:
+        for raw in (
+            macro.get("usd_broad"),
+            macro.get("dxy_broad_usd_trade_weighted"),
+            macro.get("dxy_broad_value"),
+        ):
+            text = str(raw or "")
+            marker = "dxy_zone="
+            if marker not in text:
+                continue
+            zone = _normalize_usd_broad_zone(text.split(marker, 1)[1])
+            if zone:
+                break
     parts = ["USD_BROAD"]
     if value is not None:
         parts.append(str(_r2(value)))
@@ -559,8 +694,10 @@ def _usd_broad_summary(macro: dict) -> str:
 
 
 def latest_cycle(db_root: str) -> str | None:
+    # F1：缺 --cycle 的默认选轮只认 status='ok'。9:30 占位行(error)无 regime/
+    # market_summary/signals，被选中会渲染出一份空 payload。
     r = _one(db_root, "analysis.db",
-             "SELECT cycle_id FROM analysis_runs "
+             "SELECT cycle_id FROM analysis_runs WHERE status='ok' "
              "ORDER BY ts DESC,rowid DESC LIMIT 1")
     return r["cycle_id"] if r else None
 
@@ -689,7 +826,22 @@ def _inter_report_exchange_identity(row: dict) -> dict | None:
     ):
         proof_source = INTER_REPORT_DIRECT_FILL_SOURCE
     else:
-        return None
+        # G8③：不再静默 return None。8 月落库 140 笔里 46 笔无 fill_source、
+        # 37 笔 ts_source='trusted_internal_override'，实测跨轮候选被丢 11 笔，
+        # 正文却只显示「报告间交易所成交=0笔」—— 报告与账本不对数。
+        # 降级为 excluded 记录，由调用方计数并在正文外显。
+        return {
+            "_excluded": True,
+            "id": _ledger_order(row.get("id"), 0),
+            "ts": str(row.get("ts") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "action": str(row.get("action") or "").lower(),
+            "exclusion_reason": (
+                f"reconcile_source={reconcile_source or 'none'};"
+                f"fill_source={str(raw.get('fill_source') or 'none')};"
+                f"ts_source={str(raw.get('ts_source') or 'none')};"
+                f"ord_ids={len(ord_ids)}"),
+        }
     return {
         "id": _ledger_order(row.get("id"), 0),
         "original_cycle_id": str(row.get("cycle_id") or ""),
@@ -725,18 +877,28 @@ def _inter_report_exchange_attestation(
         (start, end, cycle),
     )
     identities = []
+    excluded_fills = []
     for row in rows:
         identity = _inter_report_exchange_identity(row)
-        if identity is not None:
+        if identity is None:
+            continue
+        if identity.pop("_excluded", False):
+            excluded_fills.append(identity)
+        else:
             identities.append(identity)
     body = {
-        "schema_version": 1,
+        # G8③ v2：新增 candidate_count/excluded_*，三者闭合
+        # （窗口内账本行数 = 计入 + 未计入），可被 validator 独立验真。
+        "schema_version": 2,
         "profile": profile,
         "cycle_id": str(cycle),
         "window_start_exclusive_cst": start,
         "window_end_inclusive_cst": end,
+        "candidate_count": len(rows),
         "fill_count": len(identities),
+        "excluded_count": len(excluded_fills),
         "fills": identities,
+        "excluded_fills": excluded_fills,
     }
     canonical = json.dumps(
         body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -826,7 +988,14 @@ def _action_from_cycle(raw: dict, decision: str) -> str:
     return action if action in allowed else _map_decision(decision)
 
 
-def _upstream_failure_card(context: dict) -> dict:
+def _upstream_failure_card(
+    context: dict,
+    db_root: str | None = None,
+    cycle: str | None = None,
+) -> dict:
+    # 2026-08-19 P0-4：db_root/cycle 为可选，既有测试替身按单参调用
+    # （tests/test_push_multitimeframe_report.py、test_report_pipeline_repairs.py），
+    # 保持向后兼容；只在 dispatcher/pipeline 真实路径上传库根。
     kind = str(context.get("failure_kind") or "agent_process_failed")
     if context.get("stage") == "collection":
         missing = ",".join(
@@ -859,7 +1028,15 @@ def _upstream_failure_card(context: dict) -> dict:
         if isinstance(context.get("business_check"), dict) else []
     )
     checks = checks if isinstance(checks, list) else []
-    analysis_found = any(
+    # P0-4：business_check 只在上游肯给结构化 checks 时才有值，只给 rc 的失败
+    # 一律落空 → 「分析已落库」分支历史 0 次触发，18 轮 analysis_runs.status='ok'
+    # 的 cycle 被写成「未形成有效分析」。改为直接只读查权威库；business_check
+    # 降级为补充证据，不再是唯一来源。复用既有 _one helper，不新建连接。
+    analysis_found = bool(
+        db_root and cycle and _one(
+            db_root, "analysis.db",
+            "SELECT 1 FROM analysis_runs WHERE cycle_id=?", (cycle,))
+    ) or any(
         isinstance(item, dict)
         and item.get("db") == "analysis.db"
         and item.get("table") == "analysis_runs"
@@ -1081,6 +1258,8 @@ def build(
     upstream_failure: dict | None = None,
 ) -> dict:
     now = now or datetime.now(CST)
+    minimal_policy = thresholds.minimal_decision_contract_active(cycle)
+    closure_policy = thresholds.minimal_contract_closure_active(cycle)
     hhmm = cycle.split("T")[1] if "T" in cycle else now.strftime("%H:%M")
     failure_report = upstream_failure is not None
     if failure_report:
@@ -1113,6 +1292,16 @@ def build(
     quant = _summary_section(ms.get("quant")) if isinstance(ms, dict) else {}
     senti = _summary_section(ms.get("sentiment")) if isinstance(ms, dict) else {}
     regime = ar.get("regime") or macro.get("regime") or "-"
+    # Read once and reuse for both the headline/decision macro summary and the
+    # market section.  This prevents a prose-shaped analyst field from rendering
+    # as missing while the same report already has the authoritative value.
+    cm = _one(db_root, "regime.db",
+              "SELECT dxy,dxy_d1,vix,vix_d1,spx,spx_d1,btc_dominance,btc_etf_flow,"
+              "defillama_tvl_total,btc_etf_net_flow_usd,dxy_calc_ecb,"
+              "dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta "
+              "FROM cross_market ORDER BY ts DESC LIMIT 1") or {}
+    usd_broad_summary = _usd_broad_summary(
+        macro, fallback_value=cm.get("dxy"))
 
     sigs = _rows(db_root, "analysis.db",
                  "SELECT symbol,total,action,side,confidence,reasoning,decision_card "
@@ -1218,8 +1407,10 @@ def build(
     )
     open_trade_symbol = str((open_trade or {}).get("symbol") or "").strip()
     open_trade_side = str((open_trade or {}).get("side") or "").strip().lower()
-    open_trade_decisions = _open_trade_decisions(all_trades)
-    open_trade_card = _first_open_trade_card(all_trades)
+    open_trade_decisions = _open_trade_decisions(
+        all_trades, closure_policy=closure_policy)
+    open_trade_card = _first_open_trade_card(
+        all_trades, closure_policy=closure_policy)
     if all_trades:
         syms, seen = [], set()
         for t in all_trades:
@@ -1240,7 +1431,7 @@ def build(
         card = {}
     if failure_report:
         action = "WAIT"
-        card = _upstream_failure_card(upstream_failure)
+        card = _upstream_failure_card(upstream_failure, db_root, cycle)
     confidence = "-"  # 旧推送键保留；新协议不显示或消费评分
 
     # ── summary（确定性组装，含市场实质）────────────────
@@ -1271,7 +1462,7 @@ def build(
             break
     if not top_news and news.get("summary"):
         top_news = f"；{str(news['summary'])[:36]}"
-    summary = (f"{head_cn}：regime={regime}，{_usd_broad_summary(macro)}，"
+    summary = (f"{head_cn}：regime={regime}，{usd_broad_summary}，"
                f"{len(open_cands)} 个 open 候选{top_news}")
     if failure_report:
         kind = upstream_failure["failure_kind"]
@@ -1283,7 +1474,11 @@ def build(
         )
         failure_checks = failure_checks if isinstance(
             failure_checks, list) else []
-        failure_analysis_found = any(
+        # P0-4：同 _upstream_failure_card，权威事实优先于上游自述。
+        failure_analysis_found = bool(_one(
+            db_root, "analysis.db",
+            "SELECT 1 FROM analysis_runs WHERE cycle_id=?", (cycle,)
+        )) or any(
             isinstance(item, dict)
             and item.get("db") == "analysis.db"
             and item.get("table") == "analysis_runs"
@@ -1318,7 +1513,8 @@ def build(
         isinstance(live_facts, dict) and live_facts.get("status") == "ok"
     )
     if facts_authoritative:
-        trade_card = _loads(live_raw.get("decision_card"))
+        trade_card = _loads(live_raw.get(
+            OPEN_EXECUTION_PACKAGE_KEY if closure_policy else "decision_card"))
         if isinstance(trade_card, dict) and trade_card and not open_trade_card:
             # analysis card 生成于实时 facts 之前；交易回执 card 才能引用已核验现仓。
             card = trade_card
@@ -1354,7 +1550,7 @@ def build(
             reason_bits.append(f"执行：{tr0}")
     macro_line = "；".join(
         str(x) for x in (
-            macro.get("dxy_trend") or _usd_broad_summary(macro),
+            macro.get("dxy_trend") or usd_broad_summary,
             macro.get("risk_appetite"),
             macro.get("regime_stability_24h"),
             macro.get("summary") or macro.get("verdict"),
@@ -1518,6 +1714,14 @@ def build(
                 "hold_min": round(age * 60) if age is not None else None,
                 "sl_pct": sl_pct, "sl_px": _px(sl_px),
                 "sl_buffer_pct": sl_buffer,
+                # 2026-08-20：本路径读的是 live_facts（同轮交易所 algo 单
+                # 快照），是唯一能证明「真没挂」的地方。sl 为空 = 交易所说
+                # 没有 → absent；有 algo 但 verified=false → unverified
+                # （**不是**没挂，是没验成）。只读库的路径一律不得下 absent。
+                "sl_state": (
+                    "attached" if sl_px is not None
+                    else "unverified" if sl
+                    else "absent"),
                 "profile": "live",
             })
         return {"rows": out, "as_of": facts_as_of}
@@ -1568,7 +1772,20 @@ def build(
             if projected_open or sl_px is None:
                 sl_pct, sl_px = _open_sl_info(
                     db_root, prof, symbol, avg_px)
+            # 2026-08-20 SL 三态：facts 已给出的交易所正证据（absent/unverified）
+            # 在未被投影改动时原样保留；一旦仓位在快照之后变过（projected_open），
+            # 旧证据对新尺寸不再成立，降级为 unread —— 只读库的补全永远不够格
+            # 断言「真没挂」。
+            _incoming_sl_state = str(row.get("sl_state") or "")
+            if sl_px is not None:
+                sl_state = "attached"
+            elif (not projected_open
+                    and _incoming_sl_state in ("absent", "unverified")):
+                sl_state = _incoming_sl_state
+            else:
+                sl_state = "unread"
             out.append({
+                "sl_state": sl_state,
                 "symbol": symbol,
                 "side": side,
                 "sz": qty,
@@ -1596,19 +1813,22 @@ def build(
             "SELECT id AS ledger_rowid,ts,cycle_id,symbol,action,side,sz,fill_px,lev "
             "FROM trades ORDER BY id",
         )
+        _applied: list = []
         if prof == "live":
             canonical = _positions_from_live_facts()
             if canonical is not None:
                 rows = _project_positions_through_trades(
                     canonical["rows"], ledger_trades,
-                    canonical["as_of"], as_of=now)
+                    canonical["as_of"], as_of=now, applied_out=_applied)
+                _PROJECTION_APPLIED[prof] = bool(_applied)
                 return _complete_projected_fact_rows(rows, prof)
         snapshot_ts, rows = _latest_position_snapshot(db_root, prof, now)
         # 只把这些行用于持仓内存投影；headline / execution / trades 段仍严格展示
         # 当前 cycle，避免把交错 cycle 的成交误报为本轮执行。
         rows = _project_positions_through_trades(
-            rows, ledger_trades, snapshot_ts, as_of=now
+            rows, ledger_trades, snapshot_ts, as_of=now, applied_out=_applied
         )
+        _PROJECTION_APPLIED[prof] = bool(_applied)
         # 2026-07-15 主人要求：持仓行补名义/保证金（USD + 占净值%）。ctVal 取
         # market.db.instruments_cache，公式与 risk_validator 同口径 sz×ctVal×avgPx÷lev；
         # ctVal/净值缺失 → 字段 None，render 静默省略（不断行）。
@@ -1636,7 +1856,12 @@ def build(
                 _latest_fresh_last(db_root, r["symbol"], now),
                 sl_px,
             ) if sl_px else None
+            # 本路径（失败/WAIT 报告走这里）只读 position_snapshots + 建仓
+            # trade 的 raw，**从未问过交易所**。取不到只能是 unread，绝不
+            # 能说 absent —— 那正是 8 轮误报「SL未挂」的成因。
+            sl_state = "attached" if sl_px is not None else "unread"
             out.append({"symbol": r["symbol"], "side": r["side"], "sz": r["sz"],
+                        "sl_state": sl_state,
                         "avgPx": _px(r["avgPx"]), "lev": r["lev"], "upl": _r2(r["upl"]),
                         "notional_usd": _r2(notional), "margin_usd": _r2(margin),
                         "margin_pct": margin_pct,
@@ -1649,6 +1874,24 @@ def build(
     live_pos = _positions("live")
     positions = live_pos
 
+    # A no-trade HOLD/ADJUST cycle can legitimately have ``signals=[]`` while
+    # still completing an explicit per-position review.  In that case the old
+    # headline fallback above used the synthetic market default ``BTC`` even
+    # though the same payload carried authoritative live-facts positions (for
+    # example HYPE).  Prefer those reviewed position symbols so the title and
+    # execution line identify the same instruments as the decision card.  A
+    # flat WAIT/HOLD cycle keeps the existing BTC fallback for compatibility.
+    if not all_trades and not top_sig and action in {"HOLD", "ADJUST"}:
+        reviewed_symbols = []
+        seen_reviewed_symbols = set()
+        for position in positions:
+            reviewed = _short(position.get("symbol"))
+            if reviewed and reviewed not in seen_reviewed_symbols:
+                seen_reviewed_symbols.add(reviewed)
+                reviewed_symbols.append(reviewed)
+        if reviewed_symbols:
+            symbol = "/".join(reviewed_symbols[:3])
+
     # ── 资产段兜底（render 权威覆盖）──────────────────────
     def _assets(prof):
         a = _one(db_root, "account.db",
@@ -1657,7 +1900,7 @@ def build(
                  (prof,)) or {}
         cum = None
         try:
-            sys.path.insert(0, r".\scripts")
+            sys.path.insert(0, _public_project_path('scripts'))
             import cum_pnl
             info = cum_pnl.cum_for(db_root, prof)
             cum = info.get("cum_pnl") if info.get("ok") else None
@@ -1796,11 +2039,6 @@ def build(
                     "SELECT last,chg24h FROM tick_snapshots WHERE symbol=? "
                     "ORDER BY ts DESC LIMIT 1", (sym,)) or {}
     btc, eth = _tick("BTC-USDT-SWAP"), _tick("ETH-USDT-SWAP")
-    cm = _one(db_root, "regime.db",
-              "SELECT dxy,dxy_d1,vix,vix_d1,spx,spx_d1,btc_dominance,btc_etf_flow,"
-              "defillama_tvl_total,btc_etf_net_flow_usd,dxy_calc_ecb,"
-              "dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta "
-              "FROM cross_market ORDER BY ts DESC LIMIT 1") or {}
     market = {
         "btc": _px(btc.get("last")), "btc_chg24h": _r2(btc.get("chg24h")),
         "eth": _px(eth.get("last")), "eth_chg24h": _r2(eth.get("chg24h")),
@@ -1870,34 +2108,14 @@ def build(
             _macro_meta = json.loads(cm.get("source_meta") or "{}")
         except (TypeError, json.JSONDecodeError):
             _macro_meta = {}
-        _etf_meta = _macro_meta.get("btc_etf_net_flow_usd") or {}
-        _etf_hard = cm.get("btc_etf_net_flow_usd")
-        _etf_provisional = _etf_meta.get("provisional_value_usd")
-        _etf_confirmed_row = _public_macro.get("etf_confirmed") or {}
-        _etf_provisional_row = _public_macro.get("etf_provisional") or {}
-        _etf_conflict_row = _public_macro.get("etf_conflict") or {}
-        if _etf_confirmed_row:
-            _etf_hard = _etf_confirmed_row.get("value")
-            _etf_provisional = None
-            _etf_meta = {
-                "status": "cross_checked",
-                "source_as_of": _etf_confirmed_row.get("observation_date"),
-            }
-        elif _etf_conflict_row:
-            _etf_hard = None
-            _etf_provisional = None
-            _etf_meta = {
-                "status": "conflict",
-                "source_as_of": _etf_conflict_row.get("observation_date"),
-            }
-        elif _etf_provisional_row:
-            _etf_hard = None
-            _etf_provisional = _etf_provisional_row.get("value")
-            _etf_meta = {
-                "status": "provisional_single_source",
-                "source_as_of": _etf_provisional_row.get("observation_date"),
-                "source": _etf_provisional_row.get("source"),
-            }
+        _etf_state = _etf_push_state(
+            _public_macro,
+            _macro_meta.get("btc_etf_net_flow_usd") or {},
+            cm.get("btc_etf_net_flow_usd"),
+            cycle,
+        )
+        _etf_hard = _etf_state["hard"]
+        _etf_provisional = _etf_state["provisional"]
         macro_block = {
             "enabled": True,
             "dxy": _r2(cm.get("dxy")), "dxy_d1": _ratio_pct(cm.get("dxy_d1")),
@@ -1917,8 +2135,14 @@ def build(
                     else "-"
                 )
             ),
-            "btc_etf_flow_status": _etf_meta.get("status") or "missing",
-            "btc_etf_flow_as_of": _etf_meta.get("source_as_of") or "-",
+            "btc_etf_flow_status": _etf_state["status"],
+            "btc_etf_flow_as_of": _etf_state["as_of"],
+            "btc_etf_flow_age_days": _etf_state["age_days"],
+            "btc_etf_diagnostic_hard_value_usd": (
+                f"{_etf_state['diagnostic_hard'] / 1e6:+.1f}M"
+                if isinstance(_etf_state["diagnostic_hard"], (int, float))
+                else None
+            ),
             "tvl": (f"{_tvl / 1e9:.1f}B" if isinstance(_tvl, (int, float)) else "-"),
             "degraded_sources": ",".join(f["source"] for f in faults) or "无",
         }
@@ -1965,7 +2189,7 @@ def build(
         "cycle_id": cycle,
         "hhmm": hhmm,
         "cycle_count": 0,          # render 权威覆盖
-        "cycle_duration_s": 0,     # render 权威覆盖
+        "cycle_duration_s": None,  # 缺失不是0；render只读业务终态证据
         "channel": "live",        # render 硬编码覆盖
         "symbol": symbol or "BTC",
         "confidence": confidence,
@@ -1980,7 +2204,7 @@ def build(
                 if business_error_safety is not None
                 else "exchange_reconcile_after_business_terminal"
                 if (
-                    card
+                    (card or minimal_policy)
                     and live_raw.get("business_context_preserved") is True
                     and live_raw.get("reconcile_source") in {
                         "exchange_fills_reconcile",
@@ -1988,18 +2212,30 @@ def build(
                     }
                 )
                 else "business_terminal"),
-            "decision_protocol": "decision_card_v1" if card else "legacy_score",
-            "decision_card": card,
-            "multitimeframe_analysis": (
-                card.get("multitimeframe_analysis")
-                if isinstance(card.get("multitimeframe_analysis"), dict)
-                else None
+            "decision_protocol": (
+                MINIMAL_DECISION_PROTOCOL
+                if minimal_policy
+                else "decision_card_v1" if card else "legacy_score"
             ),
-            "multitimeframe_expected_symbol": open_trade_symbol or None,
-            "multitimeframe_expected_side": (
-                open_trade_side if open_trade_side in {"long", "short"} else None
+            **({} if minimal_policy else {
+                "decision_card": card,
+                "multitimeframe_analysis": (
+                    card.get("multitimeframe_analysis")
+                    if isinstance(card.get("multitimeframe_analysis"), dict)
+                    else None
+                ),
+                "multitimeframe_expected_symbol": open_trade_symbol or None,
+                "multitimeframe_expected_side": (
+                    open_trade_side
+                    if open_trade_side in {"long", "short"}
+                    else None
+                ),
+                "multitimeframe_analyses": open_trade_decisions,
+            }),
+            **(
+                _closure_execution_package_payload(open_trade_card)
+                if closure_policy else {}
             ),
-            "multitimeframe_analyses": open_trade_decisions,
             **play,
         },
         "execution": execution,
@@ -2015,7 +2251,11 @@ def build(
         "positions": positions,
         # render 收到与 cycle 相同的标记时，持仓数使用上述 as-of 快照+窗口成交
         # 投影，不再被交易前 position_snapshots 旧批次覆盖。
-        "positions_projected_cycle": cycle,
+        # G8①：只有**本轮确有 snapshot_ts < trade.ts 的新成交**才置位；否则留空，
+        # 让 render 回到 position_snapshots 权威复核（#588 防线重新生效）。
+        **({"positions_projected_cycle": cycle}
+           if _PROJECTION_APPLIED.get("live") else {}),
+        "positions_projection_applied": bool(_PROJECTION_APPLIED.get("live")),
         "positions_projected_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
         "exceptions": exceptions,
         "timeline": timeline,

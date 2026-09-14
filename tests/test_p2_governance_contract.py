@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-import json
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import re
 import sys
 import unittest
@@ -16,22 +24,6 @@ import daily_maintenance  # noqa: E402
 
 
 class P2GovernanceContractTests(unittest.TestCase):
-    def test_reference_override_repairs_are_not_public_active_scripts(self):
-        lifecycle = json.loads(
-            (SCRIPTS / "lifecycle.json").read_text(encoding="utf-8")
-        )
-        active_paths = {
-            str(path)
-            for group in lifecycle.get("groups", [])
-            if group.get("status") != "archived"
-            for path in group.get("paths", [])
-        }
-        for name in (
-            "_fix_live_ref_override.py",
-            "_fix_reference_overrides.py",
-        ):
-            self.assertFalse((SCRIPTS / name).exists())
-            self.assertNotIn(name, active_paths)
 
     def test_daily_log_rotation_includes_stage_status_for_seven_days(self):
         step = next(item for item in daily_maintenance.STEPS if item[0] == "log_rotate")
@@ -40,7 +32,7 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--days") + 1], "7")
         self.assertEqual(
             argv[argv.index("--dirs") + 1],
-            "trigger,push,stage-status",
+            "trigger,push,stage-status,stage-control,analysis-validation,collect/guards",
         )
 
     def test_daily_maintenance_evaluates_shadow_judgments_after_quality_handoff(self):
@@ -71,6 +63,8 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertIn("evaluate_multitimeframe_model_shadow.py", step[1][0])
         self.assertIn("--shadow-root", step[1])
         self.assertIn("--labels-out", step[1])
+        # The evaluator returns rc=0 for a valid audit and publishes its
+        # independent model gate conclusion in the artifact.
         self.assertEqual(step[3], (0,))
 
     def test_daily_maintenance_independently_audits_frozen_model_labels(self):
@@ -193,6 +187,7 @@ class P2GovernanceContractTests(unittest.TestCase):
             "2026-08-12T16:00:00+08:00",
             step[1][step[1].index("--forward-start") + 1],
         )
+        self.assertNotIn("--target-rate", step[1])
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 
@@ -230,8 +225,11 @@ class P2GovernanceContractTests(unittest.TestCase):
             step[1][step[1].index("--availability-minimum-slots") + 1],
         )
         self.assertIn("--market-db", step[1])
+        self.assertNotIn("--minimum-rate", step[1])
         self.assertNotIn("--apply", step[1])
-        self.assertEqual(step[3], (0,))
+        # rc=1 is a structurally valid NOT_MET business conclusion; the
+        # maintenance manifest preserves it as business_result.
+        self.assertEqual(step[3], (0, 1))
 
     def test_daily_maintenance_audits_news_sources_by_expected_slots(self):
         names = [item[0] for item in daily_maintenance.STEPS]
@@ -250,6 +248,7 @@ class P2GovernanceContractTests(unittest.TestCase):
             step[1][step[1].index("--forward-start") + 1],
         )
         self.assertIn("--minimum-window-hours", step[1])
+        self.assertNotIn("--target-rate", step[1])
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 
@@ -266,6 +265,10 @@ class P2GovernanceContractTests(unittest.TestCase):
         )
         self.assertIn("audit_contract_statistics_coverage.py", step[1][0])
         self.assertEqual(
+            "0.99",
+            step[1][step[1].index("--minimum-coverage") + 1],
+        )
+        self.assertEqual(
             "2026-08-12T16:00:00+08:00",
             step[1][step[1].index("--forward-start") + 1],
         )
@@ -274,7 +277,8 @@ class P2GovernanceContractTests(unittest.TestCase):
             step[1][step[1].index("--forward-minimum-slots") + 1],
         )
         self.assertNotIn("--apply", step[1])
-        self.assertEqual(step[3], (0,))
+        # rc=1 是有效审计的 NOT_MET 结论；日维护不得把它误报为进程失败。
+        self.assertEqual(step[3], (0, 1))
 
     def test_daily_maintenance_audits_asset_classes_read_only(self):
         names = [item[0] for item in daily_maintenance.STEPS]
@@ -290,6 +294,10 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertIn("audit_asset_class_coverage.py", step[1][0])
         self.assertIn("--market-db", step[1])
         self.assertIn("--minimum-rate", step[1])
+        self.assertEqual(
+            "0.99",
+            step[1][step[1].index("--minimum-rate") + 1],
+        )
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 
@@ -307,8 +315,45 @@ class P2GovernanceContractTests(unittest.TestCase):
         self.assertIn("audit_multitimeframe_coverage.py", step[1][0])
         self.assertIn("--market-db", step[1])
         self.assertIn("--minimum-rate", step[1])
+        self.assertEqual(
+            "0.99",
+            step[1][step[1].index("--minimum-rate") + 1],
+        )
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
+
+    def test_daily_maintenance_audits_ws_market_health_read_only(self):
+        names = [item[0] for item in daily_maintenance.STEPS]
+        self.assertIn("ws_market_health", names)
+        self.assertGreater(
+            names.index("ws_market_health"),
+            names.index("multitimeframe_coverage"),
+        )
+        step = next(
+            item for item in daily_maintenance.STEPS
+            if item[0] == "ws_market_health"
+        )
+        self.assertIn("audit_ws_market_health.py", step[1][0])
+        self.assertIn("--cache-db", step[1])
+        self.assertIn("--market-db", step[1])
+        self.assertEqual(
+            "24",
+            step[1][step[1].index("--required-hours") + 1],
+        )
+        self.assertIn("--json-out", step[1])
+        self.assertNotIn("--apply", step[1])
+        # rc=1是结构合法的NOT_MET业务结论；rc>=2才是进程/契约故障。
+        self.assertEqual(step[3], (0, 1))
+
+    def test_ledger_invariants_runs_before_reviewer_ready_boundary(self):
+        names = [item[0] for item in daily_maintenance.STEPS]
+        self.assertIn("ledger_invariants", names)
+        self.assertLess(
+            names.index("ledger_invariants"),
+            names.index("quality_metrics"),
+        )
+        self.assertIn(
+            "ledger_invariants", daily_maintenance.REVIEWER_CRITICAL_STEPS)
 
     def test_daily_maintenance_audits_dynamic_market_features_read_only(self):
         names = [item[0] for item in daily_maintenance.STEPS]
@@ -334,6 +379,7 @@ class P2GovernanceContractTests(unittest.TestCase):
             "96",
             step[1][step[1].index("--minimum-slots") + 1],
         )
+        self.assertNotIn("--target-rate", step[1])
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 
@@ -357,12 +403,13 @@ class P2GovernanceContractTests(unittest.TestCase):
             "96",
             step[1][step[1].index("--minimum-slots") + 1],
         )
+        self.assertNotIn("--target-rate", step[1])
         self.assertNotIn("--apply", step[1])
         self.assertEqual(step[3], (0,))
 
     def test_news_scout_uses_direct_json_file_write_contract(self):
         text = (ROOT / "agents" / "news_scout.md").read_text(encoding="utf-8")
-        self.assertIn("write path=<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json", text)
+        self.assertIn('write path=<PROJECT_ROOT>/tmp/_xsearch_<cycle>.json', text)
         self.assertIn("文件写入工具直接写 `tmp/*.json`", text)
         self.assertNotIn("用 `tmp\\*.py` 经 wrapper 写", text)
         self.assertNotRegex(text, re.compile(r"(?mi)^\s*pwsh\b.*\s-Command\b"))

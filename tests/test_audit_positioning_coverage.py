@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,7 +54,82 @@ def _row(symbol: str, long_ratio: float = 0.6) -> tuple:
     )
 
 
+def _latest_coverage_result(**overrides: object) -> dict[str, object]:
+    """Return the real audit result fields consumed by the CLI summary."""
+    result: dict[str, object] = {
+        "status": "PASSED",
+        "coverage_rate": 1.0,
+        "valid_symbols": 1,
+        "universe_symbols": 1,
+        "batch_rows": 1,
+    }
+    result.update(overrides)
+    return result
+
+
 class PositioningCoverageAuditTests(unittest.TestCase):
+    def test_cli_uses_one_explicit_as_of_for_latest_and_all_forward_windows(self):
+        as_of = "2026-08-15T19:59:00+08:00"
+        window = {
+            "status": "INSUFFICIENT_EVIDENCE",
+            "expected_slots": 0,
+            "minimum_slots": 1,
+        }
+        with (
+            mock.patch.object(
+                audit, "audit_positioning_storage_contract",
+                return_value={"status": "PASSED"}),
+            mock.patch.object(
+                audit, "audit_positioning_coverage",
+                return_value=_latest_coverage_result()) as latest,
+            mock.patch.object(
+                audit, "audit_positioning_forward_coverage",
+                return_value=dict(window)) as hourly,
+            mock.patch.object(
+                audit, "audit_positioning_decision_availability",
+                return_value=dict(window)) as availability,
+            mock.patch.object(
+                audit, "audit_positioning_collection_receipts",
+                return_value=dict(window)) as receipts,
+            mock.patch.object(audit, "_atomic_json"),
+        ):
+            self.assertEqual(0, audit.main(["--as-of", as_of]))
+        expected = audit._parse_cst(as_of)
+        self.assertEqual(expected, latest.call_args.kwargs["now"])
+        self.assertEqual(expected, hourly.call_args.kwargs["as_of"])
+        self.assertEqual(expected, availability.call_args.kwargs["as_of"])
+        self.assertEqual(expected, receipts.call_args.kwargs["as_of"])
+
+    def test_cli_returns_one_for_structured_not_met(self):
+        window = {
+            "status": "INSUFFICIENT_EVIDENCE",
+            "expected_slots": 0,
+            "minimum_slots": 1,
+        }
+        with (
+            mock.patch.object(
+                audit, "audit_positioning_storage_contract",
+                return_value={"status": "PASSED"}),
+            mock.patch.object(
+                audit, "audit_positioning_coverage",
+                return_value=_latest_coverage_result(
+                    status="NOT_MET", coverage_rate=0.5)),
+            mock.patch.object(
+                audit, "audit_positioning_forward_coverage",
+                return_value=dict(window)),
+            mock.patch.object(
+                audit, "audit_positioning_decision_availability",
+                return_value=dict(window)),
+            mock.patch.object(
+                audit, "audit_positioning_collection_receipts",
+                return_value=dict(window)),
+            mock.patch.object(audit, "_atomic_json"),
+        ):
+            self.assertEqual(
+                1,
+                audit.main(["--as-of", "2026-08-15T19:59:00+08:00"]),
+            )
+
     def test_storage_contract_requires_cycle_scoped_primary_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -98,6 +174,50 @@ class PositioningCoverageAuditTests(unittest.TestCase):
         self.assertEqual(1.0, result["coverage_rate"])
         self.assertEqual([], result["invalid_rows"])
 
+    def test_latest_snapshot_respects_as_of_and_ignores_future_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _database(Path(tmp), [
+                _row("AAA-USDT-SWAP"),
+                _row("BBB-USDT-SWAP"),
+                _row("CCC-USDT-SWAP"),
+            ])
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "INSERT INTO tick_snapshots VALUES(?,?)",
+                ("2026-08-11T19:30:02Z", "FUTURE-USDT-SWAP"),
+            )
+            future_rows = []
+            for symbol in (
+                "AAA-USDT-SWAP", "BBB-USDT-SWAP", "CCC-USDT-SWAP",
+            ):
+                row = list(_row(symbol))
+                row[0] = "2026-08-11T20:00:00Z"
+                row[1] = "2026-08-11T19:30:25Z"
+                row[2] = "2026-08-12T03:30"
+                future_rows.append(tuple(row))
+            connection.executemany(
+                "INSERT INTO market_positioning VALUES(?,?,?,?,?,?,?,?,?)",
+                future_rows,
+            )
+            connection.commit()
+            connection.close()
+
+            result = audit.audit_positioning_coverage(
+                path,
+                now=datetime(2026, 8, 11, 19, 15,
+                             tzinfo=timezone.utc),
+            )
+
+        self.assertEqual("2026-08-11T19:00:02Z", result["latest_ticker_ts"])
+        self.assertEqual(
+            "2026-08-11T19:00:25Z",
+            result["latest_batch_collected_ts"],
+        )
+        self.assertEqual("PASSED", result["status"])
+        self.assertEqual(3, result["universe_symbols"])
+        self.assertEqual(1.0, result["coverage_rate"])
+        self.assertEqual([], result["invalid_rows"])
+
     def test_missing_symbol_is_in_denominator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = _database(Path(tmp), [
@@ -133,12 +253,12 @@ class PositioningCoverageAuditTests(unittest.TestCase):
                 _row("AAA-USDT-SWAP"), _row("BBB-USDT-SWAP"), tuple(old)])
             result = audit.audit_positioning_coverage(
                 path,
-                now=datetime(2026, 8, 11, 19, 0, tzinfo=timezone.utc),
+                now=datetime(2026, 8, 11, 19, 1, tzinfo=timezone.utc),
                 maximum_source_age_minutes=90,
             )
         self.assertEqual("NOT_MET", result["status"])
-        self.assertEqual(120.0, result["maximum_source_age_minutes"])
-        self.assertEqual(60.0, result["minimum_source_age_minutes"])
+        self.assertEqual(121.0, result["maximum_source_age_minutes"])
+        self.assertEqual(61.0, result["minimum_source_age_minutes"])
         stale = next(
             item for item in result["invalid_rows"]
             if item["symbol"] == "CCC-USDT-SWAP")

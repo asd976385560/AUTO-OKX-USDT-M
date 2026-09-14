@@ -47,6 +47,9 @@ jobs:
       - name: Run isolated regressions
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
+      - name: Validate Gateway transport contracts
+        run: node --test tests/test_qq_gateway_send.mjs
+
       - name: Validate public contracts
         shell: pwsh
         run: |

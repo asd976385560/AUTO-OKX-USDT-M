@@ -5,6 +5,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import io
 import json
 import os
@@ -25,6 +34,7 @@ for path in (ROOT / "collectors", ROOT / "scripts", ROOT / "collectors" / "sourc
 import _proc  # noqa: E402
 import fast_collect  # noqa: E402
 import build_push_payload  # noqa: E402
+import collect_data  # noqa: E402
 import collect_slow  # noqa: E402
 import collect_market_features  # noqa: E402
 import collect_positioning_current  # noqa: E402
@@ -43,7 +53,539 @@ import _okx_ticker_fallback  # noqa: E402
 from core import order_executor  # noqa: E402
 
 
+_DEADLINE_PATCHER = None
+
+
+class QueryStateOutputEncodingTests(unittest.TestCase):
+    def test_captured_output_streams_are_forced_to_utf8(self):
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+
+        query_state._configure_stdio_utf8(stdout, stderr)
+
+        stdout.reconfigure.assert_called_once_with(
+            encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(
+            encoding="utf-8", errors="replace")
+
+
+def setUpModule() -> None:
+    """Historical runtime fixtures isolate repairs; deadline has dedicated tests."""
+    global _DEADLINE_PATCHER
+    _DEADLINE_PATCHER = mock.patch.object(
+        order_executor, "_cycle_side_effect_reject", return_value=None)
+    _DEADLINE_PATCHER.start()
+
+
+def tearDownModule() -> None:
+    if _DEADLINE_PATCHER is not None:
+        _DEADLINE_PATCHER.stop()
+
+
 class SlowCollectRegressionTests(unittest.TestCase):
+    def test_coin_sentiment_primary_write_retries_one_transient_lock(self):
+        connection = mock.Mock()
+        connection.executemany.side_effect = [
+            sqlite3.OperationalError("database is locked"),
+            None,
+        ]
+        rows = [("2026-08-27T00:00:00Z", "BTC-USDT-SWAP", "24h")]
+
+        with mock.patch.object(collect_slow.time, "sleep") as sleep:
+            inserted = collect_slow._write_coin_sentiment_rows(
+                connection, rows, lock_retry_seconds=1.0)
+
+        self.assertEqual(1, inserted)
+        self.assertEqual(2, connection.executemany.call_count)
+        self.assertEqual(1, connection.rollback.call_count)
+        connection.commit.assert_called_once_with()
+        sleep.assert_called_once_with(1.0)
+        first_rows = connection.executemany.call_args_list[0].args[1]
+        second_rows = connection.executemany.call_args_list[1].args[1]
+        self.assertIs(first_rows, second_rows)
+
+    def test_coin_sentiment_primary_write_does_not_retry_non_lock_error(self):
+        connection = mock.Mock()
+        connection.executemany.side_effect = sqlite3.OperationalError(
+            "no such table: coin_sentiment")
+        rows = [("2026-08-27T00:00:00Z", "BTC-USDT-SWAP", "24h")]
+
+        with (
+            mock.patch.object(collect_slow.time, "sleep") as sleep,
+            self.assertRaisesRegex(sqlite3.OperationalError, "no such table"),
+        ):
+            collect_slow._write_coin_sentiment_rows(connection, rows)
+
+        connection.executemany.assert_called_once()
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_hourly_official_macro_upsert_persists_fred_and_ecb_together(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(public_macro.TABLE_DDL)
+        ecb_rows = [{
+            "metric": public_macro.METRIC_DXY_ECB,
+            "observation_date": "2026-08-17",
+            "source": public_macro.SOURCE_ECB_DXY,
+            "collected_at": "2026-08-17T19:01:00Z",
+            "value": 99.25,
+            "unit": "index",
+            "label": "ECB reference-rate calculation",
+            "status": "calculated_public",
+        }]
+
+        result = collect_slow._upsert_hourly_official_macro(
+            connection,
+            fed_rate=3.63,
+            fed_obs_date="2026-08-13",
+            fed_d1=0.0,
+            ecb_rows=ecb_rows,
+        )
+        snapshot = public_macro.latest_snapshot(connection)
+        connection.close()
+
+        self.assertEqual(result["fed_written"], 1)
+        self.assertEqual(result["ecb_written"], 1)
+        self.assertEqual(result["ecb_latest_date"], "2026-08-17")
+        self.assertEqual(
+            snapshot["fed_funds"]["observation_date"], "2026-08-13"
+        )
+        self.assertEqual(
+            snapshot["dxy_calc_ecb"]["observation_date"], "2026-08-17"
+        )
+
+    def test_instruments_cache_migrates_and_keeps_official_listing_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "market.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE instruments_cache("
+                "instId TEXT PRIMARY KEY,ctVal REAL,lotSz REAL)"
+            )
+            connection.execute(
+                "INSERT INTO instruments_cache VALUES(?,?,?)",
+                ("BTC-USDT-SWAP", 1.0, 1.0),
+            )
+            count = collect_slow._collect_instruments_cache(
+                connection,
+                [{
+                    "instId": "BTC-USDT-SWAP",
+                    "ctVal": "0.01",
+                    "lotSz": "0.1",
+                    "listTime": "1786523400000",
+                    "state": "live",
+                    "instCategory": "1",
+                }],
+            )
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(instruments_cache)")
+            }
+            row = connection.execute(
+                "SELECT ctVal,lotSz,list_time_utc,state,inst_category,"
+                "metadata_updated_at FROM instruments_cache WHERE instId=?",
+                ("BTC-USDT-SWAP",),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(count, 1)
+        self.assertTrue({
+            "list_time_utc", "state", "inst_category", "metadata_updated_at",
+        }.issubset(columns))
+        self.assertEqual(row[0], 0.01)
+        self.assertEqual(row[1], 0.1)
+        self.assertEqual(
+            row[2], collect_slow.ms_to_iso("1786523400000"))
+        self.assertEqual(row[3], "live")
+        self.assertEqual(row[4], "1")
+        self.assertIsNotNone(row[5])
+
+    def test_instruments_cache_never_fabricates_missing_contract_specs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "market.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE instruments_cache("
+                "instId TEXT PRIMARY KEY,ctVal REAL,lotSz REAL)"
+            )
+            connection.execute(
+                "INSERT INTO instruments_cache VALUES(?,?,?)",
+                ("OLD-USDT-SWAP", 0.01, 0.1),
+            )
+            count = collect_slow._collect_instruments_cache(
+                connection,
+                [
+                    {
+                        "instId": "OLD-USDT-SWAP",
+                        "ctVal": "",
+                        "lotSz": "nan",
+                        "listTime": "1786523400000",
+                        "state": "live",
+                        "instCategory": "1",
+                    },
+                    {
+                        "instId": "NEW-USDT-SWAP",
+                        "ctVal": "0",
+                        "lotSz": None,
+                        "listTime": "1786523400000",
+                        "state": "live",
+                        "instCategory": "1",
+                    },
+                ],
+            )
+            old_specs = connection.execute(
+                "SELECT ctVal,lotSz FROM instruments_cache WHERE instId=?",
+                ("OLD-USDT-SWAP",),
+            ).fetchone()
+            new_row = connection.execute(
+                "SELECT ctVal,lotSz,list_time_utc,state,inst_category "
+                "FROM instruments_cache WHERE instId=?",
+                ("NEW-USDT-SWAP",),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(count, 2)
+        self.assertEqual(old_specs, (0.01, 0.1))
+        self.assertEqual(new_row[0:2], (None, None))
+        self.assertEqual(
+            new_row[2], collect_slow.ms_to_iso("1786523400000"))
+        self.assertEqual(new_row[3:5], ("live", "1"))
+
+    def test_collect_slow_connections_support_named_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "regime.db"
+            seed = sqlite3.connect(db_path)
+            seed.execute("CREATE TABLE sample(observation_date TEXT, value REAL)")
+            seed.execute("INSERT INTO sample VALUES('2026-07-28', 1.0)")
+            seed.commit()
+            seed.close()
+
+            connection = collect_slow.open_db(Path(tmp), "regime.db")
+            try:
+                row = connection.execute(
+                    "SELECT observation_date,value FROM sample"
+                ).fetchone()
+                self.assertEqual(row["observation_date"], "2026-07-28")
+                self.assertEqual(row["value"], 1.0)
+            finally:
+                connection.close()
+
+    def test_retry_cycle_stays_on_hour_slot(self):
+        now = datetime(2026, 7, 26, 23, 36, 58, tzinfo=slow_collect.CST)
+        self.assertEqual(slow_collect._hour_cycle_id(now), "2026-07-26T23:00")
+
+    def test_slow_collect_child_output_is_forced_to_utf8(self):
+        with mock.patch.dict(
+                slow_collect.os.environ,
+                {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"}):
+            child_env = slow_collect._python_child_env()
+        self.assertEqual("utf-8", child_env["PYTHONIOENCODING"])
+        self.assertEqual("1", child_env["PYTHONUTF8"])
+
+    def test_collect_data_connections_set_explicit_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "market.db"
+            sqlite3.connect(db_path).close()
+            connection = collect_data.open_db(Path(temporary), "market.db")
+            try:
+                self.assertEqual(
+                    5000,
+                    connection.execute("PRAGMA busy_timeout").fetchone()[0],
+                )
+                self.assertEqual(
+                    "wal",
+                    connection.execute("PRAGMA journal_mode").fetchone()[0],
+                )
+                self.assertEqual(
+                    1,
+                    connection.execute("PRAGMA synchronous").fetchone()[0],
+                )
+            finally:
+                connection.close()
+
+    def test_slow_dry_collect_rejects_production_root_before_ledger_init(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "OKX"
+            db_root = root / "db"
+            db_root.mkdir(parents=True)
+            ledger_path = db_root / "ledger.db"
+            ledger_path.write_bytes(b"sentinel-ledger")
+            argv = [
+                "slow_collect.py", "--db-root", str(db_root),
+                "--cycle", "2026-08-31T01:00", "--dry-collect",
+            ]
+            with (
+                mock.patch.object(slow_collect, "ROOT", root),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(slow_collect.ledger, "init_ledger") as init,
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(64, slow_collect.main())
+            init.assert_not_called()
+            self.assertEqual(b"sentinel-ledger", ledger_path.read_bytes())
+
+    def test_slow_collect_can_defer_dispatch_to_hourly_aggregator(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db_root = Path(temporary)
+            nudge = mock.Mock()
+            fake_nudge_module = mock.Mock(nudge_from_collector=nudge)
+            argv = [
+                "slow_collect.py",
+                "--db-root", str(db_root),
+                "--cycle", "2026-08-14T23:00",
+                "--dry-collect",
+                "--defer-dispatch-nudge",
+            ]
+            with (
+                mock.patch.object(slow_collect, "_nudge_mod", fake_nudge_module),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                return_code = slow_collect.main()
+
+            result = json.loads(output.getvalue())
+        self.assertEqual(0, return_code)
+        self.assertEqual("deferred_to_collect_cycle", result["dispatch"]["reason"])
+        nudge.assert_not_called()
+
+    def test_slow_collect_persists_and_surfaces_degraded_provenance(self):
+        collector_payload = {
+            "degraded": ["klines"],
+            "degradation_details": {
+                "slow_kline_incomplete": ["1M:420/436"],
+            },
+            "wrote": {
+                "klines": 123,
+                "cross_market": 1,
+                "coin_sentiment": 2,
+            },
+            "symbols_count": 436,
+            "position_priority_symbols": ["UNI-USDT-SWAP"],
+            "timing_s": {
+                "slow_kline_timeframes": {"1M": 50.0},
+                "total": 182.4,
+            },
+        }
+        step = {
+            "name": "collect_slow",
+            "ok": False,
+            "rc": 2,
+            "dur_s": 182.4,
+            "warn_tail": [
+                "[collect_slow][WARN] slow kline incomplete: 1M:420/436",
+            ],
+            "stderr_tail": "",
+            "payload": collector_payload,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            db_root = Path(temporary)
+            argv = [
+                "slow_collect.py",
+                "--db-root", str(db_root),
+                "--cycle", "2026-08-21T02:00",
+                "--defer-dispatch-nudge",
+            ]
+            with (
+                mock.patch.object(slow_collect, "run_step", return_value=step),
+                mock.patch.object(
+                    slow_collect, "_verify_regime_write",
+                    return_value=("ok", None),
+                ),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                return_code = slow_collect.main()
+            result = json.loads(output.getvalue())
+            con = sqlite3.connect(db_root / "ledger.db")
+            try:
+                ledger_row = con.execute(
+                    "SELECT status,err FROM collection_runs "
+                    "WHERE cycle_id=? AND source='slow'",
+                    ("2026-08-21T02:00",),
+                ).fetchone()
+            finally:
+                con.close()
+
+        self.assertEqual(0, return_code)
+        self.assertEqual("degraded", result["status_slow"])
+        self.assertEqual(["klines"], result["collector_degraded"])
+        self.assertEqual(
+            ["1M:420/436"],
+            result["collector_degradation_details"]
+            ["slow_kline_incomplete"],
+        )
+        self.assertEqual(436, result["collector_symbols_count"])
+        self.assertEqual(
+            ["UNI-USDT-SWAP"],
+            result["collector_position_priority_symbols"],
+        )
+        self.assertEqual(123, result["collector_wrote"]["klines"])
+        self.assertIn("1M:420/436", result["collector_warnings"][0])
+        self.assertEqual("degraded", ledger_row[0])
+        self.assertIn("blocks=klines", ledger_row[1])
+        self.assertIn("1M:420/436", ledger_row[1])
+
+    def test_slow_kline_partial_batch_is_degraded_and_bounded(self):
+        class FakeConnection:
+            def __init__(self):
+                self.rows = []
+                self.committed = False
+
+            def executemany(self, _sql, rows):
+                self.rows.extend(rows)
+
+            def commit(self):
+                self.committed = True
+
+        candle = [
+            "1785196800000", "100", "101", "99", "100.5",
+            "0", "0", "1234",
+        ]
+        connection = FakeConnection()
+        with (
+            mock.patch.object(collect_slow, "SLOW_TIMEFRAMES", {"1H": "1H"}),
+            mock.patch.object(
+                collect_slow,
+                "fetch_candles_batch_sync",
+                return_value={
+                    "AAA-USDT-SWAP": [candle],
+                    "BBB-USDT-SWAP": [],
+                },
+            ) as fetch,
+        ):
+            timing = {}
+            count, incomplete = collect_slow.collect_slow_klines(
+                connection,
+                ["AAA-USDT-SWAP", "BBB-USDT-SWAP"],
+                timing_out=timing,
+            )
+        self.assertEqual(count, 1)
+        self.assertEqual(incomplete, ["1H:1/2"])
+        self.assertTrue(connection.committed)
+        self.assertIn("1H", timing)
+        self.assertGreaterEqual(timing["1H"], 0.0)
+        self.assertLessEqual(
+            fetch.call_args.kwargs["batch_timeout_s"],
+            collect_slow.SLOW_KLINE_TF_TIMEOUT_S,
+        )
+
+    def test_slow_kline_order_prioritizes_positions_without_dropping_symbols(self):
+        self.assertEqual(
+            ["UNI-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            collect_slow._prioritize_symbols(
+                ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "UNI-USDT-SWAP"],
+                ["UNI-USDT-SWAP", "NOT-IN-UNIVERSE", "UNI-USDT-SWAP"],
+            ),
+        )
+
+    def test_latest_live_position_priority_uses_exact_account_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = sqlite3.connect(root / "account.db")
+            try:
+                connection.execute(
+                    "CREATE TABLE account_snapshots("
+                    "ts TEXT,profile TEXT,PRIMARY KEY(ts,profile))"
+                )
+                connection.execute(
+                    "CREATE TABLE position_snapshots("
+                    "ts TEXT,profile TEXT,symbol TEXT,sz REAL,"
+                    "PRIMARY KEY(ts,profile,symbol))"
+                )
+                connection.executemany(
+                    "INSERT INTO account_snapshots VALUES(?,?)",
+                    [
+                        ("2026-08-22 23:45:00", "live"),
+                        ("2026-08-23 00:00:00", "live"),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO position_snapshots VALUES(?,?,?,?)",
+                    [
+                        ("2026-08-22 23:45:00", "live", "OLD-USDT-SWAP", 2),
+                        ("2026-08-23 00:00:00", "live", "UNI-USDT-SWAP", 19),
+                        ("2026-08-23 00:00:00", "live", "ZERO-USDT-SWAP", 0),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(
+                ["UNI-USDT-SWAP"],
+                collect_slow._latest_live_position_symbols(root),
+            )
+
+    def test_okx_batch_deadline_stops_before_request(self):
+        client = mock.Mock()
+        with self.assertRaises(TimeoutError):
+            _okx_http._get_data(
+                client,
+                "/api/v5/market/candles",
+                {"instId": "BTC-USDT-SWAP"},
+                deadline=time.monotonic() - 1,
+            )
+        client.get.assert_not_called()
+
+    def test_okx_request_without_batch_deadline_keeps_client_timeout(self):
+        client = mock.Mock()
+        response = client.get.return_value
+        response.json.return_value = {"code": "0", "data": []}
+        self.assertEqual(
+            _okx_http._get_data(
+                client,
+                "/api/v5/market/candles",
+                {"instId": "BTC-USDT-SWAP"},
+                retries=0,
+            ),
+            [],
+        )
+        self.assertNotIn("timeout", client.get.call_args.kwargs)
+
+    def test_okx_default_domains_use_recommended_primary_and_legacy_fallback(self):
+        self.assertEqual(
+            (
+                "https://openapi.okx.com",
+                "https://www.okx.com",
+            ),
+            _okx_http._resolve_base_urls(None, None),
+        )
+
+    def test_okx_explicit_regional_domain_has_no_implicit_global_fallback(self):
+        self.assertEqual(
+            ("https://us.okx.com",),
+            _okx_http._resolve_base_urls("https://us.okx.com/", None),
+        )
+
+    def test_okx_network_retry_rotates_domains_inside_existing_budget(self):
+        client = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {"code": "0", "data": [{"instId": "BTC-USDT-SWAP"}]}
+        client.get.side_effect = [RuntimeError("ssl eof"), response]
+        domains = ("https://openapi.okx.com", "https://www.okx.com")
+        with (
+            mock.patch.object(_okx_http, "_BASE_URLS", domains),
+            mock.patch.object(_okx_http.time, "sleep"),
+        ):
+            result = _okx_http._get_data(
+                client,
+                "/api/v5/market/tickers",
+                {"instType": "SWAP"},
+                retries=1,
+            )
+        self.assertEqual([{"instId": "BTC-USDT-SWAP"}], result)
+        self.assertEqual(2, client.get.call_count)
+        self.assertEqual(
+            "https://openapi.okx.com/api/v5/market/tickers",
+            client.get.call_args_list[0].args[0],
+        )
+        self.assertEqual(
+            "https://www.okx.com/api/v5/market/tickers",
+            client.get.call_args_list[1].args[0],
+        )
 
     def test_okx_transport_fallback_uses_reserved_original_deadline(self):
         client = mock.Mock()
@@ -209,6 +751,11 @@ class SlowCollectRegressionTests(unittest.TestCase):
                     {symbols[1]: book},
                 ],
             ) as fetch,
+            mock.patch.object(
+                _okx_market_feature_recovery.market_source,
+                "current_source_mode",
+                return_value="rest_only",
+            ),
             mock.patch.object(_okx_market_feature_recovery.time, "sleep"),
         ):
             result = (
@@ -227,137 +774,47 @@ class SlowCollectRegressionTests(unittest.TestCase):
         self.assertEqual(1, stats["recovered_after_cold_retry"])
         self.assertEqual(1.0, stats["final_coverage_rate"])
 
-    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
-    def test_collect_slow_connections_support_named_columns(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "regime.db"
-            seed = sqlite3.connect(db_path)
-            seed.execute("CREATE TABLE sample(observation_date TEXT, value REAL)")
-            seed.execute("INSERT INTO sample VALUES('2026-07-28', 1.0)")
-            seed.commit()
-            seed.close()
-
-            connection = collect_slow.open_db(Path(tmp), "regime.db")
-            try:
-                row = connection.execute(
-                    "SELECT observation_date,value FROM sample"
-                ).fetchone()
-                self.assertEqual(row["observation_date"], "2026-07-28")
-                self.assertEqual(row["value"], 1.0)
-            finally:
-                connection.close()
-
-    def test_retry_cycle_stays_on_hour_slot(self):
-        now = datetime(2026, 7, 26, 23, 36, 58, tzinfo=slow_collect.CST)
-        self.assertEqual(slow_collect._hour_cycle_id(now), "2026-07-26T23:00")
-
-    def test_slow_kline_partial_batch_is_degraded_and_bounded(self):
-        class FakeConnection:
-            def __init__(self):
-                self.rows = []
-                self.committed = False
-
-            def executemany(self, _sql, rows):
-                self.rows.extend(rows)
-
-            def commit(self):
-                self.committed = True
-
-        candle = [
-            "1785196800000", "100", "101", "99", "100.5",
-            "0", "0", "1234",
-        ]
-        connection = FakeConnection()
+    def test_market_feature_transport_uses_ws_primary_without_rest(self):
+        symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+        book = {"bids": [["1", "1"]], "asks": [["2", "1"]]}
+        batch = _okx_market_feature_recovery.market_source.MarketBatch(
+            data={symbol: book for symbol in symbols},
+            source="ws",
+            ws_count=2,
+            rest_count=0,
+            missing=(),
+            as_of="2026-08-25T00:00:00Z",
+            universe_sha256="test",
+        )
         with (
-            mock.patch.object(collect_slow, "SLOW_TIMEFRAMES", {"1H": "1H"}),
             mock.patch.object(
-                collect_slow,
-                "fetch_candles_batch_sync",
-                return_value={
-                    "AAA-USDT-SWAP": [candle],
-                    "BBB-USDT-SWAP": [],
-                },
-            ) as fetch,
-        ):
-            count, incomplete = collect_slow.collect_slow_klines(
-                connection,
-                ["AAA-USDT-SWAP", "BBB-USDT-SWAP"],
-            )
-        self.assertEqual(count, 1)
-        self.assertEqual(incomplete, ["1H:1/2"])
-        self.assertTrue(connection.committed)
-        self.assertLessEqual(
-            fetch.call_args.kwargs["batch_timeout_s"],
-            collect_slow.SLOW_KLINE_TF_TIMEOUT_S,
-        )
-
-    def test_okx_batch_deadline_stops_before_request(self):
-        client = mock.Mock()
-        with self.assertRaises(TimeoutError):
-            _okx_http._get_data(
-                client,
-                "/api/v5/market/candles",
-                {"instId": "BTC-USDT-SWAP"},
-                deadline=time.monotonic() - 1,
-            )
-        client.get.assert_not_called()
-
-    def test_okx_request_without_batch_deadline_keeps_client_timeout(self):
-        client = mock.Mock()
-        response = client.get.return_value
-        response.json.return_value = {"code": "0", "data": []}
-        self.assertEqual(
-            _okx_http._get_data(
-                client,
-                "/api/v5/market/candles",
-                {"instId": "BTC-USDT-SWAP"},
-                retries=0,
+                _okx_market_feature_recovery.market_source,
+                "current_source_mode",
+                return_value="ws_first",
             ),
-            [],
-        )
-        self.assertNotIn("timeout", client.get.call_args.kwargs)
-
-    def test_okx_default_domains_use_recommended_primary_and_legacy_fallback(self):
-        self.assertEqual(
-            (
-                "https://openapi.okx.com",
-                "https://www.okx.com",
+            mock.patch.object(
+                _okx_market_feature_recovery.market_source,
+                "get_orderbooks_batch",
+                return_value=batch,
+            ) as ws_fetch,
+            mock.patch.object(
+                _okx_market_feature_recovery,
+                "_safe_batch",
+                side_effect=AssertionError("routine REST must stay offline"),
             ),
-            _okx_http._resolve_base_urls(None, None),
-        )
-
-    def test_okx_explicit_regional_domain_has_no_implicit_global_fallback(self):
-        self.assertEqual(
-            ("https://us.okx.com",),
-            _okx_http._resolve_base_urls("https://us.okx.com/", None),
-        )
-
-    def test_okx_network_retry_rotates_domains_inside_existing_budget(self):
-        client = mock.Mock()
-        response = mock.Mock()
-        response.json.return_value = {"code": "0", "data": [{"instId": "BTC-USDT-SWAP"}]}
-        client.get.side_effect = [RuntimeError("ssl eof"), response]
-        domains = ("https://openapi.okx.com", "https://www.okx.com")
-        with (
-            mock.patch.object(_okx_http, "_BASE_URLS", domains),
-            mock.patch.object(_okx_http.time, "sleep"),
         ):
-            result = _okx_http._get_data(
-                client,
-                "/api/v5/market/tickers",
-                {"instType": "SWAP"},
-                retries=1,
+            result = _okx_market_feature_recovery.fetch_orderbooks_batch_sync(
+                symbols, 50
             )
-        self.assertEqual([{"instId": "BTC-USDT-SWAP"}], result)
-        self.assertEqual(2, client.get.call_count)
-        self.assertEqual(
-            "https://openapi.okx.com/api/v5/market/tickers",
-            client.get.call_args_list[0].args[0],
-        )
-        self.assertEqual(
-            "https://www.okx.com/api/v5/market/tickers",
-            client.get.call_args_list[1].args[0],
-        )
+        self.assertEqual(book, result[symbols[0]])
+        self.assertEqual(book, result[symbols[1]])
+        ws_fetch.assert_called_once()
+        stats = _okx_market_feature_recovery.transport_snapshot()["orderbooks"]
+        self.assertEqual(1, stats["attempts"])
+        self.assertTrue(stats["routine_rest_primary_disabled"])
+        self.assertEqual("ws", stats["primary_source"])
+        self.assertEqual(2, stats["primary_ws_count"])
+        self.assertEqual(0, stats["primary_rest_count"])
 
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_timeout_returns_before_outer_cron_budget(self):
@@ -428,6 +885,72 @@ class ProcGuardTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "ping")
 
+    def test_observer_can_stop_tree_without_reporting_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "observed.py"
+            script.write_text(
+                "import time\nprint('started', flush=True)\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def observer():
+                calls.append(True)
+                return "deterministic_terminal"
+
+            started = time.monotonic()
+            rc, out, err, timed_out = _proc.run_guarded(
+                [sys.executable, str(script)],
+                timeout=20,
+                observer=observer,
+                observer_poll_seconds=0.1,
+            )
+            elapsed = time.monotonic() - started
+        self.assertFalse(timed_out)
+        self.assertEqual(_proc.RC_OBSERVED_STOP, rc)
+        self.assertTrue(calls)
+        self.assertIn("started", out)
+        self.assertIn("observer stop: deterministic_terminal", err)
+        self.assertLess(elapsed, 8)
+
+    def test_observer_prefers_bounded_graceful_stop_before_tree_kill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_file = Path(tmp) / "stop.flag"
+            script = Path(tmp) / "graceful.py"
+            script.write_text(
+                "import pathlib, sys, time\n"
+                f"p = pathlib.Path({str(stop_file)!r})\n"
+                "print('ready', flush=True)\n"
+                "while not p.exists(): time.sleep(0.02)\n"
+                "print('graceful-exit', flush=True)\n"
+                "sys.exit(143)\n",
+                encoding="utf-8",
+            )
+            stop_report = {}
+
+            def graceful_stop(_proc, reason):
+                self.assertEqual("business_terminal_committed", reason)
+                stop_file.write_text("stop", encoding="utf-8")
+                return True
+
+            rc, out, err, timed_out = _proc.run_guarded(
+                [sys.executable, str(script)],
+                timeout=20,
+                observer=lambda: "business_terminal_committed",
+                observer_poll_seconds=0.1,
+                graceful_stop=graceful_stop,
+                graceful_stop_timeout=2,
+                stop_report=stop_report,
+            )
+        self.assertFalse(timed_out)
+        self.assertEqual(_proc.RC_OBSERVED_STOP, rc)
+        self.assertIn("graceful-exit", out)
+        self.assertIn("graceful stop completed rc=143", err)
+        self.assertNotIn("process tree terminated", err)
+        self.assertTrue(stop_report["graceful_requested"])
+        self.assertTrue(stop_report["graceful_completed"])
+        self.assertFalse(stop_report["process_tree_terminated"])
+
     def test_wrapper_callers_no_longer_use_bare_subprocess_timeout(self):
         """契约：经 wrapper 起子进程的调用方一律走 run_guarded。
 
@@ -442,6 +965,75 @@ class ProcGuardTests(unittest.TestCase):
 
 
 class FastCollectRegressionTests(unittest.TestCase):
+    def test_child_output_is_forced_to_utf8(self):
+        with mock.patch.dict(
+                fast_collect.os.environ,
+                {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"}):
+            child_env = fast_collect._python_child_env()
+        self.assertEqual("utf-8", child_env["PYTHONIOENCODING"])
+        self.assertEqual("1", child_env["PYTHONUTF8"])
+
+    def test_dry_collect_rejects_production_root_before_ledger_init(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "OKX"
+            db_root = root / "db"
+            db_root.mkdir(parents=True)
+            ledger_path = db_root / "ledger.db"
+            ledger_path.write_bytes(b"sentinel-ledger")
+            argv = [
+                "fast_collect.py", "--db-root", str(db_root),
+                "--cycle", "2026-08-31T01:15", "--dry-collect",
+            ]
+            with (
+                mock.patch.object(fast_collect, "ROOT", root),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect.ledger, "init_ledger") as init,
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(64, fast_collect.main())
+            init.assert_not_called()
+            self.assertEqual(b"sentinel-ledger", ledger_path.read_bytes())
+
+    def test_budget_reservation_keeps_required_steps_ahead_of_enrichment(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, list(sargs), timeout))
+            return {
+                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
+                "payload": {}, "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T14:15",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, fast_collect.main())
+
+        self.assertEqual(
+            [
+                "collect_data", "live_account_check",
+                "contract_statistics", "market_features",
+            ],
+            [name for name, _args, _timeout in calls],
+        )
+        collect_args = next(
+            args for name, args, _timeout in calls if name == "collect_data"
+        )
+        self.assertIn("--cycle", collect_args)
+        self.assertIn("2026-08-12T14:15", collect_args)
+        self.assertIn(calls[0][2], (149, 150))
+        self.assertEqual(
+            [25, 75, 75], [timeout for _, _args, timeout in calls[1:]])
 
     def test_half_hour_positioning_is_isolated_before_market_features(self):
         calls = []
@@ -502,6 +1094,491 @@ class FastCollectRegressionTests(unittest.TestCase):
             "2026-08-12T14:15"))
         self.assertFalse(fast_collect.official_positioning_due(
             "2026-08-12T14:45"))
+
+    def test_budget_helper_never_borrows_reserved_seconds(self):
+        self.assertEqual(
+            150,
+            fast_collect._bounded_step_timeout(
+                deadline=320.9,
+                requested=150,
+                reserve_after=105,
+                now=0.0,
+            ),
+        )
+        self.assertEqual(
+            12,
+            fast_collect._bounded_step_timeout(
+                deadline=20.9,
+                requested=40,
+                reserve_after=8,
+                now=0.0,
+            ),
+        )
+        self.assertIsNone(
+            fast_collect._bounded_step_timeout(
+                deadline=19.9,
+                requested=40,
+                reserve_after=8,
+                now=0.0,
+            )
+        )
+
+    def test_full_universe_shadow_runs_three_fixed_slots_only(self):
+        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T00:00"))
+        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T08:00"))
+        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T16:00"))
+        self.assertFalse(fast_collect.full_universe_shadow_due("2026-08-11T08:15"))
+        self.assertFalse(fast_collect.full_universe_shadow_due("bad-cycle"))
+
+    def test_frozen_model_shadow_runs_each_natural_hour_only(self):
+        self.assertTrue(
+            fast_collect.frozen_model_shadow_due("2026-08-11T00:00")
+        )
+        self.assertTrue(
+            fast_collect.frozen_model_shadow_due("2026-08-11T09:00")
+        )
+        self.assertTrue(
+            fast_collect.frozen_model_shadow_due("2026-08-11T23:00")
+        )
+        self.assertFalse(
+            fast_collect.frozen_model_shadow_due("2026-08-11T09:15")
+        )
+        self.assertFalse(fast_collect.frozen_model_shadow_due("bad-cycle"))
+
+    def test_frozen_model_evaluation_runs_on_hourly_half_hour_only(self):
+        self.assertTrue(
+            fast_collect.frozen_model_shadow_evaluation_due(
+                "2026-08-11T08:30")
+        )
+        self.assertTrue(
+            fast_collect.frozen_model_shadow_evaluation_due(
+                "2026-08-11T23:30")
+        )
+        self.assertFalse(
+            fast_collect.frozen_model_shadow_evaluation_due(
+                "2026-08-11T08:00")
+        )
+        self.assertFalse(
+            fast_collect.frozen_model_shadow_evaluation_due(
+                "2026-08-11T08:15")
+        )
+        self.assertFalse(fast_collect.frozen_model_shadow_evaluation_due("bad"))
+
+    def test_full_universe_shadow_path_isolated_from_production_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_root = Path(tmp) / "db"
+            path = fast_collect.full_universe_shadow_path(
+                db_root, "2026-08-11T08:00"
+            )
+            self.assertTrue(str(path).startswith(str(Path(tmp))))
+            self.assertIn("2026-08-11", str(path))
+
+    def test_frozen_model_shadow_path_isolated_from_production_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_root = Path(tmp) / "db"
+            path = fast_collect.frozen_model_shadow_path(
+                db_root, "2026-08-11T08:00"
+            )
+            self.assertTrue(str(path).startswith(str(Path(tmp))))
+            self.assertIn("model-shadow", str(path))
+            self.assertIn("forward", str(path))
+
+    def test_frozen_model_evaluation_paths_are_isolated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_root = Path(tmp) / "db"
+            shadow_root, receipt, labels = (
+                fast_collect.frozen_model_shadow_evaluation_paths(db_root)
+            )
+            quality = Path(tmp) / "reports" / "quality"
+            self.assertEqual(quality / "model-shadow" / "forward", shadow_root)
+            self.assertEqual(quality / "model-shadow-evaluation.json", receipt)
+            self.assertEqual(quality / "model-shadow-labels.csv", labels)
+            self.assertEqual(
+                quality / "model-shadow-label-quality-audit.json",
+                fast_collect.frozen_model_shadow_quality_path(db_root),
+            )
+
+    def test_multitimeframe_coverage_path_isolated_from_production_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_root = Path(tmp) / "db"
+            path = fast_collect.multitimeframe_coverage_path(db_root)
+            self.assertEqual(
+                Path(tmp) / "reports" / "quality" /
+                "multitimeframe-coverage-audit.json",
+                path,
+            )
+
+    def test_fast_due_cycle_keeps_direct_multitimeframe_audit_compatibility(self):
+        source = (ROOT / "collectors" / "fast_collect.py").read_text(
+            encoding="utf-8")
+        self.assertIn('"multitimeframe_coverage_audit"', source)
+        self.assertIn("audit_multitimeframe_coverage.py", source)
+        self.assertIn('coverage_step["diagnostic_only"] = True', source)
+        self.assertIn("--defer-multitimeframe-coverage", source)
+
+    def test_fast_due_cycle_settles_frozen_model_labels_as_diagnostic(self):
+        source = (ROOT / "collectors" / "fast_collect.py").read_text(
+            encoding="utf-8")
+        self.assertIn('"frozen_model_shadow_evaluation"', source)
+        self.assertIn("evaluate_multitimeframe_model_shadow.py", source)
+        self.assertIn(
+            'model_evaluation_step["diagnostic_only"] = True', source
+        )
+        self.assertIn('"frozen_model_shadow_label_quality"', source)
+        self.assertIn("audit_model_shadow_label_quality.py", source)
+        self.assertIn('model_quality_step["diagnostic_only"] = True', source)
+
+    def test_half_hour_evaluation_and_quality_are_diagnostic_without_shadow_scoring(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, sargs, timeout))
+            return {
+                "name": name,
+                "ok": True,
+                "rc": 0,
+                "dur_s": 0.0,
+                "payload": {},
+                "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_root = Path(tmp) / "db"
+            stdout = io.StringIO()
+            argv = [
+                "fast_collect.py",
+                "--db-root", str(db_root),
+                "--cycle", "2026-08-12T08:30",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(
+                    fast_collect.ledger, "record_collection"
+                ) as record,
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", stdout),
+            ):
+                self.assertEqual(0, fast_collect.main())
+
+            names = [item[0] for item in calls]
+            self.assertNotIn("frozen_model_shadow", names)
+            self.assertNotIn("universe_judgment_shadow", names)
+            self.assertLess(
+                names.index("frozen_model_shadow_evaluation"),
+                names.index("frozen_model_shadow_label_quality"),
+            )
+            evaluation_args = next(
+                item[2]
+                for item in calls
+                if item[0] == "frozen_model_shadow_evaluation"
+            )
+            arg_map = dict(zip(evaluation_args[::2], evaluation_args[1::2]))
+            quality = Path(tmp) / "reports" / "quality"
+            self.assertEqual(
+                quality / "model-shadow" / "forward",
+                Path(arg_map["--shadow-root"]),
+            )
+            self.assertEqual(
+                quality / "model-shadow-evaluation.json",
+                Path(arg_map["--json-out"]),
+            )
+            self.assertEqual(
+                quality / "model-shadow-labels.csv",
+                Path(arg_map["--labels-out"]),
+            )
+            self.assertEqual("ok", record.call_args.args[3])
+            output = json.loads(stdout.getvalue().strip().splitlines()[-1])
+            self.assertEqual("ok", output["status"])
+            self.assertFalse(any(
+                "frozen_model_shadow" in warning
+                for warning in output["warnings"]
+            ))
+
+    def test_failed_half_hour_evaluation_never_audits_stale_outputs(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append(name)
+            ok = name != "frozen_model_shadow_evaluation"
+            return {
+                "name": name, "ok": ok, "rc": 0 if ok else 1,
+                "dur_s": 0.0, "payload": {},
+                "stderr_tail": "" if ok else "simulated evaluation failure",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T08:30",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(
+                    fast_collect.ledger, "record_collection"
+                ) as record,
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", stdout),
+            ):
+                self.assertEqual(0, fast_collect.main())
+        self.assertIn("frozen_model_shadow_evaluation", calls)
+        self.assertNotIn("frozen_model_shadow_label_quality", calls)
+        self.assertEqual("ok", record.call_args.args[3])
+        output = json.loads(stdout.getvalue().strip().splitlines()[-1])
+        self.assertTrue(any(
+            "frozen_model_shadow_evaluation: simulated evaluation failure"
+            in warning for warning in output["warnings"]
+        ))
+        self.assertTrue(any(
+            "frozen_model_shadow_label_quality: prerequisite" in warning
+            for warning in output["warnings"]
+        ))
+
+    def test_full_shadow_slot_scores_model_without_premature_evaluation(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, sargs, timeout))
+            return {
+                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
+                "payload": {}, "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T08:00",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, fast_collect.main())
+        names = [item[0] for item in calls]
+        self.assertIn("universe_judgment_shadow", names)
+        self.assertIn("frozen_model_shadow", names)
+        self.assertNotIn("frozen_model_shadow_evaluation", names)
+        self.assertNotIn("frozen_model_shadow_label_quality", names)
+
+    def test_full_shadow_slot_defers_mtf_coverage_for_hourly_orchestrator(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, sargs, timeout))
+            return {
+                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
+                "payload": {}, "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T08:00",
+                "--defer-multitimeframe-coverage",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, fast_collect.main())
+        names = [item[0] for item in calls]
+        self.assertIn("universe_judgment_shadow", names)
+        self.assertIn("frozen_model_shadow", names)
+        self.assertNotIn("multitimeframe_coverage_audit", names)
+
+    def test_failed_core_market_skips_frozen_scorer_with_clear_prerequisite(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, sargs, timeout))
+            ok = name != "collect_data"
+            return {
+                "name": name,
+                "ok": ok,
+                "rc": 0 if ok else 1,
+                "dur_s": 0.0,
+                "payload": {},
+                "stderr_tail": "upstream market unavailable" if not ok else "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T08:00",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", stdout),
+            ):
+                self.assertEqual(1, fast_collect.main())
+
+        names = [item[0] for item in calls]
+        self.assertNotIn("frozen_model_shadow", names)
+        output = json.loads(stdout.getvalue().strip().splitlines()[-1])
+        self.assertEqual("error", output["status"])
+        self.assertTrue(any(
+            "frozen_model_shadow: prerequisite collect_data failed; "
+            "scorer not started" in warning
+            for warning in output["warnings"]
+        ))
+
+    def test_non_anchor_hour_scores_model_without_full_universe_snapshot(self):
+        calls = []
+
+        def fake_run(name, script, sargs, timeout):
+            calls.append((name, script, sargs, timeout))
+            return {
+                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
+                "payload": {}, "stderr_tail": "",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
+                "--cycle", "2026-08-12T09:00",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
+                mock.patch.object(fast_collect.ledger, "init_ledger"),
+                mock.patch.object(fast_collect.ledger, "record_collection"),
+                mock.patch.object(fast_collect, "_nudge_mod", None),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, fast_collect.main())
+        names = [item[0] for item in calls]
+        self.assertIn("frozen_model_shadow", names)
+        self.assertNotIn("universe_judgment_shadow", names)
+        self.assertNotIn("multitimeframe_coverage_audit", names)
+        self.assertNotIn("frozen_model_shadow_evaluation", names)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_timeout_returns_before_outer_cron_budget(self):
+        """2026-08-05：步级 timeout 必须真的生效。
+
+        原实现经 pwsh wrapper 起 collect_data，TimeoutExpired 只 TerminateProcess
+        杀掉 pwsh，python 孙进程存活并持有 stdout 管道 → 二次 communicate() 阻塞到
+        孙进程自然退出。后果是 --total-budget 形同虚设，快采反复撞满 cron 480s
+        并整轮丢数据（7/16-8/5 共 22 次）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "sleepy.py"
+            script.write_text(
+                "import time\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            started = time.monotonic()
+            result = fast_collect.run_step("sleepy", script, [], timeout=1)
+            elapsed = time.monotonic() - started
+        self.assertEqual(result["rc"], 124)
+        self.assertFalse(result["ok"])
+        self.assertIn("process tree terminated", result["stderr_tail"])
+        self.assertLess(elapsed, 8, "超时未生效——孙进程仍在拖住 communicate()")
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_timeout_keeps_partial_stdout_json_for_attribution(self):
+        """超时也要保住已刷出的末行 JSON，否则底层根因只剩 rc=124。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "noisy.py"
+            script.write_text(
+                "import time\n"
+                'print(\'{"error": "upstream stalled"}\', flush=True)\n'
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            result = fast_collect.run_step("noisy", script, [], timeout=2)
+        self.assertEqual(result["rc"], 124)
+        self.assertEqual(result["payload"], {"error": "upstream stalled"})
+        self.assertEqual(
+            fast_collect._step_error(result), "noisy: upstream stalled"
+        )
+
+    def test_steps_no_longer_spawn_through_pwsh_wrapper(self):
+        """契约：内层直起 Python。回退到 pwsh 会让上面两条超时保证再次失效。"""
+        src = (ROOT / "collectors" / "fast_collect.py").read_text(encoding="utf-8")
+        self.assertIn("cmd = [sys.executable, str(script), *sargs]", src)
+        # 只钉 argv 形状——注释里提到 wrapper 是合法的（本脚本正是由它启动）。
+        self.assertNotIn('"pwsh", "-NoProfile"', src)
+
+    def test_payload_error_is_preserved(self):
+        step = {
+            "name": "collect_data",
+            "ok": False,
+            "rc": 1,
+            "payload": {"error": "TimeoutError: upstream unavailable"},
+            "stderr_tail": "",
+        }
+        self.assertEqual(
+            fast_collect._step_error(step),
+            "collect_data: TimeoutError: upstream unavailable",
+        )
+
+    def test_payload_errors_list_is_preserved(self):
+        step = {
+            "name": "contract_statistics",
+            "ok": False,
+            "rc": 1,
+            "payload": {
+                "errors": [
+                    "common_bucket:TransportError:tls eof",
+                    "open_interest:TimeoutError:deadline",
+                ],
+            },
+            "stderr_tail": "",
+        }
+        self.assertEqual(
+            fast_collect._step_error(step),
+            "contract_statistics: common_bucket:TransportError:tls eof; "
+            "open_interest:TimeoutError:deadline",
+        )
+
+    def test_stderr_fallback_is_preserved(self):
+        step = {
+            "name": "market_features",
+            "ok": False,
+            "rc": 2,
+            "payload": None,
+            "stderr_tail": "schema mismatch",
+        }
+        self.assertEqual(
+            fast_collect._step_error(step),
+            "market_features: schema mismatch",
+        )
+
+    def test_positioning_runs_on_hour_and_half_hour_by_default(self):
+        self.assertTrue(
+            collect_market_features.positioning_due("2026-07-27T20:00", "auto")
+        )
+        self.assertFalse(
+            collect_market_features.positioning_due("2026-07-27T20:15", "auto")
+        )
+        self.assertTrue(
+            collect_market_features.positioning_due("2026-07-27T20:30", "auto")
+        )
+        self.assertFalse(
+            collect_market_features.positioning_due("2026-07-27T20:45", "auto")
+        )
+        self.assertTrue(
+            collect_market_features.positioning_due("2026-07-27T20:15", "always")
+        )
 
     def test_positioning_batch_requires_99pct_whole_universe_coverage(self):
         self.assertTrue(collect_market_features.positioning_batch_passed(
@@ -710,440 +1787,41 @@ class FastCollectRegressionTests(unittest.TestCase):
             last_seen["okx_top_long_short"], "2026-08-12 08:00:00")
         self.assertNotEqual(
             last_seen["okx_top_long_short"], "2026-08-12 11:02:14")
-    def test_budget_reservation_keeps_required_steps_ahead_of_enrichment(self):
-        calls = []
 
-        def fake_run(name, script, sargs, timeout):
-            calls.append((name, list(sargs), timeout))
-            return {
-                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
-                "payload": {}, "stderr_tail": "",
-            }
+    def test_mark_index_and_instruments_freshness_use_consumed_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            con = sqlite3.connect(root / "market.db")
+            con.execute(
+                "CREATE TABLE derivatives("
+                "ts TEXT,mark_px REAL,index_px REAL)"
+            )
+            con.executemany(
+                "INSERT INTO derivatives VALUES(?,?,?)",
+                [
+                    ("2026-08-12T01:15:00Z", 100.0, 99.0),
+                    ("2026-08-12T01:30:00Z", 101.0, None),
+                    ("2026-08-12T01:45:00Z", None, 100.0),
+                ],
+            )
+            con.execute(
+                "CREATE TABLE instruments_cache(metadata_updated_at TEXT)"
+            )
+            con.execute(
+                "INSERT INTO instruments_cache VALUES(?)",
+                ("2026-08-12T01:40:00Z",),
+            )
+            con.commit()
+            con.close()
 
-        with tempfile.TemporaryDirectory() as tmp:
-            argv = [
-                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
-                "--cycle", "2026-08-12T14:15",
-            ]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
-                mock.patch.object(fast_collect.ledger, "init_ledger"),
-                mock.patch.object(fast_collect.ledger, "record_collection"),
-                mock.patch.object(fast_collect, "_nudge_mod", None),
-                mock.patch.object(sys, "stdout", io.StringIO()),
-            ):
-                self.assertEqual(0, fast_collect.main())
+            last_seen = source_freshness.derive_last_seen(root)
 
         self.assertEqual(
-            [
-                "collect_data", "live_account_check",
-                "contract_statistics", "market_features",
-            ],
-            [name for name, _args, _timeout in calls],
-        )
-        collect_args = next(
-            args for name, args, _timeout in calls if name == "collect_data"
-        )
-        self.assertIn("--cycle", collect_args)
-        self.assertIn("2026-08-12T14:15", collect_args)
-        self.assertIn(calls[0][2], (149, 150))
+            last_seen["okx_mark_price"], "2026-08-12 09:30:00")
         self.assertEqual(
-            [25, 75, 75], [timeout for _, _args, timeout in calls[1:]])
-
-    def test_budget_helper_never_borrows_reserved_seconds(self):
+            last_seen["okx_index_tickers"], "2026-08-12 09:45:00")
         self.assertEqual(
-            150,
-            fast_collect._bounded_step_timeout(
-                deadline=320.9,
-                requested=150,
-                reserve_after=105,
-                now=0.0,
-            ),
-        )
-        self.assertEqual(
-            12,
-            fast_collect._bounded_step_timeout(
-                deadline=20.9,
-                requested=40,
-                reserve_after=8,
-                now=0.0,
-            ),
-        )
-        self.assertIsNone(
-            fast_collect._bounded_step_timeout(
-                deadline=19.9,
-                requested=40,
-                reserve_after=8,
-                now=0.0,
-            )
-        )
-
-    def test_full_universe_shadow_runs_three_fixed_slots_only(self):
-        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T00:00"))
-        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T08:00"))
-        self.assertTrue(fast_collect.full_universe_shadow_due("2026-08-11T16:00"))
-        self.assertFalse(fast_collect.full_universe_shadow_due("2026-08-11T08:15"))
-        self.assertFalse(fast_collect.full_universe_shadow_due("bad-cycle"))
-
-    def test_frozen_model_shadow_runs_each_natural_hour_only(self):
-        self.assertTrue(
-            fast_collect.frozen_model_shadow_due("2026-08-11T00:00")
-        )
-        self.assertTrue(
-            fast_collect.frozen_model_shadow_due("2026-08-11T09:00")
-        )
-        self.assertTrue(
-            fast_collect.frozen_model_shadow_due("2026-08-11T23:00")
-        )
-        self.assertFalse(
-            fast_collect.frozen_model_shadow_due("2026-08-11T09:15")
-        )
-        self.assertFalse(fast_collect.frozen_model_shadow_due("bad-cycle"))
-
-    def test_frozen_model_evaluation_runs_on_hourly_half_hour_only(self):
-        self.assertTrue(
-            fast_collect.frozen_model_shadow_evaluation_due(
-                "2026-08-11T08:30")
-        )
-        self.assertTrue(
-            fast_collect.frozen_model_shadow_evaluation_due(
-                "2026-08-11T23:30")
-        )
-        self.assertFalse(
-            fast_collect.frozen_model_shadow_evaluation_due(
-                "2026-08-11T08:00")
-        )
-        self.assertFalse(
-            fast_collect.frozen_model_shadow_evaluation_due(
-                "2026-08-11T08:15")
-        )
-        self.assertFalse(fast_collect.frozen_model_shadow_evaluation_due("bad"))
-
-    def test_full_universe_shadow_path_isolated_from_production_reports(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_root = Path(tmp) / "db"
-            path = fast_collect.full_universe_shadow_path(
-                db_root, "2026-08-11T08:00"
-            )
-            self.assertTrue(str(path).startswith(str(Path(tmp))))
-            self.assertIn("2026-08-11", str(path))
-
-    def test_frozen_model_shadow_path_isolated_from_production_reports(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_root = Path(tmp) / "db"
-            path = fast_collect.frozen_model_shadow_path(
-                db_root, "2026-08-11T08:00"
-            )
-            self.assertTrue(str(path).startswith(str(Path(tmp))))
-            self.assertIn("model-shadow", str(path))
-            self.assertIn("forward", str(path))
-
-    def test_frozen_model_evaluation_paths_are_isolated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_root = Path(tmp) / "db"
-            shadow_root, receipt, labels = (
-                fast_collect.frozen_model_shadow_evaluation_paths(db_root)
-            )
-            quality = Path(tmp) / "reports" / "quality"
-            self.assertEqual(quality / "model-shadow" / "forward", shadow_root)
-            self.assertEqual(quality / "model-shadow-evaluation.json", receipt)
-            self.assertEqual(quality / "model-shadow-labels.csv", labels)
-            self.assertEqual(
-                quality / "model-shadow-label-quality-audit.json",
-                fast_collect.frozen_model_shadow_quality_path(db_root),
-            )
-
-    def test_multitimeframe_coverage_path_isolated_from_production_reports(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_root = Path(tmp) / "db"
-            path = fast_collect.multitimeframe_coverage_path(db_root)
-            self.assertEqual(
-                Path(tmp) / "reports" / "quality" /
-                "multitimeframe-coverage-audit.json",
-                path,
-            )
-
-    def test_fast_due_cycle_runs_multitimeframe_audit_as_diagnostic(self):
-        source = (ROOT / "collectors" / "fast_collect.py").read_text(
-            encoding="utf-8")
-        self.assertIn('"multitimeframe_coverage_audit"', source)
-        self.assertIn("audit_multitimeframe_coverage.py", source)
-        self.assertIn('coverage_step["diagnostic_only"] = True', source)
-
-    def test_fast_due_cycle_settles_frozen_model_labels_as_diagnostic(self):
-        source = (ROOT / "collectors" / "fast_collect.py").read_text(
-            encoding="utf-8")
-        self.assertIn('"frozen_model_shadow_evaluation"', source)
-        self.assertIn("evaluate_multitimeframe_model_shadow.py", source)
-        self.assertIn(
-            'model_evaluation_step["diagnostic_only"] = True', source
-        )
-        self.assertIn('"frozen_model_shadow_label_quality"', source)
-        self.assertIn("audit_model_shadow_label_quality.py", source)
-        self.assertIn('model_quality_step["diagnostic_only"] = True', source)
-
-    def test_half_hour_evaluation_and_quality_are_diagnostic_without_shadow_scoring(self):
-        calls = []
-
-        def fake_run(name, script, sargs, timeout):
-            calls.append((name, script, sargs, timeout))
-            return {
-                "name": name,
-                "ok": True,
-                "rc": 0,
-                "dur_s": 0.0,
-                "payload": {},
-                "stderr_tail": "",
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            db_root = Path(tmp) / "db"
-            stdout = io.StringIO()
-            argv = [
-                "fast_collect.py",
-                "--db-root", str(db_root),
-                "--cycle", "2026-08-12T08:30",
-            ]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
-                mock.patch.object(fast_collect.ledger, "init_ledger"),
-                mock.patch.object(
-                    fast_collect.ledger, "record_collection"
-                ) as record,
-                mock.patch.object(fast_collect, "_nudge_mod", None),
-                mock.patch.object(sys, "stdout", stdout),
-            ):
-                self.assertEqual(0, fast_collect.main())
-
-            names = [item[0] for item in calls]
-            self.assertNotIn("frozen_model_shadow", names)
-            self.assertNotIn("universe_judgment_shadow", names)
-            self.assertLess(
-                names.index("frozen_model_shadow_evaluation"),
-                names.index("frozen_model_shadow_label_quality"),
-            )
-            evaluation_args = next(
-                item[2]
-                for item in calls
-                if item[0] == "frozen_model_shadow_evaluation"
-            )
-            arg_map = dict(zip(evaluation_args[::2], evaluation_args[1::2]))
-            quality = Path(tmp) / "reports" / "quality"
-            self.assertEqual(
-                quality / "model-shadow" / "forward",
-                Path(arg_map["--shadow-root"]),
-            )
-            self.assertEqual(
-                quality / "model-shadow-evaluation.json",
-                Path(arg_map["--json-out"]),
-            )
-            self.assertEqual(
-                quality / "model-shadow-labels.csv",
-                Path(arg_map["--labels-out"]),
-            )
-            self.assertEqual("ok", record.call_args.args[3])
-            output = json.loads(stdout.getvalue().strip().splitlines()[-1])
-            self.assertEqual("ok", output["status"])
-            self.assertFalse(any(
-                "frozen_model_shadow" in warning
-                for warning in output["warnings"]
-            ))
-
-    def test_failed_half_hour_evaluation_never_audits_stale_outputs(self):
-        calls = []
-
-        def fake_run(name, script, sargs, timeout):
-            calls.append(name)
-            ok = name != "frozen_model_shadow_evaluation"
-            return {
-                "name": name, "ok": ok, "rc": 0 if ok else 1,
-                "dur_s": 0.0, "payload": {},
-                "stderr_tail": "" if ok else "simulated evaluation failure",
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            stdout = io.StringIO()
-            argv = [
-                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
-                "--cycle", "2026-08-12T08:30",
-            ]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
-                mock.patch.object(fast_collect.ledger, "init_ledger"),
-                mock.patch.object(
-                    fast_collect.ledger, "record_collection"
-                ) as record,
-                mock.patch.object(fast_collect, "_nudge_mod", None),
-                mock.patch.object(sys, "stdout", stdout),
-            ):
-                self.assertEqual(0, fast_collect.main())
-        self.assertIn("frozen_model_shadow_evaluation", calls)
-        self.assertNotIn("frozen_model_shadow_label_quality", calls)
-        self.assertEqual("ok", record.call_args.args[3])
-        output = json.loads(stdout.getvalue().strip().splitlines()[-1])
-        self.assertTrue(any(
-            "frozen_model_shadow_evaluation: simulated evaluation failure"
-            in warning for warning in output["warnings"]
-        ))
-        self.assertTrue(any(
-            "frozen_model_shadow_label_quality: prerequisite" in warning
-            for warning in output["warnings"]
-        ))
-
-    def test_full_shadow_slot_scores_model_without_premature_evaluation(self):
-        calls = []
-
-        def fake_run(name, script, sargs, timeout):
-            calls.append((name, script, sargs, timeout))
-            return {
-                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
-                "payload": {}, "stderr_tail": "",
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            argv = [
-                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
-                "--cycle", "2026-08-12T08:00",
-            ]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
-                mock.patch.object(fast_collect.ledger, "init_ledger"),
-                mock.patch.object(fast_collect.ledger, "record_collection"),
-                mock.patch.object(fast_collect, "_nudge_mod", None),
-                mock.patch.object(sys, "stdout", io.StringIO()),
-            ):
-                self.assertEqual(0, fast_collect.main())
-        names = [item[0] for item in calls]
-        self.assertIn("universe_judgment_shadow", names)
-        self.assertIn("frozen_model_shadow", names)
-        self.assertNotIn("frozen_model_shadow_evaluation", names)
-        self.assertNotIn("frozen_model_shadow_label_quality", names)
-
-    def test_non_anchor_hour_scores_model_without_full_universe_snapshot(self):
-        calls = []
-
-        def fake_run(name, script, sargs, timeout):
-            calls.append((name, script, sargs, timeout))
-            return {
-                "name": name, "ok": True, "rc": 0, "dur_s": 0.0,
-                "payload": {}, "stderr_tail": "",
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            argv = [
-                "fast_collect.py", "--db-root", str(Path(tmp) / "db"),
-                "--cycle", "2026-08-12T09:00",
-            ]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.object(fast_collect, "run_step", side_effect=fake_run),
-                mock.patch.object(fast_collect.ledger, "init_ledger"),
-                mock.patch.object(fast_collect.ledger, "record_collection"),
-                mock.patch.object(fast_collect, "_nudge_mod", None),
-                mock.patch.object(sys, "stdout", io.StringIO()),
-            ):
-                self.assertEqual(0, fast_collect.main())
-        names = [item[0] for item in calls]
-        self.assertIn("frozen_model_shadow", names)
-        self.assertNotIn("universe_judgment_shadow", names)
-        self.assertNotIn("multitimeframe_coverage_audit", names)
-        self.assertNotIn("frozen_model_shadow_evaluation", names)
-
-    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
-    def test_timeout_returns_before_outer_cron_budget(self):
-        """2026-08-05：步级 timeout 必须真的生效。
-
-        原实现经 pwsh wrapper 起 collect_data，TimeoutExpired 只 TerminateProcess
-        杀掉 pwsh，python 孙进程存活并持有 stdout 管道 → 二次 communicate() 阻塞到
-        孙进程自然退出。后果是 --total-budget 形同虚设，快采反复撞满 cron 480s
-        并整轮丢数据（7/16-8/5 共 22 次）。
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            script = Path(tmp) / "sleepy.py"
-            script.write_text(
-                "import time\n"
-                "time.sleep(30)\n",
-                encoding="utf-8",
-            )
-            started = time.monotonic()
-            result = fast_collect.run_step("sleepy", script, [], timeout=1)
-            elapsed = time.monotonic() - started
-        self.assertEqual(result["rc"], 124)
-        self.assertFalse(result["ok"])
-        self.assertIn("process tree terminated", result["stderr_tail"])
-        self.assertLess(elapsed, 8, "超时未生效——孙进程仍在拖住 communicate()")
-
-    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
-    def test_timeout_keeps_partial_stdout_json_for_attribution(self):
-        """超时也要保住已刷出的末行 JSON，否则底层根因只剩 rc=124。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            script = Path(tmp) / "noisy.py"
-            script.write_text(
-                "import time\n"
-                'print(\'{"error": "upstream stalled"}\', flush=True)\n'
-                "time.sleep(30)\n",
-                encoding="utf-8",
-            )
-            result = fast_collect.run_step("noisy", script, [], timeout=2)
-        self.assertEqual(result["rc"], 124)
-        self.assertEqual(result["payload"], {"error": "upstream stalled"})
-        self.assertEqual(
-            fast_collect._step_error(result), "noisy: upstream stalled"
-        )
-
-    def test_steps_no_longer_spawn_through_pwsh_wrapper(self):
-        """契约：内层直起 Python。回退到 pwsh 会让上面两条超时保证再次失效。"""
-        src = (ROOT / "collectors" / "fast_collect.py").read_text(encoding="utf-8")
-        self.assertIn("cmd = [sys.executable, str(script), *sargs]", src)
-        # 只钉 argv 形状——注释里提到 wrapper 是合法的（本脚本正是由它启动）。
-        self.assertNotIn('"pwsh", "-NoProfile"', src)
-
-    def test_payload_error_is_preserved(self):
-        step = {
-            "name": "collect_data",
-            "ok": False,
-            "rc": 1,
-            "payload": {"error": "TimeoutError: upstream unavailable"},
-            "stderr_tail": "",
-        }
-        self.assertEqual(
-            fast_collect._step_error(step),
-            "collect_data: TimeoutError: upstream unavailable",
-        )
-
-    def test_stderr_fallback_is_preserved(self):
-        step = {
-            "name": "market_features",
-            "ok": False,
-            "rc": 2,
-            "payload": None,
-            "stderr_tail": "schema mismatch",
-        }
-        self.assertEqual(
-            fast_collect._step_error(step),
-            "market_features: schema mismatch",
-        )
-
-    def test_positioning_runs_on_hour_and_half_hour_by_default(self):
-        self.assertTrue(
-            collect_market_features.positioning_due("2026-07-27T20:00", "auto")
-        )
-        self.assertFalse(
-            collect_market_features.positioning_due("2026-07-27T20:15", "auto")
-        )
-        self.assertTrue(
-            collect_market_features.positioning_due("2026-07-27T20:30", "auto")
-        )
-        self.assertFalse(
-            collect_market_features.positioning_due("2026-07-27T20:45", "auto")
-        )
-        self.assertTrue(
-            collect_market_features.positioning_due("2026-07-27T20:15", "always")
-        )
+            last_seen["okx_instruments"], "2026-08-12 09:40:00")
 
     def test_contract_statistics_runs_each_standard_quarter_hour(self):
         for minute in ("00", "15", "30", "45"):
@@ -1244,6 +1922,25 @@ class FastCollectRegressionTests(unittest.TestCase):
                 "DKNG-USDT-SWAP",
                 0.1,
             )
+
+    def test_contract_statistics_fallback_diagnostics_are_bounded(self):
+        diagnostics = (
+            collect_market_features.contract_statistics_fallback_diagnostics([
+                "COST-USDT-SWAP:contract_statistics_fallback:ValueError:"
+                "confirmed fallback candle missing",
+                "ISRG-USDT-SWAP:contract_statistics:ValueError:"
+                "no common timestamp;fallback=ValueError:"
+                "fallback trades do not reconcile to candle volume",
+                "contract_fallback_open_interest:TimeoutError:timeout",
+            ], sample_limit=1)
+        )
+
+        self.assertEqual(diagnostics["failure_count"], 2)
+        self.assertEqual(diagnostics["error_type_counts"], {"ValueError": 2})
+        self.assertEqual(len(diagnostics["samples"]), 1)
+        self.assertEqual(diagnostics["samples"][0]["symbol"],
+                         "COST-USDT-SWAP")
+        self.assertTrue(diagnostics["truncated"])
 
     def test_contract_statistics_replaces_stale_primary_with_verified_fallback(self):
         symbol = "DKNG-USDT-SWAP"
@@ -1407,6 +2104,49 @@ class FastCollectRegressionTests(unittest.TestCase):
             batch.call_args.kwargs["workers"],
             max(1, min(64, _okx_http._CONTRACT_STATS_WORKERS)),
         )
+
+    def test_contract_statistics_history_window_is_explicit_and_bounded(self):
+        expected = {"BTC-USDT-SWAP": []}
+        outcomes = {}
+        with mock.patch.object(
+            _okx_http, "_batch", return_value=expected
+        ) as batch:
+            actual = _okx_http.fetch_contract_open_interest_history_batch_sync(
+                ["BTC-USDT-SWAP"],
+                period="1H",
+                limit=100,
+                begin_ms=1_786_000_000_000,
+                end_ms="1786086400000",
+                request_retries=0,
+                outcomes=outcomes,
+            )
+        self.assertEqual(actual, expected)
+        params_fn = batch.call_args.args[2]
+        self.assertEqual(params_fn("BTC-USDT-SWAP"), {
+            "instId": "BTC-USDT-SWAP",
+            "period": "1H",
+            "limit": "100",
+            "begin": "1786000000000",
+            "end": "1786086400000",
+        })
+        self.assertEqual(batch.call_args.kwargs["request_retries"], 0)
+        self.assertIs(batch.call_args.kwargs["outcomes"], outcomes)
+
+        with self.assertRaisesRegex(
+            ValueError, "begin_ms must be earlier than end_ms"
+        ):
+            _okx_http.fetch_contract_taker_volumes_batch_sync(
+                ["BTC-USDT-SWAP"],
+                begin_ms=2000,
+                end_ms=1000,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "end_ms must be a Unix millisecond integer"
+        ):
+            _okx_http.fetch_contract_long_short_ratios_batch_sync(
+                ["BTC-USDT-SWAP"],
+                end_ms="not-a-time",
+            )
 
         expected = {"BTC-USDT-SWAP": [["1786477500000", "2", "3"]]}
         with mock.patch.object(_okx_http, "_batch", return_value=expected) as batch:
@@ -2002,7 +2742,7 @@ class ExecutionAndPushContractTests(unittest.TestCase):
                 "WLD-USDT-SWAP",
                 profile="live",
                 pos_side="short",
-                db_root=Path("<PROJECT_ROOT>/db"),
+                db_root=Path(_public_project_path('db')),
                 cycle_id=cycle_id,
                 receipt_context=receipt_context,
             )
@@ -2118,10 +2858,13 @@ class ExecutionAndPushContractTests(unittest.TestCase):
         with patches[0], patches[1], patches[2], patches[3], patches[4]:
             rendered = render_push_report.render(payload)
         validation = validate_push_format.validate(rendered["content"])
-        self.assertEqual(rendered["char_count"], len(rendered["content"]))
-        self.assertGreater(rendered["char_count"], 10_000)
-        self.assertGreaterEqual(rendered["content"].count(long_text), 2)
         self.assertTrue(validation["ok"], validation)
+        # 2026-08-14 起：超长报告全量渲染（无压缩版/最小化版、无"…详情见归档"），
+        # 整条交 QQ 外发（本地不截断、不分段；QQ 侧自行分段展示）。
+        long_text = "超长决策证据" * 180
+        self.assertIn(long_text, rendered["content"])
+        self.assertNotIn("推送过长", rendered["content"])
+        self.assertNotIn("详情见归档", rendered["content"])
 
     def test_reconcile_prefers_matching_execution_journal_semantics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2183,6 +2926,47 @@ class ScopeAndSourceRegressionTests(unittest.TestCase):
         self.assertTrue(news_collect._source_due(geo, "2026-07-27T02:00"))
         self.assertFalse(news_collect._source_due(geo, "2026-07-27T01:00"))
 
+    def test_confirmed_etf_freshness_never_uses_newer_provisional_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = sqlite3.connect(root / "regime.db")
+            connection.executescript(public_macro.TABLE_DDL)
+            public_macro.upsert_observations(connection, [
+                {
+                    "metric": public_macro.METRIC_BTC_ETF,
+                    "observation_date": "2026-08-03",
+                    "source": public_macro.SOURCE_ETF_CONSENSUS,
+                    "status": "cross_checked",
+                    "value": 170_100_000,
+                },
+                {
+                    "metric": public_macro.METRIC_BTC_ETF,
+                    "observation_date": "2026-08-28",
+                    "source": public_macro.SOURCE_SOSOVALUE,
+                    "status": "source_reported",
+                    "value": -201_806_559.49,
+                },
+            ])
+            connection.commit()
+            self.assertEqual(
+                "2026-08-03",
+                source_freshness._confirmed_etf_content_date(connection),
+            )
+            connection.close()
+            last_seen = source_freshness.derive_last_seen(root)
+        self.assertEqual(
+            "2026-08-03 23:59:59",
+            last_seen["macro_etf_flow"],
+        )
+        self.assertEqual(
+            "2026-08-03 23:59:59",
+            last_seen["macro_etf_flow_content"],
+        )
+        self.assertEqual(
+            "2026-08-28 23:59:59",
+            last_seen["macro_etf_flow_provisional_content"],
+        )
+
     def test_contract_statistics_sources_are_optional_official_15m_inputs(self):
         open_interest = self.sources["okx_contract_open_interest_history"]
         taker_volume = self.sources["okx_contract_taker_volume"]
@@ -2239,13 +3023,25 @@ class ScopeAndSourceRegressionTests(unittest.TestCase):
                 "macro_etf_flow": "2026-07-24",
                 "macro_fear_greed": "2026-07-27",
             },
+            public_checks={
+                "macro_dxy_calc_ecb": "2026-07-27T00:01:00Z",
+                "macro_fear_greed": "2026-07-27T00:01:00Z",
+            },
         )
         self.assertEqual(
-            timestamps["macro_dxy_calc_ecb"], "2026-07-24 23:59:59"
+            timestamps["macro_dxy_calc_ecb"], "2026-07-27 08:01:00"
+        )
+        self.assertEqual(
+            timestamps["macro_dxy_calc_ecb_content"],
+            "2026-07-24 23:59:59",
         )
         self.assertEqual(timestamps["macro_etf_flow"], "2026-07-24 23:59:59")
         self.assertEqual(
-            timestamps["macro_fear_greed"], "2026-07-27 23:59:59"
+            timestamps["macro_fear_greed"], "2026-07-27 08:01:00"
+        )
+        self.assertEqual(
+            timestamps["macro_fear_greed_content"],
+            "2026-07-27 23:59:59",
         )
         self.assertTrue(self.sources["macro_fear_greed"]["enabled"])
         self.assertTrue(self.sources["macro_etf_flow"]["enabled"])
@@ -2260,6 +3056,173 @@ class ScopeAndSourceRegressionTests(unittest.TestCase):
         self.assertEqual(
             timestamps["macro_dxy_vix_spx"], "2026-07-17 23:59:59"
         )
+        self.assertEqual(
+            timestamps["macro_dxy_vix_spx_content"],
+            "2026-07-17 23:59:59",
+        )
+
+    def test_macro_health_uses_clean_check_and_preserves_content_dates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            con = sqlite3.connect(root / "regime.db")
+            con.executescript(public_macro.TABLE_DDL)
+            con.execute(
+                "CREATE TABLE cross_market("
+                "ts TEXT,dxy REAL,vix REAL,spx REAL,source_meta TEXT,"
+                "carried_forward TEXT)"
+            )
+            con.execute(
+                "INSERT INTO cross_market VALUES(?,?,?,?,?,?)",
+                (
+                    "2026-08-17T17:01:00Z",
+                    119.0649,
+                    14.63,
+                    7785.76,
+                    json.dumps({
+                        "dxy": {"source_as_of": "2026-08-07"}
+                    }),
+                    "[]",
+                ),
+            )
+            con.execute(
+                "INSERT INTO cross_market VALUES(?,?,?,?,?,?)",
+                (
+                    "2026-08-17T18:01:00Z",
+                    119.0649,
+                    14.63,
+                    7785.76,
+                    json.dumps({"dxy": {"source_as_of": None}}),
+                    json.dumps(["dxy"]),
+                ),
+            )
+            public_macro.upsert_observations(con, [
+                {
+                    "metric": public_macro.METRIC_DXY_ECB,
+                    "observation_date": "2026-08-14",
+                    "source": public_macro.SOURCE_ECB_DXY,
+                    "collected_at": "2026-08-17T00:01:17Z",
+                    "value": 99.61,
+                    "status": "calculated_public",
+                },
+                {
+                    "metric": public_macro.METRIC_FED_FUNDS,
+                    "observation_date": "2026-08-13",
+                    "source": public_macro.SOURCE_FRED,
+                    "collected_at": "2026-08-17T18:04:45Z",
+                    "value": 3.63,
+                    "status": "official_primary",
+                },
+            ])
+            con.commit()
+            con.close()
+
+            last_seen = source_freshness.derive_last_seen(root)
+
+        self.assertEqual(
+            last_seen["macro_dxy_vix_spx"], "2026-08-18 01:01:00"
+        )
+        self.assertEqual(
+            last_seen["macro_dxy_vix_spx_content"],
+            "2026-08-07 23:59:59",
+        )
+        self.assertEqual(
+            last_seen["macro_dxy_calc_ecb"], "2026-08-17 08:01:17"
+        )
+        self.assertEqual(
+            last_seen["macro_dxy_calc_ecb_content"],
+            "2026-08-14 23:59:59",
+        )
+        self.assertEqual(
+            last_seen["macro_fed_funds"], "2026-08-18 02:04:45"
+        )
+        self.assertEqual(
+            last_seen["macro_fed_funds_content"],
+            "2026-08-13 23:59:59",
+        )
+
+    def test_sparse_announcement_health_uses_successful_check_not_event_time(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            news = sqlite3.connect(root / "news.db")
+            news.execute(
+                "CREATE TABLE news_items("
+                "ts TEXT,ingested_at TEXT,source TEXT)"
+            )
+            news.execute(
+                "INSERT INTO news_items VALUES(?,?,?)",
+                (
+                    "2026-08-13T03:03:08Z",
+                    "2026-08-13T03:03:08Z",
+                    "okx_announcements",
+                ),
+            )
+            news.executemany(
+                "INSERT INTO news_items VALUES(?,?,?)",
+                [
+                    (
+                        "2026-08-17T16:02:47Z",
+                        "2026-08-17T16:02:47Z",
+                        "mx-search",
+                    ),
+                    (
+                        "2026-08-17T15:57:38Z",
+                        "2026-08-17T15:57:38Z",
+                        "rss:test",
+                    ),
+                ],
+            )
+            news.commit()
+            news.close()
+            ledger = sqlite3.connect(root / "ledger.db")
+            ledger.execute(
+                "CREATE TABLE collection_runs("
+                "cycle_id TEXT,source TEXT,status TEXT,ts TEXT)"
+            )
+            ledger.execute(
+                "INSERT INTO collection_runs VALUES(?,?,?,?)",
+                (
+                    "2026-08-18T02:00",
+                    "okx_announcements",
+                    "ok",
+                    "2026-08-18 02:02:30",
+                ),
+            )
+            ledger.executemany(
+                "INSERT INTO collection_runs VALUES(?,?,?,?)",
+                [
+                    (
+                        "2026-08-18T03:00",
+                        "mx_search",
+                        "ok",
+                        "2026-08-18 03:02:30",
+                    ),
+                    (
+                        "2026-08-18T03:00",
+                        "rss_en",
+                        "degraded",
+                        "2026-08-18 03:02:07",
+                    ),
+                ],
+            )
+            ledger.commit()
+            ledger.close()
+            last_seen = source_freshness.derive_last_seen(root)
+        self.assertEqual(
+            last_seen["okx_announcements_content"],
+            "2026-08-13 11:03:08",
+        )
+        self.assertEqual(
+            last_seen["okx_announcements"],
+            "2026-08-18 02:02:30",
+        )
+        self.assertEqual(
+            last_seen["mx_search_content"], "2026-08-18 00:02:47"
+        )
+        self.assertEqual(last_seen["mx_search"], "2026-08-18 03:02:30")
+        self.assertEqual(
+            last_seen["rss_en_content"], "2026-08-17 23:57:38"
+        )
+        self.assertEqual(last_seen["rss_en"], "2026-08-18 03:02:07")
 
     def test_okx_first_and_authoritative_supplement_contract(self):
         self.assertTrue(self.sources["okx_top_long_short"]["enabled"])
@@ -2323,7 +3286,7 @@ class TmpStdlibShadowTests(unittest.TestCase):
         import tmp_cleanup
 
         self.assertEqual(
-            tmp_cleanup.find_stdlib_shadows(Path(r"<PROJECT_ROOT>\tmp\__does_not_exist__")),
+            tmp_cleanup.find_stdlib_shadows(Path(_public_project_path('tmp', '__does_not_exist__'))),
             [])
 
     def test_trigger_preflight_warns_but_never_blocks(self):
@@ -2335,7 +3298,7 @@ class TmpStdlibShadowTests(unittest.TestCase):
             mock.patch.object(trigger_agent, "_send_tmp_shadow_alert",
                               return_value=True) as alert,
             mock.patch("tmp_cleanup.find_stdlib_shadows",
-                       return_value=[Path(r"<PROJECT_ROOT>\tmp\bisect.py")]),
+                       return_value=[Path(_public_project_path('tmp', 'bisect.py'))]),
             mock.patch("sys.stderr", new=io.StringIO()) as err,
         ):
             names = trigger_agent._check_tmp_stdlib_shadow("live", "2026-08-06T19:45")

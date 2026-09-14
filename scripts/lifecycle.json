@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-08-15",
+  "last_updated": "2026-09-14",
   "authority": "public README + PUBLIC_RELEASE.md + tracked source",
   "groups": [
     {
@@ -218,6 +218,76 @@
         "check_release_version.py",
         "migration_guard.py",
         "update_star_stats.py"
+      ]
+    },
+    {
+      "name": "1.1.2 helper modules",
+      "status": "helper",
+      "invocation": "Explicit CLI or deterministic pipeline as documented in each module",
+      "write_scope": "Declared project artifacts only; migrations require --apply --backup-dir; autoheal remains read-only",
+      "default_mode": "Module contract; no implicit migration or ledger repair",
+      "replacement": null,
+      "last_verified": "2026-09-14",
+      "paths": [
+        "_artifact_paths.py",
+        "_audit_artifact_context.py",
+        "_okx_market_source.py",
+        "_okx_ws_cache.py",
+        "_plan_publication.py",
+        "_push_duration.py",
+        "_zh_labels.py",
+        "ledger_recovery.py"
+      ]
+    },
+    {
+      "name": "1.1.2 migration-pending modules",
+      "status": "migration-pending",
+      "invocation": "Explicit CLI or deterministic pipeline as documented in each module",
+      "write_scope": "Declared project artifacts only; migrations require --apply --backup-dir; autoheal remains read-only",
+      "default_mode": "Module contract; no implicit migration or ledger repair",
+      "replacement": null,
+      "last_verified": "2026-09-14",
+      "paths": [
+        "apply_basis_schema.py",
+        "apply_cross_market_staleness_schema.py",
+        "apply_position_snapshot_side_key.py"
+      ]
+    },
+    {
+      "name": "1.1.2 research modules",
+      "status": "research",
+      "invocation": "Explicit CLI or deterministic pipeline as documented in each module",
+      "write_scope": "Declared project artifacts only; migrations require --apply --backup-dir; autoheal remains read-only",
+      "default_mode": "Module contract; no implicit migration or ledger repair",
+      "replacement": null,
+      "last_verified": "2026-09-14",
+      "paths": [
+        "audit_candidate_bundle_rollout.py",
+        "audit_critical_output_liveness.py",
+        "audit_live_profitability.py",
+        "audit_rule_compliance.py",
+        "audit_weekly_trading_net_profit.py",
+        "audit_ws_market_baseline.py",
+        "audit_ws_market_health.py"
+      ]
+    },
+    {
+      "name": "1.1.2 runtime modules",
+      "status": "runtime",
+      "invocation": "Explicit CLI or deterministic pipeline as documented in each module",
+      "write_scope": "Declared project artifacts only; migrations require --apply --backup-dir; autoheal remains read-only",
+      "default_mode": "Module contract; no implicit migration or ledger repair",
+      "replacement": null,
+      "last_verified": "2026-09-14",
+      "paths": [
+        "alert_recovery.py",
+        "cancel_flat_side_protection.py",
+        "manage_ws_market_phase.py",
+        "okx_public_ws_service.py",
+        "report_diagnostic_receipt.py",
+        "run_openclaw_observed.py",
+        "write_position_plan.py",
+        "zero_open_watchdog.py"
       ]
     }
   ]

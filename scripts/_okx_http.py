@@ -108,6 +108,15 @@ _ENDPOINT_INTERVAL = {
         os.environ.get("OKX_HTTP_INDEX_HISTORY_INTERVAL", "0.22")
     ),
     "/api/v5/public/funding-rate": float(os.environ.get("OKX_HTTP_FUNDING_INTERVAL", "0.11")),
+    # 2026-08-19 D2：基差两端点，均单次全量、各自独立桶。刻意不用同文件里的
+    # history-mark-price-candles / history-index-candles —— 那两个是 per-instId
+    # 分页，~400 币 × 端点地板会直接吃掉 15m 采集预算；基差要的是即时读数。
+    "/api/v5/public/mark-price": float(
+        os.environ.get("OKX_HTTP_MARK_PRICE_INTERVAL", "0.11")
+    ),
+    "/api/v5/market/index-tickers": float(
+        os.environ.get("OKX_HTTP_INDEX_TICKERS_INTERVAL", "0.11")
+    ),
     # Trading Statistics 的规则是 IP + Instrument ID；每个 symbol 独立限频。
     "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract": float(
         os.environ.get("OKX_HTTP_CONTRACT_STATS_INTERVAL", "0.42")
@@ -345,6 +354,24 @@ def _get_data(client: httpx.Client, path: str, params: Optional[dict] = None,
     raise RuntimeError(f"okx GET {path} {params or ''} failed: {last}") from last
 
 
+def _exception_type_chain(exc: BaseException, maximum: int = 8) -> list[str]:
+    """Return bounded outer-to-root exception class names without messages."""
+    chain: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and len(chain) < max(1, int(maximum)):
+        identity = id(current)
+        if identity in seen:
+            break
+        seen.add(identity)
+        chain.append(type(current).__name__)
+        next_exc = current.__cause__
+        if next_exc is None and not current.__suppress_context__:
+            next_exc = current.__context__
+        current = next_exc
+    return chain
+
+
 def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn,
            batch_timeout_s: float | None = None, *,
            workers: int | None = None, throttle_key_fn=None,
@@ -376,13 +403,21 @@ def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn,
                 try:
                     out[s] = post_fn(f.result())
                     if outcomes is not None:
-                        outcomes[s] = {"ok": True, "error_type": None}
+                        outcomes[s] = {
+                            "ok": True,
+                            "error_type": None,
+                            "root_error_type": None,
+                            "error_type_chain": [],
+                        }
                 except Exception as exc:  # noqa: BLE001
                     out[s] = post_fn([])
                     if outcomes is not None:
+                        error_type_chain = _exception_type_chain(exc)
                         outcomes[s] = {
                             "ok": False,
-                            "error_type": type(exc).__name__,
+                            "error_type": error_type_chain[0],
+                            "root_error_type": error_type_chain[-1],
+                            "error_type_chain": error_type_chain,
                             "error": str(exc)[:500],
                         }
     return out
@@ -421,9 +456,14 @@ def fetch_instruments_sync(inst_type: str = "SWAP") -> list[dict]:
         return _get_data(c, "/api/v5/public/instruments", {"instType": inst_type})
 
 
-def fetch_candles_batch_sync(symbols: Sequence[str], bar: str = "1H",
-                             limit: int = 60,
-                             batch_timeout_s: float | None = None) -> dict:
+def fetch_candles_batch_sync(
+    symbols: Sequence[str],
+    bar: str = "1H",
+    limit: int = 60,
+    batch_timeout_s: float | None = None,
+    *,
+    outcomes: dict[str, dict] | None = None,
+) -> dict:
     """{sym: [candle 数组]}（OKX data 原样，倒序新→旧）。"""
     return _batch(
         symbols,
@@ -431,6 +471,7 @@ def fetch_candles_batch_sync(symbols: Sequence[str], bar: str = "1H",
         lambda s: {"instId": s, "bar": bar, "limit": str(limit)},
         lambda data: data,
         batch_timeout_s=batch_timeout_s,
+        outcomes=outcomes,
     )
 
 
@@ -574,7 +615,51 @@ def fetch_open_interest_all_sync(
     }
 
 
-def fetch_orderbooks_batch_sync(symbols: Sequence[str], depth: int = 50) -> dict:
+def fetch_mark_prices_all_sync(
+    inst_type: str = "SWAP",
+    request_timeout_s: float | None = None,
+) -> dict:
+    """全市场标记价，返回 ``{instId: row}``（字段 markPx/ts）。单次全量。"""
+    with _client() as c:
+        rows = _get_data(
+            c,
+            "/api/v5/public/mark-price",
+            {"instType": inst_type},
+            deadline=_deadline_from_timeout(request_timeout_s),
+        )
+    return {
+        row.get("instId"): row
+        for row in rows
+        if isinstance(row, dict) and row.get("instId")
+    }
+
+
+def fetch_index_tickers_all_sync(
+    quote_ccy: str = "USDT",
+    request_timeout_s: float | None = None,
+) -> dict:
+    """全市场指数价，返回 ``{instId: row}``（字段 idxPx/ts；instId 形如 BTC-USDT）。"""
+    with _client() as c:
+        rows = _get_data(
+            c,
+            "/api/v5/market/index-tickers",
+            {"quoteCcy": quote_ccy},
+            deadline=_deadline_from_timeout(request_timeout_s),
+        )
+    return {
+        row.get("instId"): row
+        for row in rows
+        if isinstance(row, dict) and row.get("instId")
+    }
+
+
+def fetch_orderbooks_batch_sync(
+    symbols: Sequence[str],
+    depth: int = 50,
+    batch_timeout_s: float | None = None,
+    *,
+    outcomes: dict[str, dict] | None = None,
+) -> dict:
     """批量取订单簿快照，默认每侧 50 档。"""
     depth = max(1, min(int(depth), 400))
     return _batch(
@@ -582,6 +667,8 @@ def fetch_orderbooks_batch_sync(symbols: Sequence[str], depth: int = 50) -> dict
         lambda s: "/api/v5/market/books",
         lambda s: {"instId": s, "sz": str(depth)},
         lambda data: (data[0] if data else {}),
+        batch_timeout_s=batch_timeout_s,
+        outcomes=outcomes,
     )
 
 

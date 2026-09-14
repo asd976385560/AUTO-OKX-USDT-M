@@ -24,15 +24,25 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[2])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-_COLLECTORS = str(Path(__file__).resolve().parents[1])  # .\collectors
+_COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collectors
 _SCRIPTS = str(Path(__file__).resolve().parents[2] / "scripts")
 for _p in (_COLLECTORS, _SCRIPTS):
     if _p not in sys.path:
@@ -55,6 +65,57 @@ _COLD_RETRY_TIMEOUT_SECONDS = 6.0
 _MAX_FETCH_PHASES = 2
 _TOTAL_NETWORK_BUDGET_SECONDS = 75.0
 _MIN_REQUEST_BUDGET_SECONDS = 0.25
+
+# ── 2026-08-18 类型列表缓存降级 ───────────────────────────────────────────
+# 实况：08-14 起 /announcement-types 在本机网络环境高频失败（initial+cold 双败），
+# 类型列表一失败整轮 return []，源自出生次日起持续无产出、源健康审计逐槽吃红。
+# 类型全集本身极低频变化 → types 成功时落地缓存；types 双败时降级用缓存继续
+# 拉各类别页（网络抖动下把「types 单点失败杀全轮」降为「只损失失败类别」）。
+# 缓存超过 _TYPES_CACHE_MAX_AGE_DAYS 视同无缓存（fail-closed 回到旧行为）。
+# 只在 adapter 层实现，不触碰 _okx_support_http/_okx_http 传输层。
+_TYPES_CACHE_ENV = "OKX_ANN_TYPES_CACHE"
+_TYPES_CACHE_DEFAULT = _public_project_path('logs', 'collect', 'okx_announcement_types_cache.json')
+_TYPES_CACHE_MAX_AGE_DAYS = 30
+
+
+def _types_cache_path() -> Path:
+    return Path(os.environ.get(_TYPES_CACHE_ENV) or _TYPES_CACHE_DEFAULT)
+
+
+def _save_types_cache(types: list) -> None:
+    """types 成功后原子落缓存；任何失败静默（缓存是降级件，不得反噬主链）。"""
+    try:
+        payload = {
+            "schema": "okx_announcement_types_cache_v1",
+            "fetched_at_cst": datetime.now(CST).strftime(TS_FMT),
+            "types": [t for t in (types or []) if isinstance(t, dict)],
+        }
+        path = _types_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 - cache write must never break collection
+        pass
+
+
+def _load_types_cache() -> tuple[list | None, float | None]:
+    """返回 (types, age_days)；缺失/坏损/超龄一律 (None, None)。"""
+    try:
+        path = _types_cache_path()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        types = payload.get("types")
+        fetched = datetime.strptime(
+            str(payload.get("fetched_at_cst")), TS_FMT).replace(tzinfo=CST)
+        age_days = (datetime.now(CST) - fetched).total_seconds() / 86400.0
+        if not isinstance(types, list) or not types:
+            return None, None
+        if age_days > _TYPES_CACHE_MAX_AGE_DAYS or age_days < 0:
+            return None, None
+        return [t for t in types if isinstance(t, dict)], round(age_days, 2)
+    except Exception:  # noqa: BLE001 - unreadable cache == no cache
+        return None, None
 
 # annType 关键词 → (业务类别 tag, severity, level)。类型全集按地域漂移，
 # 匹配用「包含关键词」而非精确串；未命中 wanted 的类型直接跳过（如 P2P/broker）。
@@ -173,6 +234,9 @@ def fetch_items(timeout_sec: float = _REQUEST_TIMEOUT,
         )
 
     type_initial_error: str | None = None
+    types_cold_ok = False
+    types_from_cache = False
+    types_cache_age: float | None = None
     type_timeout = remaining_timeout(float(timeout_sec))
     if type_timeout is None:
         raise RuntimeError("announcement budget exhausted before types request")
@@ -199,28 +263,47 @@ def fetch_items(timeout_sec: float = _REQUEST_TIMEOUT,
                 request_timeout_s=cold_timeout,
                 transport_stats=retry_stats,
             )
+            types_cold_ok = True
         except Exception as cold_exc:  # noqa: BLE001
             detail = (
                 f"types: initial={type_initial_error[:55]}; "
                 f"cold={type(cold_exc).__name__}: {cold_exc}"
             )[:150]
-            if errors is not None:
-                errors.append(detail)
-            if retry_stats is not None:
-                retry_stats.update({
-                    "types_attempts": 2,
-                    "types_recovered_after_cold_retry": False,
-                    "category_initial_failed": 0,
-                    "category_recovered_after_cold_retry": 0,
-                    "final_failed": 1,
-                    "maximum_fetch_phases": _MAX_FETCH_PHASES,
-                    "maximum_network_budget_seconds": (
-                        _TOTAL_NETWORK_BUDGET_SECONDS),
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                    "historical_retry": False,
-                    "unbounded_retry": False,
-                })
-            return []
+            cached_types, types_cache_age = _load_types_cache()
+            if cached_types:
+                # 降级：用上次成功的类型列表继续拉各类别页（2026-08-18）。
+                types = cached_types
+                types_from_cache = True
+                detail = (
+                    detail[:110]
+                    + f"; fallback=types_cache(age={types_cache_age:.1f}d)"
+                )[:150]
+                if errors is not None:
+                    errors.append(detail)
+                print(
+                    f"[WARN] okx announcements {detail}", file=sys.stderr)
+            else:
+                if errors is not None:
+                    errors.append(detail)
+                if retry_stats is not None:
+                    retry_stats.update({
+                        "types_attempts": 2,
+                        "types_recovered_after_cold_retry": False,
+                        "types_source": "unavailable",
+                        "category_initial_failed": 0,
+                        "category_recovered_after_cold_retry": 0,
+                        "final_failed": 1,
+                        "maximum_fetch_phases": _MAX_FETCH_PHASES,
+                        "maximum_network_budget_seconds": (
+                            _TOTAL_NETWORK_BUDGET_SECONDS),
+                        "elapsed_seconds": round(
+                            time.monotonic() - started, 3),
+                        "historical_retry": False,
+                        "unbounded_retry": False,
+                    })
+                return []
+    if not types_from_cache and types:
+        _save_types_cache(types)
     wanted: list[tuple[str, str, str, str]] = []
     for t in types or []:
         ann_type = str((t or {}).get("annType") or "")
@@ -309,7 +392,9 @@ def fetch_items(timeout_sec: float = _REQUEST_TIMEOUT,
     if retry_stats is not None:
         retry_stats.update({
             "types_attempts": 2 if type_initial_error else 1,
-            "types_recovered_after_cold_retry": bool(type_initial_error),
+            "types_recovered_after_cold_retry": types_cold_ok,
+            "types_source": "cached" if types_from_cache else "live",
+            "types_cache_age_days": types_cache_age,
             "category_initial_failed": len(failed_categories),
             "category_recovered_after_cold_retry": category_recovered,
             "final_failed": category_final_failed,

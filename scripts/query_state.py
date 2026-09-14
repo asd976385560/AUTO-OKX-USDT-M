@@ -13,16 +13,16 @@ query_state.py — V2.0 数据校验聚合查询
   sqlite3 CLI 路径（C:\\ProgramData\\chocolatey\\bin\\sqlite3.exe）仅留作 ad-hoc 排查。
 
 调用：
-  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ^
-      ./scripts//query_state.py --check all --db-root ./db
-  pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ^
-      ./scripts//query_state.py --check regime --db-root ./db --json
+  pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
+      <PROJECT_ROOT>\\scripts\\query_state.py --check all --db-root <PROJECT_ROOT>\\db
+  pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 ^
+      <PROJECT_ROOT>\\scripts\\query_state.py --check regime --db-root <PROJECT_ROOT>\\db --json
 
 参数：
   --check {all|tickers|regime|analysis_macro|news|account|kline|volume_anomaly|degraded|cycle_fresh|playbook|lost_cycles|collection_failures}
          all = 跑全部可用检查
          analysis_macro = 交易侧 regime/DXY 权威（analysis.db.analysis_runs，非 system_state.live_*）
-  --db-root ./db   (硬编码默认)
+  --db-root <PROJECT_ROOT>\\db   (硬编码默认)
   --stale-min 15          (新鲜度阈值分钟；FRESH<10 / STALE 10-15 / STALE+ >15)
   --hh01-only             (regime HH:01 必检；非 HH:01 复制 cross_market 最新行视为合规)
   --json                  (输出 JSON 而非 text，给脚本/parse 用)
@@ -40,6 +40,24 @@ import sys
 from datetime import datetime, timezone, timedelta
 
 from _db_ro import connect_ro
+
+
+def _configure_stdio_utf8(*streams) -> None:
+    """Keep Chinese JSON/text intact when stdout/stderr are captured by a pipe."""
+    targets = streams or (sys.stdout, sys.stderr)
+    for stream in targets:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # A closed or already-detached stream should not make a read-only
+            # health query fail before it can emit its structured result.
+            continue
+
+
+_configure_stdio_utf8()
 
 CST = timezone(timedelta(hours=8))
 
@@ -118,12 +136,9 @@ def load_public_macro_snapshot(db_root):
 
 def _openclaw_state_db() -> str:
     """允许巡检/隔离测试覆盖；默认只读当前用户 OpenClaw 状态库。"""
-    return (
-        os.environ.get("OKX_OPENCLAW_STATE_DB")
-        or os.environ.get("OPENCLAW_STATE_DB")  # backward-compatible alias
-        or os.path.join(
-            os.path.expanduser("~"), ".openclaw", "state", "openclaw.sqlite"
-        )
+    return os.environ.get(
+        "OPENCLAW_STATE_DB",
+        os.path.join(os.path.expanduser("~"), ".openclaw", "state", "openclaw.sqlite"),
     )
 
 
@@ -568,7 +583,8 @@ def check_degraded(db_root, stale_min, hh01_only, results):
         r = con.execute(
             "SELECT ts,dxy,dxy_d1,vix,vix_d1,spx,spx_d1,"
             "btc_mcap_chg_24h_usd,btc_etf_net_flow_usd,gold,gold_d1,"
-            "dxy_calc_ecb,dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta "
+            "dxy_calc_ecb,dxy_calc_ecb_d1,fear_greed,fear_greed_label,source_meta,"
+            "total_mcap_usd,btc_dominance "
             "FROM cross_market ORDER BY ts DESC LIMIT 1"
         ).fetchone()
         if not r:
@@ -578,7 +594,7 @@ def check_degraded(db_root, stale_min, hh01_only, results):
             ts_raw, dxy, dxy_d1, vix, vix_d1, spx, spx_d1,
             btc_mcap_chg, btc_etf_net, gold, gold_d1,
             dxy_calc_ecb, dxy_calc_ecb_d1, fear_greed, fear_greed_label,
-            source_meta,
+            source_meta, total_mcap_usd, btc_dominance,
         ) = r
         public_macro = load_public_macro_snapshot(db_root)
         if public_macro:
@@ -650,15 +666,38 @@ def check_degraded(db_root, stale_min, hh01_only, results):
                 "USD_BROAD(DTWEXBGS)源旧: "
                 f"source_as_of={dxy_as_of}（legacy字段=dxy；非ICE DXY）"
             )
-        # (2026-06-11 阈值修正) btc_etf_flow 实为 BTC 24h 市值变化 USD——1.2T 市值
-        # 日波动 ±2%（±2.4e10）属正常行情。旧阈值 1e9（市值 0.08%）几乎天天误报
-        # "异常"并被 agent 用来压置信度。新阈值 6e10（≈市值 5%）仅极端值才疑数据质量。
-        if btc_mcap_chg is not None and abs(btc_mcap_chg) > 6e10:
-            marks.append(
-                "BTC市值24h振幅: "
-                f"btc_mcap_chg_24h_usd={btc_mcap_chg:.2e}"
-                "（>5% BTC 市值，疑数据质量）"
-            )
+        # btc_etf_flow 实为 BTC 24h 市值变化 USD。
+        # (2026-06-11) 旧阈值 1e9（市值 0.08%）几乎天天误报「异常」并被 agent
+        # 用来压置信度，抬到 6e10（当时 ≈5%）。
+        # (2026-08-20) 6e10 又误报了：当日 BTC 1H K 线 64,330→69,736，**24h 真涨
+        # 8.40%**，折算 ~+105.9B 与库内 +108.9B 吻合，数据没问题。根子在**绝对
+        # 美元阈值会随市值漂**（6e10 在 1.2T 是 5%、在 1.4T 只剩 4.3%），再抬一次
+        # 数字只是把下次误报推迟。改用同一行已有的 total_mcap×dominance 折出 BTC
+        # 市值，按**占比**判定；量纲对了才不随行情漂。25%：BTC 24h 动 8% 常见、
+        # 15% 是大行情但真实存在，25% 以上更可能是数据坏。
+        btc_mcap_usd = None
+        if total_mcap_usd and btc_dominance:
+            share = float(btc_dominance)
+            if share > 1:          # 库内是百分数（56.67）不是小数
+                share /= 100.0
+            if 0 < share <= 1:
+                btc_mcap_usd = float(total_mcap_usd) * share
+        if btc_mcap_chg is not None:
+            if btc_mcap_usd:
+                pct = abs(float(btc_mcap_chg)) / btc_mcap_usd
+                if pct > 0.25:
+                    marks.append(
+                        "BTC市值24h振幅: "
+                        f"btc_mcap_chg_24h_usd={btc_mcap_chg:.2e}"
+                        f"（占 BTC 市值 {pct:.1%}，>25% 疑数据质量）"
+                    )
+            elif abs(btc_mcap_chg) > 6e10:
+                # 拿不到 dominance/total：退回旧绝对阈值，不因缺字段静默不检。
+                marks.append(
+                    "BTC市值24h振幅: "
+                    f"btc_mcap_chg_24h_usd={btc_mcap_chg:.2e}"
+                    "（>6e10 且 BTC 市值不可得，无法折算占比）"
+                )
         # v7.1.3（2026-06-11 体检 3.7）：FRED 冻结是长期已知降级，每轮 WARN 全天 96 次
         # 纯噪音。降为只在每日 08:00-08:30（P7 复盘窗口）报 WARN；其余轮次 PASS，
         # 但 msg 与 fred_frozen 字段保留——agent 仍按 决策权重=0 处理。
@@ -880,6 +919,57 @@ def check_lost_cycles(db_root, stale_min, hh01_only, results):
                                f"[{never_detail}]。只告警、不自动补派。"})
 
 
+def _read_openclaw_cron_failures(con, since_ms, until_ms, failure_states):
+    """Read old logs or authoritative SQLite receipts without changing cron."""
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    placeholders = ",".join("?" for _ in failure_states)
+    if "cron_run_receipts" in tables:
+        failures = con.execute(
+            "SELECT j.name,r.status,COALESCE(r.error_text,''),r.started_at_ms,"
+            "CASE WHEN r.finished_at_ms IS NOT NULL THEN "
+            "MAX(0,r.finished_at_ms-r.started_at_ms) ELSE NULL END "
+            "FROM cron_run_receipts r JOIN cron_jobs j "
+            "ON j.store_key=r.store_key AND j.job_id=r.job_id "
+            "WHERE j.name LIKE 'okx-%' "
+            f"AND lower(COALESCE(r.status,'')) IN ({placeholders}) "
+            "AND COALESCE(r.finished_at_ms,r.started_at_ms)>=? "
+            "AND COALESCE(r.finished_at_ms,r.started_at_ms)<? "
+            "ORDER BY COALESCE(r.finished_at_ms,r.started_at_ms)",
+            (*failure_states,since_ms,until_ms),
+        ).fetchall()
+        active = []
+        for name, raw in con.execute(
+                "SELECT name,state_json FROM cron_jobs WHERE name LIKE 'okx-%' ORDER BY name"):
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                raise ValueError("cron state_json must be an object")
+            status = str(state.get("lastRunStatus") or "")
+            consecutive = int(state.get("consecutiveErrors") or 0)
+            if consecutive > 0 or status.lower() in failure_states:
+                active.append((name,status,state.get("lastError") or "",consecutive))
+        return failures, active
+    if "cron_run_logs" not in tables:
+        raise RuntimeError("OpenClaw cron monitoring unavailable: unsupported storage schema")
+    failures = con.execute(
+        "SELECT j.name,l.status,COALESCE(l.error,''),l.run_at_ms,l.duration_ms "
+        "FROM cron_run_logs l JOIN cron_jobs j "
+        "ON j.store_key=l.store_key AND j.job_id=l.job_id "
+        "WHERE j.name LIKE 'okx-%' "
+        f"AND lower(COALESCE(l.status,'')) IN ({placeholders}) "
+        "AND l.ts>=? AND l.ts<? ORDER BY l.ts",
+        (*failure_states,since_ms,until_ms),
+    ).fetchall()
+    active = con.execute(
+        "SELECT name,last_run_status,COALESCE(last_error,''),COALESCE(consecutive_errors,0) "
+        "FROM cron_jobs WHERE name LIKE 'okx-%' "
+        "AND (COALESCE(consecutive_errors,0)>0 "
+        f"OR lower(COALESCE(last_run_status,'')) IN ({placeholders})) ORDER BY name",
+        failure_states,
+    ).fetchall()
+    return failures, active
+
+
 def check_collection_failures(db_root, stale_min, hh01_only, results):
     """近24h采集/cron失败审计；只告警，不补采、不重跑、不改变调度状态。
 
@@ -944,24 +1034,8 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
             else:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 since_ms, until_ms = now_ms - 86400 * 1000, now_ms
-            cron_errors = ocon.execute(
-                "SELECT j.name,l.status,COALESCE(l.error,''),l.run_at_ms,l.duration_ms "
-                "FROM cron_run_logs l JOIN cron_jobs j "
-                "ON j.store_key=l.store_key AND j.job_id=l.job_id "
-                "WHERE j.name LIKE 'okx-%' "
-                f"AND lower(COALESCE(l.status,'')) IN ({placeholders}) "
-                "AND l.ts>=? AND l.ts<? ORDER BY l.ts",
-                (*failure_states, since_ms, until_ms),
-            ).fetchall()
-            active_errors = ocon.execute(
-                "SELECT name,last_run_status,COALESCE(last_error,''),"
-                "COALESCE(consecutive_errors,0) "
-                "FROM cron_jobs WHERE name LIKE 'okx-%' "
-                "AND (COALESCE(consecutive_errors,0)>0 "
-                f"OR lower(COALESCE(last_run_status,'')) IN ({placeholders})) "
-                "ORDER BY name",
-                failure_states,
-            ).fetchall()
+            cron_errors, active_errors = _read_openclaw_cron_failures(
+                ocon, since_ms, until_ms, failure_states)
         except Exception as exc:  # noqa: BLE001
             cron_db_error = f"OpenClaw cron 表核对失败: {exc}"
         finally:
@@ -975,6 +1049,7 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
             "collection_errors": [],
             "cron_errors": [],
             "active_cron_errors": [],
+            "cron_monitoring_available": True,
         })
         return
 
@@ -1022,6 +1097,7 @@ def check_collection_failures(db_root, stale_min, hh01_only, results):
         "cron_errors": cron_detail,
         "active_cron_errors": active_detail,
         "cron_db_error": cron_db_error,
+        "cron_monitoring_available": cron_db_error is None,
     })
 
 

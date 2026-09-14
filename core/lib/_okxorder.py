@@ -33,12 +33,28 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[2])
+    return str(root.joinpath(*parts))
+
+
+from decimal import Decimal, InvalidOperation
+
 import os
 import sys
+import copy
+import json
+import math
+import time
+from contextvars import ContextVar
 from typing import Any, Optional
 
 # 复用 scripts/_okxcli（CLI 调用 + 节流 + 崩溃重试）
-_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", r".\scripts")
+_SCRIPTS = os.environ.get("OKX_SCRIPTS_DIR", _public_project_path('scripts'))
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
@@ -101,17 +117,33 @@ def _normalize(payload: Any) -> dict[str, Any]:
                     out["sMsg"] = str(row0.get("sMsg", "")) or out["sMsg"]
     elif isinstance(payload, list):
         out["data"] = payload
+    # CLI --json commonly emits a bare data array. Row-level API rejection
+    # is still failure; preserve every row for partial-result inspection.
+    for row in out["data"]:
+        if isinstance(row, dict):
+            code = str(row.get("sCode", "0"))
+            if code not in ("0", ""):
+                out.update(ok=False, sCode=code,
+                           sMsg=str(row.get("sMsg") or out["sMsg"]))
+                break
     return out
 
 
-def _call(*args: str, profile: str, timeout_sec: float = 45.0) -> dict[str, Any]:
+def _call(*args: str, profile: str, timeout_sec: float = 45.0,
+          retries: Optional[int] = None) -> dict[str, Any]:
     """调 okx_json + 归一；异常不穿透，落进 {ok:False, error, sCode}。"""
     try:
-        payload = okx_json(*args, global_args=_global_args(profile), timeout_sec=timeout_sec)
+        options: dict[str, Any] = {
+            "global_args": _global_args(profile), "timeout_sec": timeout_sec}
+        if retries is not None:
+            options["retries"] = retries
+        payload = okx_json(*args, **options)
     except Exception as exc:  # RuntimeError/TimeoutError/FileNotFound
         msg = str(exc)
         return {"ok": False, "sCode": _extract_scode(msg), "sMsg": msg,
-                "data": [], "raw": None, "error": msg}
+                "data": [], "raw": None, "error": msg,
+                "error_type": type(exc).__name__,
+                "timeout_seconds": float(timeout_sec)}
     return _normalize(payload)
 
 
@@ -142,16 +174,129 @@ def get_max_size(inst_id: str, td_mode: str, profile: str) -> dict[str, Any]:
     )
 
 
+_MARK_READ_BUDGET_SECONDS = 15.0
+_MARK_CLI_TIMEOUT_SECONDS = 5.0
+_MARK_MAX_AGE_MS = 15_000
+_MARK_MAX_FUTURE_MS = 5_000
+_MARK_EVIDENCE = ContextVar("okx_mark_price_evidence", default=None)
+
+
+class _MarkPriceError(ValueError):
+    pass
+
+
+def _read_mark_http(inst_id: str, deadline: float) -> dict:
+    """One unauthenticated read of the same official mark-price endpoint."""
+    import _okx_http
+    with _okx_http._client() as client:
+        rows = _okx_http._get_data(
+            client, "/api/v5/public/mark-price",
+            {"instType": "SWAP", "instId": inst_id},
+            retries=0, deadline=deadline,
+        )
+    return {"code": "0", "data": rows}
+
+
+def _validated_mark(payload: Any, inst_id: str) -> tuple[float, int, int]:
+    r = _normalize(payload)
+    if (r.get("ok") is not True
+            or isinstance(payload, dict) and payload.get("ok") is False):
+        raise _MarkPriceError("api_error:" + str(r.get("sCode") or "unknown"))
+    matches = [row for row in r.get("data", []) if isinstance(row, dict) and row.get("instId") == inst_id]
+    if len(matches) != 1:
+        raise _MarkPriceError("mark_instrument_missing_or_duplicated")
+    row = matches[0]
+    if row.get("instType") != "SWAP":
+        raise _MarkPriceError("mark_instrument_type_mismatch")
+    if isinstance(row.get("markPx"), bool) or isinstance(row.get("ts"), bool):
+        raise _MarkPriceError("mark_value_or_timestamp_invalid")
+    try:
+        price = float(row["markPx"])
+        stamp = int(row["ts"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise _MarkPriceError("mark_value_or_timestamp_invalid") from exc
+    if not math.isfinite(price) or price <= 0 or stamp <= 0:
+        raise _MarkPriceError("mark_value_or_timestamp_invalid")
+    age = int(time.time() * 1000) - stamp
+    if age > _MARK_MAX_AGE_MS or age < -_MARK_MAX_FUTURE_MS:
+        raise _MarkPriceError("mark_timestamp_stale_or_future")
+    return price, stamp, age
+
+
+def get_mark_price_evidence(
+    inst_id: str, profile: str, *, since_monotonic: float | None = None,
+) -> dict | None:
+    evidence = _MARK_EVIDENCE.get()
+    if (not isinstance(evidence, dict) or evidence.get("instId") != inst_id
+            or evidence.get("profile") != profile
+            or since_monotonic is not None and evidence["started_monotonic"] < since_monotonic):
+        return None
+    result = copy.deepcopy(evidence)
+    result.pop("started_monotonic", None)
+    return result
+
+
+def mark_price_failure_detail(evidence: dict | None) -> str:
+    if not evidence:
+        return "mark_px API 失败，拒开（禁回退 caller 值）"
+    failures = [str(a.get("source")) + ":" + str(a.get("error"))
+                + ("/" + "/".join(a["error_types"]) if a.get("error_types") else "")
+                for a in evidence.get("attempts", []) if a.get("ok") is False]
+    return "mark_px实时取价失败（禁回退caller/旧快照）：" + "; ".join(failures)
+
+
 def get_mark_price(inst_id: str, profile: str) -> Optional[float]:
-    r = _call("market", "mark-price", "--instType", "SWAP", "--instId", inst_id,
-              profile=profile)
-    for row in r.get("data", []):
-        if isinstance(row, dict) and row.get("markPx"):
-            try:
-                return float(row["markPx"])
-            except (TypeError, ValueError):
-                return None
-    return None
+    """CLI first, then one independent public read; never reuse an old price.
+
+    Both reads share a deadline. A result received after it is rejected even
+    if the HTTP transport finishes late. Only public GET reads are recovered;
+    the order-command retry policy is untouched.
+    """
+    started = time.monotonic()
+    deadline = started + _MARK_READ_BUDGET_SECONDS
+    evidence = {"schema_version": 1, "instId": inst_id, "profile": profile,
+                "started_monotonic": started, "started_at_ms": int(time.time() * 1000),
+                "budget_seconds": _MARK_READ_BUDGET_SECONDS, "attempts": [],
+                "status": "failed", "source": None, "recovered": False}
+    price = None
+    for source in ("cli", "public_http"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            evidence["attempts"].append({"source": source, "ok": False, "error": "read_budget_exhausted"})
+            break
+        try:
+            if source == "cli":
+                payload = okx_json(
+                    "market", "mark-price", "--instType", "SWAP", "--instId", inst_id,
+                    global_args=_global_args(profile),
+                    timeout_sec=min(_MARK_CLI_TIMEOUT_SECONDS, remaining), retries=0,
+                )
+            else:
+                payload = _read_mark_http(inst_id, deadline)
+            value, stamp, age = _validated_mark(payload, inst_id)
+            if time.monotonic() >= deadline:
+                raise _MarkPriceError("read_budget_exhausted")
+            price = value
+            evidence["attempts"].append({"source": source, "ok": True})
+            evidence.update(status="ok", source=source, recovered=source != "cli",
+                            markPx=value, response_ts_ms=stamp, age_ms=age)
+            break
+        except Exception as exc:
+            names, cursor = [], exc
+            while cursor is not None and len(names) < 6:
+                names.append(type(cursor).__name__)
+                cursor = cursor.__cause__ or cursor.__context__
+            evidence["attempts"].append({
+                "source": source, "ok": False,
+                "error": str(exc) if isinstance(exc, _MarkPriceError) else "read_failed",
+                "error_types": names,
+            })
+    evidence["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    _MARK_EVIDENCE.set(evidence)
+    if price is None or evidence["recovered"]:
+        visible = {k: v for k, v in evidence.items() if k != "started_monotonic"}
+        print("[mark_price] " + json.dumps(visible, ensure_ascii=False), file=sys.stderr)
+    return price
 
 
 def get_instrument(inst_id: str, profile: str) -> Optional[dict[str, Any]]:
@@ -213,9 +358,39 @@ def get_algo_orders(inst_id: str, profile: str, ord_type: Optional[str] = None,
     return [row for row in r.get("data", []) if isinstance(row, dict)]
 
 
+def list_algo_orders(profile: str, ord_type: Optional[str] = None,
+                     inst_id: Optional[str] = None) -> dict[str, Any]:
+    """pending algo 单，保留 `_call` 的 ok/error（读失败 ≠ 空列表）。只读（DRYRUN 也真跑）。
+
+    不给 inst_id 即账户级普查（残留保护单清理用）。CLI 不给 --ordType 时分别拉
+    conditional/oco/move_order_stop 三页合并，每页只有最新 100 条；CLI 不透传翻页
+    参数，勿传 --after/--limit——调用方按 ordType 计数判断是否撞满。
+    """
+    args = ["swap", "algo", "orders"]
+    if inst_id:
+        args += ["--instId", inst_id]
+    if ord_type:
+        args += ["--ordType", ord_type]
+    return _call(*args, profile=profile)
+
+
 # ---------------------------------------------------------------------------
 # 变更（DRYRUN 短路）
 # ---------------------------------------------------------------------------
+def _format_cli_decimal(value: Any) -> str:
+    """Keep the numeric value while avoiding exponent notation on OKX wire fields."""
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid CLI numeric value") from exc
+    if not number.is_finite() or abs(number.as_tuple().exponent) > 400:
+        raise ValueError("non-finite or overlong CLI numeric value")
+    result = format(number, "f")
+    if len(result) > 512:
+        raise ValueError("overlong CLI numeric value")
+    return result
+
+
 def set_leverage(inst_id: str, lever: float, mgn_mode: str, profile: str,
                  pos_side: Optional[str] = None) -> dict[str, Any]:
     if is_dryrun():
@@ -255,16 +430,16 @@ def place_market_open(inst_id: str, pos_side: str, sz: float, profile: str,
     # 注：SWAP 不支持 --tgtCcy（sCode 59110，2026-07-02 修）——tgtCcy(base/quote_ccy 计量)
     # 是现货/杠杆概念，永续 sz 恒为合约张数。tgt_ccy 形参保留兼容签名但不再下发。
     args = ["swap", "place", "--instId", inst_id, "--side", side,
-            "--ordType", "market", "--sz", str(sz), "--posSide", pos_side,
+            "--ordType", "market", "--sz", _format_cli_decimal(sz), "--posSide", pos_side,
             "--tdMode", mgn_mode]
     if sl_trigger_px is not None:
         # `--slOrdPx=-1`（等号形式，2026-07-02 修）：值 -1(市价止损)以短横开头，
         # 空格分隔会被 commander.js 当成另一个 flag → "argument is ambiguous" rc=1
         # → 带 SL 的 live/demo 下单一直失败（被 HOLD 掩盖）。等号形式才正确传值。
-        args += ["--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",
+        args += ["--slTriggerPx", _format_cli_decimal(sl_trigger_px), "--slOrdPx=-1",
                  "--slTriggerPxType", sl_trigger_px_type]
     if tp_trigger_px is not None:
-        args += ["--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",
+        args += ["--tpTriggerPx", _format_cli_decimal(tp_trigger_px), "--tpOrdPx=-1",
                  "--tpTriggerPxType", tp_trigger_px_type]
     r = _call(*args, profile=profile)
     r["sl_attached"] = (sl_trigger_px is not None) and r.get("ok", False)
@@ -281,8 +456,8 @@ def place_algo_sl(inst_id: str, pos_side: str, sz: float, sl_trigger_px: float,
         return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
                 "data": [{"algoId": "DRYRUN-ALGO", "sCode": "0"}], "dryrun": True}
     args = ["swap", "algo", "place", "--instId", inst_id, "--side", close_side,
-            "--sz", str(sz), "--ordType", "conditional",
-            "--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",  # 等号形式，见 place_market_open 注释
+            "--sz", _format_cli_decimal(sz), "--ordType", "conditional",
+            "--slTriggerPx", _format_cli_decimal(sl_trigger_px), "--slOrdPx=-1",  # 等号形式，见 place_market_open 注释
             "--slTriggerPxType", sl_trigger_px_type, "--posSide", pos_side,
             "--tdMode", mgn_mode, "--reduceOnly"]
     return _call(*args, profile=profile)
@@ -300,8 +475,8 @@ def place_algo_tp(inst_id: str, pos_side: str, sz: float, tp_trigger_px: float,
         return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
                 "data": [{"algoId": "DRYRUN-ALGO-TP", "sCode": "0"}], "dryrun": True}
     args = ["swap", "algo", "place", "--instId", inst_id, "--side", close_side,
-            "--sz", str(sz), "--ordType", "conditional",
-            "--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",  # 等号形式，见 place_market_open 注释
+            "--sz", _format_cli_decimal(sz), "--ordType", "conditional",
+            "--tpTriggerPx", _format_cli_decimal(tp_trigger_px), "--tpOrdPx=-1",  # 等号形式，见 place_market_open 注释
             "--tpTriggerPxType", tp_trigger_px_type, "--posSide", pos_side,
             "--tdMode", mgn_mode, "--reduceOnly"]
     return _call(*args, profile=profile)
@@ -329,15 +504,15 @@ def place_algo_protection(
         }
     args = [
         "swap", "algo", "place", "--instId", inst_id, "--side", close_side,
-        "--sz", str(sz), "--ordType", (
+        "--sz", _format_cli_decimal(sz), "--ordType", (
             "oco" if tp_trigger_px is not None else "conditional"),
-        "--slTriggerPx", str(sl_trigger_px), "--slOrdPx=-1",
+        "--slTriggerPx", _format_cli_decimal(sl_trigger_px), "--slOrdPx=-1",
         "--slTriggerPxType", trigger_px_type,
         "--posSide", pos_side, "--tdMode", mgn_mode, "--reduceOnly",
     ]
     if tp_trigger_px is not None:
         args += [
-            "--tpTriggerPx", str(tp_trigger_px), "--tpOrdPx=-1",
+            "--tpTriggerPx", _format_cli_decimal(tp_trigger_px), "--tpOrdPx=-1",
             "--tpTriggerPxType", trigger_px_type,
         ]
     return _call(*args, profile=profile)
@@ -370,19 +545,21 @@ def amend_algo_protection(inst_id: str, algo_id: str, profile: str,
                             "sz": new_sz}}
     args = ["swap", "algo", "amend", "--instId", inst_id, "--algoId", str(algo_id)]
     if new_sz is not None:
-        args += ["--newSz", str(new_sz)]
+        args += ["--newSz", _format_cli_decimal(new_sz)]
     if new_sl_trigger_px is not None:
-        args += ["--newSlTriggerPx", str(new_sl_trigger_px), "--newSlOrdPx=-1"]
+        args += ["--newSlTriggerPx", _format_cli_decimal(new_sl_trigger_px), "--newSlOrdPx=-1"]
     if new_tp_trigger_px is not None:
-        args += ["--newTpTriggerPx", str(new_tp_trigger_px), "--newTpOrdPx=-1"]
+        args += ["--newTpTriggerPx", _format_cli_decimal(new_tp_trigger_px), "--newTpOrdPx=-1"]
     return _call(*args, profile=profile)
 
 
 def cancel_algo_order(inst_id: str, algo_id: str, profile: str) -> dict[str, Any]:
     """撤单（`okx swap algo cancel --instId <id> --algoId <id>`）。
 
-    只用于两处：① amend 失败后的「挂新→撤旧」兜底；② 开仓未成交时清理悬挂保护单
-    （此前只能写 repair_queue 等人工）。**绝不用于让持仓变裸仓**——调用方必须
+    用于：① amend 失败后的「挂新→撤旧」兜底；② 开仓未成交时清理悬挂保护单
+    （此前只能写 repair_queue 等人工）；③ 交易所现仓已证明无仓的 symbol/posSide 上
+    的残留保护单（close_position 全平后、open_position 开仓前、
+    sweep_flat_side_protection）。**绝不用于让持仓变裸仓**——有仓一侧的调用方必须
     先确认另一张全仓止损已回读确认（主人拍板 2026-08-13：止损不可撤只能替换）。
     """
     if is_dryrun():
@@ -411,6 +588,6 @@ def place_reduce_only_market(inst_id: str, pos_side: str, sz: float, profile: st
         return {"ok": True, "sCode": "0", "sMsg": "DRYRUN",
                 "data": [{"ordId": "DRYRUN-REDUCE", "sCode": "0"}], "dryrun": True}
     args = ["swap", "place", "--instId", inst_id, "--side", close_side,
-            "--ordType", "market", "--sz", str(sz), "--posSide", pos_side,
+            "--ordType", "market", "--sz", _format_cli_decimal(sz), "--posSide", pos_side,
             "--tdMode", mgn_mode, "--reduceOnly"]
     return _call(*args, profile=profile)

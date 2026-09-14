@@ -12,6 +12,15 @@ authorizes an order.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import os
@@ -29,8 +38,8 @@ CST = timezone(timedelta(hours=8))
 SLOT_MINUTES = 15
 COMPLETE_STATUSES = frozenset({"ok"})
 AVAILABLE_STATUSES = frozenset({"ok", "degraded"})
-DEFAULT_LEDGER = Path(r".\db\ledger.db")
-DEFAULT_OUTPUT = Path(r".\reports\quality\source-health-audit.json")
+DEFAULT_LEDGER = Path(_public_project_path('db', 'ledger.db'))
+DEFAULT_OUTPUT = Path(_public_project_path('reports', 'quality', 'source-health-audit.json'))
 DEFAULT_FORWARD_START = "2026-08-12T16:00:00+08:00"
 
 

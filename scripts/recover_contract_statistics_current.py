@@ -17,6 +17,15 @@ It never reads credentials, calls an Agent or places an order.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import sqlite3
@@ -31,11 +40,15 @@ import collect_market_features as collector
 
 
 CST = timezone(timedelta(hours=8))
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 MINIMUM_DIRECT_RATE = 0.99
 RECOVERY_COOLDOWN_SECONDS = 3.0
 RECOVERY_BATCH_TIMEOUT_SECONDS = 18.0
-RECOVERY_WORKERS_PER_ENDPOINT = 4
+# Both official endpoints are rate-limited by IP + Instrument ID.  The recovery
+# wave still sends at most one request per endpoint and symbol, so matching the
+# primary collector's bounded cross-symbol concurrency improves systemic
+# recovery without increasing any single instrument's request rate.
+RECOVERY_WORKERS_PER_ENDPOINT = 12
 EXPECTED_SNAPSHOT_SOURCE = "okx_public_instruments_live_usdt_linear_swap"
 
 
@@ -135,6 +148,89 @@ def _valid_direct_symbols(
     return valid
 
 
+def _failure_diagnostics(
+    symbols: list[str],
+    outcomes: dict[str, dict],
+    *,
+    sample_limit: int = 8,
+) -> dict:
+    """Return bounded, non-text transport diagnostics for failed symbols."""
+    error_types: dict[str, int] = {}
+    root_error_types: dict[str, int] = {}
+    samples: list[dict] = []
+    for symbol in symbols:
+        outcome = outcomes.get(symbol)
+        if isinstance(outcome, dict) and bool(outcome.get("ok")):
+            continue
+        if not isinstance(outcome, dict):
+            error_type = "outcome_missing"
+            root_error_type = "outcome_missing"
+            error_type_chain: list[str] = []
+        else:
+            error_type = str(outcome.get("error_type") or "unknown")
+            root_error_type = str(
+                outcome.get("root_error_type") or error_type
+            )
+            error_type_chain = [
+                str(value)[:80]
+                for value in (outcome.get("error_type_chain") or [])[:8]
+                if value
+            ]
+        error_types[error_type] = error_types.get(error_type, 0) + 1
+        root_error_types[root_error_type] = (
+            root_error_types.get(root_error_type, 0) + 1
+        )
+        if len(samples) < max(0, int(sample_limit)):
+            samples.append({
+                "symbol": str(symbol),
+                "error_type": error_type,
+                "root_error_type": root_error_type,
+                "error_type_chain": error_type_chain,
+            })
+    return {
+        "error_types": dict(sorted(error_types.items())),
+        "root_error_types": dict(sorted(root_error_types.items())),
+        "failure_samples": samples,
+    }
+
+
+def _row_failure_diagnostics(
+    symbols: list[str], errors: list[str], *, sample_limit: int = 12,
+) -> dict:
+    """Return bounded semantic row-validation failures for attempted symbols."""
+    limit = max(0, min(int(sample_limit), 32))
+    samples: list[dict[str, str]] = []
+    error_type_counts: dict[str, int] = {}
+    seen: set[str] = set()
+    for symbol in symbols:
+        prefix = f"{symbol}:"
+        match = next((str(item) for item in errors
+                      if str(item).startswith(prefix)), None)
+        if match is None:
+            continue
+        detail = match[len(prefix):]
+        error_type, separator, reason = detail.partition(":")
+        if not separator:
+            reason = "row validation failed"
+        seen.add(symbol)
+        error_type = (error_type or "Unknown")[:80]
+        reason = (reason or "row validation failed")[:200]
+        error_type_counts[error_type] = error_type_counts.get(error_type, 0) + 1
+        if len(samples) < limit:
+            samples.append({
+                "symbol": symbol,
+                "error_type": error_type,
+                "reason": reason,
+            })
+    return {
+        "failure_count": len(seen),
+        "error_type_counts": dict(sorted(error_type_counts.items())),
+        "samples": samples,
+        "sample_limit": limit,
+        "truncated": len(seen) > len(samples),
+    }
+
+
 def _fetch_once(
     symbols: list[str],
     cycle_id: str,
@@ -215,6 +311,8 @@ def _fetch_once(
                 errors.append(
                     f"{symbol}:{type(exc).__name__}:{str(exc)[:160]}"
                 )
+    oi_diagnostics = _failure_diagnostics(symbols, oi_outcomes)
+    taker_diagnostics = _failure_diagnostics(symbols, taker_outcomes)
     transport = {
         "open_interest_ok": sum(
             bool(value.get("ok")) for value in oi_outcomes.values()
@@ -228,6 +326,16 @@ def _fetch_once(
         "taker_volume_failed": sum(
             not bool(value.get("ok")) for value in taker_outcomes.values()
         ),
+        "open_interest_error_types": oi_diagnostics["error_types"],
+        "open_interest_root_error_types": (
+            oi_diagnostics["root_error_types"]),
+        "open_interest_failure_samples": (
+            oi_diagnostics["failure_samples"]),
+        "taker_volume_error_types": taker_diagnostics["error_types"],
+        "taker_volume_root_error_types": (
+            taker_diagnostics["root_error_types"]),
+        "taker_volume_failure_samples": (
+            taker_diagnostics["failure_samples"]),
     }
     return rows, errors, transport
 
@@ -262,7 +370,7 @@ def recover(
         )
         initial_rate = len(initial_direct) / len(expected)
         missing = [symbol for symbol in expected if symbol not in initial_direct]
-        if initial_rate >= MINIMUM_DIRECT_RATE:
+        if not missing:
             return {
                 "ok": True,
                 "degraded": False,
@@ -272,6 +380,7 @@ def recover(
                 "initial_direct_symbols": len(initial_direct),
                 "initial_direct_coverage_rate": initial_rate,
                 "attempted_symbols": 0,
+                "attempted_symbol_values": [],
                 "recovered_symbols": 0,
                 "remaining_symbols": len(missing),
                 "final_direct_symbols": len(initial_direct),
@@ -287,6 +396,7 @@ def recover(
                 },
                 "production_database_writes": 0,
                 "orders_placed": 0,
+                "row_failure_diagnostics": _row_failure_diagnostics([], []),
             }
 
         time.sleep(float(cooldown_seconds))
@@ -304,10 +414,17 @@ def recover(
         final_rate = len(final_direct) / len(expected)
         recovered_symbols = len(final_direct - initial_direct)
         passed = final_rate >= MINIMUM_DIRECT_RATE
+        remaining_symbols = len(expected) - len(final_direct)
+        if remaining_symbols == 0:
+            recovery_status = "recovered"
+        elif passed:
+            recovery_status = "threshold_recovered_with_remaining"
+        else:
+            recovery_status = "recovery_incomplete"
         return {
             "ok": passed,
             "degraded": not passed,
-            "status": "recovered" if passed else "recovery_incomplete",
+            "status": recovery_status,
             "cycle": cycle_id,
             "expected_symbols": len(expected),
             "initial_direct_symbols": len(initial_direct),
@@ -315,12 +432,14 @@ def recover(
             "attempted_symbols": len(missing),
             "attempted_symbol_values": missing,
             "recovered_symbols": recovered_symbols,
-            "remaining_symbols": len(expected) - len(final_direct),
+            "remaining_symbols": remaining_symbols,
             "final_direct_symbols": len(final_direct),
             "final_direct_coverage_rate": final_rate,
             "minimum_direct_coverage_rate": MINIMUM_DIRECT_RATE,
             "transport": transport,
             "errors": errors[:20],
+            "row_failure_diagnostics": _row_failure_diagnostics(
+                missing, errors),
             "wrote": {"contract_statistics_recovery": wrote},
             "recovery_contract": {
                 "current_natural_cycle_only": True,

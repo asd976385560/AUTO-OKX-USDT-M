@@ -10,6 +10,15 @@ is opened read-only and only the explicit JSON evidence file is replaced.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -30,7 +39,7 @@ CST = timezone(timedelta(hours=8))
 TARGET_RATE = thresholds.COVERAGE_TARGET_RATE
 LEGACY_TARGET_RATE = thresholds.COVERAGE_LEGACY_TARGET_RATE
 DEFAULT_OUTPUT = Path(
-    r".\reports\quality\periodic-report-completeness-audit.json")
+    _public_project_path('reports', 'quality', 'periodic-report-completeness-audit.json'))
 DEFAULT_WEEKLY_START = date(2026, 8, 3)
 DEFAULT_MONTHLY_START = date(2026, 8, 1)
 DEFAULT_FORWARD_WEEKLY_START = date(2026, 8, 17)
@@ -397,19 +406,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--forward-monthly-minimum", type=int,
                         default=DEFAULT_FORWARD_MONTHLY_MINIMUM)
     parser.add_argument("--weekly-dir", type=Path,
-                        default=Path(r".\reports\weekly"))
+                        default=Path(_public_project_path('reports', 'weekly')))
     parser.add_argument("--monthly-dir", type=Path,
-                        default=Path(r".\reports\monthly"))
+                        default=Path(_public_project_path('reports', 'monthly')))
     parser.add_argument("--account-db", type=Path,
-                        default=Path(r".\db\account.db"))
+                        default=Path(_public_project_path('db', 'account.db')))
     parser.add_argument("--live-trades-db", type=Path,
-                        default=Path(r".\db\live_trades.db"))
+                        default=Path(_public_project_path('db', 'live_trades.db')))
     parser.add_argument("--ledger-db", type=Path,
-                        default=Path(r".\db\ledger.db"))
+                        default=Path(_public_project_path('db', 'ledger.db')))
     parser.add_argument("--lessons-db", type=Path,
-                        default=Path(r".\db\lessons.db"))
+                        default=Path(_public_project_path('db', 'lessons.db')))
     parser.add_argument("--event-log", type=Path,
-                        default=Path(r".\logs\push\qq_push_dedupe.jsonl"))
+                        default=Path(_public_project_path('logs', 'push', 'qq_push_dedupe.jsonl')))
     parser.add_argument("--json-out", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args(argv)
     if args.forward_weekly_minimum <= 0 or args.forward_monthly_minimum <= 0:

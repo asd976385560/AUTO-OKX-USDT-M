@@ -1,11 +1,14 @@
 <!--
 doc-version: V2.0-agent-deployment
-last-updated: 2026-08-12
+last-updated: 2026-09-14
 updated-by: Codex
 change-summary: Align public deployment with the live-only runtime and consolidated collection runner.
 -->
 
 # Agent and OpenClaw Deployment Guide
+
+The current public protocol is `minimal_contract_full_closure_v1`. Deploy the current `agents/` and `templates/`; historical multitimeframe cards remain compatibility input only. OPEN uses `open_execution_package_v1` and plans are published atomically by `write_position_plan.py`.
+
 
 [简体中文](agent-deployment.zh-CN.md) · [English](agent-deployment.en.md)
 

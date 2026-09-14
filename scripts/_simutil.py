@@ -123,7 +123,10 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
 # ---------------------------------------------------------------------------
 # 相似度 v2（2026-08-10 Wave2 序9，特征集按终稿方案清单）
 # ---------------------------------------------------------------------------
-SIMILARITY_VERSION = "similarity_v2"
+SIMILARITY_VERSION_V2 = "similarity_v2"
+SIMILARITY_VERSION_V3 = "similarity_v3_strict_24h"
+SIMILARITY_VERSION = SIMILARITY_VERSION_V3
+FEATURE_EPOCH_V3 = "experience_features_v3_strict_24h"
 
 # 数值特征 → 贴近度尺度（exp(-|q-r|/scale)）；尺度=该特征"半衰差"数量级，
 # 定死为常量（禁 registry/LLM 调参，与风控常量同纪律）。
@@ -156,6 +159,14 @@ def experience_features_v2(d: Mapping[str, Any]) -> dict[str, Any]:
         "trend_1h": d.get("trend_1h"),
         "trend_4h": d.get("trend_4h"),
     }
+
+
+def experience_features_v3(d: Mapping[str, Any]) -> dict[str, Any]:
+    """Forward-only v3 feature payload with an explicit non-mixable epoch."""
+    out = experience_features_v2(d)
+    out["v"] = 3
+    out["feature_epoch"] = FEATURE_EPOCH_V3
+    return out
 
 
 def similarity_v2(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
@@ -192,3 +203,15 @@ def similarity_v2(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
     coverage = len(scores) / total_soft
     return round(
         (sum(scores) / len(scores)) * (0.5 + 0.5 * math.sqrt(coverage)), 4)
+
+
+def similarity_v3(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
+    """Compare only exact v3 epochs; v2/v3 feature spaces never mix silently."""
+    if qf.get("v") != 3 or rf.get("v") != 3:
+        return 0.0
+    if (
+        qf.get("feature_epoch") != FEATURE_EPOCH_V3
+        or rf.get("feature_epoch") != FEATURE_EPOCH_V3
+    ):
+        return 0.0
+    return similarity_v2(qf, rf)

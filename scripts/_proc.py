@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""子进程超时的共用兜底：整树终止 + 有界回收。
+"""子进程收口的共用兜底：可选有界优雅停止 + 整树终止 + 有界回收。
 
 **为什么需要**：Windows 上 `subprocess.run(timeout=)` 超时后只对直接子进程
 `TerminateProcess`。若该子进程还有存活的孙进程持有 stdout/stderr 管道
@@ -27,7 +27,7 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # 超时退出码，对齐 GNU timeout(1)。
 RC_TIMEOUT = 124
-# 子进程并非超时，而是监督器观察到确定性终态/协议违规后主动整树收口。
+# 子进程并非超时，而是监督器观察到确定性终态/协议违规后主动收口。
 # 调用方必须结合自己的 observer 证据把它映射成业务成功或失败，不能把 125
 # 直接当成普通子进程退出码。
 RC_OBSERVED_STOP = 125
@@ -61,6 +61,80 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
+def _stop_started_process(
+    proc: subprocess.Popen,
+    *,
+    trigger: str,
+    reason: str,
+    graceful_stop: Callable[[subprocess.Popen, str], object] | None,
+    graceful_stop_timeout: float,
+    stop_report: dict | None,
+) -> tuple[str, str]:
+    """Request a bounded graceful stop, then retain the hard tree fallback."""
+    report = stop_report if stop_report is not None else {}
+    report.update({
+        "trigger": trigger,
+        "reason": str(reason),
+        "graceful_available": graceful_stop is not None,
+        "graceful_requested": False,
+        "graceful_completed": False,
+        "graceful_timeout_seconds": max(
+            0.0, float(graceful_stop_timeout)),
+        "child_exit_code": None,
+        "process_tree_terminated": False,
+    })
+    requested = False
+    if graceful_stop is not None:
+        try:
+            requested = bool(graceful_stop(proc, str(reason)))
+            report["graceful_requested"] = requested
+        except Exception as exc:  # noqa: BLE001 - hard fallback must survive
+            report["graceful_error"] = (
+                f"{type(exc).__name__}: {exc}")[:500]
+
+    grace = max(0.0, float(graceful_stop_timeout))
+    if requested and grace > 0:
+        try:
+            out, err = proc.communicate(timeout=grace)
+            report.update({
+                "graceful_completed": True,
+                "child_exit_code": proc.returncode,
+            })
+            return str(out or ""), str(err or "")
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:  # noqa: BLE001 - retain the hard fallback
+            report["graceful_wait_error"] = (
+                f"{type(exc).__name__}: {exc}")[:500]
+
+    terminate_process_tree(proc)
+    report.update({
+        "child_exit_code": proc.returncode,
+        "process_tree_terminated": True,
+    })
+    try:
+        out, err = proc.communicate(timeout=1)
+    except Exception:  # noqa: BLE001
+        out, err = "", ""
+    return str(out or ""), str(err or "")
+
+
+def _stop_note(report: dict | None) -> str:
+    if report and report.get("graceful_completed") is True:
+        return (
+            "graceful stop completed"
+            f" rc={report.get('child_exit_code')}"
+        )
+    if report and report.get("graceful_requested") is True:
+        return "graceful stop deadline exceeded; process tree terminated"
+    if report and report.get("graceful_error"):
+        return (
+            "graceful stop request failed: "
+            f"{report['graceful_error']}; process tree terminated"
+        )
+    return "process tree terminated"
+
+
 def run_guarded(
     cmd: list[str],
     *,
@@ -70,14 +144,18 @@ def run_guarded(
     creationflags: int = CREATE_NO_WINDOW,
     observer: Callable[[], object | None] | None = None,
     observer_poll_seconds: float = 0.5,
+    graceful_stop: Callable[[subprocess.Popen, str], object] | None = None,
+    graceful_stop_timeout: float = 0.0,
+    stop_report: dict | None = None,
 ) -> tuple[int, str, str, bool]:
-    """跑子进程，超时整树杀。
+    """跑子进程；命中监督/超时时先走可选优雅钩子，再整树兜底。
 
     返回 `(rc, stdout, stderr, timed_out)`；超时时 rc=124，并尽量保留子进程
     在被杀前已刷出的部分输出（错误归因常常只在那几行里）。
 
-    与 `subprocess.run(timeout=)` 的差别只有一点：**超时真的会在 timeout 附近
-    返回**，不会被孙进程拖住。
+    与 `subprocess.run(timeout=)` 的核心差别是：**超时真的会在 timeout 加已登记
+    优雅宽限附近返回**，不会被孙进程拖住。未传优雅钩子的调用方保持原有立即
+    整树终止语义。
     """
     proc = subprocess.Popen(
         cmd,
@@ -119,12 +197,15 @@ def run_guarded(
                     stop_reason = None
                 if stop_reason is None:
                     continue
-                terminate_process_tree(proc)
-                try:
-                    out, err = proc.communicate(timeout=1)
-                except Exception:  # noqa: BLE001
-                    out, err = "", ""
-                note = f"observer stop: {stop_reason}; process tree terminated"
+                out, err = _stop_started_process(
+                    proc,
+                    trigger="observer",
+                    reason=str(stop_reason),
+                    graceful_stop=graceful_stop,
+                    graceful_stop_timeout=graceful_stop_timeout,
+                    stop_report=stop_report,
+                )
+                note = f"observer stop: {stop_reason}; {_stop_note(stop_report)}"
                 return (
                     RC_OBSERVED_STOP,
                     str(out or ""),
@@ -133,34 +214,41 @@ def run_guarded(
                 )
     except subprocess.TimeoutExpired as exc:
         partial_out, partial_err = exc.stdout or "", exc.stderr or ""
-        terminate_process_tree(proc)
-        try:
-            tail_out, tail_err = proc.communicate(timeout=1)
-            if tail_out:
-                partial_out = tail_out
-            if tail_err:
-                partial_err = tail_err
-        except Exception:  # noqa: BLE001
-            pass
+        tail_out, tail_err = _stop_started_process(
+            proc,
+            trigger="timeout",
+            reason="timeout",
+            graceful_stop=graceful_stop,
+            graceful_stop_timeout=graceful_stop_timeout,
+            stop_report=stop_report,
+        )
+        if tail_out:
+            partial_out = tail_out
+        if tail_err:
+            partial_err = tail_err
         if isinstance(partial_out, bytes):
             partial_out = partial_out.decode("utf-8", errors="replace")
         if isinstance(partial_err, bytes):
             partial_err = partial_err.decode("utf-8", errors="replace")
-        note = f"timeout after {timeout}s; process tree terminated"
+        note = f"timeout after {timeout}s; {_stop_note(stop_report)}"
         return (RC_TIMEOUT, str(partial_out or ""),
                 (f"{note} | {partial_err}" if partial_err else note), True)
     except Exception as exc:  # noqa: BLE001 - Popen 后必须转成有证据的终态
         # Popen 已成功，因此这不是 started=False。无论异常来自 pipe、编码、
-        # observer 还是回收，先整树终止，再返回专用非零码，让 stage 保留
+        # observer 还是回收，先尝试登记的优雅收口、再整树兜底，然后返回
+        # 专用非零码，让 stage 保留
         # child_started=true 并继续 stopping/Gateway abort 流程。
-        terminate_process_tree(proc)
-        try:
-            tail_out, tail_err = proc.communicate(timeout=1)
-        except Exception:  # noqa: BLE001
-            tail_out, tail_err = "", ""
+        tail_out, tail_err = _stop_started_process(
+            proc,
+            trigger="guard_error",
+            reason=f"guard_error:{type(exc).__name__}",
+            graceful_stop=graceful_stop,
+            graceful_stop_timeout=graceful_stop_timeout,
+            stop_report=stop_report,
+        )
         note = (
             f"guard error after process start: {type(exc).__name__}: {exc}; "
-            "process tree terminated"
+            f"{_stop_note(stop_report)}"
         )
         return (
             RC_GUARD_ERROR,

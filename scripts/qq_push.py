@@ -12,15 +12,24 @@ Dedupe layers:
 
 调用方不得从正文猜测 cycle 或轮次；业务身份必须通过 --dedupe-key 显式声明。
 sent 表中其他格式的历史行只读保留，不参与当前键匹配。
+`uncertain_delivery` 表示外发命令超时且没有messageId；它与sent一样阻断同键
+再次发送，但审计仍按未确认送达计失败，禁止用幂等重跑猜测结果。
 
-⚠️ --dedupe-key / --db-root 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，runpy 前必须
+⚠️ --dedupe-key 是本 wrapper 专属参数：qq_push_raw 是严格 argparse，runpy 前必须
 _strip_wrapper_args 剥掉，否则 raw SystemExit(2) → 所有带键推送全灭。
 
-Structured events use qq_push_dedupe.jsonl for the canonical root and a
-root-hashed filename for non-default roots; dedupe SQLite truth always lives
-under that DB root.
+Structured events are appended to <PROJECT_ROOT>/logs/push/qq_push_dedupe.jsonl.
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import hashlib
 import json
@@ -33,12 +42,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(
-    os.environ.get("OKX_ROOT") or Path(__file__).resolve().parents[1]
-).resolve()
+ROOT = Path(_public_project_path())
 RAW = ROOT / "scripts" / "qq_push_raw.py"
-DEFAULT_DB_ROOT = (ROOT / "db").resolve()
-DB = DEFAULT_DB_ROOT / "qq_push_dedupe.db"
+DB = ROOT / "db" / "qq_push_dedupe.db"
 EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
 CST = timezone(timedelta(hours=8))
 SENT_TABLE_DDL = (
@@ -50,6 +56,15 @@ SENT_TABLE_DDL = (
     "updated_at TEXT, "
     "preview TEXT)"
 )
+UNCERTAIN_DELIVERY_STATUS = "uncertain_delivery"
+UNCERTAIN_DELIVERY_EXIT_CODE = 3
+PENDING_IN_FLIGHT_EXIT_CODE = 4
+STALE_PENDING_EXIT_CODE = 5
+CLAIM_ACQUIRED = "claimed"
+CLAIM_DUPLICATE_SENT = "duplicate_sent"
+CLAIM_DUPLICATE_UNCERTAIN = "duplicate_uncertain_delivery"
+CLAIM_PENDING_IN_FLIGHT = "pending_in_flight"
+CLAIM_STALE_PENDING = "stale_pending_manual_intervention"
 REVIEWER_REPORT_KEY = re.compile(
     r"^reviewer:(\d{4}-\d{2}-\d{2}):(daily|weekly|monthly)(?::[\w.-]+)?$"
 )
@@ -74,24 +89,6 @@ def _arg_value(names: tuple[str, ...]) -> str | None:
             if arg.startswith(name + "="):
                 return arg.split("=", 1)[1]
     return None
-
-
-def _configure_runtime_paths() -> Path:
-    """Bind dedupe truth and event evidence to the selected DB root."""
-    global DB, EVENT_LOG
-    raw_root = _arg_value(("--db-root",)) or os.environ.get("OKX_DB_ROOT")
-    runtime_root = Path(raw_root or DEFAULT_DB_ROOT).expanduser().resolve()
-    DB = runtime_root / "qq_push_dedupe.db"
-    if os.path.normcase(os.fspath(runtime_root)) == os.path.normcase(
-        os.fspath(DEFAULT_DB_ROOT)
-    ):
-        EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
-    else:
-        tag = "r" + hashlib.sha256(
-            os.path.normcase(os.fspath(runtime_root)).encode("utf-8")
-        ).hexdigest()[:10]
-        EVENT_LOG = ROOT / "logs" / "push" / f"qq_push_dedupe-{tag}.jsonl"
-    return runtime_root
 
 
 def _read_content_once() -> str:
@@ -119,9 +116,16 @@ def _dedupe_key(content: str) -> tuple[str, str, str | None, str]:
     dkey = _arg_value(("--dedupe-key",))
     # --alert 走 C2C 私聊（告警与业务播报分流，2026-08-04）。target 参与 dedupe basis，
     # 所以同一内容发到群和发到告警私聊互不去重——否则改路由后首条告警会被历史键吞掉。
+    # reviewer 报告族（daily|weekly|monthly）2026-08-26 主人拍板改 C2C 私聊：路由在
+    # 本 wrapper 按 dedupe-key 确定性判定并注入 --report，调用方与 15m 战报不变。
     target = _arg_value(("--target", "--group", "--to", "--group-openid"))
     if not target:
-        target = "alert" if "--alert" in sys.argv else "default"
+        if "--alert" in sys.argv or "--report" in sys.argv:
+            target = "alert" if "--alert" in sys.argv else "report"
+        elif dkey and REVIEWER_REPORT_KEY.fullmatch(str(dkey)):
+            target = "report"
+        else:
+            target = "default"
     basis = f"{target}|{dkey or content_hash}"
     key = hashlib.sha256(basis.encode("utf-8")).hexdigest()
     return key, content_hash, dkey, target
@@ -166,6 +170,8 @@ def _validate_reviewer_report_before_push(
             account_db=ROOT / "db" / "account.db",
             live_trades_db=ROOT / "db" / "live_trades.db",
             ledger_db=ROOT / "db" / "ledger.db",
+            market_db=ROOT / "db" / "market.db",
+            lessons_db=ROOT / "db" / "lessons.db",
         )
         observed_day = str(result.get("report_ts") or "")[:10]
     else:
@@ -209,16 +215,21 @@ def _connect() -> sqlite3.Connection:
         raise
 
 
-def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: str) -> bool:
+def _claim(
+    key: str,
+    content_hash: str,
+    preview: str,
+    dkey: str | None,
+    target: str,
+) -> str:
     con = _connect()
     try:
         con.execute(SENT_TABLE_DDL)
         now = _now()
         con.execute("BEGIN IMMEDIATE")
         row = con.execute("SELECT status, updated_at FROM sent WHERE k=?", (key,)).fetchone()
-        # 核验修（2026-07-16）：pending 加陈旧豁免——claim 后、mark 前进程被杀（重启/树杀）
-        # 会留永久 pending，同键当日全部重发被 duplicate_skip 吞（且 skip 走 exit 0，上游
-        # 误报"已推"）。pending 超 30min 视为死 claim，放行重发；sent 仍永久挡。
+        # pending 只表示 claim→send→mark 之间的在飞状态。超过 30 分钟时真相
+        # 已不可判定，禁止自动重发猜测外部送达结果；保留原行供人工处置。
         stale_pending = False
         if row and row[0] == "pending":
             try:
@@ -227,8 +238,18 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
                        ).total_seconds()
                 stale_pending = age > 1800
             except (ValueError, TypeError):
-                stale_pending = True  # updated_at 坏 → 按死 claim 放行（保送达）
-        if row and (row[0] == "sent" or (row[0] == "pending" and not stale_pending)):
+                stale_pending = True
+        if row and row[0] in {
+            "sent", UNCERTAIN_DELIVERY_STATUS, "pending"
+        }:
+            if row[0] == "sent":
+                claim_result = CLAIM_DUPLICATE_SENT
+            elif row[0] == UNCERTAIN_DELIVERY_STATUS:
+                claim_result = CLAIM_DUPLICATE_UNCERTAIN
+            elif stale_pending:
+                claim_result = CLAIM_STALE_PENDING
+            else:
+                claim_result = CLAIM_PENDING_IN_FLIGHT
             con.rollback()
             _append_event(
                 event="duplicate_skip",
@@ -239,10 +260,20 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
                 target=target,
                 existing_status=row[0],
                 existing_updated_at=row[1],
+                claim_result=claim_result,
+                manual_intervention_required=(
+                    claim_result == CLAIM_STALE_PENDING),
                 preview=preview[:160],
             )
-            print(f"[qq_push_dedupe] skip duplicate key={key[:12]} status={row[0]}")
-            return False
+            print(json.dumps({
+                "ok": claim_result == CLAIM_DUPLICATE_SENT,
+                "send_status": claim_result,
+                "existing_status": row[0],
+                "existing_updated_at": row[1],
+                "manual_intervention_required": (
+                    claim_result == CLAIM_STALE_PENDING),
+            }, ensure_ascii=False))
+            return claim_result
         con.execute(
             "INSERT OR REPLACE INTO sent(k, content_hash, status, first_seen, updated_at, preview) "
             "VALUES(?, ?, ?, ?, ?, ?)",
@@ -258,7 +289,7 @@ def _claim(key: str, content_hash: str, preview: str, dkey: str | None, target: 
             target=target,
             preview=preview[:160],
         )
-        return True
+        return CLAIM_ACQUIRED
     finally:
         con.close()
 
@@ -267,7 +298,21 @@ def _mark(key: str, status: str, dkey: str | None, target: str, exit_code: int |
     con = _connect()
     try:
         now = _now()
-        con.execute("UPDATE sent SET status=?, updated_at=? WHERE k=?", (status, now, key))
+        con.execute("BEGIN IMMEDIATE")
+        cursor = con.execute(
+            "UPDATE sent SET status=?, updated_at=? WHERE k=?",
+            (status, now, key),
+        )
+        if cursor.rowcount != 1:
+            con.rollback()
+            raise RuntimeError(
+                f"dedupe mark expected one row, updated {cursor.rowcount}")
+        row = con.execute(
+            "SELECT status,updated_at FROM sent WHERE k=?", (key,)
+        ).fetchone()
+        if row != (status, now):
+            con.rollback()
+            raise RuntimeError("dedupe mark read-after-write mismatch")
         con.commit()
     finally:
         con.close()
@@ -283,14 +328,36 @@ def _strip_wrapper_args() -> None:
         if skip:
             skip = False
             continue
-        if a in {"--dedupe-key", "--db-root"}:
+        if a == "--dedupe-key":
             skip = True
             continue
-        if a.startswith("--dedupe-key=") or a.startswith("--db-root="):
+        if a.startswith("--dedupe-key="):
             continue
         argv.append(a)
     sys.argv[:] = argv
 
+
+def _configure_runtime_paths() -> Path:
+    """Bind dedupe truth and event evidence to the selected DB root."""
+    global DB, EVENT_LOG
+    raw_root = _arg_value(("--db-root",)) or os.environ.get("OKX_DB_ROOT")
+    runtime_root = Path(raw_root or DEFAULT_DB_ROOT).expanduser().resolve()
+    DB = runtime_root / "qq_push_dedupe.db"
+    if os.path.normcase(os.fspath(runtime_root)) == os.path.normcase(
+        os.fspath(DEFAULT_DB_ROOT)
+    ):
+        EVENT_LOG = ROOT / "logs" / "push" / "qq_push_dedupe.jsonl"
+    else:
+        tag = "r" + hashlib.sha256(
+            os.path.normcase(os.fspath(runtime_root)).encode("utf-8")
+        ).hexdigest()[:10]
+        EVENT_LOG = ROOT / "logs" / "push" / f"qq_push_dedupe-{tag}.jsonl"
+    return runtime_root
+
+
+_PROJECT_ROOT = Path(_public_project_path()).resolve()
+_PRODUCTION_DB_ROOT = (_PROJECT_ROOT / 'db').resolve()
+DEFAULT_DB_ROOT = _PRODUCTION_DB_ROOT
 
 def main() -> int:
     _configure_runtime_paths()
@@ -319,14 +386,41 @@ def main() -> int:
             target=target,
             **validation,
         )
-    if not _claim(key, content_hash, content, dkey, target):
-        return 0
+    claim_result = _claim(key, content_hash, content, dkey, target)
+    if claim_result != CLAIM_ACQUIRED:
+        if claim_result == CLAIM_DUPLICATE_SENT:
+            return 0
+        if claim_result == CLAIM_DUPLICATE_UNCERTAIN:
+            return UNCERTAIN_DELIVERY_EXIT_CODE
+        if claim_result == CLAIM_PENDING_IN_FLIGHT:
+            return PENDING_IN_FLIGHT_EXIT_CODE
+        if claim_result == CLAIM_STALE_PENDING:
+            print(
+                "qq_push: stale pending requires manual delivery review; "
+                "automatic resend is forbidden",
+                file=sys.stderr,
+            )
+            return STALE_PENDING_EXIT_CODE
+        raise RuntimeError(f"unknown claim result: {claim_result}")
+    if (
+        target == "report"
+        and "--report" not in sys.argv
+        and _arg_value(("--target", "--group", "--to", "--group-openid")) is None
+    ):
+        # 确定性注入 raw 侧路由旗标；显式 --target 已在 target 解析层优先。
+        sys.argv.append("--report")
     _strip_wrapper_args()
     try:
         runpy.run_path(str(RAW), run_name="__main__")
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-        _mark(key, "sent" if code == 0 else "failed", dkey, target, code)
+        status = (
+            "sent" if code == 0
+            else UNCERTAIN_DELIVERY_STATUS
+            if code == UNCERTAIN_DELIVERY_EXIT_CODE
+            else "failed"
+        )
+        _mark(key, status, dkey, target, code)
         raise
     except Exception:
         _mark(key, "failed", dkey, target, None)

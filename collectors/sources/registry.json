@@ -2,7 +2,7 @@
   "_meta": {
     "doc": "V2.0 §6 声明式源注册表（弃 OKX news 单点）。news 采集器（news_collect）读本表只迭代 enabled news 源；market/macro 段为 registered-only 声明；增/停/换源＝on-demand 维护会话（主人对话触发）灰度改本表，安全可审计，改采集器代码仍走灰度+人工确认。",
     "version": "2.6.0",
-    "updated": "2026-08-13T21:30",
+    "updated": "2026-08-19T09:00",
     "cadence_values": [
       "15m",
       "hourly",
@@ -40,6 +40,34 @@
       "adapter": null,
       "timeout_sec": 25,
       "note": "全 USDT-M 一次拉；生产级，复用 _okx_http。registered-only：实采在 collect_data/collect_slow（market 真函数=scripts/_okx_http.fetch_*_sync）"
+    },
+    {
+      "id": "okx_mark_price",
+      "type": "market",
+      "endpoint": "/api/v5/public/mark-price?instType=SWAP",
+      "native_cadence": "15m",
+      "required": false,
+      "staleness_sec": null,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": null,
+      "timeout_sec": 20,
+      "audit_forward_start_cst": "2026-08-20T00:00:00+08:00",
+      "note": "2026-08-19 D2：标记价，单次全量。与 index-tickers 配对算 basis=(mark-index)/index*1e4，落 market.db.derivatives.mark_px/basis_bp。registered-only：实采在 collect_data（_okx_http.fetch_mark_prices_all_sync）。刻意不用 history-mark-price-candles——那是 per-instId 分页，~400 币会吃掉 15m 采集预算"
+    },
+    {
+      "id": "okx_index_tickers",
+      "type": "market",
+      "endpoint": "/api/v5/market/index-tickers?quoteCcy=USDT",
+      "native_cadence": "15m",
+      "required": false,
+      "staleness_sec": null,
+      "enabled": true,
+      "auth_env": null,
+      "adapter": null,
+      "timeout_sec": 20,
+      "audit_forward_start_cst": "2026-08-20T00:00:00+08:00",
+      "note": "2026-08-19 D2：指数价，单次全量（instId 形如 BTC-USDT，去 -SWAP 后缀匹配）。落 market.db.derivatives.index_px。registered-only：实采在 collect_data（_okx_http.fetch_index_tickers_all_sync）"
     },
     {
       "id": "okx_klines",
@@ -235,7 +263,7 @@
       "adapter": "news_mxsearch",
       "poll_interval_min": 60,
       "timeout_sec": 30,
-      "note": "由 news_mxsearch.py 在聚合news步每小时采集，统一经news_writer落库；首轮6秒失败后只对本查询做一次4秒重试。基础24次/日，全部失败重试最坏再24次，仍与地缘源共同受共享150次/日预算约束。required=false，失败不阻断主链。"
+      "note": "由 news_mxsearch.py 在聚合news步每小时采集，统一经news_writer落库；首轮6秒的可重试错误只对本查询做一次4秒重试，MX business code=113（免费日额度耗尽）首轮即终止且不重试。基础24次/日，全部可重试失败最坏再24次，仍与地缘源共同受共享150次/日预算约束。required=false，失败不阻断主链。"
     },
     {
       "id": "geo_political",
@@ -249,7 +277,7 @@
       "adapter": "news_geo",
       "poll_interval_min": 120,
       "timeout_sec": 45,
-      "note": "4个地缘查询由news_geo.py每2小时采集并经news_writer落库；每个查询首轮6秒失败后仅对该失败查询做一次4秒重试。基础48次/日，加密新闻基础24次/日，最坏重试72次，总计144次/日仍小于共享150次/日新闻额度；黄金ETF使用独立金融接口额度，不计入本预算。"
+      "note": "4个地缘查询由news_geo.py每2小时采集并经news_writer落库；每个查询首轮6秒的可重试错误仅对该失败查询做一次4秒重试。MX business code=113 首次出现即停止本轮剩余查询且不重试，逐项外显 attempted/skipped/final_failed，避免额度耗尽后继续浪费共享请求。基础48次/日，加密新闻基础24次/日，最坏可重试失败72次，总计144次/日仍小于共享150次/日新闻额度；黄金ETF使用独立金融接口额度，不计入本预算。"
     },
     {
       "id": "okx_news",
@@ -276,7 +304,7 @@
       "adapter": "news_okx_announcements",
       "poll_interval_min": 30,
       "timeout_sec": 75,
-      "note": "OKX官方公告（上币/下架/交易更新/API/活动）；公共无鉴权端点经_okx_http统一域名回退与0.5s端点限速（官方5req/2s）。每轮=类型列表1次+命中类别各1页；类型列表或精确失败类别统一冷却3秒后以新连接各做一次6秒上限冷恢复，最多2阶段、无循环/历史补采。代码共享75秒总网络截止，每个请求从剩余预算取上限，耗尽后明确失败且不再联网。annType→tag/severity规则映射：delistings=high、new-listings/trading-updates=medium、api/活动=low；标题高置信才提取symbol（宁缺勿假）。经news_writer落库source=okx_announcements；30分钟轮询、公告可数日无更新故staleness=48h。required=false失败不阻断主链。补规格书「官方动态」维度，供Agent做重大公告风险窗观察，不设自动闸。audit_forward_start_cst=2026-08-14T00:00（预注册前向起点：源诞生前的槽不进健康审计分母，不反向加责；不影响既有源前向窗）。",
+      "note": "OKX官方公告（上币/下架/交易更新/API/活动）；公共无鉴权端点经_okx_http统一域名回退与0.5s端点限速（官方5req/2s）。每轮=类型列表1次+命中类别各1页；类型列表或精确失败类别统一冷却3秒后以新连接各做一次6秒上限冷恢复，最多2阶段、无循环/历史补采。代码共享75秒总网络截止，每个请求从剩余预算取上限，耗尽后明确失败且不再联网。annType→tag/severity规则映射：delistings=high、new-listings/trading-updates=medium、api/活动=low；标题高置信才提取symbol（宁缺勿假）。经news_writer落库source=okx_announcements；30分钟轮询、公告可数日无更新故staleness=48h。required=false失败不阻断主链。补规格书「官方动态」维度，供Agent做重大公告风险窗观察，不设自动闸。2026-08-18 类型列表缓存降级：types 成功即落 logs/collect/okx_announcement_types_cache.json（原子替换）；types initial+cold 双败时降级用≤30天缓存继续拉各类别页并在 retry_stats 标 types_source=cached，无缓存/超龄仍整轮失败照实落账（背景：08-14 起本机对 /announcement-types 高频传输失败，单点失败曾杀全轮）。audit_forward_start_cst=2026-08-14T00:00（预注册前向起点：源诞生前的槽不进健康审计分母，不反向加责；不影响既有源前向窗）。",
       "audit_forward_start_cst": "2026-08-14T00:00:00+08:00"
     },
     {
@@ -316,7 +344,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "legacy id/字段含dxy，但实际美元绝对指数为FRED DTWEXBGS=Nominal Broad U.S. Dollar Index，非ICE DXY。工作日更；时效读source_meta.dxy.source_as_of，禁止公共行掩盖旧值。ICE官方报价仍缺；另有独立macro_dxy_calc_ecb可审计计算值"
+      "note": "legacy id/字段含dxy，但实际美元绝对指数为FRED DTWEXBGS=Nominal Broad U.S. Dollar Index，非ICE DXY。工作日更；健康时钟仅由DXY/VIX/SPX均成功且非carry-forward的cross_market行刷新，真实观测日另见macro_dxy_vix_spx_content，禁止共享行掩盖抓取失败。ICE官方报价仍缺；另有独立macro_dxy_calc_ecb可审计计算值"
     },
     {
       "id": "macro_fed_funds",
@@ -326,10 +354,11 @@
       "required": false,
       "staleness_sec": null,
       "enabled": true,
+      "audit_forward_start_cst": "2026-08-14T04:05:30+08:00",
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "美联储有效联邦基金利率（FRED DFF，日频、约1个工作日发布滞后）；复用§4.1 FRED key，由collect_slow宏观块采集并经public_macro.upsert_observations写regime.db.macro_observations（metric=us_fed_funds_rate），不加cross_market列。briefing宏观段展示当前值+观测日；仅Agent参考证据，不进硬风控。补规格书「宏观环境:美联储利率」维度。"
+      "note": "美联储有效联邦基金利率（FRED DFF，日频、约1个工作日发布滞后）；复用§4.1 FRED key，由collect_slow宏观块采集并经public_macro.upsert_observations写regime.db.macro_observations（metric=us_fed_funds_rate），不加cross_market列。健康时钟取最近成功解析落库collected_at，真实上游观测日另见macro_fed_funds_content；上游值未变化不冒充采集失败。audit_forward_start_cst 取本源在 regime.db 的首个成功 collected_at（2026-08-13T20:05:30Z），诞生前不进任何未来完善率分母。briefing宏观段展示当前值+观测日；仅Agent参考证据，不进硬风控。补规格书「宏观环境:美联储利率」维度。"
     },
     {
       "id": "macro_dxy_calc_ecb",
@@ -342,7 +371,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "用ECB六币种官方日参考汇率按ICE公布公式复算，写macro_observations/cross_market.dxy_calc_ecb；是可审计计算值，不是ICE官方实时或收盘报价，禁止混称"
+      "note": "用ECB六币种官方日参考汇率按ICE公布公式复算，写macro_observations/cross_market.dxy_calc_ecb；除07:55日维护外随既有每小时慢采有界刷新。健康时钟取最近成功解析落库collected_at，真实观测日另见macro_dxy_calc_ecb_content；是可审计计算值，不是ICE官方实时或收盘报价，禁止混称"
     },
     {
       "id": "macro_btc_dominance",
@@ -381,7 +410,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 30,
-      "note": "美国现货BTC ETF日净流写macro_observations。Farside脚本直连受Cloudflare限制，导入08:20权威证据；配置SOSOVALUE_API_KEY时额外直调官方API。单源保留provisional，只有同日双源在容差内才写cross_market.btc_etf_net_flow_usd"
+      "note": "美国现货BTC ETF日净流写macro_observations。Farside脚本直连受Cloudflare限制，导入08:20权威证据；配置SOSOVALUE_API_KEY时额外直调官方API。导入器兼容旧as_of/source_values与新trading_day|trade_date/sources结构，新结构自2026-08-18T03:00:00+08:00只向前生效，边界前遗漏证据不自动补写。单源保留provisional，只有同日双源在容差内才写cross_market.btc_etf_net_flow_usd"
     },
     {
       "id": "macro_fear_greed",
@@ -394,7 +423,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 15,
-      "note": "Alternative.me自有指数API直采，写macro_observations并同步cross_market.fear_greed/fear_greed_label；日频、0-100、保留classification和原始timestamp，展示须注明来源"
+      "note": "Alternative.me自有指数API直采，写macro_observations并同步cross_market.fear_greed/fear_greed_label；日频、0-100、保留classification和原始timestamp；健康时钟取最近成功解析落库collected_at，真实观测日另见macro_fear_greed_content，展示须注明来源"
     },
     {
       "id": "macro_economic_calendar",
@@ -407,7 +436,7 @@
       "auth_env": null,
       "adapter": null,
       "timeout_sec": 45,
-      "note": "OKX CLI优先；未来7天importance=3经济事件由daily_maintenance采集，写regime.db.macro_events"
+      "note": "OKX CLI优先；未来7天+回溯3天双窗、importance>=2的经济事件由daily_maintenance采集，写regime.db.macro_events。回溯窗专为补actual（事件发布后才有值）；写入口public_macro.upsert_macro_events只补不抹"
     },
     {
       "id": "token_unlocks",

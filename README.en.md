@@ -1,8 +1,8 @@
 <!--
 doc-version: V2.0
-last-updated: 2026-08-16
+last-updated: 2026-09-14
 updated-by: Codex
-change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidence, action contracts and public safety gates.
+change-summary: Synchronize the current decision, execution, market-data and reporting contracts while retaining public release guards.
 -->
 
 <p align="center">
@@ -21,7 +21,7 @@ change-summary: Sync the sanitized 2026-08-15 runtime snapshot, recovery evidenc
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
 </p>
 
-V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and no-API news collection. The current runtime is live-only: one unified live Agent performs analysis before deterministic multitimeframe evidence, account facts, hard risk gates, execution, and same-process writer submission.
+V2.0 keeps market collection, risk checks, order execution, bookkeeping, push delivery, and stage dispatch in deterministic code. Isolated Agents handle analysis, trading decisions, reviews, and no-API news collection. The current runtime is live-only: one unified live Agent performs analysis before deterministic decision evidence, account facts, hard risk gates, execution, and same-process writer submission.
 
 > [!WARNING]
 > This project can execute real trades. Keep `OKX_EXECUTOR_DRYRUN=1` and `OKX_TRIGGER_DRYRUN=1` during initial deployment, and validate everything against isolated databases. This project is not investment advice and does not guarantee profit.
@@ -72,16 +72,14 @@ the release workflow passes version, current-main ancestry, and full CI checks.
 
 ## Latest synchronization
 
-This branch synchronizes the actual runtime source through 2026-08-15 and reapplies portable public safety boundaries before it enters this repository:
+Public version **1.1.2** synchronizes the 2026-09-14 source snapshot and retains the public isolation and write boundaries.
 
-- Demo runtime capability, roles, and database initialization targets are retired; the main chain is unified live → push;
-- `collect_cycle.py` aggregates hourly fast → news → slow and quarter-hour fast → news runs with per-step results, absolute deadlines, and side-effect failure receipts;
-- OKX announcements, official contract history, BOLL/OBV, positioning batch identity, and bounded market-feature recovery are verified by complete-cycle SLA, field-coverage, and periodic-report audits;
-- every OPEN/ADD is bound to exact closed 15m/1H/4H evidence for the same cycle, while REDUCE and ADJUST_PROTECTION now have explicit action contracts; the writer and executor revalidate independently;
-- Live risk gates combine the 66.6% portfolio IMR cap, 15% single-order incremental IMR cap, 5% stop-loss risk cap, available margin, finite-number checks, ledger-position consistency, and actor attestation;
-- Push uses 16 static required sections; multitimeframe, execution-audit, and business-attestation evidence are independent versioned hard gates, with separate slot, archive, and exact-delivery audits;
-- public paths are project-relative or placeholders, migrations default to dry-run and require explicit authorization plus verified backups, and public `ledger_autoheal.py` is permanently read-only;
-- business and alert destinations come only from `OKX_QQ_TARGET` and `OKX_QQ_ALERT_TARGET`; real credentials, destinations, host state, databases, logs, and incident-repair tools are excluded.
+- New decisions use `minimal_contract_full_closure_v1`: one side-neutral row per symbol, deterministic facts/view publication and hash-bound handoff. Historical `all_market_lightweight_open_v1` and multitimeframe cards remain readable.
+- OPEN uses `open_execution_package_v1`. `write_position_plan.py` validates drafts and atomically publishes plans; the runner verifies plan, facts, actor and receipt identity.
+- Execution adds official tick-size alignment, identity-bound flat-side protection cleanup, bounded mark-price recovery and protection readback. The 66.6% portfolio IMR, 15% incremental IMR and 5% stop-risk caps remain enforced.
+- Proven independent refusals with no order side effects retain their failure evidence while unrelated actions may continue. Ambiguous side effects, ledger conflicts and missing protection still block execution.
+- Optional public-market WebSocket caching, collection diagnostics, dated report artifacts, missed-opportunity evidence and Gateway delivery are included. Unknown delivery remains `uncertain_delivery` and is never automatically resent.
+- Public autoheal stays permanently read-only. Migrations require explicit `--apply --backup-dir` and verified online backups. Runtime data, real routes and host operation files remain excluded.
 
 ## Architecture
 

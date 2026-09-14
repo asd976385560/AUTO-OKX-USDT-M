@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import copy
+import io
+import json
+import sqlite3
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -94,6 +98,76 @@ def _verified_protection_change():
 
 
 class LiveDecisionFactsTests(unittest.TestCase):
+    def test_analysis_authority_requires_same_cycle_ok_row(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "analysis.db"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "CREATE TABLE analysis_runs("
+                    "cycle_id TEXT PRIMARY KEY,status TEXT,ts TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO analysis_runs VALUES(?,?,?)",
+                    ("2026-08-23T00:45", "error", "2026-08-23 00:50:06"),
+                )
+                connection.execute(
+                    "INSERT INTO analysis_runs VALUES(?,?,?)",
+                    ("2026-08-23T01:00", "ok", "2026-08-23 01:08:00"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            rejected = facts.analysis_authority(
+                "2026-08-23T00:45", path)
+            accepted = facts.analysis_authority(
+                "2026-08-23T01:00", path)
+            missing = facts.analysis_authority(
+                "2026-08-23T01:15", path)
+
+        self.assertFalse(rejected["ok"])
+        self.assertEqual("analysis_not_ok", rejected["reason"])
+        self.assertTrue(accepted["ok"])
+        self.assertEqual("same_cycle_analysis_ok", accepted["reason"])
+        self.assertFalse(missing["ok"])
+        self.assertEqual("analysis_missing", missing["reason"])
+
+    def test_cli_refuses_before_exchange_or_out_file_when_analysis_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            analysis_db = root / "analysis.db"
+            connection = sqlite3.connect(analysis_db)
+            try:
+                connection.execute(
+                    "CREATE TABLE analysis_runs("
+                    "cycle_id TEXT PRIMARY KEY,status TEXT,ts TEXT)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            out_file = root / "live_facts.json"
+            with (
+                mock.patch.object(facts, "build_facts") as build,
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                return_code = facts.main([
+                    "--cycle-id", "2026-08-23T00:45",
+                    "--profile", "live",
+                    "--analysis-db", str(analysis_db),
+                    "--out-file", str(out_file),
+                ])
+
+            payload = json.loads(output.getvalue())
+
+        self.assertEqual(3, return_code)
+        self.assertEqual(
+            "analysis_authority_required_before_live_facts",
+            payload["error"],
+        )
+        self.assertFalse(payload["out_file_written"])
+        self.assertFalse(out_file.exists())
+        build.assert_not_called()
     def _facts(self, as_of_ms: int | None = None):
         stamp = as_of_ms or int(time.time() * 1000)
         inputs = _raw_inputs(stamp)
@@ -248,6 +322,15 @@ class LiveDecisionFactsTests(unittest.TestCase):
         self.assertTrue(any("action_taken" in item for item in errors))
         self.assertTrue(any("0.0666" in item for item in errors))
         self.assertTrue(any("60%" in item for item in errors))
+
+        decimal_percentage = copy.deepcopy(receipt)
+        decimal_percentage["note"] = (
+            "单仓保证金占净值2.60%，远低于15%单笔上限"
+        )
+        self.assertEqual(
+            trades_writer.validate_strict_live_receipt(decimal_percentage),
+            [],
+        )
 
     def test_adjust_protection_is_a_formal_zero_fill_action(self):
         payload = self._facts()
@@ -417,6 +500,108 @@ class LiveDecisionFactsTests(unittest.TestCase):
 
 
 class HttpDeadlineTests(unittest.TestCase):
+    def test_exception_type_chain_preserves_wrapped_root_class(self):
+        try:
+            try:
+                raise TimeoutError("batch deadline")
+            except TimeoutError as exc:
+                raise RuntimeError("outer transport wrapper") from exc
+        except RuntimeError as exc:
+            self.assertEqual(
+                _okx_http._exception_type_chain(exc),
+                ["RuntimeError", "TimeoutError"],
+            )
+
+    def test_batch_outcome_records_outer_and_root_error_types(self):
+        client_cm = mock.MagicMock()
+        client_cm.__enter__.return_value = mock.Mock()
+
+        def wrapped_timeout(*_args, **_kwargs):
+            try:
+                raise TimeoutError("batch deadline")
+            except TimeoutError as exc:
+                raise RuntimeError("outer transport wrapper") from exc
+
+        outcomes: dict[str, dict] = {}
+        with (
+            mock.patch.object(_okx_http, "_client", return_value=client_cm),
+            mock.patch.object(
+                _okx_http, "_get_data", side_effect=wrapped_timeout
+            ),
+        ):
+            result = _okx_http._batch(
+                ["BTC-USDT-SWAP"],
+                lambda _symbol: "/api/v5/market/candles",
+                lambda symbol: {"instId": symbol},
+                lambda rows: rows,
+                workers=1,
+                request_retries=0,
+                outcomes=outcomes,
+            )
+        self.assertEqual(result, {"BTC-USDT-SWAP": []})
+        self.assertEqual(
+            outcomes["BTC-USDT-SWAP"]["error_type_chain"],
+            ["RuntimeError", "TimeoutError"],
+        )
+        self.assertEqual(
+            outcomes["BTC-USDT-SWAP"]["root_error_type"],
+            "TimeoutError",
+        )
+
+    def test_candle_batch_forwards_outcomes_for_transport_diagnostics(self):
+        outcomes: dict[str, dict] = {}
+        with mock.patch.object(_okx_http, "_batch", return_value={}) as batch:
+            self.assertEqual(
+                {},
+                _okx_http.fetch_candles_batch_sync(
+                    ["BTC-USDT-SWAP"],
+                    "15m",
+                    60,
+                    135.0,
+                    outcomes=outcomes,
+                ),
+            )
+        self.assertIs(batch.call_args.kwargs["outcomes"], outcomes)
+
+    def test_candle_transport_receipt_distinguishes_failure_classes(self):
+        symbols = [
+            "BTC-USDT-SWAP",
+            "ETH-USDT-SWAP",
+            "SOL-USDT-SWAP",
+            "XRP-USDT-SWAP",
+        ]
+        receipt = collect_data.candle_transport_receipt(
+            symbols,
+            {
+                "BTC-USDT-SWAP": [["1", "1", "1", "1", "1"]],
+                "ETH-USDT-SWAP": [],
+                "SOL-USDT-SWAP": [],
+            },
+            {
+                "BTC-USDT-SWAP": {"ok": True, "error_type": None},
+                "ETH-USDT-SWAP": {"ok": True, "error_type": None},
+                "SOL-USDT-SWAP": {
+                    "ok": False,
+                    "error_type": "RuntimeError",
+                    "root_error_type": "TimeoutError",
+                    "error_type_chain": ["RuntimeError", "TimeoutError"],
+                    "error": "must not be copied into the receipt",
+                },
+            },
+        )
+        self.assertEqual(receipt["requested_symbols"], 4)
+        self.assertEqual(receipt["usable_symbols"], 1)
+        self.assertEqual(receipt["missing_symbols"], 3)
+        self.assertEqual(receipt["transport_failures"], 1)
+        self.assertEqual(receipt["empty_payloads"], 1)
+        self.assertEqual(receipt["unclassified_missing"], 1)
+        self.assertEqual(receipt["error_types"], {"RuntimeError": 1})
+        self.assertEqual(receipt["root_error_types"], {"TimeoutError": 1})
+        self.assertEqual(
+            receipt["transport_failure_samples"], ["SOL-USDT-SWAP"]
+        )
+        self.assertNotIn("error", receipt)
+
     def test_funding_any_and_fallback_share_one_deadline(self):
         client_cm = mock.MagicMock()
         client_cm.__enter__.return_value = mock.Mock()
@@ -518,7 +703,7 @@ class HttpDeadlineTests(unittest.TestCase):
             mock.patch.object(
                 collect_data, "fetch_open_interest_all_sync", return_value={}
             ),
-            mock.patch.object(collect_data.time, "sleep") as sleep,
+            mock.patch.object(collect_data, "_sleep") as sleep,
         ):
             count, _snapshot, quality = collect_data.collect_tickers(
                 connection, "2026-08-13T17:15:00+08:00", 135,
@@ -555,7 +740,7 @@ class HttpDeadlineTests(unittest.TestCase):
             mock.patch.object(
                 collect_data, "fetch_tickers_batch_sync", return_value={}
             ),
-            mock.patch.object(collect_data.time, "sleep"),
+            mock.patch.object(collect_data, "_sleep"),
         ):
             rows, transport = collect_data._fetch_tickers_with_cold_retry(
                 time.monotonic() + 135,
@@ -587,7 +772,7 @@ class HttpDeadlineTests(unittest.TestCase):
                 collect_data, "fetch_tickers_batch_sync",
                 return_value=fallback,
             ) as batch,
-            mock.patch.object(collect_data.time, "sleep"),
+            mock.patch.object(collect_data, "_sleep"),
         ):
             rows, transport = collect_data._fetch_tickers_with_cold_retry(
                 time.monotonic() + 135,
@@ -615,7 +800,7 @@ class HttpDeadlineTests(unittest.TestCase):
                 collect_data, "fetch_tickers_all_sync",
                 side_effect=[first, retry],
             ),
-            mock.patch.object(collect_data.time, "sleep"),
+            mock.patch.object(collect_data, "_sleep"),
         ):
             rows, transport = collect_data._fetch_tickers_with_cold_retry(
                 time.monotonic() + 135,
@@ -637,15 +822,33 @@ class HttpDeadlineTests(unittest.TestCase):
             mock.patch.object(
                 collect_data, "fetch_tickers_batch_sync", return_value={}
             ) as batch,
-            mock.patch.object(collect_data.time, "sleep"),
+            mock.patch.object(collect_data, "_sleep"),
         ):
             with self.assertRaisesRegex(
-                    RuntimeError, "failed after bounded cold retry"):
+                    RuntimeError, "failed after bounded cold retry") as raised:
                 collect_data._fetch_tickers_with_cold_retry(
                     time.monotonic() + 135,
                 )
         self.assertEqual(fetch.call_count, 2)
         batch.assert_called_once()
+        exc = raised.exception
+        self.assertIsInstance(exc, collect_data.TickerTransportError)
+        self.assertIn("transport=(aggregate_errors=", str(exc))
+        self.assertLess(str(exc).index("transport=("),
+                        str(exc).index("initial=("))
+        self.assertTrue(exc.transport_stats["failure_before_market_write"])
+        self.assertEqual(
+            "official_ticker_transport_exhausted",
+            exc.transport_stats["failure_reason"],
+        )
+        quality = collect_data._ticker_failure_quality(exc)
+        self.assertEqual(1, quality["expected"])
+        self.assertEqual(0, quality["tickers"])
+        self.assertEqual(0.0, quality["ticker_coverage"])
+        self.assertIs(
+            exc.transport_stats["failure_before_market_write"],
+            quality["ticker_transport"]["failure_before_market_write"],
+        )
 
 
 if __name__ == "__main__":

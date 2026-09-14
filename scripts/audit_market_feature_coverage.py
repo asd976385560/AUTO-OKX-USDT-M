@@ -13,6 +13,15 @@ production threshold, dispatches, or places an order.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -30,9 +39,9 @@ import _acceptance_thresholds as thresholds
 CST = timezone(timedelta(hours=8))
 UTC = timezone.utc
 SLOT_MINUTES = 15
-DEFAULT_DB = Path(r".\db\market.db")
+DEFAULT_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_OUTPUT = Path(
-    r".\reports\quality\market-feature-coverage-audit.json")
+    _public_project_path('reports', 'quality', 'market-feature-coverage-audit.json'))
 DEFAULT_FORWARD_START = "2026-08-12T23:15:00+08:00"
 DEFAULT_EXPECTED_SYMBOLS = 100
 DEPTH_BPS = (10, 25, 50)
@@ -241,9 +250,13 @@ def _json_levels(value: Any) -> list[list[Any]] | None:
     for level in parsed:
         if not isinstance(level, list) or len(level) < 2:
             return None
-        if not _positive(level[0]) or not _positive(level[1]):
+        try:
+            price, quantity = float(level[0]), float(level[1])
+        except (TypeError, ValueError):
             return None
-        output.append(level)
+        if not math.isfinite(price) or price <= 0 or not math.isfinite(quantity) or quantity <= 0:
+            return None
+        output.append([price, quantity])
     return output
 
 
@@ -559,12 +572,13 @@ def _trade_flow_errors(
         errors.append("raw_sample_exceeds_count")
     else:
         for item in raw:
-            if (
-                not isinstance(item, dict)
-                or not _positive(item.get("px"))
-                or not _positive(item.get("sz"))
-                or item.get("side") not in ("buy", "sell")
-            ):
+            valid = isinstance(item, dict) and item.get("side") in ("buy", "sell")
+            try:
+                px, sz = (float(item.get("px")), float(item.get("sz"))) if valid else (0.0, 0.0)
+                valid = valid and math.isfinite(px) and px > 0 and math.isfinite(sz) and sz > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
                 errors.append("raw_sample_trade_invalid")
                 break
     return errors
@@ -576,9 +590,12 @@ def _rows_by_symbol(
     cycle_id: str,
 ) -> tuple[dict[str, list[sqlite3.Row]], list[sqlite3.Row]]:
     rows = connection.execute(
-        f"SELECT * FROM {table} WHERE cycle_id=? ORDER BY symbol,ts",
+        f"SELECT * FROM {table} WHERE cycle_id=?",
         (cycle_id,),
     ).fetchall()
+    # Sort the small exact-cycle result in memory. SQLite's ORDER BY temporary
+    # B-tree copies the wide raw book/trade JSON for every historical slot.
+    rows.sort(key=lambda row: (row["symbol"], row["ts"]))
     grouped: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         grouped.setdefault(str(row["symbol"]), []).append(row)

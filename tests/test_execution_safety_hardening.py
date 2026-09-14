@@ -5,7 +5,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -222,6 +223,51 @@ def _empty_experience_contract(cycle_id: str, symbol: str,
     )
 
 
+class InstrumentSpecFreshnessTests(unittest.TestCase):
+    @staticmethod
+    def _market_db(root: Path, *, state: str, updated_at: str) -> None:
+        with closing(sqlite3.connect(root / "market.db")) as con:
+            con.execute(
+                "CREATE TABLE instruments_cache("
+                "instId TEXT PRIMARY KEY,ctVal REAL,lotSz REAL,state TEXT,"
+                "metadata_updated_at TEXT)")
+            con.execute(
+                "INSERT INTO instruments_cache VALUES(?,?,?,?,?)",
+                ("BTC-USDT-SWAP", 0.01, 1.0, state, updated_at))
+            con.commit()
+
+    def test_fresh_live_cache_is_used_without_network(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._market_db(
+                root, state="live",
+                updated_at=datetime.now(timezone.utc).isoformat())
+            with mock.patch.object(oe.ox, "get_instrument") as fetch:
+                result = oe.fetch_instrument_specs(
+                    "BTC-USDT-SWAP", "live", root)
+        fetch.assert_not_called()
+        self.assertEqual("cache", result["spec_source"])
+        self.assertEqual(0.01, result["ct_val"])
+
+    def test_stale_or_non_live_cache_forces_authoritative_fetch(self):
+        for state, age_hours in (("live", 3), ("suspend", 0)):
+            with self.subTest(state=state, age_hours=age_hours):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    updated = datetime.now(timezone.utc) - timedelta(
+                        hours=age_hours)
+                    self._market_db(
+                        root, state=state, updated_at=updated.isoformat())
+                    with mock.patch.object(oe.ox, "get_instrument", return_value={
+                        "ctVal": "0.02", "lotSz": "1", "minSz": "1",
+                    }) as fetch:
+                        result = oe.fetch_instrument_specs(
+                            "BTC-USDT-SWAP", "live", root)
+                fetch.assert_called_once()
+                self.assertEqual("live_fetch", result["spec_source"])
+                self.assertEqual(0.02, result["ct_val"])
+
+
 class ExecutionIntentProfileGateTests(unittest.TestCase):
     @staticmethod
     def _reserve(path: Path, cycle: str, symbol: str,
@@ -257,6 +303,25 @@ class ExecutionIntentProfileGateTests(unittest.TestCase):
             oe.ei.mark_failed_clean(path, error="confirmed_no_fill", **kwargs)
         else:
             raise AssertionError(state)
+
+    def test_intent_transitions_reject_out_of_order_and_terminal_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ledger.db"
+            cycle = "CYCLE-CAS"
+            symbol = "BTC-USDT-SWAP"
+            reserved = self._reserve(path, cycle, symbol)
+            kwargs = {
+                "profile": "live", "cycle_id": cycle, "symbol": symbol,
+                "side": "long", "fingerprint": reserved["fingerprint"],
+                "now_ts": "2026-07-29 10:01:00",
+            }
+            with self.assertRaisesRegex(RuntimeError, "transition lost"):
+                oe.ei.mark_submitted(path, **kwargs)
+            oe.ei.mark_submitting(path, **kwargs)
+            oe.ei.mark_completed(
+                path, receipt={"ok": True, "cycle_id": cycle}, **kwargs)
+            with self.assertRaisesRegex(RuntimeError, "transition lost"):
+                oe.ei.mark_uncertain(path, error="late ambiguity", **kwargs)
 
     def test_pending_other_symbol_blocks_before_all_exchange_io(self):
         with tempfile.TemporaryDirectory() as td:
@@ -837,6 +902,25 @@ class LiveAccountImrGateTests(unittest.TestCase):
 
 
 class StopLossDirectionTests(unittest.TestCase):
+    def test_place_ambiguity_distinguishes_timeout_from_other_write_error(self):
+        timeout = oe._place_ambiguity_evidence({
+            "error_type": "TimeoutError",
+            "error": "okx CLI timeout after 45.0s",
+            "timeout_seconds": 45.0,
+        }, False)
+        connection = oe._place_ambiguity_evidence({
+            "error_type": "RuntimeError",
+            "error": "okx CLI rc=1: connection reset",
+            "timeout_seconds": 45.0,
+        }, False)
+
+        self.assertEqual("write_timeout", timeout["classification"])
+        self.assertEqual("下单写超时，现仓回读确认未成交", timeout["summary"])
+        self.assertEqual("write_error", connection["classification"])
+        self.assertEqual("下单写结果不明，现仓回读确认未成交",
+                         connection["summary"])
+        self.assertFalse(timeout["retry_attempted"])
+
     def _validate(self, side: str, sl: float):
         return rv.validate(
             symbol="BTC-USDT-SWAP",
@@ -1376,7 +1460,8 @@ class OpenFillTruthTests(unittest.TestCase):
 
 class ReduceReceiptContractTests(unittest.TestCase):
     @staticmethod
-    def _run_reduce(*, placed=None, fill=None, reduce_sz=2.0):
+    def _run_reduce(*, placed=None, fill=None, reduce_sz=2.0,
+                    positions_side_effect=None):
         cycle = "CYCLE-REDUCE"
         context = _valid_receipt_context(cycle)
         position = {
@@ -1410,7 +1495,11 @@ class ReduceReceiptContractTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe.ei, "mark_uncertain", uncertain_mock))
             stack.enter_context(mock.patch.object(
-                oe, "fetch_open_positions", side_effect=[[position], [post]]))
+                oe, "fetch_open_positions", side_effect=(
+                    positions_side_effect
+                    if positions_side_effect is not None
+                    else [[position], [position], [post]]
+                )))
             stack.enter_context(mock.patch.object(
                 oe, "fetch_instrument_specs", return_value={
                     "ct_val": 0.01, "lot_sz": 1.0, "min_sz": 1.0,
@@ -1488,10 +1577,46 @@ class ReduceReceiptContractTests(unittest.TestCase):
         journal.assert_not_called()
         uncertain.assert_called_once()
 
+    def test_reduce_rechecks_position_fingerprint_immediately_before_order(self):
+        original = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0,
+            "posId": "P1", "cTime": "1000",
+        }
+        changed = {**original, "sz": 4.0}
+        result, order, close_fallback, adjust, journal, uncertain = (
+            self._run_reduce(positions_side_effect=[[original], [changed]]))
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "pre_position_fingerprint_changed_pre_submit",
+            result["reject_reason"])
+        order.assert_not_called()
+        close_fallback.assert_not_called()
+        adjust.assert_not_called()
+        journal.assert_not_called()
+        uncertain.assert_not_called()
+
+    def test_reduce_with_unavailable_post_position_is_not_success(self):
+        position = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0,
+        }
+        result, order_mock, close_fallback, _, journal_mock, uncertain_mock = (
+            self._run_reduce(positions_side_effect=[
+                [position], [position], oe.PositionsUnavailable("read failed"),
+            ])
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual("reduce_position_unverified", result["reject_reason"])
+        self.assertTrue(result.get("exchange_side_effect_uncertain"))
+        journal_mock.assert_called_once()
+        uncertain_mock.assert_called_once()
+        order_mock.assert_called_once()
+        close_fallback.assert_not_called()
+
 
 class CloseReceiptContractTests(unittest.TestCase):
     @staticmethod
-    def _run_close(fill: dict, *, cycle: str = "CYCLE-CLOSE"):
+    def _run_close(fill: dict, *, cycle: str = "CYCLE-CLOSE",
+                   positions_side_effect=None, ack_order_id="CLOSE-1"):
         context = _valid_receipt_context(cycle)
         position = {
             "symbol": "BTC-USDT-SWAP",
@@ -1504,10 +1629,15 @@ class CloseReceiptContractTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 oe.ox, "is_dryrun", return_value=False))
             stack.enter_context(mock.patch.object(
-                oe, "fetch_open_positions", side_effect=[[position], []]))
+                oe, "fetch_open_positions", side_effect=(
+                    positions_side_effect
+                    if positions_side_effect is not None
+                    else [[position], [], []]
+                )))
             stack.enter_context(mock.patch.object(
                 oe.ox, "place_reduce_only_market",
-                return_value={"ok": True, "data": [{"ordId": "CLOSE-1"}]}))
+                return_value={"ok": True, "data": (
+                    [{"ordId": ack_order_id}] if ack_order_id else [])}))
             stack.enter_context(mock.patch.object(
                 oe, "_read_fills", return_value=fill))
             stack.enter_context(mock.patch.object(
@@ -1554,6 +1684,23 @@ class CloseReceiptContractTests(unittest.TestCase):
         positions_mock.assert_not_called()
         order_mock.assert_not_called()
 
+    def test_close_without_ack_id_preserves_confirmed_fill_identity(self):
+        with (
+            mock.patch.object(oe, "_cancel_stale_protection", return_value=[]),
+            mock.patch.object(oe, "_live_protection_rows", return_value=oe.ProtectionRows([])),
+            mock.patch.object(oe.ox, "_call", side_effect=AssertionError("unexpected exchange I/O")) as external_io,
+        ):
+            result, _, journal, _ = self._run_close({
+                "ok": True, "fill_sz": 5.0, "fill_px": 100.0, "pnl": 2.0,
+                "fill_ts": "2026-08-20 10:01:00", "ts_source": "fills.fillTime",
+                "ord_ids": ["CONFIRMED-CLOSE-1"],
+            }, ack_order_id=None)
+        self.assertTrue(result['ok'],result)
+        self.assertEqual(result['trades'][0]['ordId'],'CONFIRMED-CLOSE-1')
+        self.assertEqual(result['trades'][0]['ord_ids'],['CONFIRMED-CLOSE-1'])
+        self.assertEqual(journal.call_args.args[1]['ordId'],'CONFIRMED-CLOSE-1')
+        external_io.assert_not_called()
+
     def test_confirmed_close_uses_authoritative_partial_fill_and_is_writer_valid(self):
         result, context, journal_mock, repair_mock = self._run_close({
             "ok": True,
@@ -1584,6 +1731,51 @@ class CloseReceiptContractTests(unittest.TestCase):
         self.assertEqual(trades_writer.validate(result), [])
         journal_mock.assert_called_once()
         repair_mock.assert_not_called()
+
+    def test_partial_close_with_unavailable_final_position_is_not_success(self):
+        position = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0,
+        }
+        result, _, journal_mock, repair_mock = self._run_close({
+            "ok": True,
+            "fill_px": 101.5,
+            "fill_sz": 2.0,
+            "pnl": 3.25,
+            "n": 1,
+            "fill_ts": "2026-07-29 10:20:30",
+            "ts_source": "fills.fillTime",
+        }, positions_side_effect=[
+            [position], [], oe.PositionsUnavailable("read failed"),
+        ])
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "close_partial_residue_unverified", result["reject_reason"])
+        self.assertTrue(result["exchange_side_effect_uncertain"])
+        self.assertEqual(2.0, result["trades"][0]["fill_sz"])
+        journal_mock.assert_called_once()
+        repair_mock.assert_called_once()
+
+    def test_full_close_with_unavailable_residue_is_not_success(self):
+        position = {
+            "symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0,
+        }
+        result, _, journal_mock, repair_mock = self._run_close({
+            "ok": True,
+            "fill_px": 101.5,
+            "fill_sz": 5.0,
+            "pnl": 3.25,
+            "n": 1,
+            "fill_ts": "2026-07-29 10:20:30",
+            "ts_source": "fills.fillTime",
+        }, positions_side_effect=[
+            [position], oe.PositionsUnavailable("read failed"),
+        ])
+        self.assertFalse(result["ok"])
+        self.assertEqual("close_residue_unverified", result["reject_reason"])
+        self.assertTrue(result["exchange_side_effect_uncertain"])
+        self.assertEqual(5.0, result["trades"][0]["fill_sz"])
+        journal_mock.assert_called_once()
+        repair_mock.assert_called_once()
 
     def test_missing_authoritative_fill_time_downgrades_without_fake_fill(self):
         result, _, journal_mock, repair_mock = self._run_close({
@@ -1641,6 +1833,255 @@ class CloseReceiptContractTests(unittest.TestCase):
             call.args[3] for call in repair_mock.call_args_list
         ]
         self.assertIn("close_pnl_unconfirmed", repair_reasons)
+
+    def test_confirmed_full_close_cancels_flat_side_protection(self):
+        dangling = oe.ProtectionRows([
+            {
+                "algoId": "OLD-SL",
+                "slTriggerPx": 95.0,
+                "tpTriggerPx": None,
+                "sz": 5.0,
+            },
+            {
+                "algoId": "OLD-TP",
+                "slTriggerPx": None,
+                "tpTriggerPx": 110.0,
+                "sz": 5.0,
+            },
+        ])
+        cancel = mock.Mock(return_value=[])
+        with (
+            mock.patch.object(
+                oe, "_live_protection_rows",
+                side_effect=[dangling, oe.ProtectionRows([])]),
+            mock.patch.object(oe, "_cancel_stale_protection", cancel),
+        ):
+            result, _, journal_mock, repair_mock = self._run_close({
+                "ok": True,
+                "fill_px": 101.5,
+                "fill_sz": 5.0,
+                "pnl": 3.25,
+                "n": 1,
+                "fill_ts": "2026-07-29 10:20:30",
+                "ts_source": "fills.fillTime",
+            }, positions_side_effect=[[
+                {"symbol": "BTC-USDT-SWAP", "side": "long", "sz": 5.0}
+            ], []])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            result["protection_cleanup"]["cancel_requested"],
+            ["OLD-SL", "OLD-TP"])
+        self.assertTrue(result["protection_cleanup"]["ok"])
+        cancel.assert_called_once()
+        journal_mock.assert_called_once()
+        repair_mock.assert_not_called()
+
+
+class PreOpenStaleProtectionCleanupTests(unittest.TestCase):
+    """开仓前撤掉无仓一侧的残留保护单（2026-09-12）。
+
+    交易所侧 SL 成交平仓后，独立挂的 reduceOnly 固定 TP 仍 live，同 symbol/posSide
+    新开的仓会继承它（09-11 UNI 23:39 新仓继承 22:08 那单的 TP 35@6.672）。
+    交易所边界只 mock `ox.get_algo_orders` / `ox.cancel_algo_order`（`ox._call`
+    设绊线），`_live_protection_rows` 过滤与 `_cancel_stale_protection` 走真实代码。
+    """
+
+    SYMBOL = "BTC-USDT-SWAP"
+    SHORT_SL = "3913749330030174208"   # 另一侧空仓在用的 SL（CGNX 形态），永远不撤
+    SHORT_HELD = {"symbol": "BTC-USDT-SWAP", "side": "short", "sz": 3.0,
+                  "posId": "P-SHORT", "cTime": "900"}
+    LONG_HELD = {"symbol": "BTC-USDT-SWAP", "side": "long", "sz": 2.0,
+                 "posId": "P-LONG", "cTime": "1000"}
+
+    def _algo(self, algo_id, pos_side, *, sl=None, tp=None, age_ms=3_600_000):
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return {
+            "instId": self.SYMBOL, "algoId": algo_id, "ordType": "conditional",
+            "posSide": pos_side,
+            "side": "sell" if pos_side == "long" else "buy",
+            "reduceOnly": "true", "state": "live", "sz": "2",
+            "slTriggerPx": "" if sl is None else str(sl),
+            "tpTriggerPx": "" if tp is None else str(tp),
+            "cTime": str(now_ms - age_ms),
+        }
+
+    def _run_open(self, *, positions, expected_exists=False, dryrun=False,
+                  cancel_result=None, deadline=None):
+        events = []
+
+        def place(*_args, **_kwargs):
+            events.append("order")
+            return {"ok": True, "sl_attached": True, "tp_attached": False,
+                    "data": [{"ordId": "O-NEW"}]}
+
+        def cancel(inst_id, algo_id, profile):
+            events.append(("cancel", algo_id))
+            return cancel_result or {"ok": True, "data": [{"sCode": "0"}]}
+
+        m = {
+            "events": events,
+            "order": mock.Mock(side_effect=place),
+            "cancel": mock.Mock(side_effect=cancel),
+            "listing": mock.Mock(return_value=[
+                self._algo("OLD-TP", "long", tp=110.0),
+                self._algo("OLD-SL", "long", sl=95.0),
+                self._algo(self.SHORT_SL, "short", sl=105.0),
+            ]),
+            "repair": mock.Mock(),
+        }
+        if expected_exists is None:
+            fingerprint = {}
+        elif expected_exists:
+            fingerprint = {"expected_pre_position_exists": True,
+                           "expected_pre_position_sz": 2.0,
+                           "expected_pre_position_pos_id": "P-LONG",
+                           "expected_pre_position_c_time": "1000"}
+        else:
+            fingerprint = {"expected_pre_position_exists": False,
+                           "expected_pre_position_sz": 0.0}
+        risk_result = {"approved": True, "approved_sz": 2.0, "clamped": False,
+                       "adjustments": [], "math": {"effective_lev": 5.0}}
+        with ExitStack() as stack, tempfile.TemporaryDirectory() as tmp:
+            p = stack.enter_context
+            p(mock.patch.object(oe, "STALE_PROTECTION_CLEANUP_OFF",
+                                Path(tmp) / "stale_protection_cleanup.off"))
+            p(mock.patch.object(oe.ox, "is_dryrun", return_value=dryrun))
+            p(mock.patch.object(oe.ox, "_call", side_effect=AssertionError(
+                "unexpected exchange I/O")))
+            p(mock.patch.object(oe, "validate_receipt_context", return_value=[]))
+            p(mock.patch.object(oe.actor_att, "timeline_state",
+                                side_effect=_same_actor_timeline))
+            p(mock.patch.object(oe, "check_multitimeframe_readiness",
+                                side_effect=_ready_multitimeframe))
+            p(mock.patch.object(oe, "resolve_execution_evidence_anchor",
+                                side_effect=_ready_evidence_anchor))
+            p(mock.patch.object(oe.ei, "reserve", return_value={
+                "status": "reserved", "fingerprint": "FP"}))
+            for name in ("mark_submitting", "mark_submitted", "mark_completed",
+                         "mark_failed_clean", "mark_uncertain"):
+                p(mock.patch.object(oe.ei, name))
+            p(mock.patch.object(oe.ox, "get_balance", return_value={"ok": True}))
+            p(mock.patch.object(oe.ac, "extract_settlement_capacity",
+                                return_value={
+                                    "ok": True, "total_equity": 1000.0,
+                                    "available_margin": 900.0,
+                                    "settlement_ccy": "USDT",
+                                    "account_imr": 100.0}))
+            p(mock.patch.object(oe, "fetch_open_positions",
+                                return_value=positions))
+            p(mock.patch.object(oe, "_verify_pretrade_ledger_positions",
+                                return_value={
+                                    "ok": True, "profile": "live",
+                                    "ledger_groups": 0, "exchange_groups": 0,
+                                    "diffs": []}))
+            p(mock.patch.object(oe.ox, "get_mark_price", return_value=100.0))
+            p(mock.patch.object(oe, "fetch_instrument_specs", return_value={
+                "ct_val": 0.01, "lot_sz": 1.0,
+                "source": "test", "spec_source": "test"}))
+            p(mock.patch.object(oe.rv, "validate", return_value=risk_result))
+            p(mock.patch.object(oe.ox, "set_leverage", return_value={"ok": True}))
+            p(mock.patch.object(oe.ox, "place_market_open", m["order"]))
+            p(mock.patch.object(oe.ox, "get_algo_orders", m["listing"]))
+            p(mock.patch.object(oe.ox, "cancel_algo_order", m["cancel"]))
+            p(mock.patch.object(oe.ox, "place_algo_tp", return_value={
+                "ok": True, "data": [{"algoId": "A-TP"}]}))
+            p(mock.patch.object(oe, "_verify_sl_placed", return_value={
+                "verified": True, "found": [], "matched": {}}))
+            p(mock.patch.object(oe, "_verify_tp_placed", return_value={
+                "verified": True, "found": []}))
+            p(mock.patch.object(oe, "_read_fills", return_value={
+                "ok": True, "fill_px": 101.0, "fill_sz": 2.0, "pnl": 0.0,
+                "n": 1, "fill_ts": "2024-01-01 08:00:01",
+                "ts_source": "fills.fillTime"}))
+            p(mock.patch.object(oe, "_journal_fill"))
+            p(mock.patch.object(oe, "_enqueue_repair", m["repair"]))
+            p(mock.patch.object(oe, "close_position"))
+            p(mock.patch.object(oe, "adjust_protection", return_value={
+                "ok": True, "action_taken": "ADJUST_PROTECTION"}))
+            if deadline is not None:
+                p(mock.patch.object(
+                    oe, "_cycle_side_effect_reject",
+                    side_effect=lambda *_args, **_kwargs: deadline(events)))
+            context = _valid_receipt_context("CYCLE-1")
+            context["decision_card"]["risk_reward"]["target"] = 110.0
+            kwargs = dict(fingerprint)
+            if dryrun:
+                kwargs.update(equity=1000.0, available_margin=900.0,
+                              account_imr=100.0)
+            result = oe.open_position(
+                self.SYMBOL, "long", 2.0, 5.0, 95.0, "live",
+                cycle_id="CYCLE-1", receipt_context=context,
+                tp_trigger_px=110.0, db_root=Path(tmp), **kwargs)
+        return result, m
+
+    def test_flat_open_cancels_leftovers_before_the_order(self):
+        result, m = self._run_open(positions=[self.SHORT_HELD])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(m["events"], [
+            ("cancel", "OLD-TP"), ("cancel", "OLD-SL"), "order"])
+        m["listing"].assert_called_once_with(self.SYMBOL, "live")
+        cleanup = result["stale_protection_cleanup"]
+        self.assertTrue(cleanup["ok"], cleanup)
+        self.assertEqual(cleanup["cancel_requested"], ["OLD-TP", "OLD-SL"])
+        self.assertNotIn(
+            self.SHORT_SL, [c.args[1] for c in m["cancel"].call_args_list])
+        m["repair"].assert_not_called()
+        receipt = {**_valid_receipt_context("CYCLE-1"), **result}
+        self.assertEqual(trades_writer.validate(receipt), [])
+
+    def test_add_legacy_and_dryrun_opens_do_no_cleanup_io(self):
+        for label, kwargs in (
+                ("add onto a held side",
+                 {"positions": [self.LONG_HELD], "expected_exists": True}),
+                ("legacy caller without fingerprint",
+                 {"positions": [self.SHORT_HELD], "expected_exists": None}),
+                ("dryrun", {"positions": [self.SHORT_HELD], "dryrun": True})):
+            with self.subTest(label):
+                result, m = self._run_open(**kwargs)
+                self.assertTrue(m["order"].called, result)
+                self.assertIsNone(result.get("stale_protection_cleanup"), result)
+                m["listing"].assert_not_called()
+                m["cancel"].assert_not_called()
+
+    def test_cleanup_trouble_never_blocks_the_open(self):
+        unreadable = oe.ProtectionRows(read_error="RuntimeError: timeout")
+        with mock.patch.object(oe, "_live_protection_rows",
+                               return_value=unreadable):
+            result, m = self._run_open(positions=[self.SHORT_HELD])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stale_protection_cleanup"]["read_error"],
+                         "RuntimeError: timeout")
+        self.assertEqual(m["events"], ["order"])
+
+        result, m = self._run_open(
+            positions=[self.SHORT_HELD],
+            cancel_result={"ok": False, "error": "okx CLI rc=1"})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stale_protection_cleanup"]["cancel_failed"],
+                         ["OLD-TP", "OLD-SL"])
+        self.assertIn(
+            "pre_open_stale_protection_cancel_failed:OLD-TP,OLD-SL",
+            [c.args[3] for c in m["repair"].call_args_list])
+        self.assertEqual(m["events"][-1], "order")
+
+    def test_deadline_reached_during_cleanup_stops_the_order(self):
+        def deadline(events):
+            if any(isinstance(item, tuple) for item in events):
+                return {"action_taken": "REJECT",
+                        "reject_reason": "fixture_deadline_passed",
+                        "reject_detail": "cutoff reached while cancelling"}
+            return None
+
+        result, m = self._run_open(positions=[self.SHORT_HELD],
+                                   deadline=deadline)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reject_reason"], "fixture_deadline_passed")
+        self.assertEqual(
+            result["stale_protection_cleanup"]["cancel_requested"],
+            ["OLD-TP", "OLD-SL"])
+        m["order"].assert_not_called()
 
 
 if __name__ == "__main__":

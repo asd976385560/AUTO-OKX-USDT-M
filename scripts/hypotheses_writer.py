@@ -23,6 +23,15 @@ schema: id, cycle_id TEXT, ts TEXT, hypothesis_id TEXT, hypothesis TEXT,
 
 退出码：0=成功且 read-after-write 校验通过；非 0=失败（Agent 视为 P2，重试一次）。
 """
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse
 import json
 import os
@@ -61,7 +70,7 @@ def load_payload(args) -> dict:
     try:
         return json.loads(raw)
     except Exception as e:  # noqa: BLE001
-        fail(f"输入 JSON 解析失败: {e}；含中文时建议先写 ./tmp//*.json 再 --json-file")
+        fail((f"输入 JSON 解析失败: {e}；含中文时建议先写 <PROJECT_ROOT>\\tmp\\*.json 再 --json-file").replace('<PROJECT_ROOT>', _public_project_path()))
 
 
 def main():

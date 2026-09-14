@@ -11,6 +11,15 @@ r"""通用 HTTP 工具（重建 2026-06-26）。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import os
 import re
 import threading
@@ -20,7 +29,7 @@ from typing import Any, Optional
 
 import httpx
 
-_CONFIG = Path(os.environ.get("OKX_CONFIG_MD", r"./config.md"))
+_CONFIG = Path(os.environ.get("OKX_CONFIG_MD", _public_project_path('config.md')))
 _UA = "okx-cex-auto/1.0"
 
 
@@ -104,3 +113,18 @@ def load_coingecko_key() -> str:
             return v.strip()
     return _key_from_config(
         r"###\s*4\.3\s*CoinGecko.*?\|\s*API\s*Key\s*\|\s*([^|\s][^|]*?)\s*\|")
+
+
+def load_sosovalue_key() -> str:
+    """SoSoValue key：env 优先（SOSOVALUE_API_KEY），否则 config.md §4.6b。缺则空串。
+
+    2026-08-19：key 落 config.md 后本函数即生效，无需机器级环境变量，也不必重启
+    cron —— `collect_public_macro.py` 由 `daily_maintenance` 以裸 python 起，
+    拿不到 `run_okx_python.ps1` 的注入 env（MX 那条路走不通），故与 FRED/CoinGecko
+    同款在 Python 侧解析。缺 key 时返回空串，`fetch_sosovalue` 照旧跳过该源。
+    """
+    v = os.environ.get("SOSOVALUE_API_KEY")
+    if v and v.strip():
+        return v.strip()
+    return _key_from_config(
+        r"###\s*4\.6b\s*SoSoValue.*?\|\s*API\s*Key\s*\|\s*([^|\s][^|]*?)\s*\|")

@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 r"""V2.0 采集聚合入口（2026-08-08 cron 整并；2026-08-15 全槽解耦）。
 
-主要由 OpenClaw 命令型 cron 调度（经 run_okx_python.ps1 wrapper）：
-  okx-collect-hourly   `0 * * * *`        --tier hourly   fast → (news || slow) → nudge
-  okx-collect-quarter  `15,30,45 * * * *` --tier quarter  fast → news
-
-外部调度器也可每 15 分钟计算当前自然槽，并显式传入 hourly/quarter 层级；
-宿主专用 Scheduled Task 适配器不属于公开仓库。所有调度进入本脚本后先
+主调度是 Windows Task `OKX-V20-Collect-All-Slots-Guard`（每 15 分钟调用薄适配
+`run_collection_slot_guard.ps1`，把当前自然槽与 hourly/quarter 层级一次钉定后传入）。
+OpenClaw 侧延迟兜底 cron 2026-08-26 起二合一（主人拍板）：
+  okx-collect  `0,15,30,45 * * * *`  --tier auto  按槽自推 hourly|quarter
+（此前的 okx-collect-hourly `0`/okx-collect-quarter `15,30,45` 两条已移除；
+重复的 `OKX-V20-Collect-0315-Guard` 更早已移除。）
+层级语义不变：hourly = fast → (news || slow) → nudge → MTF诊断；quarter = fast → news。所有调度进入本脚本后先
 争抢 `logs/collect/guards/<tier>-<cycle>.lock` 的 O_EXCL 单实例锁；成功轮原子写
 同键 receipt，晚到的另一调度只记录 duplicate_completed 后 rc=0 退出，不重复采集。
 
 步序即派发时延设计：fast 先跑、落账即 nudge——:15/:30/:45 槽（gate 只必需 fast）
 的 unified live 派发时延与拆分时代完全一致。:00 槽在 fast 后并行跑 news 与
 slow；slow 使用 ``--defer-dispatch-nudge`` 只落账，runner 等两步都终止后再拍一次
-dispatcher。这使分析仍不会抢在当轮新闻之前，而小时轮关键路径从
-``fast+news+slow`` 缩为 ``fast+max(news, slow)``。news 仍不进派发闸
+dispatcher。全宇宙锚点的 MTF 覆盖审计在 nudge 后、同槽 slow 成功收口后才发布
+canonical 工件；slow 未完整时保留上一份工件，避免中间态覆盖。这使分析仍不会抢
+在当轮新闻之前，而小时轮派发关键路径保持
+``fast+max(news, slow)``。news 仍不进派发闸
 （ledger.expected_sources），失败只按原有契约外显，不改交易安全闸。
 
 子脚本各自负责：账本落账（fast/slow → collection_runs[fast|slow|regime]，
@@ -30,18 +33,29 @@ rc=0，仅本体崩溃/超时才非 0；runner 额外把「全部到期源 faile
 （如实外显断网/代理全挂），部分源失败只进 warnings 不置 error（与旧独立
 okx-news-rss cron 的告警灵敏度一致）。news 无论如何不阻断后续 slow，不碰交易链。
 
-超时预算：fast 360s + max(news 300s, slow 480s) = 840s < hourly cron 1200s；
+超时预算：派发前 fast 360s + max(news 300s, slow 480s) = 840s，派发后 MTF
+诊断另限15s，合计仍 < hourly cron 1200s；
 quarter 660s < 900s。真正的功能死线是 15min 槽界 + gate 900s 新鲜窗，cron
 超时只是防挂死兜底。cycle 归槽：fast 显式 --cycle 钉 runner 启动槽（防链内
 漂移错槽）；外部显式 --cycle 只接受当前 UTC+8 自然槽，过期/未来/层级不符在
 联网、日志和数据库写入前拒绝；slow 用同一显式槽；news 自算
 （无 --cycle 参数，链内漂移最多损当轮 60/120min 到期源，下轮自愈）。
 
-tmp 验证：--dry-collect 透传 fast/slow（不联网不写生产），news 无 dry 模式改跳过；
-dry 模式不创建 guard/receipt，不能影响随后真实轮。非生产 db-root 时子脚本的
-nudge 自带闸门不发。零模型名（红线①）；UTF-8 无 BOM。
+tmp 验证：--dry-collect 只允许非生产 db-root 并透传 fast/slow，news 无 dry 模式
+改跳过；生产根在日志/guard/子进程/数据库写入前 rc64 拒绝。dry 模式不创建
+guard/receipt，不能影响随后真实轮；隔离根的 nudge 自带闸门不发。
+零模型名（红线①）；UTF-8 无 BOM。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import ctypes
@@ -56,7 +70,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, r".\collectors")
+sys.path.insert(0, _public_project_path('collectors'))
 import ledger          # noqa: E402  cycle_id_for
 
 try:  # hourly 并行尾段收口后的单次延后派发
@@ -68,23 +82,121 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-ROOT = Path(r".")
+ROOT = Path(_public_project_path())
 COLLECTORS = ROOT / "collectors"
+SCRIPTS = ROOT / "scripts"
 CST = timezone(timedelta(hours=8))
 # 子进程隐藏窗口：cron 经 wrapper 无窗口起本脚本，console 子进程默认新开可见窗口——抑制
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _python_child_env() -> dict[str, str]:
+    """Match the UTF-8 decoder used for captured child output."""
+    child_env = dict(os.environ)
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    return child_env
+
+
+def _is_production_db_root(db_root: Path) -> bool:
+    try:
+        return db_root.resolve() == (ROOT / "db").resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(db_root))) == os.path.normcase(
+            os.path.abspath(str(ROOT / "db")))
 RUN_GUARD_SCHEMA_VERSION = 1
 NATURAL_CYCLE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:(?:00|15|30|45)$")
+POST_SLOW_MTF_AUDIT_TIMEOUT_SECONDS = 15
 
 
-def _resolve_natural_cycle(tier: str, requested_cycle: str | None) -> str:
-    """Resolve exactly one current UTC+8 slot and reject stale/mistyped work.
+def _full_universe_shadow_due(cycle_id: str) -> bool:
+    """Match the 00:00/08:00/16:00 universe-shadow publication cadence."""
+    try:
+        value = datetime.strptime(cycle_id, "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError):
+        return False
+    return value.minute == 0 and value.hour % 8 == 0
+
+
+def _is_production_db_root(db_root: str | Path) -> bool:
+    """Return whether one DB root is the exact configured production root."""
+    root = Path(db_root)
+    try:
+        return root.resolve() == (ROOT / "db").resolve()
+    except OSError:
+        return False
+
+
+def _multitimeframe_coverage_path(db_root: str | Path) -> Path:
+    """Resolve the canonical receipt without leaking test roots to production."""
+    root = Path(db_root)
+    quality = (
+        ROOT / "reports" / "quality"
+        if _is_production_db_root(root)
+        else root.parent / "reports" / "quality"
+    )
+    return quality / "multitimeframe-coverage-audit.json"
+
+
+def _post_slow_multitimeframe_coverage(
+    db_root: str,
+    cycle: str,
+    slow_step: dict,
+) -> dict | None:
+    """Publish MTF coverage only after the same-cycle slow writer is complete.
+
+    The fast branch deliberately defers this diagnostic at universe-shadow
+    anchors.  If slow is not authoritative, retain the previous canonical
+    receipt instead of briefly replacing it with a known mid-collection view.
+    """
+    if not _full_universe_shadow_due(cycle):
+        return None
+    payload = slow_step.get("payload")
+    slow_status = (
+        payload.get("status_slow") if isinstance(payload, dict) else None
+    )
+    if slow_step.get("ok") is not True or slow_status != "ok":
+        return {
+            "name": "multitimeframe_coverage_audit",
+            "ok": True,
+            "rc": None,
+            "dur_s": 0.0,
+            "payload": None,
+            "diagnostic_only": True,
+            "skipped": "same_cycle_slow_not_complete",
+            "slow_status": slow_status,
+            "canonical_receipt_retained": True,
+        }
+    step = run_step(
+        "multitimeframe_coverage_audit",
+        SCRIPTS / "audit_multitimeframe_coverage.py",
+        [
+            "--market-db", str(Path(db_root) / "market.db"),
+            "--minimum-rate", "0.99",
+            "--json-out", str(_multitimeframe_coverage_path(db_root)),
+            "--execution-context", (
+                "production" if _is_production_db_root(db_root) else "test"),
+        ],
+        POST_SLOW_MTF_AUDIT_TIMEOUT_SECONDS,
+    )
+    step["diagnostic_only"] = True
+    step["after_same_cycle_slow"] = True
+    return step
+
+
+def _resolve_natural_cycle(
+    tier: str, requested_cycle: str | None
+) -> tuple[str, str]:
+    """Resolve one current UTC+8 slot + effective tier; reject stale work.
 
     The all-slot Windows guard passes ``--cycle`` so its slot is pinned once.
     OpenClaw callers may omit it for compatibility, but their declared tier
-    must still match the current natural slot. Every rejection happens before
-    the run guard, network calls, log writes, or database writes.
+    must still match the current natural slot. ``--tier auto``（2026-08-26
+    兜底 cron 二合一）按当前自然槽自推层级：:00=hourly、其余=quarter；
+    ``cycle_id_for`` 向下归槽，故延迟触发仍落在正确层级。Every rejection
+    happens before the run guard, network calls, log writes, or database
+    writes.
     """
     current_cycle = ledger.cycle_id_for()
     cycle = requested_cycle or current_cycle
@@ -97,11 +209,13 @@ def _resolve_natural_cycle(tier: str, requested_cycle: str | None) -> str:
             f"cycle is not the current natural slot: requested={cycle} "
             f"current={current_cycle}")
     expected_tier = "hourly" if cycle.endswith(":00") else "quarter"
+    if tier == "auto":
+        return cycle, expected_tier
     if tier != expected_tier:
         raise ValueError(
             f"tier does not match natural slot: cycle={cycle} "
             f"expected={expected_tier} observed={tier}")
-    return cycle
+    return cycle, tier
 
 
 def _guard_key(tier: str, cycle: str) -> str:
@@ -343,6 +457,7 @@ def run_step(name: str, script: Path, sargs: list[str], timeout: int) -> dict:
         proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
+            env=_python_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -460,9 +575,9 @@ def _step_error(step: dict) -> str | None:
 def _news_verdict(step: dict) -> tuple[bool, list[str]]:
     """news 步终判：(ok, warnings)。
 
-    rc!=0（崩溃/超时/spawn 失败）→ 失败。rc==0 时看逐源结果：到期源全 failed →
-    失败（整链断网/代理全挂必须外显）；部分 failed → ok + warnings（逐源 err
-    已由 news_collect 落账 collection_runs，这里只带简因方便 cron 面板直读）。
+    rc!=0（崩溃/超时/spawn 失败）→ 失败。rc==0 时看逐源结果：到期源全 failed，
+    或 degraded 且 fetched=0+err 与 failed 共同覆盖全部到期源 → 失败；正常零事件
+    和合法 cadence skipped 不算失败。逐源 err 已由 news_collect 落账。
     """
     if not step.get("ok"):
         return False, []
@@ -472,12 +587,21 @@ def _news_verdict(step: dict) -> tuple[bool, list[str]]:
         return True, []
     attempted = [s for s in sources if s.get("status") not in ("skipped",)]
     failed = [s for s in attempted if s.get("status") == "failed"]
-    warnings = [
-        f"news:{s.get('id')}: {s.get('err') or 'failed'}"[:200] for s in failed
+    outage_degraded = [
+        s for s in attempted
+        if s.get("status") == "degraded"
+        and int(s.get("fetched") or 0) == 0
+        and bool(s.get("err") or s.get("error"))
     ]
-    if attempted and len(failed) == len(attempted):
+    outage_failed = failed + outage_degraded
+    warnings = [
+        f"news:{s.get('id')}: {s.get('err') or s.get('error') or 'failed'}"[:200]
+        for s in outage_failed
+    ]
+    if attempted and len(outage_failed) == len(attempted):
         step["ok"] = False
         step["all_sources_failed"] = True
+        step["outage_equivalent_degraded"] = len(outage_degraded)
         return False, warnings
     return True, warnings
 
@@ -501,6 +625,22 @@ def _fast_warnings(step: dict) -> list[str]:
     return [f"fast:degraded: {detail}"[:500]]
 
 
+def _dispatch_warnings(receipt: dict | None, origin: str) -> list[str]:
+    """Expose a refused/missing handoff without changing collection or retrying.
+
+    A nudge receipt proves only that a dispatcher process was launched. Stage
+    dispatch and analysis/trade completion still require independent readback.
+    """
+    if isinstance(receipt, dict) and receipt.get("nudged") is True:
+        return []
+    reason = (receipt.get("reason") if isinstance(receipt, dict) else None)
+    if reason in {"dry_collect", "non_production_db_root", "no_done_status",
+                  "deferred_to_collect_cycle"}:
+        return []
+    return [f"{origin}: analysis dispatch unconfirmed "
+            f"({reason or 'receipt_missing'}); alert-only, no retry"]
+
+
 def _slim_for_log(out: dict) -> dict:
     """JSONL 行瘦身：ok 步骤去 payload（成功细节子脚本已各自落账），失败步骤
     全量留档。.jsonl 在 log_rotate 的 PROTECT_SUFFIX 保护内永不轮转（审计类
@@ -512,12 +652,45 @@ def _slim_for_log(out: dict) -> dict:
             continue
         slim = {k: v for k, v in step.items() if k != "payload"}
         payload = step.get("payload")
+        if step.get("name") in {"fast", "slow"} and isinstance(payload, dict):
+            # Keep the handoff even when successful collection payloads shrink.
+            slim["dispatch"] = payload.get("dispatch")
         if (
             step.get("name") == "fast"
             and isinstance(payload, dict)
             and isinstance(payload.get("data_quality"), dict)
         ):
             slim["data_quality"] = payload["data_quality"]
+        if step.get("name") == "slow" and isinstance(payload, dict):
+            for key in (
+                "status_slow",
+                "status_regime",
+                "error",
+                "collector_timing_s",
+                "collector_degraded",
+                "collector_degradation_details",
+                "collector_wrote",
+                "collector_symbols_count",
+                "collector_position_priority_symbols",
+                "collector_warnings",
+            ):
+                value = payload.get(key)
+                if value is not None:
+                    slim[key] = value
+        if (
+            step.get("name") == "multitimeframe_coverage_audit"
+            and isinstance(payload, dict)
+        ):
+            for key in (
+                "status",
+                "data_completeness_status",
+                "analysis_readiness_status",
+                "universe_symbols",
+                "json_out",
+            ):
+                value = payload.get(key)
+                if value is not None:
+                    slim[key] = value
         steps.append(slim)
     return {**out, "steps": steps}
 
@@ -540,7 +713,10 @@ def _append_run_log(log_dir: Path, record: dict) -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="V2.0 采集聚合 runner（系统层）")
-    ap.add_argument("--tier", required=True, choices=("hourly", "quarter"))
+    ap.add_argument(
+        "--tier", required=True, choices=("hourly", "quarter", "auto"),
+        help="hourly/quarter 显式层级；auto 按当前自然槽自推（兜底 cron 用）",
+    )
     ap.add_argument(
         "--cycle",
         help=("钉定本次当前 UTC+8 自然 15 分钟槽；仅接受当前槽，"
@@ -562,7 +738,7 @@ def main() -> int:
     t0 = time.time()
     started_at = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        cycle = _resolve_natural_cycle(args.tier, args.cycle)
+        cycle, args.tier = _resolve_natural_cycle(args.tier, args.cycle)
     except ValueError as exc:
         print(json.dumps({
             "ok": False,
@@ -580,6 +756,19 @@ def main() -> int:
         return 2
 
     db_root = str(args.db_root)
+    if args.dry_collect and _is_production_db_root(Path(db_root)):
+        print(json.dumps({
+            "ok": False,
+            "tier": args.tier,
+            "cycle": cycle,
+            "ts": started_at,
+            "failed": ["dry_collect_preflight"],
+            "warnings": [],
+            "steps": [],
+            "error": "dry_collect_production_db_root_forbidden",
+            "production_database_writes": 0,
+        }, ensure_ascii=False))
+        return 64
     log_dir = Path(args.log_dir)
 
     # 03:15 可由 Windows 硬触发与 OpenClaw 延迟兜底同时覆盖。真实采集必须先
@@ -642,11 +831,21 @@ def main() -> int:
     warnings: list[str] = []
     try:
         fast_args = ["--db-root", db_root, "--cycle", cycle]
+        if args.tier == "hourly":
+            # 1H/4H K线由后续slow分支刷新。先禁用fast中的canonical发布，
+            # 待同槽slow收口后再只读审计，避免中间态覆盖权威工件。
+            fast_args.append("--defer-multitimeframe-coverage")
         if args.dry_collect:
             fast_args.append("--dry-collect")
         fast_step = run_step("fast", COLLECTORS / "fast_collect.py",
                              fast_args, args.fast_timeout)
         warnings.extend(_fast_warnings(fast_step))
+        if (fast_step.get("ok") and not args.dry_collect
+                and _is_production_db_root(db_root)):
+            payload = fast_step.get("payload")
+            warnings.extend(_dispatch_warnings(
+                payload.get("dispatch") if isinstance(payload, dict) else None,
+                "fast dispatch nudge"))
         steps.append(fast_step)
 
         deferred_dispatch_nudge = None
@@ -663,13 +862,22 @@ def main() -> int:
             steps.extend((news_step, slow_step))
             deferred_dispatch_nudge = _nudge_after_hourly_tail(
                 db_root, slow_step)
-            if deferred_dispatch_nudge.get("reason") in {
-                "module_unavailable", "slow_payload_missing", "slow_status_missing",
-            }:
-                warnings.append(
-                    "hourly deferred dispatch nudge skipped: "
-                    f"{deferred_dispatch_nudge['reason']} (cron fallback retained)"
-                )
+            warnings.extend(_dispatch_warnings(
+                deferred_dispatch_nudge, "hourly deferred dispatch nudge"))
+            coverage_step = _post_slow_multitimeframe_coverage(
+                db_root, cycle, slow_step)
+            if coverage_step is not None:
+                steps.append(coverage_step)
+                if coverage_step.get("skipped"):
+                    warnings.append(
+                        "multitimeframe coverage canonical receipt retained: "
+                        f"{coverage_step['skipped']}"
+                    )
+                elif not coverage_step.get("ok"):
+                    warnings.append(
+                        "multitimeframe coverage diagnostic failed: "
+                        f"{_step_error(coverage_step)}"
+                    )
         elif args.dry_collect:
             steps.append({"name": "news", "ok": True, "rc": None,
                           "dur_s": 0.0,
@@ -689,7 +897,10 @@ def main() -> int:
             steps.append(run_step("slow", COLLECTORS / "slow_collect.py",
                                   slow_args, args.slow_timeout))
 
-        failed = [s["name"] for s in steps if not s.get("ok")]
+        failed = [
+            s["name"] for s in steps
+            if not s.get("ok") and not s.get("diagnostic_only")
+        ]
         out = {
             "ok": not failed,
             "tier": args.tier,

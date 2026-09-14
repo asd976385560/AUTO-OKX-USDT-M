@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """V2.0 §8.5 —— 交易经验检索（LLM 决策的长期记忆）。
 
-新判断前必搜相似经验：读 account.db.trade_experiences（已平仓、有 pnl），算与当前
-决策背景的 cosine 相似度，分别返回相似盈利、相似亏损、错失机会与统计摘要。
+新判断前必搜相似经验：读 account.db.trade_experiences（已平仓、有 pnl），仅在
+完全相同的前向 v3 feature epoch 内计算相似度，分别返回盈利、亏损与统计摘要。
+历史 v1/v2 仍留在库内和全量经营统计中，但不进入 v3 EV 先验。
 **只采不拦**：所有历史数据只供 Agent 自主裁决；Agent 必须说明 adopt/partial/ignore/none，
 但历史结果、可信度和样本数均不能自动批准或否决交易。
 
@@ -17,10 +18,19 @@
 cred<0.2 标 low_credibility（briefing 显式标，禁凭单条低相似锁决策）。找不到→不另加限制，
 只走 §7 硬上限。
 
-不复用 find_similar_history（特征空间/输出 schema/前向窗口全异）；只共用 _simutil.cosine。
+不复用 find_similar_history（特征空间/输出 schema/前向窗口全异）。
 零模型名（红线 #1）。
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -38,6 +48,16 @@ for _path in (ROOT, ROOT / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 import _simutil  # noqa: E402
+from core.ev_calculator import (  # noqa: E402  p_win 样本门与 EV 单一真源
+    MIN_P_SAMPLE_N,
+    build_ev_check,
+)
+from core.policy_epochs import (  # noqa: E402  纪元边界单一真源
+    CURRENT_EPOCH,
+    EXCLUDED_FROM_EV_PRIOR,
+    is_ev_prior_eligible,
+    policy_epoch,
+)
 from core.experience_contract import (  # noqa: E402
     build_contract,
     normalize_symbol,
@@ -50,7 +70,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 CST = timezone(timedelta(hours=8))
-DEFAULT_DB_ROOT = Path(r".\db")
+DEFAULT_DB_ROOT = Path(_public_project_path('db'))
 _LEGACY_SCORE_MARKERS = (
     re.compile(
         r"[\"']?(?:score(?:_total)?|total|conf(?:idence)?)[\"']?"
@@ -176,15 +196,23 @@ def _experience_summary(
         "sample_ids": sorted(int(r["id"]) for _, r in neighbors),
         **mix,
     }
-    if n < 3:
+    # 2026-08-19 G3：阈值与 EV 闸单一真源对齐。旧写法 n>=3 就输出 win_rate，
+    # 而 core/ev_calculator.MIN_P_SAMPLE_N=5 才算 EV —— n=3/4 时卡里有一个可被
+    # Agent 引用的胜率，ev_check 却是 indeterminate，`ev_r<0 必须带 ev_override`
+    # 的硬闸完全不触发。样本最少、最容易过度自信的区间，恰好是唯一没有确定性
+    # EV 校验的区间。诊断值另起名并显式标注不可引用。
+    if n < MIN_P_SAMPLE_N:
         return {
             **base,
             "sufficient": False,
             "credibility": 0.0,
             "reason": (
                 "no_experiences" if n == 0
-                else "insufficient_samples (n<3)"
+                else f"insufficient_samples (n<{MIN_P_SAMPLE_N})"
             ),
+            "win_rate_diagnostic_not_citable": (
+                round(sum(1 for p in pnls if p > 0) / len(pnls), 4)
+                if pnls else None),
         }
     sims = [s for s, _ in neighbors]
     ages = [_age_days(r["ts"], now) for _, r in neighbors]
@@ -208,11 +236,11 @@ def _experience_summary(
     }
 
 
-def _query_features_v2(query_symbol: str, query_side: str, query_regime: str,
+def _query_features_v3(query_symbol: str, query_side: str, query_regime: str,
                        query_action: str, as_of_cst: str, db_root: Path,
                        stop_distance_pct: Optional[float],
                        planned_rr: Optional[float]) -> dict[str, Any]:
-    """查询侧 v2 特征：asset_class + as-of 市场态（确定性派生）+ 可选计划参数。"""
+    """查询侧前向 v3 特征；只与完全相同 epoch 的已存行比较。"""
     from core.asset_class import asset_class_of
     import experience_features_v2 as efv2
     base = {
@@ -233,11 +261,11 @@ def _query_features_v2(query_symbol: str, query_side: str, query_regime: str,
                 mcon.close()
         except sqlite3.Error:
             pass
-    return _simutil.experience_features_v2(base)
+    return _simutil.experience_features_v3(base)
 
 
-def _row_features_v2(row: sqlite3.Row) -> Optional[dict[str, Any]]:
-    """行侧 v2 特征（来自回填/写方存储的 {"v":2,...}）；legacy 数组 → None。"""
+def _row_features_v3(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    """只读 exact v3 epoch；v1/v2/坏行均显式排除。"""
     raw = row["experience_vector"] if "experience_vector" in row.keys() else None
     if not raw:
         return None
@@ -245,9 +273,18 @@ def _row_features_v2(row: sqlite3.Row) -> Optional[dict[str, Any]]:
         stored = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if isinstance(stored, dict) and stored.get("v") == 2:
+    if (
+        isinstance(stored, dict)
+        and stored.get("v") == 3
+        and stored.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
+    ):
         feats = stored.get("features")
-        return feats if isinstance(feats, dict) else None
+        if (
+            isinstance(feats, dict)
+            and feats.get("v") == 3
+            and feats.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
+        ):
+            return feats
     return None
 
 
@@ -267,6 +304,7 @@ def find_similar_experience(
     entry: Optional[float] = None,
     stop: Optional[float] = None,
     target: Optional[float] = None,
+    include_all_epochs: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now(CST)
     if now.tzinfo is None:
@@ -286,7 +324,7 @@ def find_similar_experience(
         "as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
         "min_sim": float(min_sim),
         "top_k": int(top_k),
-        # Wave2 序9：相似度版本与查询特征进契约（随 evidence_hash 冻结）
+        # 相似度版本与前向 feature epoch 进契约（随 evidence_hash 冻结）。
         "similarity_version": _simutil.SIMILARITY_VERSION,
     }
     price_geometry = (entry, stop, target)
@@ -311,9 +349,10 @@ def find_similar_experience(
     feature_distance = (
         setup.get("stop_distance_pct") if setup else None)
     feature_rr = setup.get("planned_rr") if setup else None
-    query_vec = _query_features_v2(
+    query_vec = _query_features_v3(
         query_symbol, query_side, query_regime, query_action,
         query["as_of"], Path(db_root), feature_distance, feature_rr)
+    query["feature_epoch"] = _simutil.FEATURE_EPOCH_V3
     query["query_features"] = query_vec
     try:
         from core.instrument_context import build_instrument_context
@@ -357,6 +396,10 @@ def find_similar_experience(
         "cross_symbol_summary": empty_cross,
         "query": query,
         "evidence_contract": empty_contract,
+        "ev_preview": build_ev_preview(
+            entry, stop, target, query_side, empty_contract),
+        "policy_epoch_filter": build_policy_epoch_filter(
+            [], include_all_epochs),
         "query_symbol": query_symbol,
         "query_vec": query_vec,
     }
@@ -399,14 +442,23 @@ def find_similar_experience(
         con.close()
 
     scored = []
-    legacy_rows_skipped = 0
+    feature_epoch_excluded_rows: list[Any] = []
+    feature_epoch_included_total = 0
+    epoch_excluded_rows: list[Any] = []
     for r in rows:
-        rf = _row_features_v2(r)
+        rf = _row_features_v3(r)
         if rf is None:
-            # 未回填/坏行：不冒充可比（v1 余弦已废，伪近邻实锤），如实跳过
-            legacy_rows_skipped += 1
+            # v1/v2/坏行：不冒充 v3 可比，排除数在返回合同中外显。
+            feature_epoch_excluded_rows.append(r)
             continue
-        sim = _simutil.similarity_v2(query_vec, rf)
+        feature_epoch_included_total += 1
+        # 已撤回策略纪元的样本不作现行策略的 EV 先验（core/policy_epochs.py 单点
+        # 登记）。**只影响先验，不影响任何验收/报表口径**；被剔除的样本不静默
+        # 消失，逐 scope 外显计数与胜负，见 epoch_excluded_* 字段。
+        if not include_all_epochs and not is_ev_prior_eligible(r["cycle_id"]):
+            epoch_excluded_rows.append(r)
+            continue
+        sim = _simutil.similarity_v3(query_vec, rf)
         scored.append((sim, r))
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -534,11 +586,168 @@ def find_similar_experience(
         "cross_symbol_summary": cross_summary,
         "query": query,
         "evidence_contract": evidence_contract,
+        "ev_preview": build_ev_preview(
+            entry, stop, target, query_side, evidence_contract),
+        "policy_epoch_filter": build_policy_epoch_filter(
+            epoch_excluded_rows, include_all_epochs),
+        "feature_epoch_filter": build_feature_epoch_filter(
+            feature_epoch_excluded_rows, feature_epoch_included_total),
         "query_symbol": query_symbol,
         "query_vec": query_vec,
         "similarity_version": _simutil.SIMILARITY_VERSION,
-        "legacy_rows_skipped": legacy_rows_skipped,
+        "feature_epoch": _simutil.FEATURE_EPOCH_V3,
+        "feature_epoch_excluded_rows": len(feature_epoch_excluded_rows),
+        "legacy_rows_skipped": len(feature_epoch_excluded_rows),
     }
+
+
+def build_feature_epoch_filter(
+    excluded_rows: list[Any], included_total: int,
+) -> dict[str, Any]:
+    wins = sum(1 for row in excluded_rows if row["pnl_pct"] > 0)
+    return {
+        "version": "feature_epoch_filter_v1",
+        "active_epoch": _simutil.FEATURE_EPOCH_V3,
+        "included_total": int(included_total),
+        "excluded_total": len(excluded_rows),
+        "excluded_wins": wins,
+        "excluded_losses": len(excluded_rows) - wins,
+        "excluded_sample_ids": sorted(int(row["id"]) for row in excluded_rows),
+        "scope": (
+            "只约束相似经验与EV先验；历史胜率、净利、日周月报仍使用全量样本"
+        ),
+    }
+
+
+def build_policy_epoch_filter(
+    excluded_rows: list[Any], include_all_epochs: bool) -> dict[str, Any]:
+    """外显被 EV 先验排除的样本——计数、胜负、样本 id 一个都不许藏。
+
+    项目红线是「禁止通过排除失败样本提高任何指标」。本块存在的意义就是让这次
+    排除**可被独立复核**：排的是哪个纪元、几条、几胜几负、具体是哪些行 id。
+    验收口径（胜率/净利/日周月报/盈利审计）完全不看本块，那些统计仍是全量。
+    """
+    by_epoch: dict[str, dict[str, Any]] = {}
+    for row in excluded_rows:
+        name = policy_epoch(row["cycle_id"])
+        bucket = by_epoch.setdefault(
+            name, {"n": 0, "wins": 0, "losses": 0, "sample_ids": []})
+        bucket["n"] += 1
+        pnl = row["pnl_pct"]
+        if pnl is not None:
+            if pnl > 0:
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+        bucket["sample_ids"].append(int(row["id"]))
+    for bucket in by_epoch.values():
+        bucket["sample_ids"].sort()
+    return {
+        "version": "policy_epoch_filter_v1",
+        "current_epoch": CURRENT_EPOCH,
+        "excluded_epochs": sorted(EXCLUDED_FROM_EV_PRIOR),
+        "include_all_epochs": bool(include_all_epochs),
+        "excluded_total": sum(b["n"] for b in by_epoch.values()),
+        "excluded_by_epoch": by_epoch,
+        "scope": (
+            "只作用于 EV 先验（p_win）的取样；胜率/净利/日周月报/盈利审计一律全量，"
+            "不受本过滤影响"
+        ),
+        "source": "core/policy_epochs.py（纪元边界单点登记，只向前预注册）",
+    }
+
+
+EV_PREVIEW_VERSION = "ev_preview_v1"
+
+
+def build_ev_preview(
+    entry: Optional[float],
+    stop: Optional[float],
+    target: Optional[float],
+    side: str,
+    evidence_contract: Any,
+) -> dict[str, Any]:
+    """按拟用三价 + 本次证据契约预演 writer 的 ev_check（2026-08-20）。
+
+    背景：`ev_check` 此前只在 analyst_writer 落卡时才算，Agent 在决定写不写这
+    张卡时看不到 EV 符号；而写卡被拒的代价是「整文件重写只允许一次、第二次失败
+    锁死本轮」。于是「EV 符号不确定」变成了纯粹的下行风险，理性策略是不写——
+    2026-08-18~20 连续 207 轮 `signals=[]` 期间，实测被否决的候选里存在 ev_r 为
+    正的（XPL 2026-08-20T10:15：p_win=40.68% / net_rr=1.86 / ev_r=+0.163）。
+
+    本函数调用**同一个** `core.ev_calculator.build_ev_check` 纯函数、喂**同一份**
+    evidence_contract，因此预览与落库 canonical 值在输入相同时逐字段一致。这只是
+    把 writer 反正要算的结果提前告知，不新增闸、不放宽闸、不产生授权。
+
+    刻意不叫 `ev_check`：canonical 值只能由 writer 注入卡内，预览块禁止被复制进
+    决策卡（见 `note`）。
+    """
+    preview: dict[str, Any] = {
+        "version": EV_PREVIEW_VERSION,
+        "source": "core.ev_calculator.build_ev_check",
+        "status": "unavailable",
+        "note": (
+            "只读预览：与 writer 落库 ev_check 同一纯函数同一输入；禁止复制进决策卡"
+            "（canonical ev_check 只由 writer 注入）。预览不构成开仓授权。"
+        ),
+    }
+    if entry is None or stop is None or target is None:
+        preview["reason"] = "未传 entry/stop/target，无法预演 EV"
+        return preview
+
+    # rr 按几何精确回填：预览的目的是看 EV 符号，不是复查模型手写的 rr 字段，
+    # 因此不能让 rr 容差错误掩盖真正要看的 ev_r。
+    try:
+        if side == "long":
+            risk = (entry - stop) / entry
+            reward = (target - entry) / entry
+        else:
+            risk = (stop - entry) / entry
+            reward = (entry - target) / entry
+        rr = reward / risk if risk else None
+    except (TypeError, ZeroDivisionError):
+        rr = None
+    card = {
+        "risk_reward": {
+            "entry": entry, "stop": stop, "target": target, "rr": rr,
+        },
+        "historical_experience": {"evidence_contract": evidence_contract},
+    }
+    ev_check, errors = build_ev_check(card, side)
+    if not ev_check:
+        preview["reason"] = "；".join(errors) or "EV 无法计算"
+        return preview
+
+    ev_r = ev_check.get("ev_r")
+    needs_override = (
+        ev_check.get("status") == "computed"
+        and isinstance(ev_r, (int, float))
+        and ev_r < 0
+    )
+    own_note = preview["note"]
+    preview.update(ev_check)
+    # ev_check 自带 note，update 会把「禁止复制进决策卡」那句盖掉——预览身份声明
+    # 必须活下来，calculator 的口径说明另存一个键。
+    preview["note"] = own_note
+    preview["ev_calculator_note"] = ev_check.get("note")
+    preview["version"] = EV_PREVIEW_VERSION
+    preview["source"] = "core.ev_calculator.build_ev_check"
+    preview["needs_override"] = needs_override
+    preview["would_block_write_without_override"] = needs_override
+    # 摩擦占 R 的比例：窄止损被手续费+滑点吃掉的那部分此前只能靠感觉估。
+    # 实测 3×ATR 很小的标的（如 TRX 3×ATR=0.77%）摩擦占 R 达 26%，盈亏平衡胜率
+    # 被推到 42%，远高于经验池先验——把它显式算出来，取舍才有依据。
+    risk_pct = ev_check.get("risk_pct")
+    if isinstance(risk_pct, (int, float)) and risk_pct > 0:
+        preview["friction_share_of_risk"] = round(
+            ev_check.get("friction_pct", 0.0) / risk_pct, 4)
+    preview["writer_errors_preview"] = list(errors)
+    if ev_check.get("status") == "indeterminate":
+        preview["reason"] = (
+            f"三个具名 scope 均无 n≥{MIN_P_SAMPLE_N} 样本，无确定性 p_win；"
+            "EV 无闸，按结构与催化自证"
+        )
+    return preview
 
 
 def compact_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -568,6 +777,11 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "cross_symbol_summary": result.get("cross_symbol_summary") or {},
         "query": result.get("query") or {},
         "evidence_contract": result.get("evidence_contract") or {},
+        "ev_preview": result.get("ev_preview") or {},
+        "policy_epoch_filter": result.get("policy_epoch_filter") or {},
+        "feature_epoch_filter": result.get("feature_epoch_filter") or {},
+        "feature_epoch": result.get("feature_epoch"),
+        "similarity_version": result.get("similarity_version"),
         "query_symbol": result.get("query_symbol"),
         "matched_wins": [
             pick(item, keep_match)
@@ -641,7 +855,7 @@ def main() -> int:
             "如 2026-08-10T08:00"
         ),
     )
-    ap.add_argument("--db-root", default=r".\db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--stop-distance-pct", type=float, default=None,
                     help="拟用止损距离（0.04=4%%）；action=open 时必填")
     ap.add_argument("--planned-rr", type=float, default=None,
@@ -652,6 +866,10 @@ def main() -> int:
                     help="拟用止损价；与 --entry/--target 同传（open 推荐）")
     ap.add_argument("--target", type=float, default=None,
                     help="拟用目标价；与 --entry/--stop 同传（open 推荐）")
+    ap.add_argument(
+        "--include-all-epochs", action="store_true",
+        help=("审计用：连同已撤回策略纪元的样本一起入 EV 先验。"
+              "生产检索不要传——纪元过滤只影响先验，不影响任何验收口径"))
     ap.add_argument("--pretty", action="store_true")
     ap.add_argument(
         "--compact",
@@ -689,7 +907,8 @@ def main() -> int:
             db_root=Path(args.db_root), now=as_of,
             stop_distance_pct=args.stop_distance_pct,
             planned_rr=args.planned_rr,
-            entry=args.entry, stop=args.stop, target=args.target)
+            entry=args.entry, stop=args.stop, target=args.target,
+            include_all_epochs=args.include_all_epochs)
     except ValueError as exc:
         ap.error(str(exc))
     output = compact_result(res) if args.compact else res
@@ -702,6 +921,15 @@ def main() -> int:
             "bytes": size,
             "compact": bool(args.compact),
             "summary": output.get("summary") or {},
+            "policy_epoch_excluded": (
+                output.get("policy_epoch_filter") or {}).get("excluded_total"),
+            # EV 符号必须在「要不要写这张卡」之前就可见，所以进 stdout 摘要而不是
+            # 只躺在 out_file 里。
+            "ev_preview": {
+                key: (output.get("ev_preview") or {}).get(key)
+                for key in ("status", "p_win", "p_scope", "p_n", "net_rr",
+                            "breakeven_p", "ev_r", "needs_override")
+            },
         }, ensure_ascii=False))
     else:
         print(json.dumps(

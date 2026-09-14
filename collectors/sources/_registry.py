@@ -12,6 +12,15 @@ collect_slow 内声明（registry 对其仅登记，采集器暂未改读）。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[2])
+    return str(root.joinpath(*parts))
+
+
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -22,7 +31,7 @@ CST = timezone(timedelta(hours=8))
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 DEFAULT_REGISTRY = Path(os.environ.get(
-    "OKX_REGISTRY_PATH", r"./collectors/sources/registry.json"))
+    "OKX_REGISTRY_PATH", _public_project_path('collectors', 'sources', 'registry.json')))
 
 VALID_TYPES = {"market", "news", "macro", "social"}
 VALID_CADENCE = {"15m", "hourly", "daily", "weekday", "weekly", "event"}
@@ -79,6 +88,20 @@ def validate(registry: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"{sid} poll_interval_min 须为可整除一天的 15 分钟倍数"
                     f"（15..1440）: {poll_min}")
+        forward_start = s.get("audit_forward_start_cst")
+        if forward_start is not None:
+            try:
+                parsed_start = datetime.fromisoformat(str(forward_start))
+                if (
+                    parsed_start.tzinfo is None
+                    or parsed_start.utcoffset() != timedelta(hours=8)
+                ):
+                    raise ValueError("must carry an explicit +08:00 offset")
+            except (TypeError, ValueError):
+                errors.append(
+                    f"{sid} audit_forward_start_cst 须为带 +08:00 时区的 ISO 时间: "
+                    f"{forward_start!r}"
+                )
     # 至少 1 个 enabled 的 news required（§6 一期约束）
     news_req = [s for s in sources if s.get("type") == "news"
                 and s.get("required") and s.get("enabled")]

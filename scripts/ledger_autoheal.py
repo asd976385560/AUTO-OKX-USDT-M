@@ -11,19 +11,24 @@ r"""账本自愈（GHOST-EXACT 与受控 UNRECORDED 补账，2026-08-04）。
 `reconcile_exchange_closes.classify`（唯一定义源），写库一律经该模块的
 `apply_reconcile` → `collectors/trades_writer`。本脚本只负责**闸门与编排**。
 
-公开版范围：
-  - [GHOST-EXACT] 账本 > 现仓且 fills 精确解释差额 → 只生成诊断计划
+自愈范围：
+  - [GHOST-EXACT] 账本 > 现仓且 fills 精确解释差额 → 显式 `--apply` 时补 close
   - [GHOST-FUZZY] fills 对不上 → 只报告，转人工 ❌
-  - [UNRECORDED] 只有 intent/ordId/fills 归属精确且完整保护性 SL 已确认的
-    T1，也只生成诊断计划，不补 open。
+  - [UNRECORDED] 只有 intent/ordId/fills 归属精确、单一订单组且完整保护性
+    SL 已确认的 T1，才可在 `--apply --enable-unrecorded` 同时开启时补 open。
+    CLI 默认不开；生产调用方（插入点 A/B 与报告闸）是否默认传入见调用方。
+    哨兵文件 `config/ledger_autoheal_unrecorded.off` 存在时一律只报告不写
+    （它落在所有调用方共享的本子进程里，nudge 派发链收不到环境变量也生效）。
+    订单属于调用方自身 cycle 时只报告，留给该 cycle 的 runner 自己落账。
     T2（无 intent）及 SL 缺失/未知均为 P0，写前阻断。
   - [OVER_CLOSED] 账本净持仓为负 → 只报告，转人工 ❌（P3 另行设计）
 
 核心硬闸：
   1. 只补 EXACT；FUZZY、T2/T3 UNRECORDED、OVER_CLOSED 一律不写。
   2. close/open 分别需要独立正向授权；任何 P0 在本轮写库前阻断。
-  3. 单轮自愈上限 `--max-heals`（默认 3）；超限则**一笔都不补**并升级告警——
-     那意味着系统性问题而非单笔漏账。
+  3. 单次自愈写入上限 `--max-heals`（默认 3）。纯精确平仓积压可分批消化；
+     其余未证明项继续阻断。含开仓漏账、负净仓、真实歧义或身份冲突时，
+     超限仍一笔不补。查询预算耗尽项保持 FUZZY，后续调用重新取证。
   4. runner 执行期互斥：同 profile 有 running runner 时跳过（`--self-cycle`
      放行调用方自身那一条，因为插入点 A 就跑在该 runner 会话内）。
   5. 幂等：复用 `consume_recorded` 先销账已记录的平仓腿，重复跑不重复补。
@@ -33,17 +38,27 @@ r"""账本自愈（GHOST-EXACT 与受控 UNRECORDED 补账，2026-08-04）。
         3=runner 互斥跳过；4=P0。任何非 0 结果均 `blocking=true`。
 
 用法：
-  pwsh -NoProfile -File ./scripts/run_okx_python.ps1 ^
-      ./scripts/ledger_autoheal.py --profile live [--apply]
+  pwsh -NoProfile -File <PROJECT_ROOT>\scripts\run_okx_python.ps1 ^
+      <PROJECT_ROOT>\scripts\ledger_autoheal.py --profile live [--apply]
       [--enable-unrecorded] [--max-heals 3]
       [--self-cycle 2026-08-04T13:00] [--request-id <uuid>] [--json-out <path>]
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -51,10 +66,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, r"./scripts")
-sys.path.insert(0, r"./collectors")
+sys.path.insert(0, _public_project_path('scripts'))
+sys.path.insert(0, _public_project_path('collectors'))
 
-sys.path.insert(0, r"./core/lib")
+sys.path.insert(0, _public_project_path('core', 'lib'))
 
 import reconcile_exchange_closes as rec  # noqa: E402
 import repair_queue_tool  # noqa: E402
@@ -73,6 +88,14 @@ RC_P0 = 4
 UNRECORDED_LOOKBACK_DAYS = 7
 # execution_intents 终态；非终态 + 有 ord_id = 「单已提交、落库没跟上」的归属证据
 INTENT_TERMINAL = ("completed", "failed_clean")
+# 补 open 的非环境变量 kill switch（2026-09-11）：nudge 起的派发链只带白名单
+# 环境变量、收不到 OKX_*，所以关闭开关必须放在 A/B/报告闸共享的本子进程里。
+UNRECORDED_KILL_SWITCH = (
+    Path(__file__).resolve().parent.parent / "config"
+    / "ledger_autoheal_unrecorded.off")
+# 非 completed 的 intent 只在提交满这么久后才当 T1 写入依据：执行器/runner 可能
+# 还在补交它自己的回执（2026-09-11 审查：迟到写入者闸）。
+INFLIGHT_INTENT_GRACE = timedelta(minutes=15)
 
 
 def _new_result(profile: str, db_root: Path, self_cycle: str | None,
@@ -161,8 +184,9 @@ def _intent_for(db_root: Path, profile: str, sym: str, side: str) -> dict | None
     """找该 sym/side 的开仓意图归属证据（T1 判据）。
 
     非终态 + 有 ord_id ⇒ 单确实提交到交易所了、只是账没落上。
-    全历史 95 条实测是干净二元分布（completed 全有单号 / failed_clean 全无），
-    所以非终态带单号本身就是异常信号，正是我们要抓的那种。
+    ``completed`` 也可能在 intent 持久化后、trade writer 失败时留下真实
+    UNRECORDED；此时必须额外验证 stored receipt 的成交身份。failed_clean 永不
+    作为开仓归属证据。
     """
     led = db_root / "ledger.db"
     if not led.exists():
@@ -173,17 +197,49 @@ def _intent_for(db_root: Path, profile: str, sym: str, side: str) -> dict | None
     except sqlite3.Error:
         return None
     try:
-        row = con.execute(
+        rows = con.execute(
             "SELECT cycle_id, symbol, action, side, state, reserved_at, "
-            "       submitted_at, ord_id, error "
+            "       submitted_at, ord_id, error, receipt_json "
             "FROM execution_intents "
             "WHERE profile=? AND symbol=? AND side=? AND action IN ('open','add') "
-            f"  AND state NOT IN ({','.join('?' * len(INTENT_TERMINAL))}) "
+            "  AND state <> 'failed_clean' "
             "  AND ord_id IS NOT NULL AND ord_id <> '' "
-            "ORDER BY reserved_at DESC LIMIT 1",
-            (profile, sym, side, *INTENT_TERMINAL),
-        ).fetchone()
-        return dict(row) if row else None
+            "ORDER BY reserved_at DESC LIMIT 20",
+            (profile, sym, side),
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            if item.get("state") != "completed":
+                item.pop("receipt_json", None)
+                return item
+            try:
+                receipt = json.loads(item.get("receipt_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            ord_id = str(item.get("ord_id") or "")
+            trades = receipt.get("trades") if isinstance(receipt, dict) else None
+            matching = [
+                trade for trade in (trades or [])
+                if isinstance(trade, dict)
+                and str(trade.get("symbol") or "") == sym
+                and str(trade.get("side") or "").lower() == side
+                and str(trade.get("ordId") or trade.get("ord_id") or "")
+                == ord_id
+                and str(trade.get("action") or "").lower() in {"open", "add"}
+            ]
+            if (
+                receipt.get("ok") is True
+                and str(receipt.get("ord_id") or receipt.get("ordId") or "")
+                == ord_id
+                and len(matching) == 1
+            ):
+                item["completed_receipt_verified"] = True
+                # 保留已核身份的回执成交行：补 open 时沿用其保护/名义字段，
+                # 让补出的行与迟到的真回执按同一 ordId 对齐（2026-09-11）。
+                item["receipt_trade"] = dict(matching[0])
+                item.pop("receipt_json", None)
+                return item
+        return None
     except sqlite3.Error:
         return None
     finally:
@@ -277,8 +333,90 @@ def _now() -> str:
     return datetime.now(CST).strftime(TS_FMT)
 
 
-def _pending_queue_ids(account_db: Path, profile: str, sym: str, side: str) -> list[int]:
-    """找出因该 sym/side 不一致而开、且仍 pending 的 repair_queue 条目。"""
+def _unrecorded_kill_switch_on() -> bool:
+    """哨兵文件存在即关闭补 open；读不到状态按关闭处理（宁可不写）。
+
+    不能用 Path.exists()：它把 PermissionError 等 OSError 都吞成 False，
+    「读不到」会被当成「没有开关」而继续写（2026-09-11 审查）。
+    """
+    try:
+        os.stat(UNRECORDED_KILL_SWITCH)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _experience_open_recorded(account_db: Path, profile: str, sym: str,
+                              side: str, ord_ids) -> bool:
+    """只读回查补 open 应留下的开仓经验行（经验写入非致命，必须回读确认）。"""
+    ids = [str(oid) for oid in (ord_ids or []) if str(oid or "").strip()]
+    if not ids or not account_db.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{account_db.as_posix()}?mode=ro",
+                              uri=True, timeout=10)
+    except sqlite3.Error:
+        return False
+    try:
+        for oid in ids:
+            row = con.execute(
+                "SELECT 1 FROM trade_experiences WHERE profile=? AND symbol=? "
+                "AND LOWER(side)=? AND action='open' "
+                "AND status NOT IN ('superseded','orphaned') AND raw LIKE ? LIMIT 1",
+                (profile, sym, side, f"%{oid}%")).fetchone()
+            if row is None:
+                return False
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+
+
+def _experience_row_closable(account_db: Path, profile: str, sym: str,
+                             side: str) -> bool:
+    """GHOST 自愈能否顺手关同 sym/side 的 experience_position 工单。
+
+    UNRECORDED 方向（经验剩余 < 实仓）且经验库在发现时刻前后没有开仓行的工单
+    由 jobb 的 ``hold_unrecorded_vanished`` 保持可见；这里与它同一判定、只读。
+    读不到时不关（留给 jobb 同步，宁可晚关）。
+    """
+    name = f"ledger_invariant:experience_position:{profile}:{sym}:{side}"
+    if not account_db.exists():
+        return False
+    try:
+        import ledger_invariants  # noqa: PLC0415  与 jobb 共用唯一判定
+
+        con = sqlite3.connect(f"file:{account_db.as_posix()}?mode=ro",
+                              uri=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        row = con.execute(
+            "SELECT id, check_name, issue, ts FROM repair_queue "
+            "WHERE status='pending' AND check_name=? ORDER BY id DESC LIMIT 1",
+            (name,)).fetchone()
+        if row is None:
+            return True
+        note = ledger_invariants.hold_unrecorded_vanished(
+            con, {"id": row[0], "check_name": row[1],
+                  "issue": row[2], "ts": row[3]})
+        return not note
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        con.close()
+
+
+def _pending_queue_ids(account_db: Path, profile: str, sym: str, side: str,
+                       include_experience: bool = True) -> list[int]:
+    """找出因该 sym/side 不一致而开、且仍 pending 的 repair_queue 条目。
+
+    ``include_experience=False`` 只取 pretrade 账仓不一致工单：补 open 的经验行
+    未回读确认时，experience_position 工单必须留着（2026-09-11）。
+    """
     if not account_db.exists():
         return []
     try:
@@ -288,6 +426,9 @@ def _pending_queue_ids(account_db: Path, profile: str, sym: str, side: str) -> l
     except sqlite3.Error:
         return []
     try:
+        experience_name = (
+            f"ledger_invariant:experience_position:{profile}:{sym}:{side}"
+            if include_experience else None)
         rows = con.execute(
             "SELECT id FROM repair_queue WHERE status='pending' AND ("
             "  (check_name='order_executor'"
@@ -295,14 +436,30 @@ def _pending_queue_ids(account_db: Path, profile: str, sym: str, side: str) -> l
             "   AND issue LIKE ?)"
             "  OR check_name = ?"
             ")",
-            (f"%{sym}/{side}%",
-             f"ledger_invariant:experience_position:{profile}:{sym}:{side}"),
+            (f"%{sym}/{side}%", experience_name),
         ).fetchall()
         return [int(r["id"]) for r in rows]
     except sqlite3.Error:
         return []
     finally:
         con.close()
+
+
+def _pending_profile_ledger_blocks(account_db: Path, profile: str) -> list[int]:
+    """Only pre-submit/no-order ledger-block tickets; never intent/SL/fill issues."""
+    if not account_db.exists():
+        return []
+    con = None
+    try:
+        con = sqlite3.connect(account_db.resolve().as_uri()+"?mode=ro", uri=True, timeout=3)
+        pattern = re.compile(r"\["+re.escape(profile)+r"\] [A-Z0-9]+-USDT-SWAP ord=None: pretrade_ledger_autoheal_blocked:.+")
+        return [int(row[0]) for row in con.execute(
+            "SELECT id,issue FROM repair_queue WHERE status='pending' AND check_name='order_executor'")
+            if pattern.fullmatch(str(row[1] or ""))]
+    except sqlite3.Error:
+        return []
+    finally:
+        if con is not None: con.close()
 
 
 def _close_pending_queue(account_db: Path, qids: list[int], resolution: str,
@@ -334,7 +491,8 @@ def _close_pending_queue(account_db: Path, qids: list[int], resolution: str,
 
 
 def _plan_unrecorded(profile: str, db_root: Path, by_key, nets,
-                      sym: str, side: str, venue_sz: float, enabled: bool) -> dict:
+                      sym: str, side: str, venue_sz: float, enabled: bool,
+                      self_cycle: str | None = None) -> dict:
     """UNRECORDED 三级证据链定级（P2·2026-08-04）。
 
     T1 = intent 归属证据齐 + 开仓腿 fills 精确解释缺口 → 自动补，元数据全真
@@ -342,6 +500,8 @@ def _plan_unrecorded(profile: str, db_root: Path, by_key, nets,
     T3 = fills 对不上 / API 失败 → 只报告转人工
 
     ``enabled`` 只控制最终写入，不关闭只读证据检查。
+    2026-09-11 起 T1 另须：匹配集只有一个订单组（即 intent 那一单）、已核回执
+    的张数与该组一致；订单属于 ``self_cycle`` 时只报告（``write_hold``）。
     """
     ledger_sz = nets.get((sym, side), 0.0)
     missing = venue_sz - ledger_sz
@@ -355,7 +515,9 @@ def _plan_unrecorded(profile: str, db_root: Path, by_key, nets,
         t0 = datetime.now(CST) - timedelta(days=UNRECORDED_LOOKBACK_DAYS)
     t0 = t0 - timedelta(minutes=rec.OPEN_TS_BUFFER_MIN)
     try:
-        fills = rec.fetch_open_fills(profile, sym, side, int(t0.timestamp() * 1000))
+        # intent 订单整单在页内（张数 == 已核回执）同样自证 fills 覆盖（2026-09-11）。
+        fills = rec.fetch_open_fills(profile, sym, side, int(t0.timestamp() * 1000),
+                                     anchor=rec.receipt_open_anchor(intent))
     except Exception as e:  # noqa: BLE001
         return {**base, "tier": "T3", "reason": f"开仓腿 fills API 失败: {e}"}
 
@@ -384,8 +546,38 @@ def _plan_unrecorded(profile: str, db_root: Path, by_key, nets,
         return {**base, "tier": "T3",
                 "reason": f"intent ord_id={intent.get('ord_id')} 未出现在匹配 fills 组，归属存疑"}
 
+    # 一行只记一单：规则 a 可能把多笔成交折成一行、落进最新 intent 的 cycle，
+    # 其它订单的迟到写入者就无法按 ordId 去重（2026-09-11）。
+    if len(matched) != 1:
+        return {**base, "tier": "T3",
+                "reason": (f"匹配集含 {len(matched)} 个订单组；自动补 open 只接受"
+                           "与 intent 单号一致的单一订单组，转人工"),
+                "ord_ids": sorted({str(g.get("ordId")) for g in matched})}
+    receipt_trade = intent.get("receipt_trade")
+    if isinstance(receipt_trade, dict):
+        try:
+            receipt_sz = float(receipt_trade.get("sz"))
+        except (TypeError, ValueError):
+            receipt_sz = None
+        if (receipt_sz is None or not math.isfinite(receipt_sz)
+                or abs(receipt_sz - float(matched[0]["sz"])) > rec.SZ_TOL):
+            return {**base, "tier": "T3",
+                    "reason": (f"intent 回执张数 {receipt_trade.get('sz')} 与 fills "
+                               f"组 {matched[0]['sz']:g} 不一致，归属存疑")}
+
     cycle_id = (intent or {}).get("cycle_id") or rec.slot_cycle_id(
         rec.fill_dt(max(int(x.get("fillTime") or 0) for g in matched for x in g["fills"])))
+    write_hold = None
+    if self_cycle and str(cycle_id) == str(self_cycle):
+        write_hold = ("订单属于调用方自身 cycle，留给该 cycle 的 runner "
+                      "自己落账；本轮只报告")
+    if write_hold is None and intent.get("state") != "completed":
+        started = rec.parse_ts(
+            intent.get("submitted_at") or intent.get("reserved_at"))
+        if started is None or datetime.now(CST) - started < INFLIGHT_INTENT_GRACE:
+            write_hold = (f"intent 仍在途（state={intent.get('state')}）且提交不足 "
+                          f"{int(INFLIGHT_INTENT_GRACE.total_seconds() // 60)} 分钟，"
+                          "可能还有迟到回执；本轮只报告")
     return {**base,
             "tier": "T1",
             "cycle_id": cycle_id,
@@ -393,7 +585,38 @@ def _plan_unrecorded(profile: str, db_root: Path, by_key, nets,
             "card": _card_for(db_root, cycle_id, sym),
             "matched": matched,
             "leftover_groups": len(leftover),
+            "write_hold": write_hold,
             "ord_ids": sorted({str(g.get("ordId")) for g in matched})}
+
+
+def _close_backlog_batch(verdict: dict, max_heals: int) -> list | None:
+    """Bounded progress only for independent, exact, close-only repairs.
+
+    No quantity/price/identity matching lives here; classify remains the only
+    authority. Only its typed budget deferrals may coexist with an oversized
+    batch. Genuine ambiguity and missing opens retain the systemic stop.
+    """
+    if (verdict["unrecorded"] or verdict["over_closed"]
+            or verdict.get("leftover_orders")):
+        return None
+    deferred = verdict.get("deferred", [])
+    if (len(deferred) != len(verdict["fuzzy"])
+            or {(key, sz) for key, sz, _ in deferred}
+            != {(key, sz) for key, sz, _, _ in verdict["fuzzy"]}
+            or any(reason not in rec.CLOSE_DEFERRED_REASONS
+                   for _, _, reason in deferred)):
+        return None
+    claimed = set()
+    for _, _, matched, _ in verdict["exact"]:
+        if not matched:
+            return None
+        for group in matched:
+            oid = str(group.get("ordId") or "").strip()
+            if not oid or oid == "?" or oid in claimed:
+                return None
+            claimed.add(oid)
+    # Ledger order is stable; written groups disappear on the next fresh read.
+    return verdict["exact"][:max_heals]
 
 
 def autoheal(profile: str, db_root: Path, apply: bool,
@@ -404,15 +627,19 @@ def autoheal(profile: str, db_root: Path, apply: bool,
     out = _new_result(profile, db_root, self_cycle, request_id)
     out["apply"] = bool(apply)
     out["unrecorded_write_enabled"] = bool(enable_unrecorded)
-
-    # Public-release boundary: this helper is permanently report-only.  Keep
-    # the legacy flags parseable so old operators receive a structured,
-    # fail-closed result instead of accidentally invoking a different tool.
     if apply or enable_unrecorded:
         out["error"] = (
             "public release ledger_autoheal is permanently read-only; "
             "--apply and --enable-unrecorded are disabled"
         )
+        out["rc"] = RC_ERROR
+        return _finalize_result(out)
+    if enable_unrecorded and _unrecorded_kill_switch_on():
+        enable_unrecorded = False
+        out["unrecorded_kill_switch"] = str(UNRECORDED_KILL_SWITCH)
+    out["unrecorded_write_enabled"] = bool(enable_unrecorded)
+    if type(max_heals) is not int or max_heals < 1:
+        out["error"] = "max_heals must be a positive integer"
         out["rc"] = RC_ERROR
         return _finalize_result(out)
 
@@ -474,7 +701,8 @@ def autoheal(profile: str, db_root: Path, apply: bool,
         unrecorded_todo = []
         for (sym, side), sz in verdict["unrecorded"]:
             item = _plan_unrecorded(profile, db_root, by_key, nets,
-                                    sym, side, sz, enable_unrecorded)
+                                    sym, side, sz, enable_unrecorded,
+                                    self_cycle=self_cycle)
             # 保护性 SL 是现仓安全事实，与写权限无关。默认只读也必须
             # 探测；缺失或未知在任何写入前升级 P0。
             sl = _probe_sl(profile, sym, side, item["venue_sz"])
@@ -507,18 +735,55 @@ def autoheal(profile: str, db_root: Path, apply: bool,
             return _finalize_result(out)
 
         if not total_heals:
+            if apply and not out["needs_human"]:
+                from core.open_intent_recovery import recover_booked_submitted_open
+                out["intent_recovery"] = recover_booked_submitted_open(db_root,self_cycle,apply=True)
+            from scripts.ledger_recovery import enabled as recovery_enabled
+            if apply and recovery_enabled(self_cycle) and not out["needs_human"]:
+                # A block ticket names the attempted new symbol, not the old
+                # position that caused the profile mismatch. Close only this
+                # exact no-order ticket family after a clean full comparison.
+                queue_result = {"queue_closed": [], "needs_human": [], "rc": RC_OK}
+                _close_pending_queue(
+                    account_db, _pending_profile_ledger_blocks(account_db, profile),
+                    "全集账仓独立核对一致；此前交易前未下单的账本阻断已解除，未重放订单。",
+                    queue_result)
+                out["queue_closed"].extend(queue_result["queue_closed"])
+                if queue_result["needs_human"]:
+                    out.setdefault("warnings", []).extend(queue_result["needs_human"])
             return _finalize_result(out)
 
-        # --- 闸 3：单轮上限（幽灵 + UNRECORDED 合并计），超限一笔都不补 ---
+        # --- 闸 3：每次最多 max_heals 组；纯精确平仓积压允许有界进展 ---
         if total_heals > max_heals:
-            out["error"] = (f"待自愈 {total_heals} 组（幽灵 {len(exact)} + "
-                            f"UNRECORDED {len(unrecorded_todo)}）> 上限 {max_heals}，"
-                            f"判为系统性异常，本轮不自愈（升级人工）")
+            batch = _close_backlog_batch(verdict, max_heals)
+            if batch is None:
+                out["error"] = (f"待自愈 {total_heals} 组（幽灵 {len(exact)} + "
+                                f"UNRECORDED {len(unrecorded_todo)}）> 上限 {max_heals}，"
+                                "且不满足纯精确平仓分批条件，本轮不自愈（升级人工）")
+                out["needs_human"].append({
+                    "kind": "OVER_CAP", "count": total_heals, "cap": max_heals,
+                    "reason": out["error"]})
+                out["rc"] = RC_ERROR
+                return _finalize_result(out)
+            pending = exact[len(batch):]
+            out["backlog"] = {
+                "cap": max_heals,
+                "selected_count": len(batch),
+                "remaining_exact_count": len(pending),
+                "evidence_deferred_count": len(verdict.get("deferred", [])),
+                "pending": [
+                    {"symbol": sym, "side": side, "sz": sz,
+                     "ord_ids": [str(g["ordId"]) for g in matched]}
+                    for (sym, side), sz, matched, _ in pending],
+            }
             out["needs_human"].append({
-                "kind": "OVER_CAP", "count": total_heals, "cap": max_heals,
-                "reason": out["error"]})
-            out["rc"] = RC_ERROR
-            return _finalize_result(out)
+                "kind": "AUTOHEAL-BACKLOG", "count": len(pending),
+                "cap": max_heals,
+                "reason": f"本次最多处理 {len(batch)} 组精确平仓账；"
+                          f"其余 {len(pending)} 组待后续调用重新取证，"
+                          "账仓未全部一致前继续阻断交易/报告放行",
+            })
+            exact = batch
 
         for (sym, side), ghost_sz, matched, _ in exact:
             ord_ids = sorted({str(g.get("ordId")) for g in matched})
@@ -552,7 +817,13 @@ def autoheal(profile: str, db_root: Path, apply: bool,
             out["healed"].append(item)
 
             # --- 闸 6：留痕，关闭同因 pending 工单 ---
-            qids = _pending_queue_ids(account_db, profile, sym, side)
+            # UNRECORDED 方向、经验库又没有对应开仓的 experience_position 工单
+            # （补 open 时经验写入失败留下的）不在这里顺手关，交给 jobb 的
+            # hold_unrecorded_vanished 判定（2026-09-11 审查）。
+            qids = _pending_queue_ids(
+                account_db, profile, sym, side,
+                include_experience=_experience_row_closable(
+                    account_db, profile, sym, side))
             _close_pending_queue(
                 account_db, qids,
                 f"ledger_autoheal 自愈 {sym}/{side} sz={ghost_sz:g} "
@@ -580,7 +851,13 @@ def autoheal(profile: str, db_root: Path, apply: bool,
                 out["healed"].append(item)
                 continue
             if not plan.get("write_enabled"):
-                item["note"] = "report-only: --enable-unrecorded 未开启，未写库"
+                item["note"] = ("report-only: 补 open 已被哨兵文件关闭，未写库"
+                                if out.get("unrecorded_kill_switch") else
+                                "report-only: --enable-unrecorded 未开启，未写库")
+                out["healed"].append(item)
+                continue
+            if plan.get("write_hold"):
+                item["note"] = f"hold: {plan['write_hold']}"
                 out["healed"].append(item)
                 continue
             lev = None
@@ -601,11 +878,30 @@ def autoheal(profile: str, db_root: Path, apply: bool,
                 out["rc"] = RC_ERROR
                 out["healed"].append(item)
                 continue
+            if res.get("status") == "already_recorded":
+                item["note"] = ("already_recorded: 该 ordId 已由其他写入方落账，"
+                                "本轮未重复写入")
+                out["healed"].append(item)
+                continue
+            experience_ok = _experience_open_recorded(
+                account_db, profile, sym, side, plan["ord_ids"])
             item.update({"applied": True, "fill_px": res["wavg_px"],
                          "cycle_id": res["cycle_id"], "open_ts": res["open_ts"],
-                         "degradation": res["degradation"]})
+                         "degradation": res["degradation"],
+                         "experience": {"verified": experience_ok,
+                                        "write": res.get("exp")}})
             out["healed"].append(item)
-            qids = _pending_queue_ids(account_db, profile, sym, side)
+            if not experience_ok:
+                # 经验写入非致命，但不能静默：账本已一致而经验缺 open 行时，
+                # experience_position 工单留给人工补经验（不影响交易放行）。
+                out.setdefault("warnings", []).append({
+                    "kind": "UNRECORDED-EXPERIENCE-MISSING", "symbol": sym,
+                    "side": side,
+                    "reason": "账本已补 open，但经验库回读不到对应开仓行；"
+                              "experience_position 工单保持 pending，补经验后人工关单",
+                })
+            qids = _pending_queue_ids(account_db, profile, sym, side,
+                                      include_experience=experience_ok)
             _close_pending_queue(
                 account_db, qids,
                 f"ledger_autoheal 补 UNRECORDED open {sym}/{side} "
@@ -623,6 +919,9 @@ def autoheal(profile: str, db_root: Path, apply: bool,
         else:
             os.environ["OKX_ACCOUNT_DB"] = previous_account_db
 
+    if apply and not out.get("needs_human") and not out.get("error"):
+        from core.open_intent_recovery import recover_booked_submitted_open
+        out["intent_recovery"] = recover_booked_submitted_open(db_root,self_cycle,apply=True)
     return _finalize_result(out)
 
 
@@ -645,18 +944,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="账本自愈（GHOST-EXACT close / 受控 UNRECORDED T1 open）")
     ap.add_argument("--profile", choices=["live"], required=True)
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true",
-                    help="公开版禁用；传入后 fail-closed，不写库")
+                    help="真补账（默认 dry-run 只报告）")
     ap.add_argument("--max-heals", type=int, default=DEFAULT_MAX_HEALS,
-                    help=f"单轮自愈上限，超限一笔不补（默认 {DEFAULT_MAX_HEALS}）")
+                    help=f"单次写入上限；纯精确平仓积压可分批（默认 {DEFAULT_MAX_HEALS}）")
     ap.add_argument("--self-cycle",
                     help="调用方自身 cycle_id；该 runner 不视为互斥冲突")
     ap.add_argument("--request-id",
                     help="调用方生成的唯一契约身份；人工调用留空则自动生成")
     ap.add_argument("--json-out", help="结构化结果原子落盘路径（UTF-8）")
     ap.add_argument("--enable-unrecorded", action="store_true",
-                    help="公开版禁用；传入后 fail-closed，不写库")
+                    help="额外允许严格 T1 UNRECORDED 补 open（CLI 默认关闭；"
+                         "哨兵文件 config/ledger_autoheal_unrecorded.off 存在时无效）")
     args = ap.parse_args()
 
     request_id = str(args.request_id or uuid.uuid4())

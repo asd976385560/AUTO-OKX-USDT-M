@@ -9,9 +9,18 @@ r"""V2.0 §6/P5 —— 确定性币种情绪统计（OKX sentiment-rank 的确�
 覆盖面 = 我们有新闻/X 提及的币（比 OKX 全币种稀疏，属预期：自有数据口径）。
 
 用法（独立诊断）：
-  run_okx_python.ps1 scripts/sentiment_compute.py --db ./db/news.db --period 24h
+  run_okx_python.ps1 scripts/sentiment_compute.py --db <PROJECT_ROOT>/db/news.db --period 24h
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -167,7 +176,7 @@ def compute(news_db: str | Path, period: str = "24h",
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="确定性币种情绪统计（脱 OKX）")
-    ap.add_argument("--db", default=r"./db/news.db")
+    ap.add_argument("--db", default=_public_project_path('db', 'news.db'))
     ap.add_argument("--period", default="24h")
     args = ap.parse_args()
     rows = compute(args.db, args.period)

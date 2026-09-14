@@ -1,17 +1,26 @@
 # -*- coding: utf-8 -*-
 """system_state_writer.py — v7.0c 统一交易员每轮 system_state 关键字段更新
 
-写入：./db//account.db → system_state (key, value, updated_utc)
+写入：<PROJECT_ROOT>\\db\\account.db → system_state (key, value, updated_utc)
 输入：stdin JSON: {"updates": {"key1": "value1", "key2": "value2", ...}, "ts": "2026-06-05 21:46:00"}
 - ts 可选；缺省用 UTC ISO 当前时间
 - 每个 key 写一行；INSERT OR REPLACE（key 唯一）
 - 保护键（cum_pnl 冻结基线权威键）默认拒写，需 --force-protected（仅维护用）
 
 调用：
-  echo '{"updates":{...}}' | pwsh -NoProfile -File ./scripts//run_okx_python.ps1 ./scripts//system_state_writer.py --stdin
+  echo '{"updates":{...}}' | pwsh -NoProfile -File <PROJECT_ROOT>\\scripts\\run_okx_python.ps1 <PROJECT_ROOT>\\scripts\\system_state_writer.py --stdin
 
 退出码：0=成功；2=批内含保护键被拒写（其余键正常写入）；非0=失败
 """
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 import argparse, json, os, sqlite3, sys
 from datetime import datetime, timedelta, timezone
 
@@ -47,7 +56,7 @@ def load_payload(args) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description="v7.0c system_state 关键字段更新")
-    p.add_argument("--db-root", default=r"./db")
+    p.add_argument("--db-root", default=_public_project_path('db'))
     g = p.add_mutually_exclusive_group()
     g.add_argument("--stdin", action="store_true")
     g.add_argument("--json-file")

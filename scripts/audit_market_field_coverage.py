@@ -14,6 +14,15 @@ production threshold, or places an order.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import hashlib
 import json
@@ -31,9 +40,9 @@ import _acceptance_thresholds as thresholds
 CST = timezone(timedelta(hours=8))
 UTC = timezone.utc
 SLOT_MINUTES = 15
-DEFAULT_DB = Path(r".\db\market.db")
+DEFAULT_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_OUTPUT = Path(
-    r".\reports\quality\market-field-coverage-audit.json")
+    _public_project_path('reports', 'quality', 'market-field-coverage-audit.json'))
 DEFAULT_FORWARD_START = "2026-08-12T22:45:00+08:00"
 OFFICIAL_SNAPSHOT_SOURCE = "okx_public_instruments_live_usdt_linear_swap"
 

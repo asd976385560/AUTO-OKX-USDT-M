@@ -25,6 +25,15 @@ AUTOINCREMENT 的 sqlite_sequence 随显式 id 拷贝与 RENAME 自动跟随。
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import re
@@ -157,14 +166,11 @@ def legacy_risk_rows(con: sqlite3.Connection, col: str) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="1R 假语义冻结迁移（默认 dry-run）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup-dir", default=None,
                     help="--apply 必填：备份 account.db/lessons.db 的目录")
     args = ap.parse_args()
-    if args.apply and args.dry_run:
-        ap.error("--apply and --dry-run are mutually exclusive")
     root = Path(args.db_root)
     acc_path, les_path = root / "account.db", root / "lessons.db"
     for p in (acc_path, les_path):

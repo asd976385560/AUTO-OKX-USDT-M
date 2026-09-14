@@ -140,6 +140,7 @@ class PushArchiveOrderingTests(unittest.TestCase):
         *,
         archive_rc: int = 0,
         send_rc: int = 0,
+        send_out: str = "",
         send_exception: Exception | None = None,
     ) -> tuple[dict, list[str], Path]:
         calls: list[str] = []
@@ -151,9 +152,19 @@ class PushArchiveOrderingTests(unittest.TestCase):
             if name == "render_push_report.py":
                 content_path = Path(args[args.index("--out-file") + 1])
                 content_path.write_text(self.CONTENT, encoding="utf-8")
-                return 0, json.dumps({"bytes": len(self.CONTENT), "title": "test"}), ""
-            if name == "validate_push_format.py":
-                return 0, json.dumps({"char_count": len(self.CONTENT)}), ""
+                return 0, json.dumps({
+                    "ok": True,
+                    "render_ok": True,
+                    "bytes": len(self.CONTENT),
+                    "title": "test",
+                    "validation_fused": True,
+                    "validation": {
+                        "ok": True,
+                        "errors": [],
+                        "missing_fields": [],
+                        "char_count": len(self.CONTENT),
+                    },
+                }), ""
             if name == "push_archive.py":
                 archive_path.write_text(
                     "# archived\n\n" + self.CONTENT, encoding="utf-8"
@@ -168,7 +179,7 @@ class PushArchiveOrderingTests(unittest.TestCase):
             if name == "qq_push.py":
                 if send_exception is not None:
                     raise send_exception
-                return send_rc, "", "send failed" if send_rc else ""
+                return send_rc, send_out, "send failed" if send_rc else ""
             if name == "system_state_writer.py":
                 return 0, "{}", ""
             raise AssertionError(f"unexpected script: {name}")
@@ -216,6 +227,53 @@ class PushArchiveOrderingTests(unittest.TestCase):
             self.assertTrue(archive_path.exists())
             self.assertTrue(archive_path.read_text(encoding="utf-8").endswith(self.CONTENT))
 
+    def test_nonzero_action_send_without_receipt_stays_failed(self):
+        failed_outputs = (
+            json.dumps({
+                "ok": False,
+                "deliveryStatus": "failed",
+                "action": "send",
+                "payload": {"deliveryStatus": "failed"},
+            }),
+            json.dumps({"action": "send", "messageId": ""}),
+            json.dumps({"action": "send", "messageId": None}),
+        )
+        for send_out in failed_outputs:
+            with self.subTest(send_out=send_out), tempfile.TemporaryDirectory() as tmp:
+                result, _, _ = self._run_pipeline(
+                    Path(tmp), send_rc=1, send_out=send_out
+                )
+                self.assertEqual("failed", result["send_status"])
+                self.assertFalse(result["ok"])
+                self.assertEqual("send_failed", result["fatal"])
+
+    def test_nonzero_send_with_nonempty_message_id_keeps_receipt_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._run_pipeline(
+                Path(tmp),
+                send_rc=1,
+                send_out=(
+                    '{"action":"send","messageId":"receipt-1","payload":'
+                    '{"result":'
+                ),
+            )
+            self.assertEqual("sent", result["send_status"])
+            self.assertTrue(result["ok"])
+            self.assertNotIn("fatal", result)
+
+    def test_send_timeout_is_uncertain_and_never_reported_as_failed_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls, archive_path = self._run_pipeline(
+                Path(tmp), send_rc=3
+            )
+            self.assertIn("qq_push.py", calls)
+            self.assertEqual("uncertain_delivery", result["send_status"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                "send_uncertain_delivery", result["fatal"])
+            self.assertTrue(result["steps"]["archive"]["hard_check"])
+            self.assertTrue(archive_path.exists())
+
     def test_send_exception_keeps_archive_and_records_failed_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             result, calls, archive_path = self._run_pipeline(
@@ -227,6 +285,8 @@ class PushArchiveOrderingTests(unittest.TestCase):
             self.assertEqual(result["fatal"], "send_failed")
             self.assertIn("TimeoutError", result["steps"]["send"]["err"])
             self.assertTrue(archive_path.exists())
+
+
 
 
 if __name__ == "__main__":

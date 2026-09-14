@@ -8,6 +8,15 @@ not by themselves make the current repair state fail.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import shutil
@@ -572,10 +581,10 @@ def build_snapshot(db_root: Path, recent_days: int) -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate current ledger audit snapshot")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument(
         "--out",
-        default=r"./reports/quality/ledger_audit_snapshot_20260726.json",
+        default=_public_project_path('reports', 'quality', 'ledger_audit_snapshot_20260726.json'),
     )
     ap.add_argument("--recent-days", type=int, default=7)
     ap.add_argument("--backup-dir")

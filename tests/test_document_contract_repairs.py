@@ -136,8 +136,8 @@ class CrossDocumentFactTests(unittest.TestCase):
 
     def test_push_pipeline_archive_precedes_send(self):
         source = read("scripts/push_pipeline.py")
-        archive_call = source.index(r'r".\scripts\push_archive.py"')
-        send_call = source.index(r'r".\scripts\qq_push.py"')
+        archive_call = source.index("'push_archive.py'")
+        send_call = source.index("'qq_push.py'")
         self.assertLess(archive_call, send_call)
 
 

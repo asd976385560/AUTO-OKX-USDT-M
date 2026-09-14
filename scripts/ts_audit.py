@@ -6,9 +6,18 @@
 作常设哨兵（挂 monitor/reviewer 可选）：若本应全 CST 的表冒出 Z 行 = 有写方漏归一。
 
 只读（mode=ro），不改任何库。
-用法：ts_audit.py [--db-root ./db] [--json]
+用法：ts_audit.py [--db-root <PROJECT_ROOT>\\db] [--json]
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -82,7 +91,7 @@ def audit_db(path: Path) -> list[dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="全库时间戳格式巡检（只读）")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     root = Path(args.db_root)

@@ -17,10 +17,19 @@ agent 取本脚本**回执**（非自己拼 SQL），既得真值又守红线。
 权威基线键＝`{profile}_cum_pnl`（其余 *_realized_pnl* 为历史僵尸键，已清理，见 memory）。
 
 用法：
-  python cum_pnl.py --profile live --db-root ./db
-  python cum_pnl.py --both --db-root ./db        # {"live": {...}} 包一层
+  python cum_pnl.py --profile live --db-root <PROJECT_ROOT>/db
+  python cum_pnl.py --both --db-root <PROJECT_ROOT>/db        # {"live": {...}} 包一层
 """
 from __future__ import annotations
+
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
 
 import argparse
 import json
@@ -106,7 +115,7 @@ def cum_for(db_root, profile: str, as_of_ts=None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="累计交易PnL（未扣手续费/资金费）= 冻结基线 + V2.0 trades.pnl 增量")
-    ap.add_argument("--db-root", default=r"./db")
+    ap.add_argument("--db-root", default=_public_project_path('db'))
     ap.add_argument("--profile", choices=["live"])
     ap.add_argument("--both", action="store_true")
     ap.add_argument("--as-of", dest="as_of_ts", help="累计到该 UTC+8 时点（YYYY-MM-DD HH:MM:SS）")

@@ -10,6 +10,15 @@
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import os
 import sqlite3
 from pathlib import Path
@@ -49,7 +58,7 @@ def _norm(symbol: str) -> str:
     return s + "-USDT-SWAP"
 
 
-def load_map(db_root: str | os.PathLike = r"./db",
+def load_map(db_root: str | os.PathLike = _public_project_path('db'),
              refresh: bool = False) -> dict[str, tuple[str, str]]:
     """symbol → (asset_class, source), refreshed after external DB commits."""
     key = str(db_root)
@@ -83,14 +92,14 @@ def load_map(db_root: str | os.PathLike = r"./db",
 
 
 def asset_class_of(symbol: str,
-                   db_root: str | os.PathLike = r"./db") -> str:
+                   db_root: str | os.PathLike = _public_project_path('db')) -> str:
     """asset_class（未分类兜底 crypto）。"""
     cls, _ = classify(symbol, db_root)
     return cls
 
 
 def classify(symbol: str,
-             db_root: str | os.PathLike = r"./db"
+             db_root: str | os.PathLike = _public_project_path('db')
              ) -> tuple[str, str]:
     """(asset_class, source); source also includes official_inst_category."""
     entry = load_map(db_root).get(_norm(symbol))
@@ -100,5 +109,5 @@ def classify(symbol: str,
 
 
 def is_crypto(symbol: str,
-              db_root: str | os.PathLike = r"./db") -> bool:
+              db_root: str | os.PathLike = _public_project_path('db')) -> bool:
     return asset_class_of(symbol, db_root) == "crypto"

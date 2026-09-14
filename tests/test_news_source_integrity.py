@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -10,18 +11,22 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "collectors" / "sources"
-if str(SOURCES) not in sys.path:
-    sys.path.insert(0, str(SOURCES))
+COLLECTORS = ROOT / "collectors"
+for path in (SOURCES, COLLECTORS):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import news_collect  # noqa: E402
 import news_geo  # noqa: E402
 import news_mxsearch  # noqa: E402
+import _mx_news_common as mx_common  # noqa: E402
 import _news_http  # noqa: E402
 import news_jinse  # noqa: E402
 import news_odaily  # noqa: E402
 import news_okx  # noqa: E402
 import news_panews  # noqa: E402
 import news_rss  # noqa: E402
+import news_writer  # noqa: E402
 
 
 class NewsSourceIntegrityTests(unittest.TestCase):
@@ -114,6 +119,37 @@ class NewsSourceIntegrityTests(unittest.TestCase):
             news_collect._source_result_status({"ok": True}, 0), "ok")
         self.assertEqual(
             news_collect._source_result_status({"ok": False}, 12), "failed")
+
+    def test_module_missing_is_failed_not_legal_cadence_skip(self) -> None:
+        source = {"id": "broken_news", "adapter": "missing_adapter"}
+        with (
+            mock.patch.object(news_collect._registry, "load_registry",
+                              return_value={"sources": [source]}),
+            mock.patch.object(news_collect._registry, "enabled_sources",
+                              return_value=[source]),
+            mock.patch.object(news_collect, "_source_due", return_value=True),
+            mock.patch.object(news_collect, "_load_adapter", return_value=None),
+        ):
+            result = news_collect.collect_all(r"E:\isolated", apply=False)
+        self.assertEqual("failed", result["sources"][0]["status"])
+        self.assertEqual("module-missing", result["sources"][0]["err"])
+
+    def test_news_writer_rejects_empty_source_before_database_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "news.db"
+            db_path.touch()
+            with mock.patch.object(news_writer.ledger, "connect") as connect:
+                result = news_writer.write_news(
+                    [{"source": "  ", "title": "BTC update"}], db_path)
+        self.assertFalse(result["ok"])
+        self.assertEqual("news_source_required", result["error"])
+        self.assertEqual([0], result["invalid_source_indices"])
+        connect.assert_not_called()
+
+    def test_news_writer_does_not_enforce_strict_source_enum(self) -> None:
+        item = news_writer.normalize_item({
+            "source": "custom:future_source", "title": "BTC update"})
+        self.assertEqual("custom:future_source", item["source"])
 
     def test_multi_feed_outcomes_preserve_success_and_failure(self) -> None:
         xml = "<rss><channel><item><title>BTC update</title></item></channel></rss>"
@@ -529,6 +565,191 @@ class NewsSourceIntegrityTests(unittest.TestCase):
         self.assertEqual(len(calls), len(news_geo.GEO_QUERIES) + 1)
         self.assertEqual(stats["recovered_after_retry"], 1)
         self.assertEqual(stats["final_failed"], 0)
+
+    def test_mx_quota_error_is_not_retried(self) -> None:
+        calls: list[float] = []
+
+        def fake_search(_query, *, key, timeout_sec):
+            self.assertEqual(key, "test-key")
+            calls.append(timeout_sec)
+            raise mx_common.MXQuotaExceeded("MX business code=113: quota")
+
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(news_mxsearch, "api_key", return_value="test-key"), \
+                mock.patch.object(news_mxsearch, "search", side_effect=fake_search), \
+                mock.patch.object(news_mxsearch.time, "sleep"):
+            items = news_mxsearch.fetch_items(errors, stats)
+
+        self.assertEqual(items, [])
+        self.assertEqual(calls, [6.0])
+        self.assertTrue(errors)
+        self.assertEqual(stats["attempts"], 1)
+        self.assertTrue(stats["quota_exhausted"])
+        self.assertTrue(stats["retry_skipped_non_retryable"])
+
+    def test_geo_quota_error_stops_remaining_queries_without_retry(self) -> None:
+        calls: list[str] = []
+        quota_query = news_geo.GEO_QUERIES[1]
+
+        def fake_search(query, *, key, timeout_sec):
+            self.assertEqual(key, "test-key")
+            calls.append(query)
+            if query == quota_query:
+                raise mx_common.MXQuotaExceeded(
+                    "MX business code=113: quota")
+            return []
+
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(news_geo, "api_key", return_value="test-key"), \
+                mock.patch.object(news_geo, "search", side_effect=fake_search), \
+                mock.patch.object(news_geo.time, "sleep"):
+            items = news_geo.fetch_items(errors, stats)
+
+        self.assertEqual(items, [])
+        self.assertEqual(calls, list(news_geo.GEO_QUERIES[:2]))
+        self.assertTrue(errors)
+        self.assertTrue(stats["quota_exhausted"])
+        self.assertEqual(stats["queries_attempted"], 2)
+        self.assertEqual(stats["queries_skipped_after_quota"], 2)
+        self.assertEqual(stats["final_failed"], 3)
+
+
+class AnnouncementTypesCacheTests(unittest.TestCase):
+    """2026-08-18 A1：types 列表缓存降级（types 单点失败不再杀全轮）。"""
+
+    def setUp(self) -> None:
+        import tempfile
+        import news_okx_announcements as ann
+        self.ann = ann
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache_path = str(Path(self._tmp.name) / "types_cache.json")
+        self._env = mock.patch.dict(
+            "os.environ", {ann._TYPES_CACHE_ENV: self.cache_path})
+        self._env.start()
+        self._sleep = mock.patch.object(
+            self.ann.time, "sleep", lambda *_a, **_k: None)
+        self._sleep.start()
+
+    def tearDown(self) -> None:
+        self._sleep.stop()
+        self._env.stop()
+        try:
+            self._tmp.cleanup()
+        except (OSError, PermissionError):
+            pass  # Windows 桥挂载下 TemporaryDirectory 清理偶发受限
+
+    @staticmethod
+    def _page(ann_type: str) -> dict:
+        return {"details": [{
+            "title": f"OKX to delist {ann_type.upper()}X/USDT perpetual",
+            "url": "https://www.okx.com/help/x",
+            "pTime": "1786940000000",
+        }]}
+
+    def test_types_success_persists_cache(self) -> None:
+        types = [{"annType": "announcements-delistings"}]
+        with mock.patch.object(
+            self.ann._okx_http,
+            "fetch_support_announcement_types_sync", return_value=types,
+        ), mock.patch.object(
+            self.ann._okx_http, "fetch_support_announcements_sync",
+            side_effect=lambda t, **_k: self._page(t),
+        ):
+            stats: dict = {}
+            out = self.ann.fetch_items(errors=[], retry_stats=stats)
+        self.assertTrue(out)
+        self.assertEqual(stats["types_source"], "live")
+        cached = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        self.assertEqual(cached["schema"], "okx_announcement_types_cache_v1")
+        self.assertEqual(cached["types"], types)
+
+    def test_types_double_failure_falls_back_to_cache(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        cst = timezone(timedelta(hours=8))
+        Path(self.cache_path).write_text(json.dumps({
+            "schema": "okx_announcement_types_cache_v1",
+            "fetched_at_cst": (
+                datetime.now(cst) - timedelta(days=2)
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "types": [{"annType": "announcements-delistings"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(
+            self.ann._okx_http, "fetch_support_announcement_types_sync",
+            side_effect=RuntimeError("transport down"),
+        ), mock.patch.object(
+            self.ann._okx_http, "fetch_support_announcements_sync",
+            side_effect=lambda t, **_k: self._page(t),
+        ):
+            out = self.ann.fetch_items(errors=errors, retry_stats=stats)
+        self.assertTrue(out, "cached types must keep category pages flowing")
+        self.assertEqual(stats["types_source"], "cached")
+        self.assertFalse(stats["types_recovered_after_cold_retry"])
+        self.assertAlmostEqual(
+            stats["types_cache_age_days"], 2.0, delta=0.2)
+        self.assertTrue(any("fallback=types_cache" in e for e in errors))
+
+    def test_types_double_failure_without_cache_keeps_failing_closed(
+            self) -> None:
+        errors: list[str] = []
+        stats: dict = {}
+        with mock.patch.object(
+            self.ann._okx_http, "fetch_support_announcement_types_sync",
+            side_effect=RuntimeError("transport down"),
+        ):
+            out = self.ann.fetch_items(errors=errors, retry_stats=stats)
+        self.assertEqual(out, [])
+        self.assertEqual(stats["types_source"], "unavailable")
+        self.assertEqual(stats["final_failed"], 1)
+
+    def test_stale_cache_is_ignored(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        cst = timezone(timedelta(hours=8))
+        Path(self.cache_path).write_text(json.dumps({
+            "schema": "okx_announcement_types_cache_v1",
+            "fetched_at_cst": (
+                datetime.now(cst)
+                - timedelta(days=self.ann._TYPES_CACHE_MAX_AGE_DAYS + 1)
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "types": [{"annType": "announcements-delistings"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        with mock.patch.object(
+            self.ann._okx_http, "fetch_support_announcement_types_sync",
+            side_effect=RuntimeError("transport down"),
+        ):
+            out = self.ann.fetch_items(errors=[], retry_stats={})
+        self.assertEqual(out, [])
+
+
+class UnlockCalendarPrimaryDomainTests(unittest.TestCase):
+    """2026-08-18 A3-lite：解锁日历所有者域名入一级源白名单。"""
+
+    def setUp(self) -> None:
+        collectors = ROOT / "collectors"
+        if str(collectors) not in sys.path:
+            sys.path.insert(0, str(collectors))
+        import news_writer
+        self.news_writer = news_writer
+
+    def test_calendar_owner_domains_are_primary(self) -> None:
+        for url in (
+            "https://tokenomist.ai/token/zro",
+            "https://defillama.com/unlocks/calendar",
+            "https://www.okx.com/help/x",
+        ):
+            self.assertEqual(
+                self.news_writer.source_grade(url, None), "primary", url)
+
+    def test_media_and_social_links_stay_non_primary(self) -> None:
+        self.assertEqual(
+            self.news_writer.source_grade(
+                "https://x.com/Tokenomist_ai/status/1", None), "aggregator")
+        self.assertEqual(
+            self.news_writer.source_grade(
+                "https://coindesk.com/unlock-story", None), "secondary")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,15 @@ JSON evidence file is atomically replaced.
 """
 from __future__ import annotations
 
+
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
 import argparse
 import json
 import math
@@ -26,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from _audit_artifact_context import resolve_audit_output
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -36,15 +47,17 @@ from core.multitimeframe_gate import (  # noqa: E402
     MINIMUM_BARS_FOR_FULL_INDICATORS,
     RAW_FIELDS,
     TIMEFRAME_SECONDS,
+    build_closed_bar_proof,
+    open_ws_confirmation_connection,
     validate_kline_row,
 )
 
 
 CST = timezone(timedelta(hours=8))
 UTC = timezone.utc
-DEFAULT_MARKET_DB = Path(r".\db\market.db")
+DEFAULT_MARKET_DB = Path(_public_project_path('db', 'market.db'))
 DEFAULT_OUTPUT = Path(
-    r".\reports\quality\multitimeframe-coverage-audit.json")
+    _public_project_path('reports', 'quality', 'multitimeframe-coverage-audit.json'))
 def _parse_ts(value: str) -> datetime:
     text = str(value).strip().replace(" ", "T")
     if text.endswith("Z"):
@@ -65,6 +78,13 @@ def expected_closed_bar_start(evaluation_utc: datetime, timeframe: str) -> str:
     epoch = int(evaluation_utc.astimezone(UTC).timestamp())
     closed_start_epoch = (epoch // seconds) * seconds - seconds
     return _iso_utc(datetime.fromtimestamp(closed_start_epoch, tz=UTC))
+
+
+def successor_bar_start(bar_start: str, timeframe: str) -> str:
+    """Independent closure proof for legacy cache rows without OKX confirm."""
+    parsed = _parse_ts(bar_start)
+    return _iso_utc(
+        parsed + timedelta(seconds=TIMEFRAME_SECONDS[timeframe]))
 
 
 def _ro(path: Path) -> sqlite3.Connection:
@@ -95,6 +115,21 @@ def _rows_for_exact_bar(
         "SELECT symbol,ts,o,h,l,c,v,ma5,ma20,atr14,rsi14,macd_hist "
         f"FROM kline_cache WHERE tf=? AND ts=? AND symbol IN ({placeholders})",
         (timeframe, bar_ts, *symbols),
+    ).fetchall()
+    return {str(row["symbol"]): row for row in rows}
+
+
+def _successor_rows(
+    connection: sqlite3.Connection,
+    symbols: list[str],
+    timeframe: str,
+    successor_ts: str,
+) -> dict[str, sqlite3.Row]:
+    placeholders = ",".join("?" for _ in symbols)
+    rows = connection.execute(
+        "SELECT symbol,ts FROM kline_cache "
+        f"WHERE tf=? AND ts=? AND symbol IN ({placeholders})",
+        (timeframe, successor_ts, *symbols),
     ).fetchall()
     return {str(row["symbol"]): row for row in rows}
 
@@ -242,7 +277,16 @@ def audit_multitimeframe_coverage(
     evaluation_utc = (now or datetime.now(UTC)).astimezone(UTC)
     evaluation_iso = _iso_utc(evaluation_utc)
     connection = _ro(market_db)
+    ws_connection: sqlite3.Connection | None = None
+    ws_context: dict[str, Any] = {
+        "source_mode": "rest_only",
+        "available": False,
+        "cache_db": "ws_market_cache.db",
+        "reason": "not_checked",
+    }
     try:
+        ws_connection, ws_context = open_ws_confirmation_connection(
+            market_db.parent)
         latest_tick = connection.execute(
             "SELECT MAX(ts) FROM tick_snapshots WHERE ts<=?", (evaluation_iso,)
         ).fetchone()[0]
@@ -263,16 +307,47 @@ def audit_multitimeframe_coverage(
         timeframes: list[dict[str, Any]] = []
         for timeframe in TIMEFRAME_SECONDS:
             expected_ts = expected_closed_bar_start(evaluation_utc, timeframe)
+            expected_successor_ts = successor_bar_start(
+                expected_ts, timeframe)
             rows = _rows_for_exact_bar(
                 connection, symbols, timeframe, expected_ts)
+            successors = _successor_rows(
+                connection, symbols, timeframe, expected_successor_ts)
             history = _history_counts(
                 connection, symbols, timeframe, expected_ts)
             raw_valid: list[str] = []
             ready: list[str] = []
             gaps: list[dict[str, Any]] = []
+            proof_method_counts: dict[str, int] = {}
+            proven_symbols = 0
             for symbol in symbols:
                 row = rows.get(symbol)
                 raw_errors = _raw_errors(row)
+                successor_row = successors.get(symbol)
+                observed_successor_ts = (
+                    str(successor_row["ts"])
+                    if successor_row is not None else None
+                )
+                closed_bar_proof = build_closed_bar_proof(
+                    observed_successor_ts=observed_successor_ts,
+                    expected_successor_ts=expected_successor_ts,
+                    ws_connection=ws_connection,
+                    ws_context=ws_context,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    expected_ts=expected_ts,
+                    market_row=row,
+                )
+                closed_bar_proven = closed_bar_proof["proven"] is True
+                if closed_bar_proven:
+                    proven_symbols += 1
+                    method = str(closed_bar_proof.get("method") or "unknown")
+                    proof_method_counts[method] = (
+                        proof_method_counts.get(method, 0) + 1
+                    )
+                if not closed_bar_proven:
+                    raw_errors.append(
+                        "closed_state_unproven_no_successor_bar")
                 indicator_errors = _indicator_errors(row)
                 bars_seen = history.get(symbol, 0)
                 if not raw_errors:
@@ -296,6 +371,7 @@ def audit_multitimeframe_coverage(
                     "bars_seen": bars_seen,
                     "raw_errors": raw_errors,
                     "indicator_errors": indicator_errors,
+                    "closed_bar_proof": closed_bar_proof,
                     **_listing_history_evidence(
                         listing_times.get(symbol), timeframe,
                         expected_ts, bars_seen,
@@ -308,8 +384,13 @@ def audit_multitimeframe_coverage(
             timeframes.append({
                 "timeframe": timeframe,
                 "expected_closed_bar_ts": expected_ts,
+                "expected_successor_bar_ts": expected_successor_ts,
                 "universe_symbols": denominator,
                 "observed_exact_bar_rows": len(rows),
+                "closed_bar_proven_symbols": proven_symbols,
+                "closed_bar_proof_rate": round(
+                    proven_symbols / denominator, 6),
+                "closed_bar_proof_method_counts": proof_method_counts,
                 "raw_ohlcv_valid_symbols": len(raw_valid),
                 "raw_ohlcv_coverage_rate": round(raw_rate, 6),
                 "raw_ohlcv_status": (
@@ -350,6 +431,8 @@ def audit_multitimeframe_coverage(
             })
     finally:
         connection.close()
+        if ws_connection is not None:
+            ws_connection.close()
 
     data_passed = all(
         row["raw_ohlcv_status"] == "PASSED" for row in timeframes)
@@ -362,6 +445,7 @@ def audit_multitimeframe_coverage(
         "generated_at_cst": datetime.now(UTC).astimezone(CST).isoformat(),
         "evaluation_at_utc": evaluation_utc.isoformat(),
         "mode": "read_only",
+        "closed_bar_proof_context": ws_context,
         "latest_ticker_ts": latest_tick,
         "universe_symbols": len(symbols),
         "minimum_rate": minimum_rate,
@@ -375,6 +459,11 @@ def audit_multitimeframe_coverage(
         "contracts": {
             "universe": "latest ticker symbols ending -USDT-SWAP",
             "bar_selection": "exact latest fully closed UTC-aligned bar",
+            "closure_proof": (
+                "legacy market.db immediate successor, or in active ws_first "
+                "mode an exact source=ws confirm=1 ws_market_cache candle "
+                "whose OHLCV matches the production market row"
+            ),
             "source_data_completeness": "valid exact OHLCV row / full universe",
             "analysis_readiness": (
                 "valid exact OHLCV plus MA5/MA20/ATR14/RSI14/MACD histogram "
@@ -422,14 +511,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-out", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--minimum-rate", type=float, default=0.99)
     parser.add_argument("--as-of", help="ISO-8601 evaluation time; default now")
+    parser.add_argument("--execution-context", choices=("production", "test", "probe"))
+    parser.add_argument("--artifact-root")
     args = parser.parse_args(argv)
     try:
+        output, context, context_fields = resolve_audit_output(
+            args.json_out,
+            tool_name="audit_multitimeframe_coverage",
+            execution_context=args.execution_context,
+            artifact_root=args.artifact_root,
+        )
         payload = audit_multitimeframe_coverage(
             args.market_db,
             minimum_rate=args.minimum_rate,
             now=_parse_ts(args.as_of) if args.as_of else None,
         )
-        _atomic_json(args.json_out, payload)
+        payload["artifact_context"] = context_fields
+        _atomic_json(output, payload)
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(json.dumps({
             "ok": False,
@@ -452,7 +550,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             for row in payload["timeframes"]
         ],
-        "json_out": str(args.json_out),
+        "json_out": str(output),
+        "execution_context": context,
         "production_database_writes": 0,
         "orders_placed": 0,
     }, ensure_ascii=False))

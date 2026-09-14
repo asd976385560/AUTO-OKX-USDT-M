@@ -85,6 +85,15 @@ collect_data.py —— Job A 数据采集（每 15 分钟由 cron 调用）。
 from __future__ import annotations
 
 
+def _public_project_path(*parts):
+    """Resolve this public checkout without a host-specific fallback."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('OKX_ROOT') or Path(__file__).resolve().parents[1])
+    return str(root.joinpath(*parts))
+
+
+
 
 
 
@@ -109,6 +118,8 @@ import sqlite3
 import sys
 
 import time
+
+_sleep = time.sleep
 
 
 
@@ -135,14 +146,12 @@ from pathlib import Path
 
 
 
-from _okxcli import okx_json
-
 from _kline_indicators import (
     extend_with_boll_obv,
     extended_row_tail,
     kline_insert_plan,
 )
-from _okx_http import (
+from _okx_market_source import (
 
     fetch_tickers_all_sync,
 
@@ -150,6 +159,10 @@ from _okx_http import (
 
     fetch_funding_rates_batch_sync,
 
+    fetch_instruments_sync,
+
+    fetch_index_tickers_all_sync,
+    fetch_mark_prices_all_sync,
     fetch_open_interest_all_sync,
 
 )
@@ -176,6 +189,14 @@ TICKER_SINGLE_FALLBACK_TIMEOUT_SECONDS = 60.0
 TICKER_SCHANNEL_RESERVE_SECONDS = 6.0
 TICKER_COMPLETE_COVERAGE = 0.99
 TICKER_MAX_FETCH_PHASES = 3
+
+
+class TickerTransportError(RuntimeError):
+    """Fail-closed ticker error that keeps compact structured telemetry."""
+
+    def __init__(self, message: str, transport_stats: dict[str, object]):
+        super().__init__(message)
+        self.transport_stats = dict(transport_stats)
 
 
 
@@ -209,15 +230,10 @@ def _fetch_all_swap_instruments(cli_global_args: list[str]) -> list[dict]:
 
 
 
-    all_instruments = okx_json(
-
-
-
-        "market", "instruments", "--instType", "SWAP", global_args=cli_global_args
-
-
-
-    )
+    # 参数仅为旧调用兼容保留。公共产品初始快照统一经过市场源适配器：
+    # shadow/dual_read 仍以 REST 为生产事实，ws_first 才读取健康的 WS 缓存。
+    del cli_global_args
+    all_instruments = fetch_instruments_sync("SWAP")
 
 
 
@@ -428,7 +444,7 @@ COIN_TO_SYMBOL: dict[str, str] = {}
 
 
 
-DEFAULT_DB_ROOT = Path(r".\db")
+DEFAULT_DB_ROOT = Path(_public_project_path('db'))
 
 
 
@@ -593,11 +609,15 @@ def open_db(db_root: Path, name: str) -> sqlite3.Connection:
 
 
 
-    connection = sqlite3.connect(str(path))
+    connection = sqlite3.connect(str(path), timeout=5)
 
 
 
     connection.execute("PRAGMA journal_mode=WAL;")
+
+    connection.execute("PRAGMA busy_timeout=5000;")
+
+    connection.execute("PRAGMA synchronous=NORMAL;")
 
 
 
@@ -853,9 +873,10 @@ def compute_indicators(candles: list[dict]) -> list[dict]:
 
         for i in range(14, len(deltas) + 1):
 
-            rs = avg_gain / avg_loss if avg_loss != 0 else 100.0
+            rsi = (100.0 if avg_gain > 0 else 50.0) if avg_loss == 0 else (
+                100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
 
-            rsi_series.append(100.0 - (100.0 / (1.0 + rs)))
+            rsi_series.append(rsi)
 
             if i < len(deltas):
 
@@ -939,6 +960,19 @@ def _ticker_symbol_coverage(rows: list[dict]) -> float:
         if _ticker_row_usable(row)
     }
     return len(expected & observed) / len(expected)
+
+
+def _ticker_failure_quality(exc: Exception) -> dict[str, object] | None:
+    """Expose ticker transport telemetry even when collection fails early."""
+    if not isinstance(exc, TickerTransportError):
+        return None
+    expected = int(exc.transport_stats.get("expected_symbols", len(SYMBOLS)))
+    return {
+        "expected": expected,
+        "tickers": 0,
+        "ticker_coverage": 0.0,
+        "ticker_transport": dict(exc.transport_stats),
+    }
 
 
 def _fetch_tickers_with_cold_retry(
@@ -1032,7 +1066,7 @@ def _fetch_tickers_with_cold_retry(
         max(0.0, deadline - time.monotonic() - 0.2),
     )
     if delay > 0:
-        time.sleep(delay)
+        _sleep(delay)
     remaining = max(0.1, deadline - time.monotonic())
     retry_budget = min(
         TICKER_COLD_RETRY_TIMEOUT_SECONDS,
@@ -1161,13 +1195,38 @@ def _fetch_tickers_with_cold_retry(
         f"{type(retry_error).__name__}: {retry_error}"
         if retry_error else "empty official ticker response"
     )
-    raise RuntimeError(
+    stats["expected_symbols"] = len(SYMBOLS)
+    stats["failure_before_market_write"] = True
+    stats["failure_reason"] = "official_ticker_transport_exhausted"
+    schannel_errors = ",".join(
+        str(value)
+        for value in stats.get("schannel_fallback_error_types", [])
+    ) or "none"
+    probe_errors = ",".join(
+        str(value)
+        for value in fallback_transport.get("probe_error_types", [])
+    ) or "none"
+    compact_transport = (
+        "aggregate_errors="
+        f"{stats['initial_error_type']}/{stats['cold_retry_error_type']}; "
+        f"selected_coverage={stats['selected_coverage_rate']}; "
+        "schannel="
+        f"{stats['schannel_fallback_successes']}/"
+        f"{stats['schannel_fallback_requested']} success/requested"
+        f" errors={schannel_errors}; "
+        "single_ticker="
+        f"{stats['single_ticker_fallback_usable']}/"
+        f"{stats['single_ticker_fallback_symbols']} usable"
+        f" probes={stats['single_ticker_fallback_probe_attempts']}"
+        f" probe_errors={probe_errors}"
+        f" base={stats['single_ticker_fallback_selected_base'] or 'none'}"
+    )
+    raise TickerTransportError(
         "official ticker fetch failed after bounded cold retry and "
         "single-ticker fallback: "
-        f"initial=({first_detail}); retry=({retry_detail}); "
-        "single_ticker=(usable="
-        f"{stats['single_ticker_fallback_usable']}, "
-        f"error={stats['single_ticker_fallback_error_type']})"
+        f"transport=({compact_transport}); "
+        f"initial=({first_detail}); retry=({retry_detail})",
+        stats,
     )
 
 
@@ -1213,6 +1272,22 @@ def collect_tickers(
     except Exception as oi_exc:  # 单项失败不阻断 tick/funding 主采集
         oi_map = {}
         print(f"[collect_data] OI degraded: {oi_exc}", file=sys.stderr)
+    # 2026-08-19 D2：基差 = mark − index。它是永续拥挤度的**即时**读数，比 8h
+    # 结算的 funding 领先；也是强平缓冲的直接输入。两端点均单次全量，各自失败
+    # 降级为空 map（basis 列写 NULL），绝不阻断 tick/funding/OI 主采集。
+    try:
+        mark_map: dict[str, dict] = fetch_mark_prices_all_sync(
+            "SWAP", request_timeout_s=remaining())
+    except Exception as mk_exc:
+        mark_map = {}
+        print(f"[collect_data] mark-price degraded: {mk_exc}", file=sys.stderr)
+    try:
+        index_map: dict[str, dict] = fetch_index_tickers_all_sync(
+            "USDT", request_timeout_s=remaining())
+    except Exception as ix_exc:
+        index_map = {}
+        print(f"[collect_data] index-tickers degraded: {ix_exc}",
+              file=sys.stderr)
 
 
 
@@ -1259,6 +1334,13 @@ def collect_tickers(
             )
         # 不把全空占位行写成“本轮新衍生品快照”；否则一次批次超时会把
         # 最新值整体顶成 NULL，后续分析难以区分“真实 0”与“未采到”。
+        # D2：instId 形如 BTC-USDT-SWAP → 指数 id 去掉 -SWAP 后缀。
+        mark_px = to_float((mark_map.get(symbol) or {}).get("markPx"))
+        index_px = to_float(
+            (index_map.get(symbol.rsplit("-", 1)[0]) or {}).get("idxPx"))
+        basis_bp = None
+        if mark_px is not None and index_px not in (None, 0):
+            basis_bp = (mark_px - index_px) / index_px * 10000.0
         if funding_rate is not None or oi_value is not None:
             derivative_rows.append(
                 (
@@ -1271,6 +1353,9 @@ def collect_tickers(
                     oi_value,
                     to_float(oi_row.get("oiCcy")),
                     to_float(oi_row.get("oiUsd")),
+                    mark_px,
+                    index_px,
+                    basis_bp,
                 )
             )
 
@@ -1308,9 +1393,12 @@ def collect_tickers(
 
         "INSERT OR REPLACE INTO derivatives "
 
-        "(ts, symbol, funding_rate, funding_time, next_funding_time, premium, oi, oi_ccy, oi_usd) "
+        "(ts, symbol, funding_rate, funding_time, next_funding_time, premium, oi, oi_ccy, oi_usd, "
 
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        # D2：基差三列（迁移脚本 apply_basis_schema.py 先补齐）。
+        "mark_px, index_px, basis_bp) "
+
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
 
         derivative_rows,
 
@@ -1664,7 +1752,7 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
         from _regime_read import latest_cross_market as _lcm
         _main = next((r[2] for r in market_con.execute("PRAGMA database_list").fetchall()
                       if r[1] == "main"), None)
-        _db_root = _os.path.dirname(_main) if _main else r".\db"
+        _db_root = _os.path.dirname(_main) if _main else _public_project_path('db')
         row = _lcm(_db_root)
     except Exception:
         row = None
@@ -1683,7 +1771,13 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
             row = dict(zip(_k, r2))
         else:
             row = {}
-    copied_regime = row.get("regime") if row.get("regime") is not None else regime
+    # 2026-08-19 G5：regime 只认 regime_classifier 写进 regime.db 的三类标签
+    # （trend_up/trend_down/range）。读不到就是 None（未知），不再回落到本地
+    # compute_regime 的四类值 —— 那个 low_vol 在 _simutil.experience_vector 里
+    # 与「regime 未知」编码完全相同（regime_dir=0/range=0/extreme=0），会让相似
+    # 度检索静默失真。本地值只保留在 summary.regime_computed_local 作诊断。
+    copied_regime = row.get("regime")
+    regime_stale = 1 if copied_regime is None else 0
     snapshot = {
         "dxy": row.get("dxy"),
         "gold": row.get("gold"),
@@ -1697,6 +1791,10 @@ def collect_cross_market(market_con: sqlite3.Connection, ts: str, regime: str | 
         "total_mcap_usd": row.get("total_mcap_usd"),
         "total_volume_24h_usd": row.get("total_volume_24h_usd"),
         "regime": copied_regime,
+        # G5：显式 stale 位 —— 下游（_simutil.regime_stale / skill.md 的
+        # carry-forward 语义）据此区分「regime 未知」与「regime 是某个标签」。
+        # collect_cross_market 只 return snapshot、不写库，故零 schema 影响。
+        "regime_stale": regime_stale,
     }
     return 0, snapshot
 
@@ -1811,6 +1909,96 @@ def update_state(
 
 
     write_state(state_path, state)
+
+
+def market_degraded_reasons(
+    quality: dict,
+    *,
+    instrument_snapshot_failed: bool = False,
+) -> list[str]:
+    """Classify partial market evidence without turning it into a hard stop."""
+    reasons: list[str] = []
+    if instrument_snapshot_failed:
+        reasons.append("official_instrument_snapshot_incomplete")
+    if quality["ticker_coverage"] < TICKER_COMPLETE_COVERAGE:
+        reasons.append(
+            f"ticker_coverage={quality['ticker_coverage']:.1%}<99%"
+        )
+    if quality["candle_coverage"] < 0.95:
+        reasons.append(
+            f"candle_coverage={quality['candle_coverage']:.1%}<95%"
+        )
+    if quality["funding_coverage"] < 0.80:
+        reasons.append(
+            f"funding_coverage={quality['funding_coverage']:.1%}<80%"
+        )
+    oi_coverage = quality.get("open_interest_coverage")
+    if (
+        isinstance(oi_coverage, (int, float))
+        and not isinstance(oi_coverage, bool)
+        and oi_coverage < TICKER_COMPLETE_COVERAGE
+    ):
+        reasons.append(
+            f"open_interest_coverage={oi_coverage:.1%}<99%"
+        )
+    return reasons
+
+
+def candle_transport_receipt(
+    symbols: list[str],
+    candle_data: dict,
+    outcomes: dict[str, dict],
+) -> dict:
+    """Summarize current-cycle candle misses without changing collection policy."""
+    requested = sorted({str(symbol) for symbol in symbols if str(symbol)})
+    usable = {symbol for symbol in requested if candle_data.get(symbol)}
+    missing = [symbol for symbol in requested if symbol not in usable]
+    transport_failures: list[str] = []
+    empty_payloads: list[str] = []
+    unclassified: list[str] = []
+    error_types: dict[str, int] = {}
+    root_error_types: dict[str, int] = {}
+
+    for symbol in missing:
+        outcome = outcomes.get(symbol)
+        if isinstance(outcome, dict) and outcome.get("ok") is False:
+            transport_failures.append(symbol)
+            error_type = str(outcome.get("error_type") or "UnknownError")
+            error_types[error_type] = error_types.get(error_type, 0) + 1
+            root_error_type = str(
+                outcome.get("root_error_type") or error_type
+            )
+            root_error_types[root_error_type] = (
+                root_error_types.get(root_error_type, 0) + 1
+            )
+        elif isinstance(outcome, dict) and outcome.get("ok") is True:
+            empty_payloads.append(symbol)
+        else:
+            unclassified.append(symbol)
+
+    return {
+        "contract_version": 1,
+        "requested_symbols": len(requested),
+        "outcomes_recorded": sum(
+            1 for symbol in requested if symbol in outcomes
+        ),
+        "usable_symbols": len(usable),
+        "missing_symbols": len(missing),
+        "transport_failures": len(transport_failures),
+        "empty_payloads": len(empty_payloads),
+        "unclassified_missing": len(unclassified),
+        "error_types": {
+            key: error_types[key] for key in sorted(error_types)
+        },
+        "root_error_types": {
+            key: root_error_types[key] for key in sorted(root_error_types)
+        },
+        "transport_failure_samples": transport_failures[:8],
+        "empty_payload_samples": empty_payloads[:8],
+        "unclassified_missing_samples": unclassified[:8],
+        "historical_retry": False,
+        "unbounded_retry": False,
+    }
 
 
 
@@ -2068,6 +2256,7 @@ def main() -> int:
         # 2026-06-30 提速：candles 预取与 collect_tickers(含 funding 抓取) 并发——
         # _okx_http 已按端点分桶限速、两端点互不阻塞；candles 后台跑，collect_tickers
         # 同时抓 tickers+funding 并写库（market_con 只此主线程写），wall≈max 而非串行相加。
+        _cand_outcomes: dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=1) as _cand_ex:
             _cand_fut = _cand_ex.submit(
                 fetch_candles_batch_sync,
@@ -2075,6 +2264,7 @@ def main() -> int:
                 "15m",
                 60,
                 args.http_batch_timeout,
+                outcomes=_cand_outcomes,
             )
             tick_count, ticker_snapshot, ticker_quality = collect_tickers(
                 market_con,
@@ -2089,6 +2279,12 @@ def main() -> int:
 
         expected = len(SYMBOLS)
         candle_symbols = sum(1 for rows in _cand_data.values() if rows)
+        candle_transport = candle_transport_receipt(
+            SYMBOLS,
+            _cand_data,
+            _cand_outcomes,
+        )
+        candle_transport["batch_timeout_seconds"] = args.http_batch_timeout
         quality = {
             **ticker_quality,
             "candles": candle_symbols,
@@ -2098,10 +2294,14 @@ def main() -> int:
             "funding_coverage": round(
                 ticker_quality["funding"] / expected, 4
             ) if expected else 0.0,
+            "open_interest_coverage": round(
+                ticker_quality.get("open_interest", 0) / expected, 4
+            ) if expected else 0.0,
             "candle_coverage": round(
                 candle_symbols / expected, 4
             ) if expected else 0.0,
             "batch_timeout_s": args.http_batch_timeout,
+            "candle_transport": candle_transport,
         }
         summary["quality"] = quality
 
@@ -2138,21 +2338,10 @@ def main() -> int:
         if quality_errors and error is None:
             error = "market_quality_fail_closed: " + "; ".join(quality_errors)
 
-        degraded_reasons: list[str] = []
-        if instrument_snapshot_failed:
-            degraded_reasons.append("official_instrument_snapshot_incomplete")
-        if quality["ticker_coverage"] < TICKER_COMPLETE_COVERAGE:
-            degraded_reasons.append(
-                f"ticker_coverage={quality['ticker_coverage']:.1%}<99%"
-            )
-        if quality["candle_coverage"] < 0.95:
-            degraded_reasons.append(
-                f"candle_coverage={quality['candle_coverage']:.1%}<95%"
-            )
-        if quality["funding_coverage"] < 0.80:
-            degraded_reasons.append(
-                f"funding_coverage={quality['funding_coverage']:.1%}<80%"
-            )
+        degraded_reasons = market_degraded_reasons(
+            quality,
+            instrument_snapshot_failed=instrument_snapshot_failed,
+        )
         if degraded_reasons:
             summary["degraded"] = True
             warnings.append("market_partial: " + "; ".join(degraded_reasons))
@@ -2199,7 +2388,20 @@ def main() -> int:
 
 
 
-        error = f"{type(exc).__name__}: {exc}"
+        failure_quality = _ticker_failure_quality(exc)
+        if failure_quality is not None:
+            summary["quality"] = failure_quality
+
+
+
+        # Preserve the existing external RuntimeError category while the
+        # subclass carries structured transport evidence for parent receipts.
+        error_type = (
+            "RuntimeError"
+            if isinstance(exc, TickerTransportError)
+            else type(exc).__name__
+        )
+        error = f"{error_type}: {exc}"
 
 
 
@@ -2218,8 +2420,8 @@ def main() -> int:
         try:
             _pnow = datetime.now(timezone(timedelta(hours=8)))
             if (market_con is not None and _pnow.hour == 4 and 30 <= _pnow.minute < 45):
-                if r".\scripts" not in sys.path:
-                    sys.path.insert(0, r".\scripts")
+                if _public_project_path('scripts') not in sys.path:
+                    sys.path.insert(0, _public_project_path('scripts'))
                 import market_prune
                 _pstat = market_prune.prune(market_con, retention_days=45, apply=True)
                 print(f"[collect_data] market.db prune: {_pstat}", file=sys.stderr)
