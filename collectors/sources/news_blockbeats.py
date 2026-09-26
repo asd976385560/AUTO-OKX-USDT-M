@@ -37,16 +37,10 @@ _COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collect
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
-
-try:
-    from . import _coin_names  # noqa: E402  包内加载
-except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
-    import os as _coin_os
-    import sys as _coin_sys
-    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
-    if _SOURCES_DIR not in _coin_sys.path:
-        _coin_sys.path.insert(0, _SOURCES_DIR)
-    import _coin_names  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -63,10 +57,8 @@ DEFAULT_ENDPOINT = (
     "?size=30&type=push&lang=cn"
 )
 
-# 英文 ticker（词边界匹配，避免 ON/ARB 误命中）
-# 币名 / ticker / 中文名登记表与匹配规则统一见 _coin_names.py（2026-09-26 合并五处副本）。
-# $TICKER 形式（$BTC / $PEPE）
-# 中文币名 → ticker
+# 币种抽取：中文币名 + $TICKER + 英文 ticker，共享规范表见 _coin_names.py
+# （_extract_symbols 由其导入）
 
 
 def _fetch(url: str, timeout: int = 12) -> str:
@@ -78,11 +70,6 @@ def _fetch(url: str, timeout: int = 12) -> str:
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
-
-
-def _extract_symbols(text: str) -> list[str]:
-    """文本 → <BASE>-USDT-SWAP 列表；规则与登记表统一在 _coin_names（V3 symbols_in 同口径）。"""
-    return _coin_names.extract_symbols(text)
 
 
 # severity：critical/high 中英关键词（确定性，非 LLM）

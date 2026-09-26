@@ -38,20 +38,12 @@ _COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collect
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
-
-try:
-    from . import _coin_names  # noqa: E402  包内加载
-except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
-    import os as _coin_os
-    import sys as _coin_sys
-    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
-    if _SOURCES_DIR not in _coin_sys.path:
-        _coin_sys.path.insert(0, _SOURCES_DIR)
-    import _coin_names  # noqa: E402
 try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
     from ._news_http import fetch_text as _fetch_text_httpx  # type: ignore
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
 except ImportError:  # pragma: no cover - production imports adapters by module name
     from _news_http import fetch_text as _fetch_text_httpx  # noqa: E402
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -70,13 +62,8 @@ _ARTICLE_ID_RE = re.compile(
     re.I,
 )
 
-# ── 币种抽取 ──────────────────────────────────────────────────────────────
-# 1) 中文币名 → 符号（先匹配，避免「比特币」被英文规则漏掉）
-# 币名 / ticker / 中文名登记表与匹配规则统一见 _coin_names.py（2026-09-26 合并五处副本）。
-# 2) 英文/大写 ticker（词边界匹配；curated 避免 ON/ARB 等误命中普通词）
-# 注：Python re 把 CJK 当作 word char，`\b` 在「美国HYPE现货」里不触发 → ticker 漏抽。
-# 改用 ASCII 边界 lookaround：ticker 两侧不得是 ASCII 字母/数字（容许紧贴中文/标点），
-# 既能命中「ZEC空单」「美国HYPE」，又不会在 BITCOINIST 等更长拉丁词内部误命中。
+# ── 币种抽取：中文币名 + 英文 ticker/全称，共享规范表见 _coin_names.py ──────
+# （_extract_symbols 由其导入；「美国HYPE现货」ASCII 边界处理的说明也在该模块）
 
 # ── 规则标签（确定性；中英文关键词）─────────────────────────────────────────
 _TAG_RULES = [
@@ -242,11 +229,6 @@ def _parse_official_page(page_text: str, max_age_hours: int) -> list[dict]:
             },
         })
     return out
-
-
-def _extract_symbols(text: str) -> list[str]:
-    """文本 → <BASE>-USDT-SWAP 列表；规则与登记表统一在 _coin_names（V3 symbols_in 同口径）。"""
-    return _coin_names.extract_symbols(text)
 
 
 def _severity(title: str) -> str:

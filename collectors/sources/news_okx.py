@@ -17,16 +17,6 @@
 """
 from __future__ import annotations
 
-try:
-    from . import _coin_names  # noqa: E402  包内加载
-except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
-    import os as _coin_os
-    import sys as _coin_sys
-    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
-    if _SOURCES_DIR not in _coin_sys.path:
-        _coin_sys.path.insert(0, _SOURCES_DIR)
-    import _coin_names  # noqa: E402
-
 
 def _public_project_path(*parts):
     """Resolve this public checkout without a host-specific fallback."""
@@ -38,7 +28,6 @@ def _public_project_path(*parts):
 
 import argparse
 import json
-import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -52,6 +41,10 @@ for _p in (_COLLECTORS, _SCRIPTS):
 
 import news_writer  # noqa: E402
 from _okxcli import okx_json  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._coin_names import instrument_for_ticker  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _coin_names import instrument_for_ticker  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -68,7 +61,7 @@ _COLD_RETRY_DELAY_SECONDS = 3.0
 _COLD_RETRY_TIMEOUT_SECONDS = 4.0
 _MAX_FETCH_PHASES_PER_ENDPOINT = 3
 
-# 币名 / ticker / 中文名登记表与匹配规则统一见 _coin_names.py（2026-09-26 合并五处副本）。
+# ccyList / ccySentiments 里的 ccy 经共享规范表映射到合约（_coin_names.instrument_for_ticker）
 
 
 def _ms_to_cst(value) -> str | None:
@@ -92,17 +85,16 @@ def _importance_to_level_sev(importance: str | None) -> tuple[str, str]:
 
 
 def _symbols_from_item(item: dict) -> list[str]:
-    """OKX 资讯 ccyList / ccySentiments 的币种代码 → 合约（登记表统一在 _coin_names）。"""
     out: list[str] = []
     for ccy in item.get("ccyList") or []:
-        sym = _coin_names.swap_symbol(ccy)
+        sym = instrument_for_ticker(ccy)
         if sym and sym not in out:
             out.append(sym)
     # ccySentiments 可能带币
     for s in item.get("ccySentiments") or []:
         if not isinstance(s, dict):
             continue
-        sym = _coin_names.swap_symbol(s.get("ccy"))
+        sym = instrument_for_ticker(s.get("ccy"))
         if sym and sym not in out:
             out.append(sym)
     return out

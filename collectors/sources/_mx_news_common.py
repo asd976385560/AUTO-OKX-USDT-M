@@ -8,21 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 from datetime import datetime
 from typing import Any
 
 import httpx
 
-try:
-    from . import _coin_names  # noqa: E402  包内加载
-except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
-    import os as _coin_os
-    import sys as _coin_sys
-    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
-    if _SOURCES_DIR not in _coin_sys.path:
-        _coin_sys.path.insert(0, _SOURCES_DIR)
-    import _coin_names  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._coin_names import extract_symbols as _symbols  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _coin_names import extract_symbols as _symbols  # noqa: E402
 
 ENDPOINT = "https://mkapi2.dfcfs.com/finskillshub/api/claw/news-search"
 DEFAULT_TIMEOUT_SEC = 8.0
@@ -44,10 +38,7 @@ _HIGH = (
     "降息", "加息", "战争", "军事", "冲突", "制裁", "核", "导弹",
     "经济危机", "金融风险", "黑天鹅", "主权债务", "革命", "政变", "紧急状态",
 )
-# 本源私有补充名（公共表见 _coin_names.py）：ASCII 名整词、中文名子串。
-_EXTRA_NAMES = {
-    "OKX平台币": "OKB", "欧易平台币": "OKB", "Trump": "TRUMP", "Allo": "ALLO",
-}
+# 币种抽取走共享规范表 _coin_names.py（_symbols 由其导入）
 
 
 def api_key() -> str | None:
@@ -93,11 +84,6 @@ def _event_time(value: Any) -> str | None:
         )
     except ValueError:
         return None
-
-
-def _symbols(text: str) -> list[str]:
-    """文本 → 合约列表：公共登记表（_coin_names）+ 本源私有补充名（OKB/ALLO/TRUMP）。"""
-    return _coin_names.extract_symbols(text, extra_names=_EXTRA_NAMES)
 
 
 def normalize(row: dict, *, source: str, fingerprint_prefix: str,

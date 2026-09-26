@@ -16,6 +16,17 @@ All notable public-release changes are recorded here. Public versions follow
 
 ### Changed
 
+- Consolidated the duplicated coin-name extraction in the RSS, Jinse, PANews, Odaily,
+  BlockBeats, OKX news and MX news adapters into one shared table and matcher
+  (`collectors/sources/_coin_names.py`). Bare tickers now match only in uppercase
+  (or with a `$` prefix) so ordinary English words such as "cap", "near" or "lit"
+  no longer produce symbols; English full names stay case-insensitive.
+  `news_okx_announcements.py` keeps its announcement-specific extraction.
+- The shared coin-name matcher also follows the V3 news rules: bare tickers must
+  be at least three letters (two-letter tickers such as OP only match as `$OP`),
+  stablecoins are recognised but never emitted as instruments, symbols are
+  ordered by first mention across English and Chinese names, and at most ten
+  symbols are kept per text.
 - Similarity retrieval now scores experiences in a v4 feature space aligned with
   the V3 similarity design: 1H ATR%, RSI, EMA20/50/200 alignment, 4h/16h returns,
   volume z-score, stop distance and opening hour combined by geometric mean, with
@@ -31,10 +42,6 @@ All notable public-release changes are recorded here. Public versions follow
   clamp(1 × ATR1h, 3%, 6%) with a 4% default, take-profit +5%, same-bar double
   touches count as `ambiguous` instead of losses, and rows carry a `sim_rule` tag
   so results computed under the previous rule stay frozen.
-- News collectors share one coin-name table with V3's matching rules: the longest
-  name wins ("Bitcoin Cash" is BCH, "Ethereum Classic" is ETC), bare tickers must
-  be upper-case and at least three letters, Polygon maps to POL and stablecoins
-  are not emitted.
 - Optimized the experience-feature derivation shared by the trade experience
   writer, the similarity finder and the instrument context against the V3
   similarity design: the strict 24h volatility window now anchors to the 15m bar
@@ -51,6 +58,10 @@ All notable public-release changes are recorded here. Public versions follow
 
 ### Fixed
 
+- "Bitcoin Cash" / "比特币现金" now map to BCH only and "Ethereum Classic" /
+  "以太经典" to ETC only, instead of also emitting the parent chain.
+- Polygon mentions (POLYGON / MATIC / $MATIC) now map to `POL-USDT-SWAP` instead of
+  the delisted `MATIC-USDT-SWAP`, in text extraction and in OKX news `ccyList`.
 - The trade experience writer now stamps `path_metric_version` from the single
   path-metrics source instead of a stale literal, so freshly closed rows are no
   longer re-flagged as outdated by the backfill or read under the retired

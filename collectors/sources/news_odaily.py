@@ -38,20 +38,12 @@ _COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collect
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
-
-try:
-    from . import _coin_names  # noqa: E402  包内加载
-except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
-    import os as _coin_os
-    import sys as _coin_sys
-    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
-    if _SOURCES_DIR not in _coin_sys.path:
-        _coin_sys.path.insert(0, _SOURCES_DIR)
-    import _coin_names  # noqa: E402
 try:
     from ._news_http import fetch_text as _fetch_text_alternate  # type: ignore
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
 except ImportError:
     from _news_http import fetch_text as _fetch_text_alternate  # noqa: E402
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -74,10 +66,8 @@ REQ_HEADERS = {
     "Origin": "https://www.odaily.news",
 }
 
-# 币种抽取：英文 ticker（词边界，避免 ON/ARB 等误命中普通词）
-# 币名 / ticker / 中文名登记表与匹配规则统一见 _coin_names.py（2026-09-26 合并五处副本）。
-# $TICKER 形式（$BTC / $HYPE）
-# 中文币名 → SYM（确定性字典）
+# 币种抽取：英文 ticker/全称 + $TICKER + 中文币名，共享规范表见 _coin_names.py
+# （_extract_symbols 由其导入）
 
 # 规则标签（确定性，中英双语关键词）
 _TAG_RULES = [
@@ -127,11 +117,6 @@ def _strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s)
     s = _html.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
-
-
-def _extract_symbols(text: str) -> list[str]:
-    """文本 → <BASE>-USDT-SWAP 列表；规则与登记表统一在 _coin_names（V3 symbols_in 同口径）。"""
-    return _coin_names.extract_symbols(text)
 
 
 def _severity(text: str, is_important: bool = False) -> str:
