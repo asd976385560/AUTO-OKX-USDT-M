@@ -5,6 +5,16 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the push-payload builder joining its read-only SQLite URI with a hard-coded
+  backslash, which only Windows treats as a path separator. On Linux and macOS every
+  `build_push_payload` ledger lookup silently returned no rows and WAIT reports were
+  refused as unreadable; the builder now uses the shared portable `connect_ro` helper.
+- Restored Python 3.11 compatibility for the tmp cleanup script (a multi-line
+  f-string replacement field is Python 3.12-only syntax) and removed a
+  same-millisecond race from the collection-failure inspection regression fixture.
+
 ## [1.1.2] - 2026-09-14
 
 ### Added
