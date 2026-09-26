@@ -5,6 +5,22 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidated the duplicated coin-name extraction in the RSS, Jinse, PANews, Odaily,
+  BlockBeats, OKX news and MX news adapters into one shared table and matcher
+  (`collectors/sources/_coin_names.py`). Bare tickers now match only in uppercase
+  (or with a `$` prefix) so ordinary English words such as "cap", "near" or "lit"
+  no longer produce symbols; English full names stay case-insensitive.
+  `news_okx_announcements.py` keeps its announcement-specific extraction.
+
+### Fixed
+
+- "Bitcoin Cash" / "比特币现金" now map to BCH only and "Ethereum Classic" /
+  "以太经典" to ETC only, instead of also emitting the parent chain.
+- Polygon mentions (POLYGON / MATIC / $MATIC) now map to `POL-USDT-SWAP` instead of
+  the delisted `MATIC-USDT-SWAP`, in text extraction and in OKX news `ccyList`.
+
 ## [1.1.2] - 2026-09-14
 
 ### Added

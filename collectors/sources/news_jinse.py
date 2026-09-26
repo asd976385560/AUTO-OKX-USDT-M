@@ -37,8 +37,10 @@ if _COLLECTORS not in sys.path:
 import news_writer  # noqa: E402
 try:
     from ._news_http import fetch_text as _fetch_text_alternate  # type: ignore
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
 except ImportError:
     from _news_http import fetch_text as _fetch_text_alternate  # noqa: E402
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -61,38 +63,8 @@ LIVE_LINK_PREFIX = "https://m.jinse.com.cn/lives/"
 
 SOURCE_ID = "jinse"
 
-# ── 币种抽取：英文 ticker（词边界）+ 中文币名映射 ──────────────────────────
-_COINS = [
-    "BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "SOLANA", "XRP", "RIPPLE",
-    "BNB", "DOGE", "DOGECOIN", "ADA", "CARDANO", "AVAX", "LINK", "CHAINLINK",
-    "TRX", "TRON", "TON", "DOT", "POLKADOT", "MATIC", "POLYGON", "SHIB",
-    "LTC", "LITECOIN", "BCH", "UNI", "AAVE", "ARB", "ARBITRUM", "OP",
-    "OPTIMISM", "SUI", "APT", "APTOS", "INJ", "SEI", "TIA", "PEPE", "WIF",
-    "NEAR", "FIL", "ATOM", "ETC", "XLM", "ICP", "HBAR", "RNDR", "RENDER",
-    "HYPE", "ORDI", "BLUR", "JTO", "PYTH", "STX", "RUNE", "FTM",
-]
-_COIN_TO_SYM = {
-    "BITCOIN": "BTC", "ETHEREUM": "ETH", "SOLANA": "SOL", "RIPPLE": "XRP",
-    "DOGECOIN": "DOGE", "CARDANO": "ADA", "CHAINLINK": "LINK", "TRON": "TRX",
-    "POLKADOT": "DOT", "POLYGON": "MATIC", "LITECOIN": "LTC", "ARBITRUM": "ARB",
-    "OPTIMISM": "OP", "APTOS": "APT", "RENDER": "RNDR",
-}
-# 边界用「非 ASCII 字母数字」前后视（而非 \b）——中文与 ticker 直接相邻时
-# Python \b 失效（CJK 也是 \w，"中BTC和" 无 ASCII 边界），故用 (?<![A-Za-z0-9])
-# 显式排除两侧 ASCII 字母数字，CJK/标点/空白/串首尾均算边界。
-_COIN_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + "|".join(sorted(_COINS, key=len, reverse=True))
-    + r")(?![A-Za-z0-9])", re.I)
-
-# 中文币名 → SYM（子串匹配，确定性 dict）
-_ZH_COIN = {
-    "比特币": "BTC", "以太坊": "ETH", "以太币": "ETH", "索拉纳": "SOL",
-    "瑞波": "XRP", "瑞波币": "XRP", "狗狗币": "DOGE", "狗狗": "DOGE",
-    "莱特币": "LTC", "卡尔达诺": "ADA", "波卡": "DOT", "波场": "TRX",
-    "柚子": "EOS", "门罗": "XMR", "艾达": "ADA", "雪崩": "AVAX",
-    "比特现金": "BCH", "恒星": "XLM", "狗币": "DOGE", "屎币": "SHIB",
-    "佩佩": "PEPE",
-}
+# ── 币种抽取：英文 ticker/全称 + 中文币名，共享规范表见 _coin_names.py ──────
+# （_extract_symbols 由其导入；ASCII 边界 lookaround 的说明也在该模块）
 
 # ── 规则标签（确定性，中英双语关键词）─────────────────────────────────────
 _TAG_RULES = [
@@ -127,25 +99,6 @@ def _fetch_alternate(url: str, timeout: int = 6) -> str:
     """Retry the same publisher URL through the bounded alternate TLS chain."""
     return _fetch_text_alternate(
         url, timeout=float(timeout), headers=REQ_HEADERS)
-
-
-def _extract_symbols(text: str) -> list[str]:
-    found: list[str] = []
-    text = text or ""
-    # 英文 ticker / 英文币名（词边界）
-    for m in _COIN_RE.finditer(text):
-        tok = m.group(1).upper()
-        sym = _COIN_TO_SYM.get(tok, tok)
-        inst = f"{sym}-USDT-SWAP"
-        if inst not in found:
-            found.append(inst)
-    # 中文币名（子串）
-    for zh, sym in _ZH_COIN.items():
-        if zh in text:
-            inst = f"{sym}-USDT-SWAP"
-            if inst not in found:
-                found.append(inst)
-    return found
 
 
 def _severity(text: str) -> str:
