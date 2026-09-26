@@ -105,6 +105,29 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
             connection.close()
         self.assertIsNone(result["vol_24h_pct"])
 
+    def test_similarity_v2_trend_keys_go_through_the_finite_gate(self) -> None:
+        base = {
+            "asset_class": "crypto", "side": "long", "action": "open",
+            "regime": "range", "stop_distance_pct": 0.04, "trend_4h": 1,
+        }
+        query = {**base, "trend_1h": 1}
+        missing = _simutil.similarity_v2(query, {**base, "trend_1h": None})
+        self.assertLess(missing, _simutil.similarity_v2(query, query))
+        # 非有限 / 非数字的趋势值 = 缺失：既不算 0 分，也不能让 True 冒充 1
+        for bad in (float("nan"), float("inf"), True, "up", "", "1x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    missing, _simutil.similarity_v2(query, {**base, "trend_1h": bad}))
+        # 1.0 / "1" 与 1 是同一个趋势值；-1 才是错配
+        self.assertEqual(
+            _simutil.similarity_v2(query, query),
+            _simutil.similarity_v2(query, {**base, "trend_1h": 1.0}))
+        self.assertEqual(
+            _simutil.similarity_v2(query, query),
+            _simutil.similarity_v2(query, {**base, "trend_1h": "1"}))
+        self.assertLess(
+            _simutil.similarity_v2(query, {**base, "trend_1h": -1}), missing)
+
     def test_similarity_v3_refuses_v2_and_wrong_epoch(self) -> None:
         base = {
             "asset_class": "crypto", "side": "long", "action": "open",

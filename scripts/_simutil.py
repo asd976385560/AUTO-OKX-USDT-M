@@ -222,7 +222,8 @@ def similarity_v2(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
             continue
         scores.append(math.exp(-abs(q - r) / scale))
     for key in V2_TREND_KEYS:
-        q, r = qf.get(key), rf.get(key)
+        # 趋势值同样过有限性门（NaN/inf/bool/坏字符串 → 缺失，不冒充 0 分或误配 True==1）。
+        q, r = _trend_int(qf.get(key)), _trend_int(rf.get(key))
         if q is None or r is None:
             continue
         scores.append(1.0 if q == r else 0.0)
