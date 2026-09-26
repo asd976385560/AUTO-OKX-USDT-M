@@ -264,6 +264,38 @@ class Sim2rAtrTests(unittest.TestCase):
                 con, "AAA-USDT-SWAP", "2026-08-20T02:00:00Z", 100.0))
         con.close()
 
+    def test_atr_excludes_the_1h_bar_still_open_at_the_slot(self):
+        con = sqlite3.connect(":memory:")
+        con.execute(
+            "CREATE TABLE kline_cache (symbol TEXT, tf TEXT, ts TEXT, "
+            "o REAL, h REAL, l REAL, c REAL, atr14 REAL)")
+        hour = datetime(2026, 8, 20, 2, 0)   # 槽位 02:15Z 所在的 1H 开盘时刻
+        rows = []
+        for index in range(15):
+            ts = (hour - timedelta(hours=15 - index)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rows.append(("AAA-USDT-SWAP", "1H", ts, 100.0, 102.0, 98.0, 100.0, 9.0))
+        # 02:00Z 这根在 02:15Z 时还没收盘：它的巨幅波动与存列 atr14 都不得进入
+        rows.append(("AAA-USDT-SWAP", "1H", "2026-08-20T02:00:00Z",
+                     100.0, 150.0, 50.0, 100.0, 99.0))
+        con.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?)", rows)
+        self.assertAlmostEqual(
+            4.0,
+            missed_opps_writer._atr_pct_1h(
+                con, "AAA-USDT-SWAP", "2026-08-20T02:15:00Z", 100.0))
+        # 03:00Z 时它已收盘：TR=100 进入 14 根均值
+        self.assertAlmostEqual(
+            (13 * 4.0 + 100.0) / 14.0,
+            missed_opps_writer._atr_pct_1h(
+                con, "AAA-USDT-SWAP", "2026-08-20T03:00:00Z", 100.0))
+        con.execute("DELETE FROM kline_cache WHERE ts<?",
+                    ("2026-08-19T20:00:00Z",))
+        # 退回存列时同样只看已收盘那根（01:00Z 的 9），不是 02:00Z 的 99
+        self.assertAlmostEqual(
+            9.0,
+            missed_opps_writer._atr_pct_1h(
+                con, "AAA-USDT-SWAP", "2026-08-20T02:15:00Z", 100.0))
+        con.close()
+
     def test_long_hit_tp_first(self):
         # 入场 100、ATR=1 → 1% 抬到 3% 下限（97）、TP 固定 5%（105）
         bars = self._bars(self.SLOT, 96)

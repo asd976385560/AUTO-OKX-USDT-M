@@ -69,6 +69,11 @@ All notable public-release changes are recorded here. Public versions follow
 - The per-symbol funding-rate fallback now caps its remaining budget at the
   caller's original timeout; on coarse monotonic clocks a rounding error could
   previously hand it a budget slightly larger than requested.
+- Market features derived as-of a timestamp (the 24h volatility window, the
+  1H/4H MA trends, the 1H indicators and the missed-opportunity ATR) now use
+  only bars that had closed by that instant. The bar still open at the as-of
+  time was previously included, so backfilled and recomputed historical
+  features could see prices from after the decision.
 - Fixed the push-payload builder joining its read-only SQLite URI with a hard-coded
   backslash, which only Windows treats as a path separator. On Linux and macOS every
   `build_push_payload` ledger lookup silently returned no rows and WAIT reports were

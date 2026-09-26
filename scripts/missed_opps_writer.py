@@ -131,12 +131,23 @@ def sim_outcome(tp_index, sl_index) -> str:
     return "neither"
 
 
+def _closed_1h_cutoff(t0_utcz: str) -> str:
+    """t0 前已收盘 1H bar 的最晚开盘时刻 = t0 − 1h（kline_cache.ts 是开盘时刻，收盘 = ts + 1h）。"""
+    t0 = datetime.strptime(t0_utcz, "%Y-%m-%dT%H:%M:%SZ")
+    return (t0 - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _atr_pct_1h(mkt, sym: str, t0_utcz: str, px0: float):
-    """判断时刻前 14 根已收盘 1H 真实波幅均值 / 入场价（%）；退回存列 atr14；都无 → None。"""
+    """判断时刻前 14 根**已收盘** 1H 真实波幅均值 / 入场价（%）；退回存列 atr14；都无 → None。
+
+    t0 所在的那根 1H（ts = floor(t0, 1h)）在 t0 时还没收盘，它的 h/l/c 与存列
+    atr14 都是事后才定的，算进去就是前视；两条查询都只取 ts ≤ t0 − 1h。
+    """
+    cutoff = _closed_1h_cutoff(t0_utcz)
     rows = mkt.execute(
-        "SELECT h, l, c FROM kline_cache WHERE symbol=? AND tf='1H' AND ts<? "
+        "SELECT h, l, c FROM kline_cache WHERE symbol=? AND tf='1H' AND ts<=? "
         "ORDER BY ts DESC LIMIT ?",
-        (sym, t0_utcz, SIM_ATR_BARS + 1),
+        (sym, cutoff, SIM_ATR_BARS + 1),
     ).fetchall()
     rows = list(reversed(rows))
     if len(rows) == SIM_ATR_BARS + 1:
@@ -157,7 +168,7 @@ def _atr_pct_1h(mkt, sym: str, t0_utcz: str, px0: float):
     stored = mkt.execute(
         "SELECT atr14 FROM kline_cache WHERE symbol=? AND tf='1H' "
         "AND ts<=? AND atr14 IS NOT NULL ORDER BY ts DESC LIMIT 1",
-        (sym, t0_utcz),
+        (sym, cutoff),
     ).fetchone()
     if stored and stored[0] is not None:
         try:

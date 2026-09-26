@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """2026-09-26 对照 V3 similarity 模块优化 V2 经验特征派生的回归覆盖。
 
-覆盖：15m 栅格锚定的严格 24h 窗（非栅格 as_of 也能给数）、字段子集只跑对应
+覆盖：K 线 as-of 只取已收盘 bar、15m 栅格锚定的严格 24h 窗（非栅格 as_of 也能给数）、字段子集只跑对应
 查询、执行包三价推 planned_rr、writer / finder / 特征脚本共用装配、版本分布与
 finder 共用 exact-epoch 判定、贴近度的有限性门、Wilson 下界与加权统计、
 path_metric_version 单一真源。
@@ -48,21 +48,24 @@ def _market(with_derivatives: bool = True) -> sqlite3.Connection:
 
 def _fill_15m(connection: sqlite3.Connection, upper: datetime,
               count: int = 96, prices=(110.0, 90.0, 100.0)) -> None:
+    """upper 前 24h 的已收盘 15m bar：upper−24h … upper−15m（upper 所属 bar 未收盘）。"""
     lower = upper - timedelta(hours=24)
     rows = [
         ("BTC-USDT-SWAP", "15m",
          (lower + timedelta(minutes=15 * index)).strftime(UTC_FMT), *prices)
-        for index in range(1, count + 1)
+        for index in range(count)
     ]
     connection.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?)", rows)
 
 
 def _fill_trend(connection: sqlite3.Connection, tf: str, count: int,
                 upper: datetime, null_at: int | None = None) -> None:
+    """count 根已收盘 bar，最后一根 = upper 所属栅格的前一根（upper 所属 bar 未收盘）。"""
     step = timedelta(hours=1 if tf == "1H" else 4)
+    last = features.last_closed_bar_open(upper, step)
     rows = []
     for index in range(count):
-        ts = upper - step * (count - 1 - index)
+        ts = last - step * (count - 1 - index)
         close = None if index == null_at else 100.0 + index
         rows.append(("BTC-USDT-SWAP", tf, ts.strftime(UTC_FMT), close, close, close))
     connection.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?)", rows)
@@ -90,9 +93,8 @@ class StrictWindowGridTests(unittest.TestCase):
             self.assertIsNone(result["vol_24h_pct"])
             connection.execute(
                 "INSERT INTO kline_cache VALUES(?,?,?,?,?,?)",
-                ("BTC-USDT-SWAP", "15m",
-                 (UPPER + timedelta(minutes=15)).strftime(UTC_FMT),
-                 130.0, 90.0, 100.0))
+                ("BTC-USDT-SWAP", "15m", UPPER.strftime(UTC_FMT),
+                 130.0, 90.0, 100.0))   # 01:15 CST 时 17:00Z 这根已收盘
             result = features.derive_market_features(
                 connection, "BTC-USDT-SWAP", "2026-08-31 01:15:00")
             self.assertEqual(0.4, result["vol_24h_pct"])
@@ -118,6 +120,97 @@ class StrictWindowGridTests(unittest.TestCase):
             connection.close()
         self.assertEqual(
             {key: None for key in features.MARKET_FEATURE_KEYS}, result)
+
+
+class ClosedBarCutoffTests(unittest.TestCase):
+    """kline_cache.ts 是开盘时刻：as_of 所属的 bar 还没收盘，不得进入 as-of 特征。"""
+
+    def test_open_15m_bar_is_excluded_until_it_closes(self) -> None:
+        connection = _market()
+        _fill_15m(connection, UPPER)                       # 最后一根 16:45Z
+        connection.execute(
+            "INSERT INTO kline_cache VALUES(?,?,?,?,?,?)",
+            ("BTC-USDT-SWAP", "15m", UPPER.strftime(UTC_FMT), 1000.0, 90.0, 100.0))
+        try:
+            inside = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T17:07:00Z",
+                fields=("vol_24h_pct",))
+            at_open = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T17:00:00Z",
+                fields=("vol_24h_pct",))
+            after_close = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T17:15:00Z",
+                fields=("vol_24h_pct",))
+        finally:
+            connection.close()
+        # 17:00Z 这根（h=1000）在 17:07Z / 17:00:00Z 都还在走；17:15Z 收盘后才算进去
+        self.assertEqual(0.2, inside["vol_24h_pct"])
+        self.assertEqual(0.2, at_open["vol_24h_pct"])
+        self.assertEqual(9.1, after_close["vol_24h_pct"])
+
+    def test_open_trend_bars_are_excluded_until_they_close(self) -> None:
+        connection = _market()
+        rows = []
+        for tf, step in (("1H", timedelta(hours=1)), ("4H", timedelta(hours=4))):
+            last = features.last_closed_bar_open(UPPER, step)   # 16:00Z / 12:00Z
+            for index in range(50):
+                ts = last - step * index
+                rows.append(("BTC-USDT-SWAP", tf, ts.strftime(UTC_FMT),
+                             100.0, 100.0, 100.0))
+            # UPPER 所属的那根（17:00Z 的 1H / 16:00Z 的 4H）还在走，收盘价会把趋势拉成 +1
+            rows.append(("BTC-USDT-SWAP", tf, (last + step).strftime(UTC_FMT),
+                         200.0, 200.0, 200.0))
+        connection.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?)", rows)
+        try:
+            inside = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T17:07:00Z",
+                fields=("trend_1h", "trend_4h"))
+            closed_1h = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T18:00:00Z",
+                fields=("trend_1h", "trend_4h"))
+            closed_4h = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T20:00:00Z",
+                fields=("trend_4h",))
+        finally:
+            connection.close()
+        self.assertEqual({"trend_1h": 0, "trend_4h": 0}, inside)
+        self.assertEqual({"trend_1h": 1, "trend_4h": 0}, closed_1h)
+        self.assertEqual({"trend_4h": 1}, closed_4h)
+
+    def test_open_1h_bar_is_excluded_from_indicators(self) -> None:
+        connection = _market()
+        last = features.last_closed_bar_open(UPPER, timedelta(hours=1))   # 16:00Z
+        rows = [
+            ("BTC-USDT-SWAP", "1H", (last - timedelta(hours=index)).strftime(UTC_FMT),
+             100.0, 100.0, 100.0)
+            for index in range(30)
+        ]
+        rows.append(("BTC-USDT-SWAP", "1H", UPPER.strftime(UTC_FMT), 110.0, 90.0, 100.0))
+        connection.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?)", rows)
+        try:
+            inside = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T17:07:00Z",
+                fields=("atr_pct_1h",))
+            closed = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-30T18:00:00Z",
+                fields=("atr_pct_1h",))
+        finally:
+            connection.close()
+        self.assertEqual(0.0, inside["atr_pct_1h"])      # 17:00Z 的振幅 17:07Z 时看不到
+        self.assertGreater(closed["atr_pct_1h"], 0.0)
+
+    def test_last_closed_bar_open_on_and_off_the_grid(self) -> None:
+        hour = timedelta(hours=1)
+        self.assertEqual(
+            datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc),
+            features.last_closed_bar_open(datetime(2026, 8, 30, 17, 7, tzinfo=timezone.utc), hour))
+        self.assertEqual(
+            datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc),
+            features.last_closed_bar_open(datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc), hour))
+        self.assertEqual(
+            datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+            features.last_closed_bar_open(
+                datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc), timedelta(hours=4)))
 
 
 class SubsetAndTrendTests(unittest.TestCase):
@@ -311,7 +404,7 @@ class IndicatorCacheTests(unittest.TestCase):
             for row in rows:
                 features.features_v4_for_row(row, Path(temporary), market, cache)
         market.close()
-        # 同一小时内两个不同时刻 → 两个键，各自按自己的 ts<=as_of 查 K 线，无前视
+        # 同一小时内两个不同时刻 → 两个键，各自按自己的 as_of 查已收盘 K 线，无前视
         self.assertEqual(
             {("BTC-USDT-SWAP", "2026-08-30T16:05:00Z"),
              ("BTC-USDT-SWAP", "2026-08-30T16:50:00Z")},

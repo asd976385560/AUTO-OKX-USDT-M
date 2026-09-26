@@ -40,14 +40,17 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
             features._cst_to_utcz("2026-08-31T01:00:00+08:00"),
         )
 
-    def test_strict_24h_window_excludes_lower_and_same_day_older_rows(self) -> None:
+    def test_strict_24h_window_excludes_lower_open_bar_and_older_rows(self) -> None:
         connection = self._market()
-        upper = datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc)
-        lower = upper - timedelta(hours=24)
+        upper = datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc)   # as_of；这根 15m 还没收盘
+        last_closed = upper - timedelta(minutes=15)
+        lower = last_closed - timedelta(hours=24)                    # 严格下界，不含
         rows = [
             ("BTC-USDT-SWAP", "15m", "2026-08-29T00:00:00Z",
              1000.0, 1.0, 100.0),
             ("BTC-USDT-SWAP", "15m", lower.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             900.0, 2.0, 100.0),
+            ("BTC-USDT-SWAP", "15m", upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
              900.0, 2.0, 100.0),
         ]
         for index in range(1, 97):

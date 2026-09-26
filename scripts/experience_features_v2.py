@@ -8,8 +8,8 @@ r"""experience_features_v2.py — 经验特征派生（v2 冻结、v3 前向启�
                      risk_reward entry/stop/target 几何重算（旧卡），或
                      open_execution_package_v1 三价几何重算（最小闭环执行包）
   funding_rate       market.db.derivatives 最近一条 ≤ as_of（4h 内，否则 None）
-  vol_24h_pct        15m K 线 as_of 前 24h (max(h)-min(l))/last(c)
-  trend_1h/4h        1H/4H K 线 as_of 时 MA20 vs MA50（+1/-1；bars<50=None）
+  vol_24h_pct        as_of 前最后 96 根已收盘 15m K 线 (max(h)-min(l))/last(c)
+  trend_1h/4h        as_of 前已收盘的 1H/4H K 线 MA20 vs MA50（+1/-1；bars<50=None）
 
 现有 v2 向量按历史证据冻结，不回填、不重算。部署后 writer 仅新增带明确
 ``experience_features_v3_strict_24h`` epoch 的 v3；finder 也只在完全相同的
@@ -35,6 +35,11 @@ v3 epoch 内比较，禁止 v2/v3 静默混算。CLI 仅报告版本分布，--a
 开仓 UTC 小时；writer 落 v4（另存 features_v3 供追溯），finder 在 v4 空间比较，
 历史 v1/v2/v3 行由 features_v4_for_row 按行 ts 从 kline_cache 现算（确定性、
 无前视）——V3 对 legacy 行也是"有什么特征比什么"，不再以 epoch 一刀切排除。
+
+K 线 as-of 口径：kline_cache.ts 是开盘时刻，as_of 所属的那根 bar 还没收盘，其
+h/l/c 要到收盘才定；波幅窗 / MA 趋势 / 1H 指标一律只取 ts ≤ floor(as_of, bar) − bar
+的已收盘 bar（V3 只入库已收盘柱，天然如此），否则回填与历史行现算会把之后的价格
+算进 as-of 特征。
 """
 from __future__ import annotations
 
@@ -72,6 +77,9 @@ if hasattr(sys.stdout, "reconfigure"):
 CST = timezone(timedelta(hours=8))
 UTC_Z_FMT = "%Y-%m-%dT%H:%M:%SZ"
 BAR_15M = timedelta(minutes=15)
+BAR_1H = timedelta(hours=1)
+BAR_4H = timedelta(hours=4)
+_TF_BARS = {"15m": BAR_15M, "1H": BAR_1H, "4H": BAR_4H}
 VOL_WINDOW_BARS = 96                      # 24h / 15m
 FUNDING_LOOKBACK = timedelta(hours=4)
 TREND_FAST_BARS = 20
@@ -127,12 +135,22 @@ def _floor_to_bar(dt: datetime, bar: timedelta = BAR_15M) -> datetime:
     return datetime.fromtimestamp(epoch - epoch % seconds, tz=timezone.utc)
 
 
+def last_closed_bar_open(as_of: datetime, bar: timedelta) -> datetime:
+    """as_of 时刻最后一根**已收盘** bar 的开盘时刻（UTC 栅格）。
+
+    kline_cache.ts 是开盘时刻，收盘 = ts + bar；as_of 所属的那根 bar 仍在走，
+    它的 h/l/c 在 as_of 之后才定，回填 / 历史行现算时把它算进去就是前视。
+    因此 K 线 as-of 查询一律取 ts ≤ floor(as_of, bar) − bar。
+    """
+    return _floor_to_bar(as_of, bar) - bar
+
+
 def _finite(value: Any) -> Optional[float]:
     return _simutil._finite(value)
 
 
 # ---------------------------------------------------------------------------
-# 市场态（as-of，严格 ``(lower, as_of]`` 窗）
+# 市场态（as-of：K 线只用 as_of 前已收盘的 bar；funding 取 ``(as_of−4h, as_of]`` 内最近快照）
 # ---------------------------------------------------------------------------
 def _funding_rate(mcon: sqlite3.Connection, symbol: str,
                   as_of: datetime) -> Optional[float]:
@@ -145,8 +163,8 @@ def _funding_rate(mcon: sqlite3.Connection, symbol: str,
 
 def _vol_24h_pct(mcon: sqlite3.Connection, symbol: str,
                  as_of: datetime) -> Optional[float]:
-    """恰好 96 根不重复 15m bar（锚定到 as_of 所属栅格点）才给数，否则 None。"""
-    anchor = _floor_to_bar(as_of)
+    """恰好 96 根不重复、已收盘的 15m bar（锚 = as_of 前最后一根已收盘 bar）才给数，否则 None。"""
+    anchor = last_closed_bar_open(as_of, BAR_15M)
     lower = anchor - VOL_WINDOW_BARS * BAR_15M
     bars = mcon.execute(
         "SELECT ts, h, l, c FROM kline_cache WHERE symbol=? AND tf='15m' "
@@ -173,11 +191,12 @@ def _vol_24h_pct(mcon: sqlite3.Connection, symbol: str,
 
 def _ma_trend(mcon: sqlite3.Connection, symbol: str, tf: str,
               as_of: datetime) -> Optional[int]:
-    """MA20 vs MA50（收盘价，升序求和与历史实现逐字节一致）；不足 50 根 → None。"""
+    """MA20 vs MA50（只用 as_of 前已收盘 bar 的收盘价，升序求和与历史实现逐字节一致）；不足 50 根 → None。"""
     rows = mcon.execute(
         "SELECT c FROM kline_cache WHERE symbol=? AND tf=? AND ts<=? "
         "ORDER BY ts DESC LIMIT ?",
-        (symbol, tf, _utcz(as_of), TREND_SLOW_BARS)).fetchall()
+        (symbol, tf, _utcz(last_closed_bar_open(as_of, _TF_BARS[tf])),
+         TREND_SLOW_BARS)).fetchall()
     closes = [c for c in (_finite(row[0]) for row in rows) if c is not None]
     if len(closes) < TREND_SLOW_BARS:
         return None
@@ -189,8 +208,9 @@ def _ma_trend(mcon: sqlite3.Connection, symbol: str, tf: str,
 
 def _indicators_1h(mcon: sqlite3.Connection, symbol: str,
                    as_of: datetime) -> dict[str, Any]:
-    """as-of 之前（含）最多 500 根 1H K 线 → V3 同口径指标（见 _simutil.compute_indicators_1h）。"""
-    params = (symbol, _utcz(as_of), _simutil.INDICATOR_1H_BARS)
+    """as-of 前最多 500 根**已收盘** 1H K 线 → V3 同口径指标（见 _simutil.compute_indicators_1h）。"""
+    params = (symbol, _utcz(last_closed_bar_open(as_of, BAR_1H)),
+              _simutil.INDICATOR_1H_BARS)
     try:
         rows = mcon.execute(
             "SELECT h, l, c, v FROM kline_cache WHERE symbol=? AND tf='1H' "
@@ -212,7 +232,7 @@ def derive_market_features(
     as_of_cst: Any,
     fields: Iterable[str] = MARKET_FEATURE_KEYS,
 ) -> dict[str, Any]:
-    """funding / vol / trend / 1H 指标 as-of（严格 ``(lower, as_of]`` 窗）。
+    """funding / vol / trend / 1H 指标 as-of（K 线只用 as_of 前已收盘的 bar；funding 严格 ``(as_of−4h, as_of]``）。
 
     ``fields`` 只取子集时仅执行对应查询；返回 dict 的键 = 请求的合法键
     （按 MARKET_FEATURE_KEYS 顺序），缺数据一律 None，如实留空。
