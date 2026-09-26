@@ -14,6 +14,11 @@
     age_decay = 0.5 ^ (age_days / 60)（半衰期 60 天，用邻居平均 age）
     n         = 入算邻居数
 
+样本充足（n≥5）的 scope 另给（2026-09-26 对照 V3 similarity 模块补齐，只展示不设闸）：
+  win_rate_lo95       胜率的 Wilson 95% 下界（对小样本不撒谎）
+  sim_weighted        贴近度加权的胜率 / 平均 pnl_pct（权重 = 各邻居 sim）
+  avg_realized_r_net  有路径埋点邻居的净 R 均值，realized_r_n 为其样本数
+
 豁免阈值（拍板「无足够样本」）：n<3 或所有 sim<min_sim → summary.sufficient=False；
 cred<0.2 标 low_credibility（briefing 显式标，禁凭单条低相似锁决策）。找不到→不另加限制，
 只走 §7 硬上限。
@@ -222,10 +227,23 @@ def _experience_summary(
     avg_age = sum(ages) / len(ages)
     age_decay = 0.5 ** (avg_age / 60.0)
     credibility = wr_at_sim * conf_sim * age_decay * min(n / 20.0, 1.0)
+    # 2026-09-26 对照 V3 similarity 模块补齐：Wilson 下界与贴近度加权统计
+    # 只展示不设闸；计数/样本身份仍由 n/wins/losses/sample_ids 冻结。
+    weighted_win_rate, weighted_pnl = _simutil.similarity_weighted(
+        (s, r["pnl_pct"]) for s, r in neighbors if r["pnl_pct"] is not None)
+    realized_r = [
+        value for value in (
+            _simutil._finite(r["realized_r_net"])
+            if "realized_r_net" in r.keys() else None
+            for _, r in neighbors)
+        if value is not None
+    ]
     return {
         **base,
         "sufficient": True,
         "win_rate": round(wr_at_sim, 4),
+        "win_rate_lo95": (
+            round(_simutil.wilson_lo95(wins, len(pnls)), 4) if pnls else None),
         "avg_sim": round(conf_sim, 4),
         "avg_age_days": round(avg_age, 1),
         "age_decay": round(age_decay, 4),
@@ -233,6 +251,17 @@ def _experience_summary(
         "low_credibility": credibility < 0.2,
         "avg_pnl_pct": (
             round(sum(pnls) / len(pnls), 4) if pnls else None),
+        "sim_weighted": {
+            "win_rate": (
+                round(weighted_win_rate, 4)
+                if weighted_win_rate is not None else None),
+            "avg_pnl_pct": (
+                round(weighted_pnl, 4) if weighted_pnl is not None else None),
+        },
+        "avg_realized_r_net": (
+            round(sum(realized_r) / len(realized_r), 4)
+            if realized_r else None),
+        "realized_r_n": len(realized_r),
     }
 
 
@@ -240,7 +269,11 @@ def _query_features_v3(query_symbol: str, query_side: str, query_regime: str,
                        query_action: str, as_of_cst: str, db_root: Path,
                        stop_distance_pct: Optional[float],
                        planned_rr: Optional[float]) -> dict[str, Any]:
-    """查询侧前向 v3 特征；只与完全相同 epoch 的已存行比较。"""
+    """查询侧前向 v3 特征；只与完全相同 epoch 的已存行比较。
+
+    市场态与 writer 落库时同一派生实现（experience_features_v2.market_features）；
+    market.db 读失败 → 市场态 None 如实留空，资产类别与 setup 特征照常参与。
+    """
     from core.asset_class import asset_class_of
     import experience_features_v2 as efv2
     base = {
@@ -249,23 +282,15 @@ def _query_features_v3(query_symbol: str, query_side: str, query_regime: str,
         "stop_distance_pct": stop_distance_pct,
         "planned_rr": planned_rr,
     }
-    market_db = Path(db_root) / "market.db"
-    if market_db.exists():
-        try:
-            mcon = sqlite3.connect(
-                f"file:{market_db}?mode=ro", uri=True, timeout=5)
-            try:
-                base.update(efv2.derive_market_features(
-                    mcon, query_symbol, as_of_cst))
-            finally:
-                mcon.close()
-        except sqlite3.Error:
-            pass
+    try:
+        base.update(efv2.market_features(query_symbol, as_of_cst, db_root))
+    except sqlite3.Error:
+        pass
     return _simutil.experience_features_v3(base)
 
 
 def _row_features_v3(row: sqlite3.Row) -> Optional[dict[str, Any]]:
-    """只读 exact v3 epoch；v1/v2/坏行均显式排除。"""
+    """只读 exact v3 epoch；v1/v2/坏行均显式排除（判定与版本分布报告共用）。"""
     raw = row["experience_vector"] if "experience_vector" in row.keys() else None
     if not raw:
         return None
@@ -273,19 +298,7 @@ def _row_features_v3(row: sqlite3.Row) -> Optional[dict[str, Any]]:
         stored = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if (
-        isinstance(stored, dict)
-        and stored.get("v") == 3
-        and stored.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
-    ):
-        feats = stored.get("features")
-        if (
-            isinstance(feats, dict)
-            and feats.get("v") == 3
-            and feats.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
-        ):
-            return feats
-    return None
+    return _simutil.stored_v3_features(stored)
 
 
 def find_similar_experience(
@@ -425,10 +438,14 @@ def find_similar_experience(
             if "experience_summary_version" in columns
             else "NULL AS experience_summary_version"
         )
+        realized_r_sql = (
+            "realized_r_net" if "realized_r_net" in columns
+            else "NULL AS realized_r_net"
+        )
         sql = ("SELECT id, cycle_id, ts, profile, symbol, side, action, regime, "
                "regime_stale, score_total, confidence, playbook_ref, "
                "experience_vector, pnl_pct, hold_hours, raw, "
-               f"experience_summary, {summary_version_sql} "
+               f"experience_summary, {summary_version_sql}, {realized_r_sql} "
                "FROM trade_experiences WHERE status='closed' "
                "AND pnl_pct IS NOT NULL "
                f"AND {availability_col} IS NOT NULL "

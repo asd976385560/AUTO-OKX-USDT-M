@@ -44,46 +44,31 @@ _DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _public_project_path('db')))
 def _v3_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
     """前向 v3 特征载荷（严格24h；历史 v2 不重算）。
 
-    市场态派生失败 → 字段 None 如实留空，绝不因特征派生失败阻断记账。
+    基础特征（止损距离、计划 RR）由 experience_features_v2.experience_base 装配，
+    资产类别与市场态由 market_context 派生——三处（writer / finder / 特征脚本）
+    共用同一实现。派生失败 → 字段 None 如实留空，绝不因特征派生失败阻断记账。
     外层和内层均携带固定 epoch，finder 只比较完全相同的 v3 epoch。
     """
-    stop_distance = None
-    try:
-        fill_px = float(trade.get("fill_px") or trade.get("px") or 0)
-        sl = float(trade.get("sl_trigger_px") or 0)
-        if fill_px > 0 and sl > 0:
-            stop_distance = round(abs(fill_px - sl) / fill_px, 6)
-    except (TypeError, ValueError):
-        pass
     base = {
         "asset_class": None, "side": side, "action": action, "regime": regime,
-        "stop_distance_pct": stop_distance, "planned_rr": None,
+        "stop_distance_pct": None, "planned_rr": None,
         "funding_rate": None, "vol_24h_pct": None,
         "trend_1h": None, "trend_4h": None,
     }
     try:
         import experience_features_v2 as efv2
-        try:
-            from core.asset_class import asset_class_of
-        except ImportError:
-            if _public_project_path() not in sys.path:
-                sys.path.insert(0, _public_project_path())
-            from core.asset_class import asset_class_of
-        base["asset_class"] = asset_class_of(symbol, _DB_ROOT)
-        card = trade.get("decision_card")
-        base["planned_rr"] = efv2._planned_rr_from_card(card)
-        market_db = _DB_ROOT / "market.db"
-        if market_db.exists():
-            mcon = sqlite3.connect(
-                f"file:{market_db}?mode=ro", uri=True, timeout=5)
-            try:
-                base.update(efv2.derive_market_features(
-                    mcon, symbol, now_ts))
-            finally:
-                mcon.close()
-    except Exception as exc:  # noqa: BLE001  特征派生永不阻断记账
-        print(f"[trade_experience_writer][WARN] v3 特征派生失败 "
+    except Exception as exc:  # noqa: BLE001  特征模块不可用：只落方向/动作/regime
+        print(f"[trade_experience_writer][WARN] v3 特征模块不可用 "
               f"{symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        efv2 = None
+    if efv2 is not None:
+        # 纯函数部分（止损距离 / 计划 RR）不依赖任何库，先装配再补市场态。
+        base = efv2.experience_base(symbol, side, action, regime, trade)
+        try:
+            base.update(efv2.market_context(symbol, now_ts, _DB_ROOT))
+        except Exception as exc:  # noqa: BLE001  特征派生永不阻断记账
+            print(f"[trade_experience_writer][WARN] v3 特征派生失败 "
+                  f"{symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
     return {
         "v": 3,
         "feature_epoch": _simutil.FEATURE_EPOCH_V3,
@@ -93,7 +78,12 @@ def _v3_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
 
 def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
                        close_ts, realized_pnl, close_trade) -> None:
-    """Wave2 序10：closed 行的 MFE/MAE/realized_r/出口类别（失败静默告警）。"""
+    """Wave2 序10：closed 行的 MFE/MAE/realized_r/出口类别（失败静默告警）。
+
+    path_metric_version 只认 apply_path_metrics_schema.PATH_METRIC_VERSION 单一
+    真源：此前写死 2，而计算已是 v3 净 R 口径——写侧刚落的行被回填器视为
+    过期重算、被 exit_quality 按旧口径解读。
+    """
     try:
         cols = {str(r[1]) for r in conn.execute(
             "PRAGMA table_info(trade_experiences)")}
@@ -113,7 +103,7 @@ def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
                 conn.execute(
                     "UPDATE trade_experiences SET path_coverage='none', "
                     "path_metric_version=? WHERE id=?",
-                    (2, exp_id),)
+                    (pms.PATH_METRIC_VERSION, exp_id),)
             else:
                 conn.execute(
                     "UPDATE trade_experiences SET path_coverage='none' "
@@ -144,7 +134,7 @@ def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
                 (metrics["initial_risk_usdt"], metrics["mfe_r"],
                  metrics["mae_r"], metrics["realized_r_net"],
                  metrics["close_at_1r"], metrics["ever_hit_1r"], exit_cat,
-                 metrics["path_coverage"], 2, exp_id))
+                 metrics["path_coverage"], pms.PATH_METRIC_VERSION, exp_id))
         else:
             conn.execute(
                 "UPDATE trade_experiences SET initial_risk_usdt=?, mfe_r=?, "

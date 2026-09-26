@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 VEC_DIM = 10
 
@@ -41,6 +41,43 @@ def _f(v: Any, default: float = 0.0) -> float:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def _finite(v: Any) -> Optional[float]:
+    """有限 float；None/bool/空串/NaN/inf/不可解析 → None。
+
+    2026-09-26 对照 V3 similarity 的 ``near`` 有限性门：非有限数字不再以
+    NaN 混进贴近度求和，而是按"该特征缺失"处理（只降低覆盖率）。
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, str) and not v.strip():
+        return None
+    try:
+        out = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def side_token(v: Any) -> Optional[str]:
+    """side 归一：long/buy → ``long``，short/sell → ``short``，其余 None。"""
+    s = _s(v)
+    if "long" in s or s == "buy":
+        return "long"
+    if "short" in s or s == "sell":
+        return "short"
+    return None
+
+
+def action_token(v: Any) -> Optional[str]:
+    """action 归一：含 open → ``open``，含 close → ``close``，其余 None。"""
+    s = _s(v)
+    if "open" in s:
+        return "open"
+    if "close" in s:
+        return "close"
+    return None
 
 
 def _symbol_bucket(symbol: str) -> float:
@@ -146,11 +183,8 @@ def experience_features_v2(d: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "v": 2,
         "asset_class": _s(d.get("asset_class")) or None,
-        "side": ("long" if "long" in _s(d.get("side")) or _s(d.get("side")) == "buy"
-                 else ("short" if "short" in _s(d.get("side"))
-                       or _s(d.get("side")) == "sell" else None)),
-        "action": ("open" if "open" in _s(d.get("action"))
-                   else ("close" if "close" in _s(d.get("action")) else None)),
+        "side": side_token(d.get("side")),
+        "action": action_token(d.get("action")),
         "regime": _s(d.get("regime")) or None,
         "stop_distance_pct": d.get("stop_distance_pct"),
         "planned_rr": d.get("planned_rr"),
@@ -179,13 +213,11 @@ def similarity_v2(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
             return 0.0
     scores: list[float] = []
     for key, scale in V2_NUMERIC_SCALES.items():
-        q, r = qf.get(key), rf.get(key)
+        # 非有限值（NaN/inf/bool/坏字符串）视为缺失：只降覆盖率，不污染求和。
+        q, r = _finite(qf.get(key)), _finite(rf.get(key))
         if q is None or r is None:
             continue
-        try:
-            scores.append(math.exp(-abs(float(q) - float(r)) / scale))
-        except (TypeError, ValueError):
-            continue
+        scores.append(math.exp(-abs(q - r) / scale))
     for key in V2_TREND_KEYS:
         q, r = qf.get(key), rf.get(key)
         if q is None or r is None:
@@ -215,3 +247,90 @@ def similarity_v3(qf: Mapping[str, Any], rf: Mapping[str, Any]) -> float:
     ):
         return 0.0
     return similarity_v2(qf, rf)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-26 对照 V3 similarity 模块补齐的统计与版本判定工具（纯函数、无 I/O）
+# ---------------------------------------------------------------------------
+STORED_VECTOR_CLASSES = (
+    "v1_or_legacy", "v2_frozen", "v3_forward", "v3_epoch_mismatch", "invalid",
+)
+
+
+def wilson_lo95(wins: int, n: int) -> float:
+    """胜率的 Wilson 95% 置信下界（对小样本不撒谎：3/3 不能算"必胜"）。"""
+    try:
+        wins_i = int(wins)
+        n_i = int(n)
+    except (TypeError, ValueError):
+        return 0.0
+    if n_i <= 0 or wins_i < 0:
+        return 0.0
+    wins_i = min(wins_i, n_i)
+    z = 1.959963984540054
+    p = wins_i / n_i
+    denom = 1.0 + z * z / n_i
+    centre = p + z * z / (2.0 * n_i)
+    spread = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n_i)) / n_i)
+    return min(1.0, max(0.0, (centre - spread) / denom))
+
+
+def similarity_weighted(
+    pairs: Iterable[tuple[Any, Any]],
+) -> tuple[Optional[float], Optional[float]]:
+    """按贴近度加权的 (胜率, 平均结果)；输入 (sim, outcome) 对。
+
+    权重 = sim（非有限或 ≤0 的对跳过）；总权重 ≤ 0 → (None, None)。
+    """
+    weight_sum = 0.0
+    win_weight = 0.0
+    outcome_sum = 0.0
+    for sim, outcome in pairs:
+        w = _finite(sim)
+        o = _finite(outcome)
+        if w is None or o is None or w <= 0.0:
+            continue
+        weight_sum += w
+        outcome_sum += w * o
+        if o > 0.0:
+            win_weight += w
+    if weight_sum <= 0.0:
+        return None, None
+    return win_weight / weight_sum, outcome_sum / weight_sum
+
+
+def stored_v3_features(stored: Any) -> Optional[dict[str, Any]]:
+    """已存 experience_vector（解析后的 JSON）→ 前向 v3 特征 dict；非 exact epoch → None。
+
+    外层与内层 features 都必须是 v==3 且携带 FEATURE_EPOCH_V3；v1（list）、
+    v2、坏行、epoch 不符一律拒绝——finder 与版本分布报告共用本判定，避免两处漂移。
+    """
+    if not (
+        isinstance(stored, dict)
+        and stored.get("v") == 3
+        and stored.get("feature_epoch") == FEATURE_EPOCH_V3
+    ):
+        return None
+    feats = stored.get("features")
+    if (
+        isinstance(feats, dict)
+        and feats.get("v") == 3
+        and feats.get("feature_epoch") == FEATURE_EPOCH_V3
+    ):
+        return feats
+    return None
+
+
+def classify_stored_vector(stored: Any) -> str:
+    """已存 experience_vector（解析后的 JSON）→ STORED_VECTOR_CLASSES 之一。"""
+    if stored is None or isinstance(stored, list):
+        return "v1_or_legacy"
+    if not isinstance(stored, dict):
+        return "invalid"
+    version = stored.get("v")
+    if version == 3:
+        return ("v3_forward" if stored_v3_features(stored) is not None
+                else "v3_epoch_mismatch")
+    if version == 2:
+        return "v2_frozen"
+    return "invalid"

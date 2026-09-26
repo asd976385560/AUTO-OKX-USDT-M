@@ -5,6 +5,29 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- Optimized the experience-feature derivation shared by the trade experience
+  writer, the similarity finder and the instrument context against the V3
+  similarity design: the strict 24h volatility window now anchors to the 15m bar
+  grid (fill-time timestamps previously never matched the grid and left
+  `vol_24h_pct` empty), planned RR is derived from `open_execution_package_v1`
+  when no decision card exists, numeric inputs are validated as finite, callers
+  can request a subset of market features, and one shared builder replaces three
+  copies of the stop-distance and RR logic.
+- Experience summaries with sufficient samples now also report the Wilson 95%
+  lower-bound win rate, similarity-weighted win rate and average return, and the
+  mean net R of path-instrumented neighbours; the feature version report
+  classifies `v3_epoch_mismatch` rows separately using the same acceptance rule
+  as the finder.
+
+### Fixed
+
+- The trade experience writer now stamps `path_metric_version` from the single
+  path-metrics source instead of a stale literal, so freshly closed rows are no
+  longer re-flagged as outdated by the backfill or read under the retired
+  gross-R convention.
+
 ## [1.1.2] - 2026-09-14
 
 ### Added

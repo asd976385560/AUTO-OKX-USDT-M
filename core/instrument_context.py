@@ -27,7 +27,9 @@ def build_instrument_context(symbol: str, cycle_regime: Any, cycle_id: str,
         con = sqlite3.connect(
             f"file:{root / 'market.db'}?mode=ro", uri=True, timeout=5)
         try:
-            trend = efv2.derive_market_features(con, symbol, as_of).get("trend_4h")
+            # 只取 trend_4h：不再为一个字段执行资金费 / 24h 波幅 / 1H 趋势三条多余查询。
+            trend = efv2.derive_market_features(
+                con, symbol, as_of, fields=("trend_4h",)).get("trend_4h")
         finally:
             con.close()
         instrument_regime = {
