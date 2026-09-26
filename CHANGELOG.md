@@ -66,6 +66,9 @@ All notable public-release changes are recorded here. Public versions follow
   path-metrics source instead of a stale literal, so freshly closed rows are no
   longer re-flagged as outdated by the backfill or read under the retired
   gross-R convention.
+- The per-symbol funding-rate fallback now caps its remaining budget at the
+  caller's original timeout; on coarse monotonic clocks a rounding error could
+  previously hand it a budget slightly larger than requested.
 
 ## [1.1.2] - 2026-09-14
 
