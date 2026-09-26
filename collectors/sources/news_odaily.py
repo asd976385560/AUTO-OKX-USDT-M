@@ -40,8 +40,10 @@ if _COLLECTORS not in sys.path:
 import news_writer  # noqa: E402
 try:
     from ._news_http import fetch_text as _fetch_text_alternate  # type: ignore
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
 except ImportError:
     from _news_http import fetch_text as _fetch_text_alternate  # noqa: E402
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -64,32 +66,8 @@ REQ_HEADERS = {
     "Origin": "https://www.odaily.news",
 }
 
-# 币种抽取：英文 ticker（词边界，避免 ON/ARB 等误命中普通词）
-_COINS = [
-    "BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "SOLANA", "XRP", "RIPPLE",
-    "BNB", "DOGE", "DOGECOIN", "ADA", "CARDANO", "AVAX", "LINK", "CHAINLINK",
-    "TRX", "TRON", "TON", "DOT", "POLKADOT", "MATIC", "POLYGON", "SHIB",
-    "LTC", "LITECOIN", "BCH", "UNI", "AAVE", "ARB", "ARBITRUM", "OP",
-    "OPTIMISM", "SUI", "APT", "APTOS", "INJ", "SEI", "TIA", "PEPE", "WIF",
-    "NEAR", "FIL", "ATOM", "ETC", "XLM", "ICP", "HBAR", "RNDR", "RENDER",
-    "HYPE", "ZEC", "LIT",
-]
-_COIN_TO_SYM = {
-    "BITCOIN": "BTC", "ETHEREUM": "ETH", "SOLANA": "SOL", "RIPPLE": "XRP",
-    "DOGECOIN": "DOGE", "CARDANO": "ADA", "CHAINLINK": "LINK", "TRON": "TRX",
-    "POLKADOT": "DOT", "POLYGON": "MATIC", "LITECOIN": "LTC", "ARBITRUM": "ARB",
-    "OPTIMISM": "OP", "APTOS": "APT", "RENDER": "RNDR",
-}
-_COIN_RE = re.compile(
-    r"\b(" + "|".join(sorted(_COINS, key=len, reverse=True)) + r")\b", re.I)
-# $TICKER 形式（$BTC / $HYPE）
-_DOLLAR_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
-# 中文币名 → SYM（确定性字典）
-_CN_COIN_TO_SYM = {
-    "比特币": "BTC", "以太坊": "ETH", "以太币": "ETH", "索拉纳": "SOL",
-    "瑞波": "XRP", "瑞波币": "XRP", "狗狗币": "DOGE", "狗狗": "DOGE",
-    "莱特币": "LTC", "波场": "TRX", "波卡": "DOT", "艾达币": "ADA",
-}
+# 币种抽取：英文 ticker/全称 + $TICKER + 中文币名，共享规范表见 _coin_names.py
+# （_extract_symbols 由其导入）
 
 # 规则标签（确定性，中英双语关键词）
 _TAG_RULES = [
@@ -139,31 +117,6 @@ def _strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s)
     s = _html.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
-
-
-def _extract_symbols(text: str) -> list[str]:
-    found: list[str] = []
-
-    def _add(sym: str) -> None:
-        inst = f"{sym}-USDT-SWAP"
-        if inst not in found:
-            found.append(inst)
-
-    t = text or ""
-    # 英文 ticker / 全称
-    for m in _COIN_RE.finditer(t):
-        tok = m.group(1).upper()
-        _add(_COIN_TO_SYM.get(tok, tok))
-    # $TICKER
-    for m in _DOLLAR_RE.finditer(t):
-        tok = m.group(1).upper()
-        if tok in _COINS or tok in _COIN_TO_SYM:
-            _add(_COIN_TO_SYM.get(tok, tok))
-    # 中文币名
-    for cn, sym in _CN_COIN_TO_SYM.items():
-        if cn in t:
-            _add(sym)
-    return found
 
 
 def _severity(text: str, is_important: bool = False) -> str:

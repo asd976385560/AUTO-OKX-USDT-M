@@ -28,7 +28,6 @@ def _public_project_path(*parts):
 
 import argparse
 import json
-import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -42,6 +41,10 @@ for _p in (_COLLECTORS, _SCRIPTS):
 
 import news_writer  # noqa: E402
 from _okxcli import okx_json  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._coin_names import instrument_for_ticker  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _coin_names import instrument_for_ticker  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -58,20 +61,7 @@ _COLD_RETRY_DELAY_SECONDS = 3.0
 _COLD_RETRY_TIMEOUT_SECONDS = 4.0
 _MAX_FETCH_PHASES_PER_ENDPOINT = 3
 
-_COIN_TO_SWAP = {
-    "BTC": "BTC-USDT-SWAP", "ETH": "ETH-USDT-SWAP", "SOL": "SOL-USDT-SWAP",
-    "XRP": "XRP-USDT-SWAP", "BNB": "BNB-USDT-SWAP", "DOGE": "DOGE-USDT-SWAP",
-    "ADA": "ADA-USDT-SWAP", "AVAX": "AVAX-USDT-SWAP", "LINK": "LINK-USDT-SWAP",
-    "TRX": "TRX-USDT-SWAP", "TON": "TON-USDT-SWAP", "DOT": "DOT-USDT-SWAP",
-    "MATIC": "MATIC-USDT-SWAP", "SHIB": "SHIB-USDT-SWAP", "LTC": "LTC-USDT-SWAP",
-    "BCH": "BCH-USDT-SWAP", "UNI": "UNI-USDT-SWAP", "AAVE": "AAVE-USDT-SWAP",
-    "ARB": "ARB-USDT-SWAP", "OP": "OP-USDT-SWAP", "SUI": "SUI-USDT-SWAP",
-    "APT": "APT-USDT-SWAP", "INJ": "INJ-USDT-SWAP", "SEI": "SEI-USDT-SWAP",
-    "TIA": "TIA-USDT-SWAP", "PEPE": "PEPE-USDT-SWAP", "WIF": "WIF-USDT-SWAP",
-    "NEAR": "NEAR-USDT-SWAP", "FIL": "FIL-USDT-SWAP", "ATOM": "ATOM-USDT-SWAP",
-    "ETC": "ETC-USDT-SWAP", "XLM": "XLM-USDT-SWAP", "ICP": "ICP-USDT-SWAP",
-    "HBAR": "HBAR-USDT-SWAP", "HYPE": "HYPE-USDT-SWAP", "ZEC": "ZEC-USDT-SWAP",
-}
+# ccyList / ccySentiments 里的 ccy 经共享规范表映射到合约（_coin_names.instrument_for_ticker）
 
 
 def _ms_to_cst(value) -> str | None:
@@ -97,18 +87,16 @@ def _importance_to_level_sev(importance: str | None) -> tuple[str, str]:
 def _symbols_from_item(item: dict) -> list[str]:
     out: list[str] = []
     for ccy in item.get("ccyList") or []:
-        c = str(ccy or "").upper().strip()
-        if c in _COIN_TO_SWAP:
-            out.append(_COIN_TO_SWAP[c])
+        sym = instrument_for_ticker(ccy)
+        if sym and sym not in out:
+            out.append(sym)
     # ccySentiments 可能带币
     for s in item.get("ccySentiments") or []:
         if not isinstance(s, dict):
             continue
-        c = str(s.get("ccy") or "").upper().strip()
-        if c in _COIN_TO_SWAP:
-            sym = _COIN_TO_SWAP[c]
-            if sym not in out:
-                out.append(sym)
+        sym = instrument_for_ticker(s.get("ccy"))
+        if sym and sym not in out:
+            out.append(sym)
     return out
 
 

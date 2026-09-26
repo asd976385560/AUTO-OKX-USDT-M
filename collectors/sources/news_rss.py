@@ -39,8 +39,10 @@ if _COLLECTORS not in sys.path:
 import news_writer  # noqa: E402
 try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
     from ._news_http import fetch_text as _fetch_text_httpx  # type: ignore
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
 except ImportError:  # pragma: no cover - production imports adapters by module name
     from _news_http import fetch_text as _fetch_text_httpx  # noqa: E402
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -76,22 +78,7 @@ OFFICIAL_PUBLISHER_FALLBACKS = {
     ),
 }
 
-# 币种抽取：curated 常见 ticker（词边界匹配，避免 ON/ARB 等误命中普通词）
-_COINS = [
-    "BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "SOLANA", "XRP", "RIPPLE",
-    "BNB", "DOGE", "DOGECOIN", "ADA", "CARDANO", "AVAX", "LINK", "CHAINLINK",
-    "TRX", "TRON", "TON", "DOT", "POLKADOT", "MATIC", "POLYGON", "SHIB",
-    "LTC", "LITECOIN", "BCH", "UNI", "AAVE", "ARB", "ARBITRUM", "OP",
-    "OPTIMISM", "SUI", "APT", "APTOS", "INJ", "SEI", "TIA", "PEPE", "WIF",
-    "NEAR", "FIL", "ATOM", "ETC", "XLM", "ICP", "HBAR", "RNDR", "RENDER",
-]
-_COIN_TO_SYM = {
-    "BITCOIN": "BTC", "ETHEREUM": "ETH", "SOLANA": "SOL", "RIPPLE": "XRP",
-    "DOGECOIN": "DOGE", "CARDANO": "ADA", "CHAINLINK": "LINK", "TRON": "TRX",
-    "POLKADOT": "DOT", "POLYGON": "MATIC", "LITECOIN": "LTC", "ARBITRUM": "ARB",
-    "OPTIMISM": "OP", "APTOS": "APT", "RENDER": "RNDR",
-}
-_COIN_RE = re.compile(r"\b(" + "|".join(sorted(_COINS, key=len, reverse=True)) + r")\b", re.I)
+# 币种抽取：共享规范表见 _coin_names.py（_extract_symbols 由其导入）
 
 # 规则标签（确定性）
 _TAG_RULES = [
@@ -344,17 +331,6 @@ def _cold_retry_failed_feeds(
                 f"hot={pre_cold_error[:70] or 'unknown'}; "
                 f"cold={type(error).__name__}: {error}"
             )[:150]
-
-
-def _extract_symbols(title: str) -> list[str]:
-    found = []
-    for m in _COIN_RE.finditer(title or ""):
-        tok = m.group(1).upper()
-        sym = _COIN_TO_SYM.get(tok, tok)
-        inst = f"{sym}-USDT-SWAP"
-        if inst not in found:
-            found.append(inst)
-    return found
 
 
 def _severity(title: str) -> str:

@@ -37,6 +37,10 @@ _COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collect
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
+try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
+    from ._coin_names import extract_symbols as _extract_symbols  # type: ignore
+except ImportError:  # pragma: no cover - production imports adapters by module name
+    from _coin_names import extract_symbols as _extract_symbols  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -53,23 +57,8 @@ DEFAULT_ENDPOINT = (
     "?size=30&type=push&lang=cn"
 )
 
-# 英文 ticker（词边界匹配，避免 ON/ARB 误命中）
-_COINS = [
-    "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "TRX",
-    "TON", "DOT", "MATIC", "SHIB", "LTC", "BCH", "UNI", "AAVE", "ARB", "OP",
-    "SUI", "APT", "INJ", "SEI", "TIA", "PEPE", "WIF", "NEAR", "FIL", "ATOM",
-    "ETC", "XLM", "ICP", "HBAR", "RNDR", "ORDI", "JUP", "STX", "RUNE",
-]
-_COIN_RE = re.compile(r"\b(" + "|".join(sorted(_COINS, key=len, reverse=True)) + r")\b", re.I)
-# $TICKER 形式（$BTC / $PEPE）
-_DOLLAR_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
-# 中文币名 → ticker
-_CN_COINS = {
-    "比特币": "BTC", "以太坊": "ETH", "以太": "ETH", "索拉纳": "SOL", "瑞波": "XRP",
-    "瑞波币": "XRP", "狗狗币": "DOGE", "狗狗": "DOGE", "莱特币": "LTC", "波卡": "DOT",
-    "波场": "TRX", "艾达币": "ADA", "卡尔达诺": "ADA", "链克": "LINK", "柴犬": "SHIB",
-    "雪崩": "AVAX", "币安币": "BNB", "门罗币": "XMR", "稳定币": None,
-}
+# 币种抽取：中文币名 + $TICKER + 英文 ticker，共享规范表见 _coin_names.py
+# （_extract_symbols 由其导入）
 
 
 def _fetch(url: str, timeout: int = 12) -> str:
@@ -81,30 +70,6 @@ def _fetch(url: str, timeout: int = 12) -> str:
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
-
-
-def _extract_symbols(text: str) -> list[str]:
-    found: list[str] = []
-    text = text or ""
-
-    def _add(sym: str | None) -> None:
-        if not sym:
-            return
-        inst = f"{sym.upper()}-USDT-SWAP"
-        if inst not in found:
-            found.append(inst)
-
-    # 中文币名
-    for cn, sym in _CN_COINS.items():
-        if cn in text:
-            _add(sym)
-    # $TICKER
-    for m in _DOLLAR_RE.finditer(text):
-        _add(m.group(1))
-    # 裸英文 ticker（词边界）
-    for m in _COIN_RE.finditer(text):
-        _add(m.group(1))
-    return found
 
 
 # severity：critical/high 中英关键词（确定性，非 LLM）
