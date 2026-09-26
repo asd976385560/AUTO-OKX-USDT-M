@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """V2.0 §8.5 —— 交易经验检索（LLM 决策的长期记忆）。
 
-新判断前必搜相似经验：读 account.db.trade_experiences（已平仓、有 pnl），仅在
-完全相同的前向 v3 feature epoch 内计算相似度，分别返回盈利、亏损与统计摘要。
-历史 v1/v2 仍留在库内和全量经营统计中，但不进入 v3 EV 先验。
+新判断前必搜相似经验：读 account.db.trade_experiences（已平仓、有 pnl），在前向
+v4 特征空间（2026-09-26 对照 V3 experience::similarity：1H ATR% / RSI / EMA 排列 /
+4h·16h 收益 / 成交额 z / 止损距离 / 开仓小时，几何平均贴近度，异币 ×0.9）计算
+相似度，分别返回盈利、亏损与统计摘要。历史 v1/v2/v3 行按行 ts 从 kline_cache
+现算 v4 特征后同场比较（V3 对 legacy 行同一做法：有什么特征比什么）；只有一个
+可比特征都没有的行才被排除并在 feature_epoch_filter 外显。
 **只采不拦**：所有历史数据只供 Agent 自主裁决；Agent 必须说明 adopt/partial/ignore/none，
 但历史结果、可信度和样本数均不能自动批准或否决交易。
 
@@ -14,6 +17,12 @@
     age_decay = 0.5 ^ (age_days / 60)（半衰期 60 天，用邻居平均 age）
     n         = 入算邻居数
 
+样本充足（n≥5）的 scope 另给（2026-09-26 对照 V3 similarity 模块补齐，只展示不设闸）：
+  win_rate_lo95       胜率的 Wilson 95% 下界（对小样本不撒谎）
+  sim_weighted        贴近度加权的胜率 / 平均 pnl_pct（权重 = 各邻居 sim）
+  avg_realized_r_net  有路径埋点邻居的净 R 均值，realized_r_n 为其样本数
+
+min_sim 缺省 0.35（V3 同值；几何平均的贴近度尺度低于旧 v2/v3 的算术平均）。
 豁免阈值（拍板「无足够样本」）：n<3 或所有 sim<min_sim → summary.sufficient=False；
 cred<0.2 标 low_credibility（briefing 显式标，禁凭单条低相似锁决策）。找不到→不另加限制，
 只走 §7 硬上限。
@@ -222,10 +231,23 @@ def _experience_summary(
     avg_age = sum(ages) / len(ages)
     age_decay = 0.5 ** (avg_age / 60.0)
     credibility = wr_at_sim * conf_sim * age_decay * min(n / 20.0, 1.0)
+    # 2026-09-26 对照 V3 similarity 模块补齐：Wilson 下界与贴近度加权统计
+    # 只展示不设闸；计数/样本身份仍由 n/wins/losses/sample_ids 冻结。
+    weighted_win_rate, weighted_pnl = _simutil.similarity_weighted(
+        (s, r["pnl_pct"]) for s, r in neighbors if r["pnl_pct"] is not None)
+    realized_r = [
+        value for value in (
+            _simutil._finite(r["realized_r_net"])
+            if "realized_r_net" in r.keys() else None
+            for _, r in neighbors)
+        if value is not None
+    ]
     return {
         **base,
         "sufficient": True,
         "win_rate": round(wr_at_sim, 4),
+        "win_rate_lo95": (
+            round(_simutil.wilson_lo95(wins, len(pnls)), 4) if pnls else None),
         "avg_sim": round(conf_sim, 4),
         "avg_age_days": round(avg_age, 1),
         "age_decay": round(age_decay, 4),
@@ -233,39 +255,52 @@ def _experience_summary(
         "low_credibility": credibility < 0.2,
         "avg_pnl_pct": (
             round(sum(pnls) / len(pnls), 4) if pnls else None),
+        "sim_weighted": {
+            "win_rate": (
+                round(weighted_win_rate, 4)
+                if weighted_win_rate is not None else None),
+            "avg_pnl_pct": (
+                round(weighted_pnl, 4) if weighted_pnl is not None else None),
+        },
+        "avg_realized_r_net": (
+            round(sum(realized_r) / len(realized_r), 4)
+            if realized_r else None),
+        "realized_r_n": len(realized_r),
     }
 
 
-def _query_features_v3(query_symbol: str, query_side: str, query_regime: str,
+def _query_features_v4(query_symbol: str, query_side: str, query_regime: str,
                        query_action: str, as_of_cst: str, db_root: Path,
                        stop_distance_pct: Optional[float],
                        planned_rr: Optional[float]) -> dict[str, Any]:
-    """查询侧前向 v3 特征；只与完全相同 epoch 的已存行比较。"""
+    """查询侧前向 v4 特征：与 writer 落库时同一派生实现（experience_features_v2）。
+
+    market.db 读失败 → 市场态 None 如实留空，资产类别 / 止损距离 / 开仓小时照常参与。
+    """
     from core.asset_class import asset_class_of
     import experience_features_v2 as efv2
     base = {
+        "symbol": query_symbol,
         "asset_class": asset_class_of(query_symbol, db_root),
         "side": query_side, "action": query_action, "regime": query_regime,
         "stop_distance_pct": stop_distance_pct,
+        "sl_pct": stop_distance_pct,
         "planned_rr": planned_rr,
+        "hour_utc": efv2.hour_utc(as_of_cst),
     }
-    market_db = Path(db_root) / "market.db"
-    if market_db.exists():
-        try:
-            mcon = sqlite3.connect(
-                f"file:{market_db}?mode=ro", uri=True, timeout=5)
-            try:
-                base.update(efv2.derive_market_features(
-                    mcon, query_symbol, as_of_cst))
-            finally:
-                mcon.close()
-        except sqlite3.Error:
-            pass
-    return _simutil.experience_features_v3(base)
+    try:
+        base.update(efv2.market_features(query_symbol, as_of_cst, db_root))
+    except sqlite3.Error:
+        pass
+    return _simutil.experience_features_v4(base)
+
+
+# 旧名兼容（v3 epoch 时代的查询侧装配入口）。
+_query_features_v3 = _query_features_v4
 
 
 def _row_features_v3(row: sqlite3.Row) -> Optional[dict[str, Any]]:
-    """只读 exact v3 epoch；v1/v2/坏行均显式排除。"""
+    """只读 exact v3 epoch；v1/v2/坏行均显式排除（判定与版本分布报告共用）。"""
     raw = row["experience_vector"] if "experience_vector" in row.keys() else None
     if not raw:
         return None
@@ -273,19 +308,7 @@ def _row_features_v3(row: sqlite3.Row) -> Optional[dict[str, Any]]:
         stored = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if (
-        isinstance(stored, dict)
-        and stored.get("v") == 3
-        and stored.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
-    ):
-        feats = stored.get("features")
-        if (
-            isinstance(feats, dict)
-            and feats.get("v") == 3
-            and feats.get("feature_epoch") == _simutil.FEATURE_EPOCH_V3
-        ):
-            return feats
-    return None
+    return _simutil.stored_v3_features(stored)
 
 
 def find_similar_experience(
@@ -294,7 +317,7 @@ def find_similar_experience(
     regime: str,
     action: str,
     top_k: int = 8,
-    min_sim: float = 0.5,
+    min_sim: float = 0.35,
     profile_filter: str = "all",
     score_total: Optional[float] = None,
     db_root: Path = DEFAULT_DB_ROOT,
@@ -349,10 +372,10 @@ def find_similar_experience(
     feature_distance = (
         setup.get("stop_distance_pct") if setup else None)
     feature_rr = setup.get("planned_rr") if setup else None
-    query_vec = _query_features_v3(
+    query_vec = _query_features_v4(
         query_symbol, query_side, query_regime, query_action,
         query["as_of"], Path(db_root), feature_distance, feature_rr)
-    query["feature_epoch"] = _simutil.FEATURE_EPOCH_V3
+    query["feature_epoch"] = _simutil.FEATURE_EPOCH_V4
     query["query_features"] = query_vec
     try:
         from core.instrument_context import build_instrument_context
@@ -425,10 +448,14 @@ def find_similar_experience(
             if "experience_summary_version" in columns
             else "NULL AS experience_summary_version"
         )
+        realized_r_sql = (
+            "realized_r_net" if "realized_r_net" in columns
+            else "NULL AS realized_r_net"
+        )
         sql = ("SELECT id, cycle_id, ts, profile, symbol, side, action, regime, "
                "regime_stale, score_total, confidence, playbook_ref, "
                "experience_vector, pnl_pct, hold_hours, raw, "
-               f"experience_summary, {summary_version_sql} "
+               f"experience_summary, {summary_version_sql}, {realized_r_sql} "
                "FROM trade_experiences WHERE status='closed' "
                "AND pnl_pct IS NOT NULL "
                f"AND {availability_col} IS NOT NULL "
@@ -441,25 +468,42 @@ def find_similar_experience(
     finally:
         con.close()
 
+    import experience_features_v2 as efv2
     scored = []
+    coverage_by_id: dict[int, int] = {}
     feature_epoch_excluded_rows: list[Any] = []
     feature_epoch_included_total = 0
     epoch_excluded_rows: list[Any] = []
-    for r in rows:
-        rf = _row_features_v3(r)
-        if rf is None:
-            # v1/v2/坏行：不冒充 v3 可比，排除数在返回合同中外显。
-            feature_epoch_excluded_rows.append(r)
-            continue
-        feature_epoch_included_total += 1
-        # 已撤回策略纪元的样本不作现行策略的 EV 先验（core/policy_epochs.py 单点
-        # 登记）。**只影响先验，不影响任何验收/报表口径**；被剔除的样本不静默
-        # 消失，逐 scope 外显计数与胜负，见 epoch_excluded_* 字段。
-        if not include_all_epochs and not is_ev_prior_eligible(r["cycle_id"]):
-            epoch_excluded_rows.append(r)
-            continue
-        sim = _simutil.similarity_v3(query_vec, rf)
-        scored.append((sim, r))
+    market_db = Path(db_root) / "market.db"
+    mcon = None
+    if market_db.exists():
+        try:
+            mcon = sqlite3.connect(
+                f"file:{market_db}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            mcon = None
+    indicator_cache: dict[Any, dict[str, Any]] = {}
+    try:
+        for r in rows:
+            # 历史 v1/v2/v3 行按行 ts 现算 v4 特征（V3 对 legacy 行同一做法）。
+            rf = efv2.features_v4_for_row(r, db_root, mcon, indicator_cache)
+            if not _simutil.v4_comparable(rf):
+                # 一个可比特征都没有：不冒充可比，排除数在返回合同中外显。
+                feature_epoch_excluded_rows.append(r)
+                continue
+            feature_epoch_included_total += 1
+            # 已撤回策略纪元的样本不作现行策略的 EV 先验（core/policy_epochs.py 单点
+            # 登记）。**只影响先验，不影响任何验收/报表口径**；被剔除的样本不静默
+            # 消失，逐 scope 外显计数与胜负，见 epoch_excluded_* 字段。
+            if not include_all_epochs and not is_ev_prior_eligible(r["cycle_id"]):
+                epoch_excluded_rows.append(r)
+                continue
+            sim, coverage = _simutil.similarity_v4(query_vec, rf)
+            coverage_by_id[int(r["id"])] = coverage
+            scored.append((sim, r))
+    finally:
+        if mcon is not None:
+            mcon.close()
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # 邻居 = sim≥min_sim
@@ -470,6 +514,7 @@ def find_similar_experience(
         all_matches.append({
             "experience_id": r["id"],
             "sim": round(sim, 4),
+            "coverage": coverage_by_id.get(int(r["id"]), 0),
             "pnl_pct": r["pnl_pct"],
             "hold_hours": r["hold_hours"],
             "side_match": normalize_token(r["side"]) == query_side,
@@ -595,7 +640,7 @@ def find_similar_experience(
         "query_symbol": query_symbol,
         "query_vec": query_vec,
         "similarity_version": _simutil.SIMILARITY_VERSION,
-        "feature_epoch": _simutil.FEATURE_EPOCH_V3,
+        "feature_epoch": _simutil.FEATURE_EPOCH_V4,
         "feature_epoch_excluded_rows": len(feature_epoch_excluded_rows),
         "legacy_rows_skipped": len(feature_epoch_excluded_rows),
     }
@@ -606,15 +651,16 @@ def build_feature_epoch_filter(
 ) -> dict[str, Any]:
     wins = sum(1 for row in excluded_rows if row["pnl_pct"] > 0)
     return {
-        "version": "feature_epoch_filter_v1",
-        "active_epoch": _simutil.FEATURE_EPOCH_V3,
+        "version": "feature_epoch_filter_v2",
+        "active_epoch": _simutil.FEATURE_EPOCH_V4,
         "included_total": int(included_total),
         "excluded_total": len(excluded_rows),
         "excluded_wins": wins,
         "excluded_losses": len(excluded_rows) - wins,
         "excluded_sample_ids": sorted(int(row["id"]) for row in excluded_rows),
         "scope": (
-            "只约束相似经验与EV先验；历史胜率、净利、日周月报仍使用全量样本"
+            "排除的是连一个可比 v4 特征都现算不出的行；只约束相似经验与EV先验，"
+            "历史胜率、净利、日周月报仍使用全量样本"
         ),
     }
 
@@ -753,7 +799,7 @@ def build_ev_preview(
 def compact_result(result: dict[str, Any]) -> dict[str, Any]:
     """Return the decision-useful subset without raw/vector payload bloat."""
     keep_match = (
-        "experience_id", "sim", "pnl_pct", "hold_hours", "age_days",
+        "experience_id", "sim", "coverage", "pnl_pct", "hold_hours", "age_days",
         "playbook_ref", "cycle_id", "profile", "symbol", "outcome", "lesson",
         "side_match", "action_match", "regime_match",
     )
@@ -846,7 +892,8 @@ def main() -> int:
     ap.add_argument("--regime", default="")
     ap.add_argument("--action", default="open")
     ap.add_argument("--top-k", type=int, default=8)
-    ap.add_argument("--min-sim", type=float, default=0.5)
+    ap.add_argument("--min-sim", type=float, default=0.35,
+                    help="贴近度门槛（V3 同值 0.35；几何平均尺度低于旧算术平均）")
     ap.add_argument("--profile", default="live", choices=["live", "all"])
     ap.add_argument(
         "--as-of",

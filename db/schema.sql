@@ -610,7 +610,7 @@ CREATE TABLE "missed_opportunities" (
     notes           TEXT,
     reviewed_utc    TEXT NOT NULL,
     decision_card   TEXT
-, sim_stop_pct REAL, sim_tp_pct REAL, sim_outcome_24h TEXT, sim_first_touch_cst TEXT);
+, sim_stop_pct REAL, sim_tp_pct REAL, sim_outcome_24h TEXT, sim_first_touch_cst TEXT, sim_rule TEXT);
 
 CREATE TABLE param_suggestions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,

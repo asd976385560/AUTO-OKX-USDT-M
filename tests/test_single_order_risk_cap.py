@@ -75,9 +75,11 @@ class SingleOrderRiskCapTests(unittest.TestCase):
         """名义 1% 下限张数 > 风险预算最大张数 → 拒绝，不上调绕闸。
 
         构造：equity 大 → 名义下限高；止损距宽 → 风险预算张数低。
+        2026-09-26 起止损距还受 0.8×(1/杠杆−1%) 约束（V3 同口径），20%/29% 的
+        宽止损只有低杠杆才放得下 → 用 2x（可扛 39.2%）。
         """
         res = _validate(
-            symbol="WIDE-USDT-SWAP", side="long", intended_sz=1.0,
+            symbol="WIDE-USDT-SWAP", side="long", intended_sz=1.0, lev=2.0,
             mark_px=10.0, ct_val=1.0, lot_sz=1.0, equity=100000.0,
             sl_trigger_px=8.0,  # 20% 止损距 → 每张风险≈2.02，预算 5000→2475 张
             available_margin=90000.0, account_imr=0.0,
@@ -85,12 +87,12 @@ class SingleOrderRiskCapTests(unittest.TestCase):
         # 名义下限 1%×100000=1000 USDT → 100 张；风险预算 5000/2.02≈2475 张。
         # 此例风险不 binding；换更宽止损让它 binding：
         res2 = _validate(
-            symbol="WIDE-USDT-SWAP", side="long", intended_sz=1.0,
+            symbol="WIDE-USDT-SWAP", side="long", intended_sz=1.0, lev=2.0,
             mark_px=10.0, ct_val=1.0, lot_sz=1.0, equity=100000.0,
             sl_trigger_px=7.1,  # 29% 距 → 每张 2.92 → 预算最多 1712 张
             available_margin=2000.0, account_imr=0.0,
         )
-        # available 2000×0.98/每张保证金1 → 1960 张下限外；名义下限 100 张可行。
+        # available 2000×0.98/每张保证金5 → 392 张下限外；名义下限 100 张可行。
         self.assertTrue(res["approved"])
         self.assertTrue(res2["approved"])
         # 真正的冲突用小预算复现：equity 100000 → 名义下限 1000 USDT=100 张，
@@ -112,10 +114,11 @@ class SingleOrderRiskCapTests(unittest.TestCase):
 
     def test_risk_clamp_tighter_than_margin_clamp(self):
         """止损距宽时风险闸先于保证金闸 binding：两闸取最小。"""
-        # 每张保证金 10（10x），margin 预算 147 → 14.7 张；
-        # 每张风险 100×(10%+0.2%)=10.2，风险预算 50 → 4.9 张 → 风险闸 binding。
+        # 每张保证金 20（5x；10% 止损在 10x 下超出 7.2% 可扛距离，2026-09-26 起被拒），
+        # margin 预算 147 → 7.3 张；每张风险 100×(10%+0.2%)=10.2，风险预算 50 →
+        # 4.9 张 → 风险闸 binding。
         res = _validate(
-            intended_sz=20.0, mark_px=100.0, ct_val=1.0, lot_sz=0.1,
+            intended_sz=20.0, lev=5.0, mark_px=100.0, ct_val=1.0, lot_sz=0.1,
             equity=1000.0, sl_trigger_px=110.0,
             available_margin=900.0, account_imr=0.0,
         )

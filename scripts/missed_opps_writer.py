@@ -73,29 +73,111 @@ R_PCT = 2.0  # 兼容记录无失效距离时的后验评估兜底
 OUTCOME_HOURS = 4
 EXPECTED_15M_BARS = 16
 
-# ── 2026-08-28 实盘口径模拟（主人拍板：先做功能后做监测） ────────────────
-# 固定 ±2% 代理与实盘（3×ATR 止损、2R 固定 TP、持仓 6~49h）不可比，导致
-# 「结构关是否过严/门槛降级值不值」测不准。新增四列按实盘口径模拟：
-#   sim_stop_pct     = 候选时刻 3×ATR14(1H)/入场价（%）
-#   sim_tp_pct       = 2 × sim_stop_pct
-#   sim_outcome_24h  = hit_tp | hit_sl | ambiguous_sl(同棒双触按保守先止损)
-#                      | neither | no_data(ATR/入场K线缺失或24h覆盖<90%)
+# ── 实盘口径模拟（2026-08-28 首版 3×ATR/2R；2026-09-26 对照 V3 report::numbers 改口径） ──
+# 固定 ±2% 代理与实盘不可比，故另有四列按实盘口径模拟。2026-09-26 起口径与 V3
+# `sim_sl_pct` / `sim_outcome` 一致：
+#   sim_stop_pct     = clamp(1×ATR14(1H)/入场价, 3%, 6%)；缺 ATR 用 4%（不再 no_data）
+#   sim_tp_pct       = 固定 +5%
+#   sim_outcome_24h  = hit_tp | hit_sl | ambiguous(同棒双触、先后不可知，不计入胜负)
+#                      | neither(24h 内都没碰到) | no_data(入场K线缺失或24h覆盖<90%)
 #   sim_first_touch_cst = 首触时刻（CST），neither/no_data 为 NULL
+#   sim_rule         = 口径标签（SIM_RULE）；口径改动前已得出结论的行 rule 为 NULL、
+#                      不重算——改了前后不可比（V3 同一纪律）
+# ATR 按 V3 算法：判断时刻前 14 根已收盘 1H K 线的真实波幅均值；不足 15 根时退回
+# kline_cache 存的 atr14；两者都没有用 4%。
 # 写入时 24h 未成熟的行先记 no_data，由每次运行末尾的成熟回补通道
 # （_mature_sim_backfill）在窗口成熟后重算——幂等、有界、无需改 cron。
-SIM_ATR_MULT = 3.0
-SIM_RR = 2.0
+SIM_ATR_MULT = 1.0
+SIM_ATR_BARS = 14
+SIM_SL_MIN_PCT = 3.0
+SIM_SL_MAX_PCT = 6.0
+SIM_SL_DEFAULT_PCT = 4.0
+SIM_TP_PCT = 5.0
 SIM_HOURS = 24
 SIM_MIN_COVERAGE = 0.9
-# 3×ATR 止损距超过该值 = 缓存 atr14 错标度或上市初期畸变（实测 LAB 2500%、
-# BEAT 180%），不是任何真实会下的单 → 记 'stop_unrealistic'，不进成熟重扫集。
-SIM_MAX_STOP_PCT = 15.0
+SIM_RULE = "v3_clamp_1xatr1h_3to6_tp5_h24"
 SIM_COLUMNS = (
     ("sim_stop_pct", "REAL"),
     ("sim_tp_pct", "REAL"),
     ("sim_outcome_24h", "TEXT"),
     ("sim_first_touch_cst", "TEXT"),
+    ("sim_rule", "TEXT"),
 )
+
+
+def sim_sl_pct(atr_pct_1h) -> float:
+    """纯函数（V3 sim_sl_pct 移植，百分比单位）：clamp(1×ATR%, 3, 6)；缺 ATR → 4。"""
+    try:
+        atr = float(atr_pct_1h) if atr_pct_1h is not None else None
+    except (TypeError, ValueError):
+        atr = None
+    if atr is None or not math.isfinite(atr) or atr <= 0:
+        return SIM_SL_DEFAULT_PCT
+    return min(SIM_SL_MAX_PCT, max(SIM_SL_MIN_PCT, atr * SIM_ATR_MULT))
+
+
+def sim_outcome(tp_index, sl_index) -> str:
+    """纯函数（V3 sim_outcome 移植）：按先后到达的 bar 序判 hit_tp / hit_sl / ambiguous / neither。"""
+    if tp_index is not None and sl_index is not None:
+        if tp_index < sl_index:
+            return "hit_tp"
+        if tp_index > sl_index:
+            return "hit_sl"
+        return "ambiguous"
+    if tp_index is not None:
+        return "hit_tp"
+    if sl_index is not None:
+        return "hit_sl"
+    return "neither"
+
+
+def _closed_1h_cutoff(t0_utcz: str) -> str:
+    """t0 前已收盘 1H bar 的最晚开盘时刻 = t0 − 1h（kline_cache.ts 是开盘时刻，收盘 = ts + 1h）。"""
+    t0 = datetime.strptime(t0_utcz, "%Y-%m-%dT%H:%M:%SZ")
+    return (t0 - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _atr_pct_1h(mkt, sym: str, t0_utcz: str, px0: float):
+    """判断时刻前 14 根**已收盘** 1H 真实波幅均值 / 入场价（%）；退回存列 atr14；都无 → None。
+
+    t0 所在的那根 1H（ts = floor(t0, 1h)）在 t0 时还没收盘，它的 h/l/c 与存列
+    atr14 都是事后才定的，算进去就是前视；两条查询都只取 ts ≤ t0 − 1h。
+    """
+    cutoff = _closed_1h_cutoff(t0_utcz)
+    rows = mkt.execute(
+        "SELECT h, l, c FROM kline_cache WHERE symbol=? AND tf='1H' AND ts<=? "
+        "ORDER BY ts DESC LIMIT ?",
+        (sym, cutoff, SIM_ATR_BARS + 1),
+    ).fetchall()
+    rows = list(reversed(rows))
+    if len(rows) == SIM_ATR_BARS + 1:
+        ranges = []
+        for index in range(1, len(rows)):
+            try:
+                hi, lo = float(rows[index][0]), float(rows[index][1])
+                prev_close = float(rows[index - 1][2])
+            except (TypeError, ValueError):
+                ranges = []
+                break
+            if not all(math.isfinite(v) and v > 0 for v in (hi, lo, prev_close)):
+                ranges = []
+                break
+            ranges.append(max(hi - lo, abs(hi - prev_close), abs(lo - prev_close)))
+        if len(ranges) == SIM_ATR_BARS:
+            return sum(ranges) / SIM_ATR_BARS / px0 * 100.0
+    stored = mkt.execute(
+        "SELECT atr14 FROM kline_cache WHERE symbol=? AND tf='1H' "
+        "AND ts<=? AND atr14 IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (sym, cutoff),
+    ).fetchone()
+    if stored and stored[0] is not None:
+        try:
+            atr = float(stored[0])
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(atr) and atr > 0:
+            return atr / px0 * 100.0
+    return None
 
 
 def _ensure_sim_columns(les) -> None:
@@ -120,31 +202,24 @@ def _open_lessons_database(path: str | Path, dry_run: bool):
     return con
 
 
-def _evaluate_sim_2r_atr(mkt, sym: str, slot_cst: str, direction: str):
-    """实盘口径模拟：3×ATR14(1H) 止损、2R 固定 TP、24h 内 15m 先触判定。
+def _evaluate_sim(mkt, sym: str, slot_cst: str, direction: str):
+    """V3 口径模拟：止损 clamp(1×ATR14(1H), 3%, 6%)、止盈 +5%、24h 内 15m 先触判定。
 
-    返回 (stop_pct, tp_pct, outcome, first_touch_cst)。ATR/入场棒缺失
-    → (None, None, 'no_data', None)；同一根 15m 双触按保守计 'ambiguous_sl'；
+    返回 (stop_pct, tp_pct, outcome, first_touch_cst)。入场棒缺失 →
+    (None, None, 'no_data', None)；同一根 15m 双触 'ambiguous'（不计入胜负）；
     未触及且 24h 覆盖 < SIM_MIN_COVERAGE → 'no_data'（不冒充 neither）。"""
     t0 = _utcz_from_cst(slot_cst)
-    atr_row = mkt.execute(
-        "SELECT atr14, c FROM kline_cache WHERE symbol=? AND tf='1H' "
-        "AND ts<=? AND atr14 IS NOT NULL ORDER BY ts DESC LIMIT 1",
-        (sym, t0),
-    ).fetchone()
     entry_row = mkt.execute(
         "SELECT o FROM kline_cache WHERE symbol=? AND tf='15m' AND ts=?",
         (sym, t0),
     ).fetchone()
-    if not atr_row or not atr_row[0] or not entry_row or not entry_row[0]:
+    if not entry_row or not entry_row[0]:
         return None, None, "no_data", None
     px0 = float(entry_row[0])
-    stop_pct = float(atr_row[0]) * SIM_ATR_MULT / px0 * 100.0
-    if not (math.isfinite(stop_pct) and stop_pct > 0):
+    if not (math.isfinite(px0) and px0 > 0):
         return None, None, "no_data", None
-    tp_pct = stop_pct * SIM_RR
-    if stop_pct > SIM_MAX_STOP_PCT:
-        return round(stop_pct, 4), round(tp_pct, 4), "stop_unrealistic", None
+    stop_pct = sim_sl_pct(_atr_pct_1h(mkt, sym, t0, px0))
+    tp_pct = SIM_TP_PCT
     t24 = _utcz_from_cst(
         (datetime.strptime(slot_cst, "%Y-%m-%d %H:%M:%S")
          + timedelta(hours=SIM_HOURS)).strftime("%Y-%m-%d %H:%M:%S"))
@@ -159,8 +234,9 @@ def _evaluate_sim_2r_atr(mkt, sym: str, slot_cst: str, direction: str):
     else:
         sl_px = px0 * (1 - stop_pct / 100.0)
         tp_px = px0 * (1 + tp_pct / 100.0)
-    outcome, touch = "neither", None
-    for ts_, _o, h, l, _c in bars:
+    tp_index = sl_index = None
+    touch = None
+    for index, (ts_, _o, h, l, _c) in enumerate(bars):
         try:
             hi, lo = float(h), float(l)
         except (TypeError, ValueError):
@@ -169,15 +245,14 @@ def _evaluate_sim_2r_atr(mkt, sym: str, slot_cst: str, direction: str):
             sl_hit, tp_hit = hi >= sl_px, lo <= tp_px
         else:
             sl_hit, tp_hit = lo <= sl_px, hi >= tp_px
-        if sl_hit and tp_hit:
-            outcome, touch = "ambiguous_sl", ts_
+        if tp_hit and tp_index is None:
+            tp_index = index
+        if sl_hit and sl_index is None:
+            sl_index = index
+        if tp_hit or sl_hit:
+            touch = ts_
             break
-        if sl_hit:
-            outcome, touch = "hit_sl", ts_
-            break
-        if tp_hit:
-            outcome, touch = "hit_tp", ts_
-            break
+    outcome = sim_outcome(tp_index, sl_index)
     if outcome == "neither" and len(bars) < SIM_HOURS * 4 * SIM_MIN_COVERAGE:
         outcome = "no_data"
     touch_cst = None
@@ -189,32 +264,35 @@ def _evaluate_sim_2r_atr(mkt, sym: str, slot_cst: str, direction: str):
     return round(stop_pct, 4), round(tp_pct, 4), outcome, touch_cst
 
 
+# 旧名兼容（2026-08-28 首版）；口径已随 SIM_RULE 变更。
+_evaluate_sim_2r_atr = _evaluate_sim
+
+
 def _mature_sim_backfill(les, mkt, now_cst: datetime | None = None):
-    """成熟回补：sim 列为空/no_data 且 24h 窗已成熟的行重算并 UPDATE。
+    """成熟回补：sim 列为空/no_data 且 24h 窗已成熟的行按当前口径重算并 UPDATE。
 
     幂等有界：只扫 briefing_layer_v1 激活边界之后、ts ≤ now-25h 的行。
-    重扫集合 = 从未评估（outcome NULL）∪ 因窗口未成熟记过 no_data 但
-    ATR 可得（sim_stop_pct 非空）的行；ATR 永久缺失的行（stop_pct NULL
-    且已记 no_data）不再重扫。返回 (评估行数, 得出结论行数)。"""
+    重扫集合 = 从未评估（outcome NULL）∪ 记过 no_data 但还没按当前口径
+    （sim_rule）评估过的行；当前口径下仍 no_data 的行（入场 K 线永久缺失）
+    不再重扫。已得出结论的旧口径行冻结不动。返回 (评估行数, 得出结论行数)。"""
     now = now_cst or datetime.now()
     matured_before = (now - timedelta(hours=SIM_HOURS + 1)).strftime(
         "%Y-%m-%d %H:%M:%S")
     rows = les.execute(
         "SELECT id, ts, symbol, direction_hint FROM missed_opportunities "
         "WHERE ts >= ? AND ts <= ? AND (sim_outcome_24h IS NULL "
-        "OR (sim_outcome_24h = 'no_data' AND sim_stop_pct IS NOT NULL))",
+        "OR (sim_outcome_24h = 'no_data' AND COALESCE(sim_rule,'') <> ?))",
         (BRIEFING_SOURCE_ACTIVATION_CYC.replace("T", " ") + ":00",
-         matured_before),
+         matured_before, SIM_RULE),
     ).fetchall()
     evaluated = concluded = 0
     for rid, ts, sym, direction in rows:
         d = direction if direction in ("long", "short") else "long"
-        stop_pct, tp_pct, outcome, touch = _evaluate_sim_2r_atr(
-            mkt, sym, str(ts), d)
+        stop_pct, tp_pct, outcome, touch = _evaluate_sim(mkt, sym, str(ts), d)
         les.execute(
             "UPDATE missed_opportunities SET sim_stop_pct=?, sim_tp_pct=?, "
-            "sim_outcome_24h=?, sim_first_touch_cst=? WHERE id=?",
-            (stop_pct, tp_pct, outcome, touch, rid),
+            "sim_outcome_24h=?, sim_first_touch_cst=?, sim_rule=? WHERE id=?",
+            (stop_pct, tp_pct, outcome, touch, SIM_RULE, rid),
         )
         evaluated += 1
         if outcome not in (None, "no_data"):
@@ -638,7 +716,7 @@ def main() -> int:
     print(f"{tag}briefing_layer_v1 cycles={b_cycles} pairs_written={b_written} "
           f"caught={b_caught} dup_skipped={b_skipped} no_kline={b_nodata}"
           f"{b_note}")
-    print(f"{tag}sim_2r_atr matured_evaluated={sim_evaluated} "
+    print(f"{tag}sim({SIM_RULE}) matured_evaluated={sim_evaluated} "
           f"concluded={sim_concluded}")
     if wait_total > 0 and wait_directional == 0:
         # 静默写 0 正是 2026-07-29~31 对照组断供两天没被发现的原因，必须发声。

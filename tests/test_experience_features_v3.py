@@ -40,14 +40,17 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
             features._cst_to_utcz("2026-08-31T01:00:00+08:00"),
         )
 
-    def test_strict_24h_window_excludes_lower_and_same_day_older_rows(self) -> None:
+    def test_strict_24h_window_excludes_lower_open_bar_and_older_rows(self) -> None:
         connection = self._market()
-        upper = datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc)
-        lower = upper - timedelta(hours=24)
+        upper = datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc)   # as_of；这根 15m 还没收盘
+        last_closed = upper - timedelta(minutes=15)
+        lower = last_closed - timedelta(hours=24)                    # 严格下界，不含
         rows = [
             ("BTC-USDT-SWAP", "15m", "2026-08-29T00:00:00Z",
              1000.0, 1.0, 100.0),
             ("BTC-USDT-SWAP", "15m", lower.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             900.0, 2.0, 100.0),
+            ("BTC-USDT-SWAP", "15m", upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
              900.0, 2.0, 100.0),
         ]
         for index in range(1, 97):
@@ -102,6 +105,29 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
             connection.close()
         self.assertIsNone(result["vol_24h_pct"])
 
+    def test_similarity_v2_trend_keys_go_through_the_finite_gate(self) -> None:
+        base = {
+            "asset_class": "crypto", "side": "long", "action": "open",
+            "regime": "range", "stop_distance_pct": 0.04, "trend_4h": 1,
+        }
+        query = {**base, "trend_1h": 1}
+        missing = _simutil.similarity_v2(query, {**base, "trend_1h": None})
+        self.assertLess(missing, _simutil.similarity_v2(query, query))
+        # 非有限 / 非数字的趋势值 = 缺失：既不算 0 分，也不能让 True 冒充 1
+        for bad in (float("nan"), float("inf"), True, "up", "", "1x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    missing, _simutil.similarity_v2(query, {**base, "trend_1h": bad}))
+        # 1.0 / "1" 与 1 是同一个趋势值；-1 才是错配
+        self.assertEqual(
+            _simutil.similarity_v2(query, query),
+            _simutil.similarity_v2(query, {**base, "trend_1h": 1.0}))
+        self.assertEqual(
+            _simutil.similarity_v2(query, query),
+            _simutil.similarity_v2(query, {**base, "trend_1h": "1"}))
+        self.assertLess(
+            _simutil.similarity_v2(query, {**base, "trend_1h": -1}), missing)
+
     def test_similarity_v3_refuses_v2_and_wrong_epoch(self) -> None:
         base = {
             "asset_class": "crypto", "side": "long", "action": "open",
@@ -114,7 +140,7 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
         self.assertEqual(0.0, _simutil.similarity_v3(v3, wrong_epoch))
         self.assertGreater(_simutil.similarity_v3(v3, v3), 0.0)
 
-    def test_writer_creates_explicit_v3_epoch(self) -> None:
+    def test_writer_creates_explicit_v4_epoch_and_keeps_v3_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             trade_experience_writer, "_DB_ROOT", Path(temporary)
         ), mock.patch(
@@ -125,12 +151,19 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
                 "2026-08-31 01:00:00",
                 {"fill_px": 100.0, "sl_trigger_px": 95.0},
             )
-        self.assertEqual(3, payload["v"])
-        self.assertEqual(_simutil.FEATURE_EPOCH_V3, payload["feature_epoch"])
-        self.assertEqual(3, payload["features"]["v"])
+        self.assertEqual(4, payload["v"])
+        self.assertEqual(_simutil.FEATURE_EPOCH_V4, payload["feature_epoch"])
+        self.assertEqual(4, payload["features"]["v"])
+        self.assertEqual(
+            _simutil.FEATURE_EPOCH_V4,
+            payload["features"]["feature_epoch"],
+        )
+        self.assertEqual(0.05, payload["features"]["sl_pct"])
+        self.assertEqual(17, payload["features"]["hour_utc"])
+        self.assertEqual(3, payload["features_v3"]["v"])
         self.assertEqual(
             _simutil.FEATURE_EPOCH_V3,
-            payload["features"]["feature_epoch"],
+            payload["features_v3"]["feature_epoch"],
         )
 
     def test_row_loader_accepts_only_exact_v3_epoch(self) -> None:

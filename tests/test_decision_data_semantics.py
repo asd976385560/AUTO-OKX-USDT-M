@@ -415,14 +415,19 @@ class ExperienceRegimePointInTimeTests(unittest.TestCase):
             finally:
                 con.close()
             self.assertEqual(row[0], "range")
-            # 前向 v3：writer 落严格24h epoch；regime 仍直接看 features.regime。
+            # 前向 v4（2026-09-26 对照 V3）：writer 落 v4 epoch 并另存 features_v3；
+            # regime 仍直接看 features.regime。
             stored_vec = json.loads(row[1])
-            self.assertEqual(stored_vec.get("v"), 3)
+            self.assertEqual(stored_vec.get("v"), 4)
             self.assertEqual(
                 stored_vec.get("feature_epoch"),
+                "experience_features_v4_v3parity",
+            )
+            self.assertEqual(stored_vec["features"].get("v"), 4)
+            self.assertEqual(
+                stored_vec["features_v3"].get("feature_epoch"),
                 "experience_features_v3_strict_24h",
             )
-            self.assertEqual(stored_vec["features"].get("v"), 3)
             self.assertEqual(stored_vec["features"]["regime"], "range")
             self.assertEqual(stored_vec["features"]["side"], "long")
 

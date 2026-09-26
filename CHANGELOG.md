@@ -5,6 +5,15 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Added
+
+- Added a hard rule to the risk gate, ported from V3: a stop-loss farther than
+  0.8 × (1/leverage − maintenance margin rate) is rejected as
+  `sl_beyond_margin_distance` because liquidation would arrive first. The
+  executor uses the conservative default rate of 1% (as V3 does until position
+  tiers are wired); the parameter accepts a tier rate and is only validated when
+  a stop is supplied. The live trader manual states the limit.
+
 ### Changed
 
 - Consolidated the duplicated coin-name extraction in the RSS, Jinse, PANews, Odaily,
@@ -13,6 +22,39 @@ All notable public-release changes are recorded here. Public versions follow
   (or with a `$` prefix) so ordinary English words such as "cap", "near" or "lit"
   no longer produce symbols; English full names stay case-insensitive.
   `news_okx_announcements.py` keeps its announcement-specific extraction.
+- The shared coin-name matcher also follows the V3 news rules: bare tickers must
+  be at least three letters (two-letter tickers such as OP only match as `$OP`),
+  stablecoins are recognised but never emitted as instruments, symbols are
+  ordered by first mention across English and Chinese names, and at most ten
+  symbols are kept per text.
+- Similarity retrieval now scores experiences in a v4 feature space aligned with
+  the V3 similarity design: 1H ATR%, RSI, EMA20/50/200 alignment, 4h/16h returns,
+  volume z-score, stop distance and opening hour combined by geometric mean, with
+  a 0.9 cross-symbol factor and a 0.35 default threshold. New rows store v4
+  features next to the frozen v3 payload, and older rows are rebuilt as-of their
+  own timestamp from the K-line cache so history stays comparable.
+- Exit categories are derived from prices as in V3: exchange-side fills resolve to
+  `tp_hit`, `sl_hit`, `breakeven_stop` or `trail_stop` by the nearest level within
+  1.5% (sign-based fallbacks carry an `_inferred` suffix), agent closes split by
+  the recorded invalidation price, and close events now keep the close reason and
+  exchange-side flag so backfills classify identically.
+- The missed-opportunity simulation follows the V3 rule: stop =
+  clamp(1 × ATR1h, 3%, 6%) with a 4% default, take-profit +5%, same-bar double
+  touches count as `ambiguous` instead of losses, and rows carry a `sim_rule` tag
+  so results computed under the previous rule stay frozen.
+- Optimized the experience-feature derivation shared by the trade experience
+  writer, the similarity finder and the instrument context against the V3
+  similarity design: the strict 24h volatility window now anchors to the 15m bar
+  grid (fill-time timestamps previously never matched the grid and left
+  `vol_24h_pct` empty), planned RR is derived from `open_execution_package_v1`
+  when no decision card exists, numeric inputs are validated as finite, callers
+  can request a subset of market features, and one shared builder replaces three
+  copies of the stop-distance and RR logic.
+- Experience summaries with sufficient samples now also report the Wilson 95%
+  lower-bound win rate, similarity-weighted win rate and average return, and the
+  mean net R of path-instrumented neighbours; the feature version report
+  classifies `v3_epoch_mismatch` rows separately using the same acceptance rule
+  as the finder.
 
 ### Fixed
 
@@ -20,6 +62,18 @@ All notable public-release changes are recorded here. Public versions follow
   "以太经典" to ETC only, instead of also emitting the parent chain.
 - Polygon mentions (POLYGON / MATIC / $MATIC) now map to `POL-USDT-SWAP` instead of
   the delisted `MATIC-USDT-SWAP`, in text extraction and in OKX news `ccyList`.
+- The trade experience writer now stamps `path_metric_version` from the single
+  path-metrics source instead of a stale literal, so freshly closed rows are no
+  longer re-flagged as outdated by the backfill or read under the retired
+  gross-R convention.
+- The per-symbol funding-rate fallback now caps its remaining budget at the
+  caller's original timeout; on coarse monotonic clocks a rounding error could
+  previously hand it a budget slightly larger than requested.
+- Market features derived as-of a timestamp (the 24h volatility window, the
+  1H/4H MA trends, the 1H indicators and the missed-opportunity ATR) now use
+  only bars that had closed by that instant. The bar still open at the as-of
+  time was previously included, so backfilled and recomputed historical
+  features could see prices from after the decision.
 - Fixed the push-payload builder joining its read-only SQLite URI with a hard-coded
   backslash, which only Windows treats as a path separator. On Linux and macOS every
   `build_push_payload` ledger lookup silently returned no rows and WAIT reports were

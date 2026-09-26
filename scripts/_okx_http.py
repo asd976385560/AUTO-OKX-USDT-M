@@ -424,10 +424,16 @@ def _batch(symbols: Sequence[str], path_fn, params_fn, post_fn,
 
 
 # ---------------------------------------------------------------------------
-def _deadline_from_timeout(timeout_s: float | None) -> float | None:
+def _budget_seconds(timeout_s: float | None) -> float | None:
+    """调用方给的超时预算（秒，≥0.1）；None 表示不限。"""
     if timeout_s is None:
         return None
-    return time.monotonic() + max(0.1, float(timeout_s))
+    return max(0.1, float(timeout_s))
+
+
+def _deadline_from_timeout(timeout_s: float | None) -> float | None:
+    budget = _budget_seconds(timeout_s)
+    return None if budget is None else time.monotonic() + budget
 
 
 def fetch_tickers_all_sync(
@@ -580,10 +586,12 @@ def fetch_funding_rates_batch_sync(
             raise RuntimeError("funding instId=ANY returned no rows")
         return {s: by_id.get(s, {}) for s in syms}
     except Exception:  # noqa: BLE001 — 批量端点异常时回退逐币老路径
-        remaining = (
-            max(0.1, deadline - time.monotonic())
-            if deadline is not None else None
-        )
+        # 回退共享同一 deadline，再用原始预算封顶：粗粒度 monotonic 时钟（Windows）
+        # 下 (t0 + budget) - t0 可能因浮点舍入比 budget 多出 1 ulp。
+        remaining = None
+        if deadline is not None:
+            remaining = max(0.1, min(
+                _budget_seconds(batch_timeout_s), deadline - time.monotonic()))
         return _batch(
             symbols,
             lambda s: "/api/v5/public/funding-rate",

@@ -130,12 +130,40 @@ def backup(con: sqlite3.Connection, bdir: Path, name: str, tag: str) -> Path:
     return path
 
 
+def _column_types(con: sqlite3.Connection, table: str) -> dict[str, str]:
+    return {str(r[1]): str(r[2] or "") for r in con.execute(f"PRAGMA table_info({table})")}
+
+
+def extra_columns(con: sqlite3.Connection, old: str, copy_cols_old: str,
+                  new_table_cols: set[str]) -> list[tuple[str, str]]:
+    """旧表里不在拷贝清单、也不在新 DDL 里的列（后来由其它迁移 / writer 加的）。
+
+    2026-09-26：missed_opportunities 的 sim_* 列、trade_experiences 的路径埋点列
+    都是在本迁移的 DDL 定稿之后追加的；重建只拷贝固定清单会把它们连同数据一起
+    丢掉，因此重建时原样带上（保留 PRAGMA 里的声明类型）。
+    """
+    listed = {c.strip() for c in copy_cols_old.split(",")}
+    return [
+        (name, typ) for name, typ in _column_types(con, old).items()
+        if name not in listed and name not in new_table_cols
+    ]
+
+
 def rebuild(con: sqlite3.Connection, old: str, new_ddl: str,
             copy_cols_new: str, copy_cols_old: str,
             indexes: tuple[str, ...]) -> int:
     n_before = con.execute(f"SELECT COUNT(*) FROM {old}").fetchone()[0]
     con.execute("BEGIN IMMEDIATE")
     con.execute(new_ddl)
+    carried = extra_columns(
+        con, old, copy_cols_old, set(_column_types(con, f"{old}_new")))
+    for name, typ in carried:
+        con.execute(
+            f'ALTER TABLE {old}_new ADD COLUMN "{name}" {typ}'.rstrip())
+    if carried:
+        extra_sql = ", ".join(f'"{name}"' for name, _typ in carried)
+        copy_cols_new = f"{copy_cols_new}, {extra_sql}"
+        copy_cols_old = f"{copy_cols_old}, {extra_sql}"
     con.execute(
         f"INSERT INTO {old}_new({copy_cols_new}) "
         f"SELECT {copy_cols_old} FROM {old}")
