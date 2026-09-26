@@ -878,10 +878,16 @@ def main() -> int:
             print(f"[WARN] 遮蔽文件删除失败 {path}: {exc}")
     stats.stdlib_shadow_found = len(shadows)
     if shadows:
+        # Keep the f-string replacement field on a single line: an expression
+        # that spans lines inside ``{...}`` is PEP 701 syntax (Python >= 3.12)
+        # and is a SyntaxError on 3.11, which broke ``import tmp_cleanup``.
+        shadow_action = (
+            "已删除" if not dry_run
+            else "下一笔 OPEN/CLOSE 会炸在 import；加 --apply 删除，或手工移走"
+        )
         print(f"[P1] tmp 根下有 {len(shadows)} 个文件遮蔽标准库："
               f"{', '.join(p.name for p in shadows)}"
-              f"——{'已删除' if not dry_run else '下一笔 OPEN/CLOSE 会炸在 import；'
-                 '加 --apply 删除，或手工移走'}")
+              f"——{shadow_action}")
 
     operation_failures = cleanup_failure_count(stats)
     report = {

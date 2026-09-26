@@ -872,6 +872,64 @@ CREATE TABLE trade_cycles(
 """
 
 
+class PushPayloadReadOnlyConnectTests(unittest.TestCase):
+    """build_push_payload.connect must join ``db_root`` and the file name portably.
+
+    The helper used to render ``file:{db_root}\\{name}?mode=ro``: a backslash is a
+    path separator only on Windows, so on Linux/macOS it named a literal
+    ``<root>\\ledger.db`` file, ``_rows`` silently returned [] and every WAIT
+    report failed with "failure report requires readable execution_intents".
+    These cases run the real helper on the host platform without mocks."""
+
+    def _seed(self, root: Path, name: str = "ledger.db") -> None:
+        con = sqlite3.connect(root / name)
+        try:
+            con.execute("CREATE TABLE probe(v TEXT)")
+            con.execute("INSERT INTO probe VALUES('ok')")
+            con.commit()
+        finally:
+            con.close()
+
+    def test_connect_joins_root_and_name_for_path_and_str_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed(root)
+            for db_root in (root, str(root)):
+                with self.subTest(db_root=type(db_root).__name__):
+                    con = build_push_payload.connect(db_root, "ledger.db")
+                    try:
+                        row = con.execute("SELECT v FROM probe").fetchone()
+                        self.assertEqual(row["v"], "ok")
+                    finally:
+                        con.close()
+            self.assertEqual(
+                build_push_payload._rows(root, "ledger.db", "SELECT v FROM probe"),
+                [{"v": "ok"}],
+            )
+
+    def test_connect_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed(root)
+            con = build_push_payload.connect(root, "ledger.db")
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    con.execute("INSERT INTO probe VALUES('write')")
+            finally:
+                con.close()
+
+    def test_connect_fails_fast_on_missing_database_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(sqlite3.OperationalError):
+                build_push_payload.connect(root, "ledger.db")
+            self.assertFalse((root / "ledger.db").exists())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), [])
+            # _rows keeps its tolerant contract: an absent book reads as no rows.
+            self.assertEqual(
+                build_push_payload._rows(root, "ledger.db", "SELECT 1"), [])
+
+
 class PushSingleBookPayloadTests(unittest.TestCase):
     """2026-08-06 demo 全量下线后 push payload 只组 live 一本账。
 

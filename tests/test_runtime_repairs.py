@@ -2547,14 +2547,19 @@ class DailyInspectionRegressionTests(unittest.TestCase):
                 "store_key TEXT,job_id TEXT,ts INTEGER,status TEXT,error TEXT,"
                 "run_at_ms INTEGER,duration_ms INTEGER)"
             )
-            now_ms = int(time.time() * 1000)
+            # check_collection_failures samples its own "now" and audits the
+            # half-open window [now-24h, now), so a run logged in the very same
+            # millisecond as the audit falls outside it (seen ~1 in 400 runs on
+            # a fast Linux tmpfs).  Stamp the failed run one minute ago: still
+            # well inside the window, never racing the audit's clock.
+            run_ms = int(time.time() * 1000) - 60_000
             cron.execute(
                 "INSERT INTO cron_jobs VALUES(?,?,?,?,?,?)",
                 ("cron", "slow", "okx-collect-hourly", "error", "timed out", 2),
             )
             cron.execute(
                 "INSERT INTO cron_run_logs VALUES(?,?,?,?,?,?,?)",
-                ("cron", "slow", now_ms, "error", "timed out", now_ms, 480000),
+                ("cron", "slow", run_ms, "error", "timed out", run_ms, 480000),
             )
             cron.commit()
             cron.close()
