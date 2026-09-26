@@ -375,7 +375,8 @@ def features_v4_for_row(row: sqlite3.Row, db_root: Any,
 
     已存 v4 行直接取；v1/v2/v3 行按行 ts 从 kline_cache 现算 1H 指标（确定性、
     无前视），止损距离 / 计划 RR / 资产类别优先取当年冻结值，缺则按 raw 重算。
-    ``cache`` 按 (symbol, as-of 整点) 复用同轮已算过的指标。
+    ``cache`` 按 (symbol, 精确 as-of 时刻) 复用同轮已算过的指标——只在完全相同的
+    as-of 才复用，杜绝同一小时内后一行的 K 线被前一行"看到"的前视。
     """
     stored = _stored_vector(row)
     feats = _simutil.stored_v4_features(stored)
@@ -402,7 +403,7 @@ def features_v4_for_row(row: sqlite3.Row, db_root: Any,
     base["hour_utc"] = hour_utc(row["ts"])
     as_of = parse_as_of(row["ts"])
     if mcon is not None and as_of is not None:
-        key = (symbol, as_of.strftime("%Y-%m-%dT%H"))
+        key = (symbol, _utcz(as_of))
         indicators = cache.get(key) if cache is not None else None
         if indicators is None:
             try:

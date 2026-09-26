@@ -2427,6 +2427,9 @@ def open_position(
         open_positions=open_positions, sl_trigger_px=sl_trigger_px,
         profile="live", available_margin=available_margin,
         account_imr=account_imr,
+        # 止损距离硬规则的维持保证金率：尚未接 position-tiers，与 V3 一样恒用
+        # 保守缺省 rv.DEFAULT_MMR（1%）；回执 math.mmr 如实记录所用值。
+        mmr=None,
     )
 
     if not v["approved"]:

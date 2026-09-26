@@ -35,9 +35,10 @@ MIN_NOTIONAL_PCT = 0.01      # 单笔名义价值 ≥ 1% 净值（不足 → cla
 MAX_SL_DEVIATION = 0.30      # 止损价偏离 mark_px ≤ 30%（超 → reject，防填错标的）
 # 2026-09-26 对照 V3 risk::protection 硬规则：止损距离还必须在保证金能扛的范围内
 # ≤ SL_MARGIN_DISTANCE_FACTOR × (1/杠杆 − 维持保证金率)，否则价格先到强平线、
-# 止损单永远不会触发（10x≈7.2%、5x≈15.2%、3x≈25.9%）。维持保证金率未接
-# position-tiers 前用保守缺省 1%（与 V3 execution.default_mmr 同值），调用方可传
-# 交易所档位真实值；加仓按现仓实际杠杆核（与增量 IMR 同一 effective_lev）。
+# 止损单永远不会触发（10x≈7.2%、5x≈15.2%、3x≈25.9%）。维持保证金率：executor
+# 与 V3 一样尚未接 position-tiers，生产恒用保守缺省 1%（V3 execution.default_mmr
+# 同值；0.8 系数即为档位差异留的余量）；``mmr`` 入参只供接了档位数据的调用方与
+# 单测使用。加仓按现仓实际杠杆核（与增量 IMR 同一 effective_lev）。
 SL_MARGIN_DISTANCE_FACTOR = 0.8
 DEFAULT_MMR = 0.01
 # 市价单按 mark_px 估增量 IMR，另保留可用资金余量，避免本笔耗尽结算币保证金。
@@ -342,8 +343,9 @@ def validate(
 ) -> dict[str, Any]:
     """确定性风控闸。
 
-    ``mmr``：该合约当前档位的维持保证金率（比例）；缺省 DEFAULT_MMR（保守 1%），
-    只用于「止损距离 ≤ 0.8×(1/杠杆−mmr)」这道 V3 同口径硬规则。
+    ``mmr``：该合约当前档位的维持保证金率（比例）；缺省 DEFAULT_MMR（保守 1%，
+    executor 生产路径目前恒用缺省，与 V3 同），只用于「止损距离 ≤
+    0.8×(1/杠杆−mmr)」这道 V3 同口径硬规则；未传 SL 时不校验 mmr，只留诊断值。
 
     返回 dict:
       {
@@ -593,28 +595,35 @@ def validate(
         )
 
     # ── 止损距离 vs 保证金可扛距离（V3 risk::protection 同口径；有 SL 才校）──
-    mmr_value = DEFAULT_MMR if mmr is None else mmr
+    mmr_raw = DEFAULT_MMR if mmr is None else mmr
     try:
-        mmr_value = float(mmr_value)
+        mmr_value: Optional[float] = float(mmr_raw)
     except (TypeError, ValueError, OverflowError):
-        return _reject("bad_mmr", f"维持保证金率非法: {mmr!r}")
-    if (not math.isfinite(mmr_value) or mmr_value < 0
+        mmr_value = None
+    if mmr_value is not None and (
+            not math.isfinite(mmr_value) or mmr_value < 0
             or mmr_value >= 1.0 / effective_lev):
-        return _reject(
-            "bad_mmr",
-            f"维持保证金率 {mmr_value} 须在 [0, 1/lev={1.0 / effective_lev:.4f}) 内",
-        )
-    max_sl_dist = max_sl_distance_pct(effective_lev, mmr_value)
+        mmr_value = None
+    max_sl_dist = (
+        max_sl_distance_pct(effective_lev, mmr_value)
+        if mmr_value is not None else None)
     math_box["mmr"] = mmr_value
     math_box["sl_margin_distance_factor"] = SL_MARGIN_DISTANCE_FACTOR
     math_box["max_sl_distance_pct"] = max_sl_dist
-    if sl_dev is not None and max_sl_dist is not None and sl_dev > max_sl_dist + _EPS:
-        return _reject(
-            "sl_beyond_margin_distance",
-            f"止损距 {sl_dev:.2%} > 保证金可扛距离 {max_sl_dist:.2%}"
-            f"（{SL_MARGIN_DISTANCE_FACTOR:g}×(1/{effective_lev:g}x−{mmr_value:.2%})）："
-            "价格先到强平线，止损单不会触发；请放近止损或降杠杆",
-        )
+    if sl_dev is not None:
+        if mmr_value is None or max_sl_dist is None:
+            return _reject(
+                "bad_mmr",
+                f"维持保证金率非法: {mmr!r}（须在 [0, 1/lev="
+                f"{1.0 / effective_lev:.4f}) 内的有限数）",
+            )
+        if sl_dev > max_sl_dist + _EPS:
+            return _reject(
+                "sl_beyond_margin_distance",
+                f"止损距 {sl_dev:.2%} > 保证金可扛距离 {max_sl_dist:.2%}"
+                f"（{SL_MARGIN_DISTANCE_FACTOR:g}×(1/{effective_lev:g}x−{mmr_value:.2%})）："
+                "价格先到强平线，止损单不会触发；请放近止损或降杠杆",
+            )
 
     rounded_intended = _round_down_to_step(intended_sz, lot_sz)
     # demo 的两阶段定仓分支（minSz/lotSz 物理下单校验 + preflight_only 预检 +

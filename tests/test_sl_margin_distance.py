@@ -82,7 +82,14 @@ class MaxStopDistanceTests(unittest.TestCase):
     def test_no_stop_supplied_skips_the_rule(self):
         result = _validate(sl_trigger_px=None)
         self.assertTrue(result["approved"], result)
-        self.assertIn("max_sl_distance_pct", result["math"])
+        self.assertAlmostEqual(0.072, result["math"]["max_sl_distance_pct"])
+
+    def test_invalid_mmr_without_stop_is_diagnostic_only(self):
+        # 规则只在有 SL 时生效：无 SL 的校验不因档位数据坏掉而拒单，只留空诊断值
+        result = _validate(sl_trigger_px=None, mmr="x")
+        self.assertTrue(result["approved"], result)
+        self.assertIsNone(result["math"]["mmr"])
+        self.assertIsNone(result["math"]["max_sl_distance_pct"])
 
 
 if __name__ == "__main__":

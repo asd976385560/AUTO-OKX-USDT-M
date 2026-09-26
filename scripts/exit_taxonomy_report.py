@@ -150,6 +150,9 @@ def is_exchange_side_close(reason: Any, raw: Any) -> bool:
     text = str(reason or "")
     lowered = text.lower()
     if isinstance(raw, dict):
+        # writer 落 close_events 时已按回执判定并持久化的标记优先。
+        if raw.get("exchange_side") is True:
+            return True
         if raw.get("reconcile_source") or raw.get("reconcile") is True:
             return True
         source = str(raw.get("source") or raw.get("fill_source") or "").lower()
@@ -338,66 +341,86 @@ def main() -> int:
                     help="写 reports/quality/exit_taxonomy_<tag>.{json,md}；缺省只打印")
     args = ap.parse_args()
 
-    con = sqlite3.connect(
-        f"file:{Path(args.db_root) / 'live_trades.db'}?mode=ro", uri=True)
+    db_root = Path(args.db_root)
+    con = sqlite3.connect(f"file:{db_root / 'live_trades.db'}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     rows = list(con.execute(
         "SELECT id, ts, symbol, side, action, sz, fill_px, notional, pnl, "
         "reasoning, raw FROM trades WHERE ts>=? AND ts<? ORDER BY ts",
         (args.since, args.until)))
     con.close()
+    market_db = db_root / "market.db"
+    mcon = None
+    if market_db.exists():
+        try:
+            mcon = sqlite3.connect(f"file:{market_db}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            mcon = None
 
-    # FIFO 配对 open（同 symbol+side），取初始 SL 与开仓名义
+    # FIFO 配对 open（同 symbol+side），保留开仓回执原文供出口实证分类
     open_q: dict[tuple, collections.deque] = collections.defaultdict(
         collections.deque)
     results = []
-    for row in rows:
-        key = (row["symbol"], row["side"])
-        raw = _load(row["raw"])
-        if row["action"] == "open":
-            open_q[key].append({
-                "fill_px": row["fill_px"],
-                "notional": row["notional"],
-                "sl": raw.get("sl_trigger_px"),
-                "tps": take_profit_levels(raw),
+    try:
+        for row in rows:
+            key = (row["symbol"], row["side"])
+            raw = _load(row["raw"])
+            if row["action"] == "open":
+                opener_raw = dict(raw)
+                opener_raw.setdefault("fill_px", row["fill_px"])
+                opener_raw.setdefault("notional", row["notional"])
+                open_q[key].append({
+                    "fill_px": row["fill_px"],
+                    "notional": row["notional"],
+                    "sl": raw.get("sl_trigger_px"),
+                    "ts": row["ts"],
+                    "raw": opener_raw,
+                })
+                continue
+            if not str(row["action"]).startswith("close") or row["pnl"] is None:
+                continue
+            opener = open_q[key].popleft() if open_q[key] else None
+            sl_px = None
+            r_source = "missing"
+            initial_risk = None
+            realized_r = None
+            if opener and opener["sl"] and opener["fill_px"] and opener["notional"]:
+                try:
+                    sl_px = float(opener["sl"])
+                    stop_dist = abs(opener["fill_px"] - sl_px) / opener["fill_px"]
+                    if stop_dist > 0:
+                        initial_risk = opener["notional"] * stop_dist
+                        realized_r = row["pnl"] / initial_risk
+                        r_source = "sl_from_open_raw"
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            # 与 writer / 回填同一套实证输入：移动过的止损、止盈价位、失效价、
+            # 平仓前已收盘 15m 收盘价。
+            close_trade = dict(raw)
+            close_trade["fill_px"] = row["fill_px"]
+            close_trade["reason"] = (
+                row["reasoning"] or raw.get("reason") or raw.get("reasoning") or "")
+            context = exit_context(
+                opener["raw"] if opener else {}, close_trade,
+                symbol=row["symbol"], side=row["side"],
+                open_ts=opener["ts"] if opener else None, close_ts=row["ts"],
+                realized_pnl=row["pnl"], db_root=db_root, mcon=mcon)
+            cat = classify_exit(**context)
+            results.append({
+                "trade_id": row["id"],
+                "ts": row["ts"],
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "pnl": round(row["pnl"], 4),
+                "category": cat,
+                "r_source": r_source,
+                "initial_risk_usdt": round(initial_risk, 2) if initial_risk else None,
+                "realized_r": round(realized_r, 3) if realized_r is not None else None,
+                "reason_head": (row["reasoning"] or "")[:80],
             })
-            continue
-        if not str(row["action"]).startswith("close") or row["pnl"] is None:
-            continue
-        opener = open_q[key].popleft() if open_q[key] else None
-        sl_px = None
-        r_source = "missing"
-        initial_risk = None
-        realized_r = None
-        if opener and opener["sl"] and opener["fill_px"] and opener["notional"]:
-            try:
-                sl_px = float(opener["sl"])
-                stop_dist = abs(opener["fill_px"] - sl_px) / opener["fill_px"]
-                if stop_dist > 0:
-                    initial_risk = opener["notional"] * stop_dist
-                    realized_r = row["pnl"] / initial_risk
-                    r_source = "sl_from_open_raw"
-            except (TypeError, ValueError, ZeroDivisionError):
-                pass
-        cat = classify_exit(
-            row["reasoning"] or "", raw, sl_px, row["fill_px"],
-            side=row["side"],
-            entry_px=opener["fill_px"] if opener else None,
-            tps=opener.get("tps", []) if opener else [],
-            net=row["pnl"],
-        )
-        results.append({
-            "trade_id": row["id"],
-            "ts": row["ts"],
-            "symbol": row["symbol"],
-            "side": row["side"],
-            "pnl": round(row["pnl"], 4),
-            "category": cat,
-            "r_source": r_source,
-            "initial_risk_usdt": round(initial_risk, 2) if initial_risk else None,
-            "realized_r": round(realized_r, 3) if realized_r is not None else None,
-            "reason_head": (row["reasoning"] or "")[:80],
-        })
+    finally:
+        if mcon is not None:
+            mcon.close()
 
     agg = collections.defaultdict(lambda: {"n": 0, "pnl": 0.0})
     for x in results:

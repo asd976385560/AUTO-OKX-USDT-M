@@ -291,6 +291,33 @@ class SharedBuilderTests(unittest.TestCase):
         self.assertEqual(0.0002, derived["funding_rate"])
 
 
+class IndicatorCacheTests(unittest.TestCase):
+    def test_cache_is_keyed_by_the_exact_as_of_instant(self):
+        market = _market()
+        _fill_trend(market, "1H", 30, UPPER)
+        market.row_factory = sqlite3.Row
+        market.execute(
+            "CREATE TABLE trade_experiences(id INTEGER,symbol TEXT,side TEXT,"
+            "action TEXT,regime TEXT,ts TEXT,raw TEXT,experience_vector TEXT)")
+        market.executemany(
+            "INSERT INTO trade_experiences VALUES(?,?,?,?,?,?,?,?)",
+            [(1, "BTC-USDT-SWAP", "long", "open", "range",
+              "2026-08-31 00:05:00", "{}", None),
+             (2, "BTC-USDT-SWAP", "long", "open", "range",
+              "2026-08-31 00:50:00", "{}", None)])
+        rows = market.execute("SELECT * FROM trade_experiences ORDER BY id").fetchall()
+        cache: dict = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            for row in rows:
+                features.features_v4_for_row(row, Path(temporary), market, cache)
+        market.close()
+        # 同一小时内两个不同时刻 → 两个键，各自按自己的 ts<=as_of 查 K 线，无前视
+        self.assertEqual(
+            {("BTC-USDT-SWAP", "2026-08-30T16:05:00Z"),
+             ("BTC-USDT-SWAP", "2026-08-30T16:50:00Z")},
+            set(cache))
+
+
 class BackfillClassificationTests(unittest.TestCase):
     @staticmethod
     def _vectors() -> list[str | None]:

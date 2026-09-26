@@ -203,6 +203,55 @@ class ContextTests(unittest.TestCase):
         maintenance = dict(context, reason="IMR 破 0.66 硬闸去风险")
         self.assertEqual("imr_forced_reduce", taxonomy.classify_exit(**maintenance))
 
+    def test_persisted_exchange_side_flag_is_honoured(self):
+        self.assertTrue(taxonomy.is_exchange_side_close("filled", {"exchange_side": True}))
+        self.assertFalse(taxonomy.is_exchange_side_close("filled", {"exchange_side": False}))
+        context = taxonomy.exit_context(
+            self.OPEN_RAW, None, symbol="BTC-USDT-SWAP", side="long",
+            open_ts="2026-08-10 08:00:00", close_ts="2026-08-10 11:00:00",
+            realized_pnl=0.8, db_root=None, mcon=None)
+        # close_events 里的最后一次事件带 exchange_side=True 时走价位实证
+        self.assertEqual("reconcile_backfill" if False else taxonomy.classify_exit(
+            **dict(context, raw={"exchange_side": True}, fill_px=109.6)), "tp_hit")
+
+    def test_report_cli_uses_the_full_exit_context(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._root_with_adjustments(root)
+            con = sqlite3.connect(root / "live_trades.db")
+            con.execute(
+                "CREATE TABLE trades(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "cycle_id TEXT,ts TEXT,symbol TEXT,action TEXT,side TEXT,sz REAL,"
+                "fill_px REAL,lev REAL,margin REAL,notional REAL,score_total INTEGER,"
+                "reasoning TEXT,deviation TEXT,degradation TEXT,pnl REAL,raw TEXT)")
+            con.execute(
+                "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,fill_px,"
+                "notional,reasoning,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("c0", "2026-08-10 08:00:00", "BTC-USDT-SWAP", "open", "long",
+                 1.0, 100.0, 1000.0, "open", None,
+                 json.dumps({"sl_trigger_px": 95.0, "tp_trigger_px": 110.0})))
+            con.execute(
+                "INSERT INTO trades(cycle_id,ts,symbol,action,side,sz,fill_px,"
+                "notional,reasoning,pnl,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("c9", "2026-08-10 11:00:00", "BTC-USDT-SWAP", "close", "long",
+                 1.0, 100.9, 1009.0, "RECON-fill", 8.0,
+                 json.dumps({"reconcile_source": "fills"})))
+            con.commit()
+            con.close()
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", [
+                "exit_taxonomy_report.py", "--db-root", str(root),
+                "--since", "2026-08-01", "--until", "2026-09-01",
+            ]), contextlib.redirect_stdout(output):
+                self.assertEqual(0, taxonomy.main())
+        report = json.loads(output.getvalue())
+        self.assertEqual(1, report["total_closes"])
+        # 成交 100.9 贴 10:00 那次 ADJUST_PROTECTION 落地的止损 101（盈利侧）→ trail_stop
+        self.assertEqual("trail_stop", report["rows"][0]["category"])
+        self.assertEqual("sl_from_open_raw", report["rows"][0]["r_source"])
+
     def test_legacy_four_argument_call_still_works(self):
         self.assertEqual(
             "reconcile_backfill",

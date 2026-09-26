@@ -9,8 +9,10 @@ All notable public-release changes are recorded here. Public versions follow
 
 - Added a hard rule to the risk gate, ported from V3: a stop-loss farther than
   0.8 × (1/leverage − maintenance margin rate) is rejected as
-  `sl_beyond_margin_distance` because liquidation would arrive first; the live
-  trader manual states the limit and callers may pass the exchange tier rate.
+  `sl_beyond_margin_distance` because liquidation would arrive first. The
+  executor uses the conservative default rate of 1% (as V3 does until position
+  tiers are wired); the parameter accepts a tier rate and is only validated when
+  a stop is supplied. The live trader manual states the limit.
 
 ### Changed
 
