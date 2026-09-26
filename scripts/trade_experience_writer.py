@@ -5,8 +5,9 @@
 （含决策背景 + experience_vector），平仓 UPDATE 该行为 closed（补 pnl_pct/hold_hours/is_gross_profit_close）。
 caller 提供 account.db 连接并负责 commit；交易账与经验跨库，经验失败不阻塞交易记账。
 
-新行 `experience_vector` 由 `_simutil.experience_features_v3` 编码并携带固定 epoch；
-历史 v2 blob 原样冻结（与 find_similar_experience 的前向 v3 空间严格隔离）。
+新行 `experience_vector` 由 `experience_features_v2.vector_payload` 编码为前向 v4
+（V3 similarity 特征集，携带固定 epoch，另存 features_v3）；历史 blob 原样冻结，
+find_similar_experience 按行 ts 现算 v4 特征后在同一空间比较。
 本模块用 caller 传入的 conn.execute（**不** 自己 commit、**不** 开新连接）——保证同事务。
 
     决策卡随 trade raw 一并保存；L2 教训摘要由 reviewer 流程
@@ -42,7 +43,7 @@ _DB_ROOT = Path(os.environ.get("OKX_DB_ROOT", _public_project_path('db')))
 
 
 def _v3_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
-    """前向 v3 特征载荷（严格24h；历史 v2 不重算）。
+    """前向 v4 特征载荷（V3 特征集；另存 features_v3；历史 v2/v3 不重算）。
 
     基础特征（止损距离、计划 RR）由 experience_features_v2.experience_base 装配，
     资产类别与市场态由 market_context 派生——三处（writer / finder / 特征脚本）
@@ -67,12 +68,14 @@ def _v3_vector_payload(symbol, side, action, regime, now_ts, trade) -> dict:
         try:
             base.update(efv2.market_context(symbol, now_ts, _DB_ROOT))
         except Exception as exc:  # noqa: BLE001  特征派生永不阻断记账
-            print(f"[trade_experience_writer][WARN] v3 特征派生失败 "
+            print(f"[trade_experience_writer][WARN] v4 特征派生失败 "
                   f"{symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return efv2.vector_payload(base)
     return {
-        "v": 3,
-        "feature_epoch": _simutil.FEATURE_EPOCH_V3,
-        "features": _simutil.experience_features_v3(base),
+        "v": 4,
+        "feature_epoch": _simutil.FEATURE_EPOCH_V4,
+        "features": _simutil.experience_features_v4(base),
+        "features_v3": _simutil.experience_features_v3(base),
     }
 
 
@@ -120,11 +123,19 @@ def _fill_path_metrics(conn, exp_id, symbol, side, open_raw, open_ts,
                 open_ts, close_ts, realized_pnl)
         finally:
             mcon.close()
-        reason = str((close_trade or {}).get("reason")
-                     or (close_trade or {}).get("reasoning") or "")
-        exit_cat = classify_exit(
-            reason, close_trade if isinstance(close_trade, dict) else {},
-            sl, None)
+        # 2026-09-26 对照 V3：按价位实证分类（止盈 / 止损 / 保本 / 追踪 /
+        # 论点失效），输入由 exit_taxonomy_report.exit_context 统一装配。
+        import exit_taxonomy_report as _exit_taxonomy
+        mcon = sqlite3.connect(
+            f"file:{market_db}?mode=ro", uri=True, timeout=5)
+        try:
+            context = _exit_taxonomy.exit_context(
+                open_raw, close_trade, symbol=symbol, side=side,
+                open_ts=open_ts, close_ts=close_ts,
+                realized_pnl=realized_pnl, db_root=_DB_ROOT, mcon=mcon)
+        finally:
+            mcon.close()
+        exit_cat = _exit_taxonomy.classify_exit(**context)
         if "path_metric_version" in cols:
             conn.execute(
                 "UPDATE trade_experiences SET initial_risk_usdt=?, mfe_r=?, "
@@ -371,6 +382,12 @@ def _close_event(
         "sz": consumed_sz,
         "pnl": allocated_pnl,
         "fill_px": trade.get("fill_px") or trade.get("px"),
+        # 2026-09-26：出口分类回填需要平仓回执的理由与来源（交易所侧 / Agent 主动），
+        # 此前事件只记数量与价格，回填时 reasoning 恒为空。
+        "reason": str(trade.get("reason") or trade.get("reasoning") or "")[:240],
+        "exchange_side": bool(
+            trade.get("reconcile_source")
+            or str(trade.get("reason") or "").startswith("RECON-")),
     }
     if event["ordId"] is None:
         # 2026-09-12：身份不唯一时 _trade_ordid 按设计返回 None（交易所用多张

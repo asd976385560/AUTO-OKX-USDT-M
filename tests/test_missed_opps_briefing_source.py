@@ -197,7 +197,7 @@ class ActivationBoundarySyncTests(unittest.TestCase):
 
 
 class Sim2rAtrTests(unittest.TestCase):
-    """2026-08-28 实盘口径模拟：3×ATR 止损、2R TP、24h 先触。"""
+    """实盘口径模拟（2026-09-26 对照 V3）：止损 clamp(1×ATR, 3%, 6%)、TP +5%、24h 先触。"""
 
     SLOT = "2026-08-20 10:00:00"
 
@@ -228,14 +228,50 @@ class Sim2rAtrTests(unittest.TestCase):
             for i in range(n)
         ]
 
+    def test_sl_rule_matches_v3(self):
+        self.assertEqual(4.0, missed_opps_writer.sim_sl_pct(None))
+        self.assertEqual(3.0, missed_opps_writer.sim_sl_pct(1.0))
+        self.assertEqual(4.5, missed_opps_writer.sim_sl_pct(4.5))
+        self.assertEqual(6.0, missed_opps_writer.sim_sl_pct(80.0))
+        self.assertEqual(4.0, missed_opps_writer.sim_sl_pct("nan"))
+        self.assertEqual("ambiguous", missed_opps_writer.sim_outcome(3, 3))
+        self.assertEqual("hit_tp", missed_opps_writer.sim_outcome(2, 5))
+        self.assertEqual("hit_sl", missed_opps_writer.sim_outcome(None, 5))
+        self.assertEqual("neither", missed_opps_writer.sim_outcome(None, None))
+
+    def test_atr_uses_true_range_of_last_14_closed_1h_bars(self):
+        con = sqlite3.connect(":memory:")
+        con.execute(
+            "CREATE TABLE kline_cache (symbol TEXT, tf TEXT, ts TEXT, "
+            "o REAL, h REAL, l REAL, c REAL, atr14 REAL)")
+        t0 = datetime(2026, 8, 20, 2, 0)   # SLOT in UTC
+        rows = []
+        for index in range(15):
+            ts = (t0 - timedelta(hours=15 - index)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rows.append(("AAA-USDT-SWAP", "1H", ts, 100.0, 102.0, 98.0, 100.0, 9.0))
+        con.executemany("INSERT INTO kline_cache VALUES(?,?,?,?,?,?,?,?)", rows)
+        # 14 根 TR 均为 4 → ATR% = 4%（存列 atr14=9 不参与）
+        self.assertAlmostEqual(
+            4.0,
+            missed_opps_writer._atr_pct_1h(
+                con, "AAA-USDT-SWAP", "2026-08-20T02:00:00Z", 100.0))
+        con.execute("DELETE FROM kline_cache WHERE ts<?",
+                    ("2026-08-19T20:00:00Z",))
+        # 不足 15 根 → 退回存列 atr14=9 → 9%
+        self.assertAlmostEqual(
+            9.0,
+            missed_opps_writer._atr_pct_1h(
+                con, "AAA-USDT-SWAP", "2026-08-20T02:00:00Z", 100.0))
+        con.close()
+
     def test_long_hit_tp_first(self):
-        # 入场 100、ATR=1 → 止损 3%（97）、TP 6%（106）
+        # 入场 100、ATR=1 → 1% 抬到 3% 下限（97）、TP 固定 5%（105）
         bars = self._bars(self.SLOT, 96)
         bars[10] = (bars[10][0], 100.0, 106.5, 99.8, 106.0)
-        stop, tp, outcome, touch = missed_opps_writer._evaluate_sim_2r_atr(
+        stop, tp, outcome, touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "long")
         self.assertAlmostEqual(stop, 3.0)
-        self.assertAlmostEqual(tp, 6.0)
+        self.assertAlmostEqual(tp, 5.0)
         self.assertEqual(outcome, "hit_tp")
         self.assertEqual(touch, "2026-08-20 12:30:00")
 
@@ -243,49 +279,57 @@ class Sim2rAtrTests(unittest.TestCase):
         bars = self._bars(self.SLOT, 96)
         bars[5] = (bars[5][0], 100.0, 100.5, 96.8, 97.0)
         bars[20] = (bars[20][0], 100.0, 107.0, 99.8, 106.5)
-        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim_2r_atr(
+        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "long")
         self.assertEqual(outcome, "hit_sl")
 
-    def test_same_bar_both_touches_is_conservative_sl(self):
+    def test_same_bar_both_touches_is_ambiguous_not_a_loss(self):
         bars = self._bars(self.SLOT, 96)
         bars[3] = (bars[3][0], 100.0, 106.5, 96.5, 100.0)
-        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim_2r_atr(
+        _s, _t, outcome, touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "long")
-        self.assertEqual(outcome, "ambiguous_sl")
+        self.assertEqual(outcome, "ambiguous")
+        self.assertEqual(touch, "2026-08-20 10:45:00")
 
     def test_short_direction_mirrors(self):
         bars = self._bars(self.SLOT, 96)
-        bars[7] = (bars[7][0], 100.0, 100.2, 93.5, 94.0)  # 空头 TP=94
-        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim_2r_atr(
+        bars[7] = (bars[7][0], 100.0, 100.2, 93.5, 94.0)  # 空头 TP=95
+        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "short")
         self.assertEqual(outcome, "hit_tp")
 
-    def test_missing_atr_is_no_data(self):
+    def test_missing_atr_uses_default_four_percent(self):
         bars = self._bars(self.SLOT, 96)
-        stop, tp, outcome, touch = missed_opps_writer._evaluate_sim_2r_atr(
+        stop, tp, outcome, touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars, with_atr=False), "AAA-USDT-SWAP", self.SLOT,
             "long")
+        self.assertAlmostEqual(stop, 4.0)
+        self.assertAlmostEqual(tp, 5.0)
+        self.assertEqual(outcome, "neither")
+
+    def test_missing_entry_bar_is_no_data(self):
+        stop, tp, outcome, touch = missed_opps_writer._evaluate_sim(
+            self._mkt([]), "AAA-USDT-SWAP", self.SLOT, "long")
         self.assertIsNone(stop)
         self.assertEqual(outcome, "no_data")
 
     def test_untouched_with_incomplete_window_is_no_data(self):
         bars = self._bars(self.SLOT, 20)  # 24h 应有 96 根，覆盖不足
-        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim_2r_atr(
+        _s, _t, outcome, _touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "long")
         self.assertEqual(outcome, "no_data")
 
-    def test_absurd_atr_is_stop_unrealistic(self):
+    def test_absurd_atr_is_clamped_to_six_percent(self):
         bars = self._bars(self.SLOT, 96)
-        stop, _t, outcome, touch = missed_opps_writer._evaluate_sim_2r_atr(
+        stop, _t, outcome, touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars, atr14=80.0), "AAA-USDT-SWAP", self.SLOT, "long")
-        self.assertAlmostEqual(stop, 240.0)
-        self.assertEqual(outcome, "stop_unrealistic")
+        self.assertAlmostEqual(stop, 6.0)
+        self.assertEqual(outcome, "neither")
         self.assertIsNone(touch)
 
     def test_untouched_full_window_is_neither(self):
         bars = self._bars(self.SLOT, 96)
-        _s, _t, outcome, touch = missed_opps_writer._evaluate_sim_2r_atr(
+        _s, _t, outcome, touch = missed_opps_writer._evaluate_sim(
             self._mkt(bars), "AAA-USDT-SWAP", self.SLOT, "long")
         self.assertEqual(outcome, "neither")
         self.assertIsNone(touch)
@@ -316,22 +360,46 @@ class MatureSimBackfillTests(unittest.TestCase):
             les, mkt, now_cst=now)
         self.assertEqual((n_eval, n_done), (1, 1))
         got = les.execute(
-            "SELECT sim_outcome_24h, sim_stop_pct FROM missed_opportunities "
+            "SELECT sim_outcome_24h, sim_stop_pct, sim_rule FROM missed_opportunities "
             "ORDER BY id").fetchall()
         self.assertEqual(got[0][0], "hit_tp")
         self.assertAlmostEqual(got[0][1], 3.0)
+        self.assertEqual(got[0][2], missed_opps_writer.SIM_RULE)
         self.assertIsNone(got[1][0])
+        self.assertIsNone(got[1][2])
 
-    def test_permanent_no_atr_rows_not_rescanned(self):
+    def test_permanent_no_entry_bar_rows_not_rescanned(self):
         slot = Sim2rAtrTests.SLOT
-        mkt = Sim2rAtrTests()._mkt(
-            Sim2rAtrTests._bars(slot, 96), with_atr=False)
+        mkt = Sim2rAtrTests()._mkt([])  # 入场 15m K 线永久缺失
         les = self._les([(slot, "AAA-USDT-SWAP", "long")])
         now = datetime(2026, 8, 21, 12, 0)
         first = missed_opps_writer._mature_sim_backfill(les, mkt, now_cst=now)
         second = missed_opps_writer._mature_sim_backfill(les, mkt, now_cst=now)
         self.assertEqual(first, (1, 0))
         self.assertEqual(second, (0, 0))
+
+    def test_old_rule_pending_rows_are_re_evaluated_once_and_conclusions_frozen(self):
+        slot = Sim2rAtrTests.SLOT
+        bars = Sim2rAtrTests._bars(slot, 96)
+        mkt = Sim2rAtrTests()._mkt(bars)
+        les = self._les([(slot, "AAA-USDT-SWAP", "long"),
+                         (slot, "BBB-USDT-SWAP", "long")])
+        # 第一行：旧口径挂起（no_data、rule 为空）→ 按当前口径重算；
+        # 第二行：旧口径已有结论（hit_sl）→ 冻结不动
+        les.execute(
+            "UPDATE missed_opportunities SET sim_outcome_24h='no_data', "
+            "sim_stop_pct=3.0 WHERE id=1")
+        les.execute(
+            "UPDATE missed_opportunities SET sim_outcome_24h='hit_sl', "
+            "sim_stop_pct=9.0, sim_tp_pct=18.0 WHERE id=2")
+        now = datetime(2026, 8, 21, 12, 0)
+        self.assertEqual(
+            (1, 1), missed_opps_writer._mature_sim_backfill(les, mkt, now_cst=now))
+        rows = les.execute(
+            "SELECT sim_outcome_24h, sim_tp_pct, sim_rule FROM missed_opportunities "
+            "ORDER BY id").fetchall()
+        self.assertEqual(("neither", 5.0, missed_opps_writer.SIM_RULE), rows[0])
+        self.assertEqual(("hit_sl", 18.0, None), rows[1])
 
 
 class DryRunSchemaSafetyTests(unittest.TestCase):

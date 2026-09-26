@@ -5,8 +5,34 @@ All notable public-release changes are recorded here. Public versions follow
 
 ## [Unreleased]
 
+### Added
+
+- Added a hard rule to the risk gate, ported from V3: a stop-loss farther than
+  0.8 × (1/leverage − maintenance margin rate) is rejected as
+  `sl_beyond_margin_distance` because liquidation would arrive first; the live
+  trader manual states the limit and callers may pass the exchange tier rate.
+
 ### Changed
 
+- Similarity retrieval now scores experiences in a v4 feature space aligned with
+  the V3 similarity design: 1H ATR%, RSI, EMA20/50/200 alignment, 4h/16h returns,
+  volume z-score, stop distance and opening hour combined by geometric mean, with
+  a 0.9 cross-symbol factor and a 0.35 default threshold. New rows store v4
+  features next to the frozen v3 payload, and older rows are rebuilt as-of their
+  own timestamp from the K-line cache so history stays comparable.
+- Exit categories are derived from prices as in V3: exchange-side fills resolve to
+  `tp_hit`, `sl_hit`, `breakeven_stop` or `trail_stop` by the nearest level within
+  1.5% (sign-based fallbacks carry an `_inferred` suffix), agent closes split by
+  the recorded invalidation price, and close events now keep the close reason and
+  exchange-side flag so backfills classify identically.
+- The missed-opportunity simulation follows the V3 rule: stop =
+  clamp(1 × ATR1h, 3%, 6%) with a 4% default, take-profit +5%, same-bar double
+  touches count as `ambiguous` instead of losses, and rows carry a `sim_rule` tag
+  so results computed under the previous rule stay frozen.
+- News collectors share one coin-name table with V3's matching rules: the longest
+  name wins ("Bitcoin Cash" is BCH, "Ethereum Classic" is ETC), bare tickers must
+  be upper-case and at least three letters, Polygon maps to POL and stablecoins
+  are not emitted.
 - Optimized the experience-feature derivation shared by the trade experience
   writer, the similarity finder and the instrument context against the V3
   similarity design: the strict 24h volatility window now anchors to the 15m bar

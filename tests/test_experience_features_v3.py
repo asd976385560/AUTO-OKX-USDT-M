@@ -114,7 +114,7 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
         self.assertEqual(0.0, _simutil.similarity_v3(v3, wrong_epoch))
         self.assertGreater(_simutil.similarity_v3(v3, v3), 0.0)
 
-    def test_writer_creates_explicit_v3_epoch(self) -> None:
+    def test_writer_creates_explicit_v4_epoch_and_keeps_v3_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             trade_experience_writer, "_DB_ROOT", Path(temporary)
         ), mock.patch(
@@ -125,12 +125,19 @@ class ExperienceFeaturesV3Tests(unittest.TestCase):
                 "2026-08-31 01:00:00",
                 {"fill_px": 100.0, "sl_trigger_px": 95.0},
             )
-        self.assertEqual(3, payload["v"])
-        self.assertEqual(_simutil.FEATURE_EPOCH_V3, payload["feature_epoch"])
-        self.assertEqual(3, payload["features"]["v"])
+        self.assertEqual(4, payload["v"])
+        self.assertEqual(_simutil.FEATURE_EPOCH_V4, payload["feature_epoch"])
+        self.assertEqual(4, payload["features"]["v"])
+        self.assertEqual(
+            _simutil.FEATURE_EPOCH_V4,
+            payload["features"]["feature_epoch"],
+        )
+        self.assertEqual(0.05, payload["features"]["sl_pct"])
+        self.assertEqual(17, payload["features"]["hour_utc"])
+        self.assertEqual(3, payload["features_v3"]["v"])
         self.assertEqual(
             _simutil.FEATURE_EPOCH_V3,
-            payload["features"]["feature_epoch"],
+            payload["features_v3"]["feature_epoch"],
         )
 
     def test_row_loader_accepts_only_exact_v3_epoch(self) -> None:

@@ -117,26 +117,30 @@ class StrictWindowGridTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(
-            {"funding_rate": None, "vol_24h_pct": None,
-             "trend_1h": None, "trend_4h": None},
-            result,
-        )
+            {key: None for key in features.MARKET_FEATURE_KEYS}, result)
 
 
 class SubsetAndTrendTests(unittest.TestCase):
     def test_fields_subset_skips_unrequested_queries(self) -> None:
         connection = _market(with_derivatives=False)
         _fill_trend(connection, "4H", 50, UPPER)
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
         try:
-            with self.assertRaises(sqlite3.OperationalError):
-                features.derive_market_features(
-                    connection, "BTC-USDT-SWAP", "2026-08-31 01:00:00")
             result = features.derive_market_features(
                 connection, "BTC-USDT-SWAP", "2026-08-31 01:00:00",
                 fields=("trend_4h", "unknown_key"))
+            self.assertEqual({"trend_4h": 1}, result)
+            self.assertEqual(1, len(statements))
+            self.assertIn("tf='4H'", statements[0])
+            # 全量请求：缺 derivatives 表只让 funding_rate 留空，其它特征照算
+            full = features.derive_market_features(
+                connection, "BTC-USDT-SWAP", "2026-08-31 01:00:00")
         finally:
             connection.close()
-        self.assertEqual({"trend_4h": 1}, result)
+        self.assertIsNone(full["funding_rate"])
+        self.assertEqual(1, full["trend_4h"])
+        self.assertEqual(len(features.MARKET_FEATURE_KEYS), len(full))
 
     def test_trend_needs_fifty_finite_closes(self) -> None:
         connection = _market()
@@ -232,9 +236,12 @@ class SharedBuilderTests(unittest.TestCase):
         self.assertEqual("tokenized_stock", payload["features"]["asset_class"])
         self.assertEqual(2.0, payload["features"]["planned_rr"])
         self.assertEqual(0.05, payload["features"]["stop_distance_pct"])
-        self.assertEqual(_simutil.FEATURE_EPOCH_V3, payload["feature_epoch"])
+        self.assertEqual(0.05, payload["features"]["sl_pct"])
+        self.assertEqual(_simutil.FEATURE_EPOCH_V4, payload["feature_epoch"])
         self.assertEqual(
-            _simutil.FEATURE_EPOCH_V3, payload["features"]["feature_epoch"])
+            _simutil.FEATURE_EPOCH_V4, payload["features"]["feature_epoch"])
+        self.assertEqual(
+            _simutil.FEATURE_EPOCH_V3, payload["features_v3"]["feature_epoch"])
 
     def test_writer_payload_survives_derivation_failure(self) -> None:
         trade = {"fill_px": 100.0, "sl_trigger_px": 95.0,
@@ -245,7 +252,7 @@ class SharedBuilderTests(unittest.TestCase):
             payload = trade_experience_writer._v3_vector_payload(
                 "BTC-USDT-SWAP", "long", "open", "range",
                 "2026-08-31 01:07:23", trade)
-        self.assertEqual(3, payload["v"])
+        self.assertEqual(4, payload["v"])
         self.assertEqual(0.05, payload["features"]["stop_distance_pct"])
         self.assertEqual(2.0, payload["features"]["planned_rr"])
         self.assertIsNone(payload["features"]["asset_class"])
@@ -275,8 +282,9 @@ class SharedBuilderTests(unittest.TestCase):
                     connection, row, Path(temporary))
             finally:
                 connection.close()
-        self.assertEqual(3, derived["v"])
+        self.assertEqual(4, derived["v"])
         self.assertEqual("crypto", derived["asset_class"])
+        self.assertEqual(17, derived["hour_utc"])
         self.assertEqual(0.05, derived["stop_distance_pct"])
         self.assertEqual(2.0, derived["planned_rr"])
         self.assertEqual(0.2, derived["vol_24h_pct"])
@@ -319,7 +327,8 @@ class BackfillClassificationTests(unittest.TestCase):
         self.assertEqual(7, report["total_rows"])
         self.assertEqual(
             {"v1_or_legacy": 2, "v2_frozen": 1, "v3_forward": 1,
-             "v3_epoch_mismatch": 2, "invalid": 1},
+             "v3_epoch_mismatch": 2, "v4_forward": 0, "v4_epoch_mismatch": 0,
+             "invalid": 1},
             report["versions"],
         )
         self.assertFalse(refused["ok"])

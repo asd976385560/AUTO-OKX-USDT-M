@@ -38,6 +38,16 @@ _COLLECTORS = str(Path(__file__).resolve().parents[1])  # <PROJECT_ROOT>\collect
 if _COLLECTORS not in sys.path:
     sys.path.insert(0, _COLLECTORS)
 import news_writer  # noqa: E402
+
+try:
+    from . import _coin_names  # noqa: E402  包内加载
+except ImportError:  # 裸模块加载（run_okx_python / 单测直接 import）
+    import os as _coin_os
+    import sys as _coin_sys
+    _SOURCES_DIR = _coin_os.path.dirname(_coin_os.path.abspath(__file__))
+    if _SOURCES_DIR not in _coin_sys.path:
+        _coin_sys.path.insert(0, _SOURCES_DIR)
+    import _coin_names  # noqa: E402
 try:  # 兼容生产 sys.path 模块导入与项目包导入两种入口
     from ._news_http import fetch_text as _fetch_text_httpx  # type: ignore
 except ImportError:  # pragma: no cover - production imports adapters by module name
@@ -62,37 +72,11 @@ _ARTICLE_ID_RE = re.compile(
 
 # ── 币种抽取 ──────────────────────────────────────────────────────────────
 # 1) 中文币名 → 符号（先匹配，避免「比特币」被英文规则漏掉）
-_CN_COIN_MAP = {
-    "比特币": "BTC", "以太坊": "ETH", "以太币": "ETH", "索拉纳": "SOL",
-    "瑞波": "XRP", "瑞波币": "XRP", "狗狗币": "DOGE", "狗狗": "DOGE",
-    "莱特币": "LTC", "波场": "TRX", "波卡": "DOT", "艾达币": "ADA",
-    "柴犬币": "SHIB", "屎币": "SHIB", "门罗币": "XMR", "大零币": "ZEC",
-    "比特现金": "BCH", "恒星币": "XLM", "唯链": "VET", "波场币": "TRX",
-    "泰达币": "USDT", "稳定币": None,  # 「稳定币」泛指，不映射具体符号
-}
+# 币名 / ticker / 中文名登记表与匹配规则统一见 _coin_names.py（2026-09-26 合并五处副本）。
 # 2) 英文/大写 ticker（词边界匹配；curated 避免 ON/ARB 等误命中普通词）
-_COINS = [
-    "BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "SOLANA", "XRP", "RIPPLE",
-    "BNB", "DOGE", "DOGECOIN", "ADA", "CARDANO", "AVAX", "LINK", "CHAINLINK",
-    "TRX", "TRON", "TON", "DOT", "POLKADOT", "MATIC", "POLYGON", "SHIB",
-    "LTC", "LITECOIN", "BCH", "UNI", "AAVE", "ARB", "ARBITRUM", "OP",
-    "OPTIMISM", "SUI", "APT", "APTOS", "INJ", "SEI", "TIA", "PEPE", "WIF",
-    "NEAR", "FIL", "ATOM", "ETC", "XLM", "ICP", "HBAR", "RNDR", "RENDER",
-    "HYPE", "ZEC", "TRUMP", "POPCAT", "WBTC", "USDT", "USDC", "POND",
-    "ALCX", "ARDR", "NFP", "CAP", "ARX", "POPMART",
-]
-_COIN_TO_SYM = {
-    "BITCOIN": "BTC", "ETHEREUM": "ETH", "SOLANA": "SOL", "RIPPLE": "XRP",
-    "DOGECOIN": "DOGE", "CARDANO": "ADA", "CHAINLINK": "LINK", "TRON": "TRX",
-    "POLKADOT": "DOT", "POLYGON": "MATIC", "LITECOIN": "LTC", "ARBITRUM": "ARB",
-    "OPTIMISM": "OP", "APTOS": "APT", "RENDER": "RNDR",
-}
 # 注：Python re 把 CJK 当作 word char，`\b` 在「美国HYPE现货」里不触发 → ticker 漏抽。
 # 改用 ASCII 边界 lookaround：ticker 两侧不得是 ASCII 字母/数字（容许紧贴中文/标点），
 # 既能命中「ZEC空单」「美国HYPE」，又不会在 BITCOINIST 等更长拉丁词内部误命中。
-_COIN_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + "|".join(sorted(_COINS, key=len, reverse=True))
-    + r")(?![A-Za-z0-9])", re.I)
 
 # ── 规则标签（确定性；中英文关键词）─────────────────────────────────────────
 _TAG_RULES = [
@@ -260,26 +244,9 @@ def _parse_official_page(page_text: str, max_age_hours: int) -> list[dict]:
     return out
 
 
-def _extract_symbols(title: str) -> list[str]:
-    title = title or ""
-    found: list[str] = []
-
-    def _add(sym: str) -> None:
-        if not sym:
-            return
-        inst = f"{sym}-USDT-SWAP"
-        if inst not in found:
-            found.append(inst)
-
-    # 1) 中文币名优先
-    for cn, sym in _CN_COIN_MAP.items():
-        if cn in title:
-            _add(sym)
-    # 2) 大写 ticker（含 $TICKER）
-    for m in _COIN_RE.finditer(title):
-        tok = m.group(1).upper()
-        _add(_COIN_TO_SYM.get(tok, tok))
-    return found
+def _extract_symbols(text: str) -> list[str]:
+    """文本 → <BASE>-USDT-SWAP 列表；规则与登记表统一在 _coin_names（V3 symbols_in 同口径）。"""
+    return _coin_names.extract_symbols(text)
 
 
 def _severity(title: str) -> str:

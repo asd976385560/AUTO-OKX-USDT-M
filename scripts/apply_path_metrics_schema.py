@@ -45,7 +45,7 @@ from core.risk_validator import (  # noqa: E402
     RISK_FEE_BUFFER_PCT,
     RISK_SLIPPAGE_BUFFER_PCT,
 )
-from exit_taxonomy_report import classify as classify_exit  # noqa: E402
+from exit_taxonomy_report import classify_exit  # noqa: E402,F401  旧名保留供调用方
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -205,8 +205,8 @@ def compute_path_metrics(mcon: sqlite3.Connection, symbol: str, side: str,
     return out
 
 
-def metrics_for_row(mcon: sqlite3.Connection, row: sqlite3.Row
-                    ) -> Optional[dict[str, Any]]:
+def metrics_for_row(mcon: sqlite3.Connection, row: sqlite3.Row,
+                    db_root: Optional[Path] = None) -> Optional[dict[str, Any]]:
     try:
         raw = json.loads(row["raw"] or "{}")
     except json.JSONDecodeError:
@@ -236,14 +236,14 @@ def metrics_for_row(mcon: sqlite3.Connection, row: sqlite3.Row
     metrics = compute_path_metrics(
         mcon, row["symbol"], row["side"], entry, sl, notional,
         row["ts"], close_ts, row["realized_pnl"])
-    # 出口类别：从 close_events 的最后一次事件 reasoning 判（存于 raw）
-    events = raw.get("close_events")
-    reason = ""
-    if isinstance(events, list) and events:
-        last = events[-1]
-        if isinstance(last, dict):
-            reason = str(last.get("reasoning") or last.get("reason") or "")
-    metrics["exit_category"] = classify_exit(reason, raw, sl, None)
+    # 出口类别（2026-09-26 对照 V3 按价位实证）：close_events 最后一次事件的
+    # 理由 / 来源 / 成交价 + 开仓 SL/TP + 持仓期内移动过的止损 + 平仓前 15m 收盘。
+    import exit_taxonomy_report as _exit_taxonomy
+    context = _exit_taxonomy.exit_context(
+        raw, None, symbol=row["symbol"], side=row["side"], open_ts=row["ts"],
+        close_ts=close_ts, realized_pnl=row["realized_pnl"], db_root=db_root,
+        mcon=mcon)
+    metrics["exit_category"] = _exit_taxonomy.classify_exit(**context)
     return metrics
 
 
@@ -326,7 +326,7 @@ def main() -> int:
             (PATH_METRIC_VERSION,)).fetchall()
         filled = skipped = ever1 = 0
         for row in rows:
-            metrics = metrics_for_row(mcon, row)
+            metrics = metrics_for_row(mcon, row, root)
             if metrics is None:
                 acon.execute(
                     "UPDATE trade_experiences SET initial_risk_usdt=NULL, "

@@ -1,12 +1,12 @@
 <!--
 doc-name: live_trader
-doc-version: V2.22-role
+doc-version: V2.23-role
 role: OKX 统一分析与实盘交易员（okx-live-trader）
 trigger: dispatcher stage=live；正常 mode=unified，人工回滚 mode=full
 session: 每 cycle 独立 session，cycle 只取触发消息
-last-updated: 2026-09-14
-updated-by: Codex
-change-summary: 同轮明确无下单副作用的最小风险拒绝保留失败并继续独立标的，真实安全异常继续停止。
+last-updated: 2026-09-26
+updated-by: Claude
+change-summary: OPEN/ADD 止损距新增保证金可扛距离硬规则（≤0.8×(1/杠杆−1%)，对照 V3），超出由 executor 拒单。前批（2026-09-14）：同轮明确无下单副作用的最小风险拒绝保留失败并继续独立标的，真实安全异常继续停止。
 -->
 
 # live_trader — 无三周期、无六项卡合同
@@ -169,7 +169,7 @@ runner在同一个固定 Python 进程调用order_executor并执行
 - `MAX_SINGLE_ORDER_IMR_RATIO=0.15`，定仓预算14.7%。
 - `MAX_SINGLE_ORDER_RISK_PCT_EQUITY=0.05`，含费用与滑点。
 - 可用USDT最多98%；名义至少净值1%；杠杆≤10x。
-- OPEN/ADD必须有方向正确、偏离mark不超过30%的SL。
+- OPEN/ADD必须有方向正确、偏离mark不超过30%的SL，且止损距≤0.8×(1/杠杆−1%)（10x≈7.2%、5x≈15.2%、3x≈25.9%；更远会先强平，executor 以 sl_beyond_margin_distance 拒单）。
 - 账户、仓位、mark、规格、账仓、intent任一不可验证即fail-closed。
 - 写入歧义不盲重下；成交后必须验证SL，失败安全unwind；TP按exit_mode处理。
 - 钱路留痕必须保留 `risk.math.account_imr`、`projected_portfolio_imr_ratio`、
