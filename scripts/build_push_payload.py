@@ -56,6 +56,7 @@ from core.decision_card import (
 )
 from core.risk_validator import MAX_PORTFOLIO_IMR_RATIO
 from scripts import _acceptance_thresholds as thresholds
+from scripts._db_ro import connect_ro
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -81,9 +82,16 @@ _CLOSE = {"close", "reduce", "stop_loss"}
 
 
 def connect(db_root: str, name: str) -> sqlite3.Connection:
-    con = sqlite3.connect(f"file:{db_root}\\{name}?mode=ro", uri=True, timeout=10)
-    con.row_factory = sqlite3.Row
-    return con
+    """Open ``<db_root>/<name>`` read-only through the shared portable URI helper.
+
+    ``db_root`` may be a str or a Path.  The two parts are joined with pathlib and
+    rendered as a POSIX-style ``file:`` URI, so the same code works on Windows and
+    on Linux/macOS.  (A hard-coded backslash only ever acted as a separator on
+    Windows; elsewhere it named a literal ``db\\ledger.db`` file, every lookup
+    raised ``unable to open database file`` and ``_rows`` silently returned [].)
+    A missing database still raises ``sqlite3.OperationalError`` (fail-fast).
+    """
+    return connect_ro(Path(db_root, name), timeout=10, row_factory=sqlite3.Row)
 
 
 def _rows(db_root, name, sql, args=()):
